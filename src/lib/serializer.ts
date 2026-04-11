@@ -204,9 +204,9 @@ function buildPrompt(
   }
 
   if (images.length > 0) {
-    parts.push("Images:");
+    parts.push("Images (refer to these files for visual context):");
     for (const img of images) {
-      parts.push(`- Image "${img.fileName}" at position (${img.x}, ${img.y}), size ${img.width}x${img.height}`);
+      parts.push(`- File: ${img.fileName} (position: ${img.x},${img.y}, size: ${img.width}x${img.height})`);
     }
     parts.push("");
   }

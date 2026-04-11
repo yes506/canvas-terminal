@@ -4,7 +4,7 @@ import type { ShapeTool } from "../types/canvas";
 
 export const CANVAS_COLORS = [
   "transparent",
-  "#000000", "#333333", "#666666", "#999999", "#cccccc", "#ffffff",
+  "#666666", "#888888", "#aaaaaa", "#cccccc", "#e0e0e0", "#ffffff",
   "#ef4444", "#f97316", "#eab308", "#22c55e", "#3b82f6", "#8b5cf6",
 ];
 
@@ -76,7 +76,7 @@ interface CanvasState {
 export const useCanvasStore = create<CanvasState>((set) => ({
   activeTool: "select",
   setActiveTool: (tool) => set({ activeTool: tool }),
-  strokeColor: "#000000",
+  strokeColor: "#cccccc",
   fillColor: "transparent",
   colorMode: "stroke",
   setStrokeColor: (color) => set({ strokeColor: color }),

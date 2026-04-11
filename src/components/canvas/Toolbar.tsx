@@ -1,4 +1,3 @@
-import { useRef } from "react";
 import {
   MousePointer2,
   Square,
@@ -10,6 +9,8 @@ import {
   ImagePlus,
   Send,
 } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 import * as fabric from "fabric";
 import {
   useCanvasStore,
@@ -39,13 +40,12 @@ export function Toolbar({ onSendToTerminal }: ToolbarProps) {
     setStrokeColor, setFillColor, setColorMode,
     fabricCanvas,
   } = useCanvasStore();
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const activeColor = colorMode === "stroke" ? strokeColor : fillColor;
 
   const handleColorPick = (color: string) => {
     if (colorMode === "stroke") {
-      setStrokeColor(color === "transparent" ? "#000000" : color);
+      setStrokeColor(color === "transparent" ? "#cccccc" : color);
     } else {
       setFillColor(color);
     }
@@ -54,10 +54,9 @@ export function Toolbar({ onSendToTerminal }: ToolbarProps) {
       const active = fabricCanvas.getActiveObject();
       if (active) {
         if (colorMode === "stroke") {
-          active.set("stroke", color === "transparent" ? "#000000" : color);
-          // Also apply to text fill (text color = stroke in our model)
+          active.set("stroke", color === "transparent" ? "#cccccc" : color);
           if (active instanceof fabric.IText || active instanceof fabric.Textbox) {
-            active.set("fill", color === "transparent" ? "#000000" : color);
+            active.set("fill", color === "transparent" ? "#cccccc" : color);
           }
         } else {
           active.set("fill", color);
@@ -68,39 +67,46 @@ export function Toolbar({ onSendToTerminal }: ToolbarProps) {
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !fabricCanvas) return;
+  const handleImageInsert = async () => {
+    if (!fabricCanvas) return;
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      const imgEl = new Image();
-      imgEl.onload = () => {
-        const img = new fabric.Image(imgEl, { left: 50, top: 50 });
-        if (img.width && img.width > 300) img.scaleToWidth(300);
-        (img as fabric.FabricObject & { filePath?: string }).filePath = file.name;
-        fabricCanvas.add(img);
-        fabricCanvas.setActiveObject(img);
-        fabricCanvas.renderAll();
-        pushCanvasState(fabricCanvas);
-        setActiveTool("select");
-      };
-      imgEl.src = reader.result as string;
+    const result = await open({
+      filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "svg", "webp"] }],
+      multiple: false,
+    });
+
+    if (!result) return;
+
+    // result is the full file path (e.g. /Users/donghyeon/Desktop/screenshot.png)
+    const fullPath = typeof result === "string" ? result : result;
+
+    // Read the file via Rust and get base64 data
+    const dataUrl = await invoke<string>("read_image_as_data_url", { path: fullPath });
+
+    const imgEl = new Image();
+    imgEl.onload = () => {
+      const img = new fabric.Image(imgEl, { left: 50, top: 50 });
+      if (img.width && img.width > 300) img.scaleToWidth(300);
+      // Store FULL path for AI CLI tools to access
+      (img as fabric.FabricObject & { filePath?: string }).filePath = fullPath;
+      fabricCanvas.add(img);
+      fabricCanvas.setActiveObject(img);
+      fabricCanvas.renderAll();
+      pushCanvasState(fabricCanvas);
+      setActiveTool("select");
     };
-    reader.readAsDataURL(file);
-    e.target.value = "";
+    imgEl.src = dataUrl;
   };
 
   return (
     <div className="flex flex-col items-center gap-1 p-2 bg-surface-light border-r border-surface-lighter w-12">
-      {/* Shape tools */}
       {tools.map(({ tool, icon, label }) => (
         <button
           key={tool}
           title={label}
           className={`w-8 h-8 flex items-center justify-center rounded transition-colors ${
             activeTool === tool
-              ? "bg-white text-black"
+              ? "bg-surface-lighter text-white"
               : "text-text-muted hover:bg-surface-lighter hover:text-text"
           }`}
           onClick={() => setActiveTool(tool)}
@@ -113,19 +119,12 @@ export function Toolbar({ onSendToTerminal }: ToolbarProps) {
       <button
         title="Insert Image"
         className="w-8 h-8 flex items-center justify-center rounded text-text-muted hover:bg-surface-lighter hover:text-text transition-colors"
-        onClick={() => fileInputRef.current?.click()}
+        onClick={handleImageInsert}
       >
         <ImagePlus size={16} />
       </button>
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/png,image/jpeg,image/gif,image/svg+xml,image/webp"
-        className="hidden"
-        onChange={handleFileChange}
-      />
 
-      {/* Stroke / Fill mode toggle */}
+      {/* Stroke / Fill toggle */}
       <div className="w-8 h-px bg-surface-lighter my-1" />
       <div className="flex flex-col items-center gap-1 w-full">
         <button
