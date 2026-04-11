@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { terminalThemes } from "./themes";
@@ -48,12 +49,26 @@ export function useTerminal(sessionId: string) {
 
     const fitAddon = new FitAddon();
     const searchAddon = new SearchAddon();
+    const unicode11Addon = new Unicode11Addon();
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(new WebLinksAddon());
     terminal.loadAddon(searchAddon);
+    terminal.loadAddon(unicode11Addon);
+    terminal.unicode.activeVersion = "11";
 
     // Let app-level shortcuts bubble past xterm
     terminal.attachCustomKeyEventHandler((e) => {
+      // Never interfere with IME composition (Korean, Japanese, Chinese input)
+      if (e.isComposing || e.keyCode === 229) return true;
+
+      // Shift+Enter → send CSI u escape sequence so apps (e.g. Claude Code) recognise it
+      if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        if (e.type === "keydown") {
+          invoke("write_to_pty", { sessionId, data: "\x1b[13;2u" }).catch(() => {});
+        }
+        return false;
+      }
       if ((e.metaKey || e.ctrlKey) && INTERCEPTED_KEYS.has(e.key)) {
         return false; // Don't handle — let DOM event propagate
       }
@@ -138,13 +153,43 @@ export function useTerminal(sessionId: string) {
 
     if (disposed.current) return;
 
-    // Forward user input to PTY
+    // IME composition handling for CJK input (Korean, Japanese, Chinese)
+    // xterm.js in Tauri's webview may fire onData for individual jamo/kana
+    // before the OS IME can compose them into syllables. We suppress onData
+    // during composition and send the composed result from compositionend.
+    let isComposing = false;
+    let skipNextOnData = false;
+    const helperTextarea = termRef.current?.querySelector<HTMLTextAreaElement>(
+      ".xterm-helper-textarea"
+    );
+
+    if (helperTextarea) {
+      helperTextarea.addEventListener("compositionstart", () => {
+        isComposing = true;
+      });
+
+      helperTextarea.addEventListener("compositionend", (e: CompositionEvent) => {
+        isComposing = false;
+        if (e.data) {
+          skipNextOnData = true;
+          invoke("write_to_pty", { sessionId, data: e.data }).catch((err) => {
+            console.error("Failed to write to PTY:", err);
+          });
+        }
+      });
+    }
+
+    // Forward user input to PTY (skip during IME composition)
     terminal.onData((data) => {
-      if (!disposed.current) {
-        invoke("write_to_pty", { sessionId, data }).catch((err) => {
-          console.error("Failed to write to PTY:", err);
-        });
+      if (disposed.current) return;
+      if (skipNextOnData) {
+        skipNextOnData = false;
+        return;
       }
+      if (isComposing) return;
+      invoke("write_to_pty", { sessionId, data }).catch((err) => {
+        console.error("Failed to write to PTY:", err);
+      });
     });
 
     // Handle resize

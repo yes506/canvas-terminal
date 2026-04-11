@@ -9,7 +9,7 @@ import {
 } from "../../stores/canvasStore";
 import type { ShapeTool } from "../../types/canvas";
 
-const CANVAS_BG = "#f0f0f0";
+const CANVAS_BG = "#2f2f2f";
 
 export function useCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -18,7 +18,7 @@ export function useCanvas() {
   const isDrawing = useRef(false);
   const startPoint = useRef({ x: 0, y: 0 });
   const activeShape = useRef<fabric.FabricObject | null>(null);
-  const drawStrokeColor = useRef("#000000");
+  const drawStrokeColor = useRef("#cccccc");
   const prevSize = useRef({ width: 0, height: 0 });
 
   // Polyline state
@@ -97,8 +97,8 @@ export function useCanvas() {
       backgroundColor: CANVAS_BG,
       selection: false,
       preserveObjectStacking: true,
-      selectionColor: "rgba(0, 0, 0, 0.1)",
-      selectionBorderColor: "#000000",
+      selectionColor: "rgba(255, 255, 255, 0.1)",
+      selectionBorderColor: "#999999",
       selectionLineWidth: 1,
     });
 
@@ -166,8 +166,9 @@ export function useCanvas() {
           if (img.width && img.width > maxW) {
             img.scaleToWidth(maxW);
           }
-          // Store original file path for serialization
-          (img as fabric.FabricObject & { filePath?: string }).filePath = file.name;
+          // Store file path — Tauri webview may expose full path via .path
+          const fullPath = (file as File & { path?: string }).path || file.name;
+          (img as fabric.FabricObject & { filePath?: string }).filePath = fullPath;
           canvas.add(img);
           canvas.setActiveObject(img);
           canvas.renderAll();
@@ -319,7 +320,7 @@ export function useCanvas() {
         const label = new fabric.IText("Label", {
           left: bounds.left + bounds.width / 2,
           top: bounds.top + bounds.height / 2,
-          fontSize: 14, fill: "#333333", fontFamily: "monospace",
+          fontSize: 14, fill: "#d0d0d0", fontFamily: "monospace",
           originX: "center", originY: "center", textAlign: "center",
         });
         canvas.add(label);

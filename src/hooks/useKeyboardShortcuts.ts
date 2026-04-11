@@ -13,6 +13,9 @@ import {
 export function useKeyboardShortcuts() {
   useEffect(() => {
     const handleKeyDown = async (e: KeyboardEvent) => {
+      // Never interfere with IME composition (Korean, Japanese, Chinese)
+      if (e.isComposing || e.keyCode === 229) return;
+
       const mod = e.metaKey || e.ctrlKey;
 
       // Escape to close search (no mod needed)

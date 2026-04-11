@@ -25,6 +25,17 @@ pub fn spawn_shell(
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let mut cmd = CommandBuilder::new(&shell);
     cmd.env("TERM", "xterm-256color");
+    // Force UTF-8 locale — Tauri GUI apps do NOT inherit shell env on macOS
+    cmd.env("LANG", "en_US.UTF-8");
+    cmd.env("LC_ALL", "en_US.UTF-8");
+    cmd.env("LC_CTYPE", "en_US.UTF-8");
+    // Inherit HOME and PATH from the system
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("HOME", &home);
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", &path);
+    }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
@@ -35,12 +46,36 @@ pub fn spawn_shell(
     let event_id = session_id.clone();
     let reader_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        // Buffer for incomplete UTF-8 sequences split across reads
+        let mut pending = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app.emit(&format!("pty-data-{}", event_id), data);
+                    pending.extend_from_slice(&buf[..n]);
+
+                    // Find the last valid UTF-8 boundary in pending
+                    let valid_up_to = match std::str::from_utf8(&pending) {
+                        Ok(_) => pending.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+
+                    if valid_up_to > 0 {
+                        // Safety: we just verified this slice is valid UTF-8
+                        let data = unsafe {
+                            std::str::from_utf8_unchecked(&pending[..valid_up_to])
+                        };
+                        let _ = app.emit(&format!("pty-data-{}", event_id), data);
+                    }
+
+                    // Keep only the incomplete trailing bytes for the next read
+                    if valid_up_to < pending.len() {
+                        let remaining = pending[valid_up_to..].to_vec();
+                        pending.clear();
+                        pending = remaining;
+                    } else {
+                        pending.clear();
+                    }
                 }
                 Err(e) => {
                     // EIO (Linux), EBADF (macOS fd closed), ENOTTY — all expected on PTY close
