@@ -52,34 +52,44 @@ Canvas Terminal combines a full-featured terminal emulator with a drawing board.
 - **Zustand** — State management
 - **Tailwind CSS** — Styling
 
-## Getting Started
+## Installation
 
-### Prerequisites
+### Build from Source
 
+**Prerequisites:**
 - [Rust](https://rustup.rs/) (1.70+)
 - [Node.js](https://nodejs.org/) (18+)
-- [Tauri CLI](https://v2.tauri.app/start/prerequisites/)
 
 ```bash
+# 1. Install Rust (if not installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# 2. Install Tauri CLI
 cargo install tauri-cli
+
+# 3. Clone the repository
+git clone https://github.com/yes506/canvas-terminal.git
+cd canvas-terminal
+
+# 4. Install dependencies
+npm install
+
+# 5. Build for production
+cargo tauri build
+
+# 6. Install the app
+open src-tauri/target/release/bundle/dmg/Canvas\ Terminal_*.dmg
 ```
+
+Drag **Canvas Terminal** to your Applications folder from the opened DMG.
 
 ### Development
 
 ```bash
-# Install dependencies
 npm install
-
-# Run in development mode (hot reload)
-cargo tauri dev
-
-# Build for production
-cargo tauri build
+cargo tauri dev    # Hot reload — frontend changes apply instantly
 ```
-
-The built app will be at:
-- `src-tauri/target/release/bundle/macos/Canvas Terminal.app`
-- `src-tauri/target/release/bundle/dmg/Canvas Terminal_*.dmg`
 
 ## Keyboard Shortcuts
 
