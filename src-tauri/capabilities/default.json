@@ -1,0 +1,12 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for Canvas Terminal",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text",
+    "dialog:allow-save",
+    "dialog:allow-open"
+  ]
+}
