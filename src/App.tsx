@@ -7,7 +7,7 @@ import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useCanvasStore } from "./stores/canvasStore";
 
 export default function App() {
-  const { sendToTerminal } = useCanvasIntegration();
+  const { exportToTerminal, importIntoCanvas, isWaitingForImport } = useCanvasIntegration();
   const drawerOpen = useCanvasStore((s) => s.drawerOpen);
   useKeyboardShortcuts();
 
@@ -44,7 +44,7 @@ export default function App() {
         className="flex flex-shrink-0 h-full overflow-hidden"
         style={{ width: drawerOpen ? "35%" : 0, minWidth: drawerOpen ? 280 : 0 }}
       >
-        <Toolbar onSendToTerminal={sendToTerminal} />
+        <Toolbar onExportToTerminal={exportToTerminal} onImportIntoCanvas={importIntoCanvas} isWaitingForImport={isWaitingForImport} />
         <div className="flex-1 h-full min-w-0 border-r border-surface-lighter">
           <DrawingBoard />
         </div>

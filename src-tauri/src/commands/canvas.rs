@@ -158,6 +158,108 @@ pub fn save_binary_file(path: String, base64_data: String) -> Result<(), String>
 }
 
 #[tauri::command]
+pub fn export_snapshot(base64_data: String) -> Result<String, String> {
+    // Pre-flight size estimate
+    let estimated_size = (base64_data.len() / 4) * 3;
+    if estimated_size > MAX_BINARY_SIZE {
+        return Err(format!(
+            "Snapshot too large: ~{} bytes exceeds {} byte limit",
+            estimated_size, MAX_BINARY_SIZE
+        ));
+    }
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&base64_data)
+        .map_err(|e| format!("Invalid base64: {}", e))?;
+
+    if bytes.len() > MAX_BINARY_SIZE {
+        return Err(format!(
+            "Decoded snapshot too large: {} bytes exceeds {} byte limit",
+            bytes.len(), MAX_BINARY_SIZE
+        ));
+    }
+
+    // Validate PNG magic bytes
+    if bytes.len() < 8 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("Data is not a valid PNG file".to_string());
+    }
+
+    let home = get_home_dir()?;
+    let cache_dir = home.join(".cache").join("canvas-terminal");
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+
+    let snapshot_path = cache_dir.join("snapshot.png");
+
+    let file = create_file_no_follow(&snapshot_path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(&bytes).map_err(|e| e.to_string())?;
+
+    Ok(snapshot_path.to_string_lossy().to_string())
+}
+
+fn get_import_path() -> Result<std::path::PathBuf, String> {
+    let home = get_home_dir()?;
+    let cache_dir = home.join(".cache").join("canvas-terminal");
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+    Ok(cache_dir.join("import"))
+}
+
+/// Returns (absolute_path, modified_epoch_ms) for the import file, or (path, null) if it doesn't exist.
+#[tauri::command]
+pub fn check_import_file() -> Result<(String, Option<u64>), String> {
+    let import_path = get_import_path()?;
+    let path_str = import_path.to_string_lossy().to_string();
+
+    match std::fs::metadata(&import_path) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .map_err(|e| e.to_string())?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_millis() as u64;
+            Ok((path_str, Some(mtime)))
+        }
+        Err(_) => Ok((path_str, None)),
+    }
+}
+
+/// Reads the import file and returns (format, content).
+/// format: "png" → content is a data:image/png;base64 URL
+/// format: "text" → content is raw text (markdown, SVG, HTML, plain text, etc.)
+#[tauri::command]
+pub fn read_import_file() -> Result<(String, String), String> {
+    let import_path = get_import_path()?;
+
+    let metadata = std::fs::metadata(&import_path).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_IMAGE_READ_SIZE {
+        return Err(format!("Import file too large: {} bytes", metadata.len()));
+    }
+
+    let mut file = std::fs::File::open(&import_path).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+
+    // Check PNG magic bytes
+    if buf.len() >= 8 && &buf[..8] == b"\x89PNG\r\n\x1a\n" {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        return Ok(("png".to_string(), format!("data:image/png;base64,{}", b64)));
+    }
+
+    // Check JPEG magic bytes
+    if buf.len() >= 3 && &buf[..3] == b"\xff\xd8\xff" {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        return Ok(("png".to_string(), format!("data:image/jpeg;base64,{}", b64)));
+    }
+
+    // Otherwise treat as text
+    let text = String::from_utf8_lossy(&buf).to_string();
+    Ok(("text".to_string(), text))
+}
+
+#[tauri::command]
 pub fn read_image_as_data_url(path: String) -> Result<String, String> {
     let safe_path = validate_read_path(&path)?;
 

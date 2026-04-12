@@ -20,6 +20,9 @@ pub fn run() {
             commands::canvas::load_canvas,
             commands::canvas::read_image_as_data_url,
             commands::canvas::save_binary_file,
+            commands::canvas::export_snapshot,
+            commands::canvas::check_import_file,
+            commands::canvas::read_import_file,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

@@ -7,7 +7,8 @@ import {
   MoveRight,
   Type,
   ImagePlus,
-  Send,
+  Upload,
+  Download,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
@@ -30,10 +31,12 @@ const tools: { tool: ShapeTool; icon: React.ReactNode; label: string }[] = [
 ];
 
 interface ToolbarProps {
-  onSendToTerminal?: () => void;
+  onExportToTerminal?: () => void;
+  onImportIntoCanvas?: () => void;
+  isWaitingForImport?: boolean;
 }
 
-export function Toolbar({ onSendToTerminal }: ToolbarProps) {
+export function Toolbar({ onExportToTerminal, onImportIntoCanvas, isWaitingForImport }: ToolbarProps) {
   const {
     activeTool, setActiveTool,
     strokeColor, fillColor, colorMode,
@@ -185,13 +188,26 @@ export function Toolbar({ onSendToTerminal }: ToolbarProps) {
 
       <div className="flex-1" />
 
-      {/* Send to terminal */}
+      {/* Import into Canvas — request AI image and auto-render */}
       <button
-        title="Send to Terminal"
-        className="w-8 h-8 flex items-center justify-center rounded text-white/60 hover:text-white hover:bg-surface-lighter transition-colors"
-        onClick={onSendToTerminal}
+        title={isWaitingForImport ? "Waiting for AI response... (click to cancel)" : "Import into Canvas"}
+        className={`w-8 h-8 flex items-center justify-center rounded transition-colors ${
+          isWaitingForImport
+            ? "text-green-400 animate-pulse bg-surface-lighter"
+            : "text-white/60 hover:text-white hover:bg-surface-lighter"
+        }`}
+        onClick={onImportIntoCanvas}
       >
-        <Send size={16} />
+        <Download size={16} />
+      </button>
+
+      {/* Export to Terminal — snapshot canvas and write path to terminal */}
+      <button
+        title="Export to Terminal"
+        className="w-8 h-8 flex items-center justify-center rounded text-white/60 hover:text-white hover:bg-surface-lighter transition-colors"
+        onClick={onExportToTerminal}
+      >
+        <Upload size={16} />
       </button>
     </div>
   );
