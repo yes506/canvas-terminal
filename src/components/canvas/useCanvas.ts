@@ -13,6 +13,9 @@ import type { ShapeTool } from "../../types/canvas";
 
 const CANVAS_BG = "#2f2f2f";
 
+// Clipboard for copy/paste (module-level so it persists across re-renders)
+let clipboard: fabric.FabricObject[] = [];
+
 export function useCanvas() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fabricRef = useRef<Canvas | null>(null);
@@ -22,6 +25,11 @@ export function useCanvas() {
   const activeShape = useRef<fabric.FabricObject | null>(null);
   const drawStrokeColor = useRef("#cccccc");
   const prevSize = useRef({ width: 0, height: 0 });
+
+  // Panning state
+  const isPanning = useRef(false);
+  const lastPanPoint = useRef({ x: 0, y: 0 });
+  const spacePressed = useRef(false);
 
   // Polyline state
   const polyPoints = useRef<{ x: number; y: number }[]>([]);
@@ -102,12 +110,14 @@ export function useCanvas() {
       selectionColor: "rgba(255, 255, 255, 0.1)",
       selectionBorderColor: "#999999",
       selectionLineWidth: 1,
+      fireRightClick: true,
+      stopContextMenu: true,
     });
 
     fabricRef.current = canvas;
     setFabricCanvasRef.current(canvas);
 
-    // Resize with proportional scaling
+    // Resize: adjust viewport transform to maintain content proportions
     const resize = () => {
       if (!containerRef.current || !fabricRef.current) return;
       const { width, height } = containerRef.current.getBoundingClientRect();
@@ -119,19 +129,20 @@ export function useCanvas() {
 
       c.setDimensions({ width, height });
 
-      // Scale all objects proportionally if we have a previous size
       if (oldW > 0 && oldH > 0 && (oldW !== width || oldH !== height)) {
-        const scaleX = width / oldW;
-        const scaleY = height / oldH;
-        c.getObjects().forEach((obj) => {
-          obj.set({
-            left: (obj.left ?? 0) * scaleX,
-            top: (obj.top ?? 0) * scaleY,
-            scaleX: (obj.scaleX ?? 1) * scaleX,
-            scaleY: (obj.scaleY ?? 1) * scaleY,
-          });
-          obj.setCoords();
-        });
+        const scale = Math.min(width / oldW, height / oldH);
+        const vpt = c.viewportTransform;
+        const oldZoom = vpt[0];
+        const newZoom = oldZoom * scale;
+
+        // Keep the old viewport center stable in the new viewport
+        const centerSceneX = (oldW / 2 - vpt[4]) / oldZoom;
+        const centerSceneY = (oldH / 2 - vpt[5]) / oldZoom;
+        const panX = width / 2 - centerSceneX * newZoom;
+        const panY = height / 2 - centerSceneY * newZoom;
+
+        c.setViewportTransform([newZoom, 0, 0, newZoom, panX, panY]);
+        useCanvasStore.getState().setZoomLevel(newZoom);
       }
 
       prevSize.current = { width, height };
@@ -195,6 +206,18 @@ export function useCanvas() {
     // --- Mouse handlers ---
 
     canvas.on("mouse:down", (opt: TPointerEventInfo<TPointerEvent>) => {
+      // Pan with space+click or middle mouse button
+      const rawEvent = opt.e as MouseEvent;
+      if (spacePressed.current || rawEvent.button === 1) {
+        isPanning.current = true;
+        lastPanPoint.current = { x: rawEvent.clientX, y: rawEvent.clientY };
+        canvas.defaultCursor = "grabbing";
+        return;
+      }
+
+      // Only handle left-click for drawing/selection (right-click handled by context menu)
+      if (rawEvent.button !== 0) return;
+
       const tool = activeToolRef.current;
       if (tool === "select") return;
 
@@ -272,6 +295,17 @@ export function useCanvas() {
     });
 
     canvas.on("mouse:move", (opt: TPointerEventInfo<TPointerEvent>) => {
+      // Handle panning
+      if (isPanning.current) {
+        const e = opt.e as MouseEvent;
+        const vpt = canvas.viewportTransform;
+        vpt[4] += e.clientX - lastPanPoint.current.x;
+        vpt[5] += e.clientY - lastPanPoint.current.y;
+        canvas.setViewportTransform(vpt);
+        lastPanPoint.current = { x: e.clientX, y: e.clientY };
+        return;
+      }
+
       const pointer = canvas.getScenePoint(opt.e);
 
       if (isPolyDrawing.current && polyPreviewLine.current) {
@@ -300,6 +334,15 @@ export function useCanvas() {
     });
 
     canvas.on("mouse:up", () => {
+      if (isPanning.current) {
+        isPanning.current = false;
+        canvas.defaultCursor = spacePressed.current
+          ? "grab"
+          : activeToolRef.current === "select"
+            ? "default"
+            : "crosshair";
+        return;
+      }
       if (isPolyDrawing.current) return;
       if (!isDrawing.current) return;
       isDrawing.current = false;
@@ -337,6 +380,20 @@ export function useCanvas() {
       if (!fabricRef.current) return;
       const c = fabricRef.current;
 
+      // Space = pan mode
+      if (e.key === " " && !spacePressed.current && !e.repeat) {
+        const active = document.activeElement;
+        if (!(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement)) {
+          e.preventDefault();
+          spacePressed.current = true;
+          c.defaultCursor = "grab";
+          c.selection = false;
+          c.forEachObject((obj) => {
+            obj.evented = false;
+          });
+        }
+      }
+
       if (isPolyDrawing.current && (e.key === "Enter" || e.key === "Escape")) {
         e.preventDefault();
         if (e.key === "Escape") {
@@ -351,12 +408,100 @@ export function useCanvas() {
         return;
       }
 
+      // Arrow keys = move selected object(s), Shift = 10px steps
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+        const active = c.getActiveObject();
+        if (!active) return;
+        if (active instanceof fabric.IText && active.isEditing) return;
+        e.preventDefault();
+        const step = e.shiftKey ? 10 : 1;
+        switch (e.key) {
+          case "ArrowUp":    active.top! -= step; break;
+          case "ArrowDown":  active.top! += step; break;
+          case "ArrowLeft":  active.left! -= step; break;
+          case "ArrowRight": active.left! += step; break;
+        }
+        active.setCoords();
+        c.renderAll();
+        pushCanvasState(c);
+      }
+
       if (e.key === "Delete" || e.key === "Backspace") {
         const active = c.getActiveObject();
-        if (active && !(active instanceof fabric.IText && active.isEditing)) {
+        if (!active) return;
+        // Don't delete while editing text
+        if (active instanceof fabric.IText && active.isEditing) return;
+        // Handle ActiveSelection (multi-select cluster)
+        if (active instanceof fabric.ActiveSelection) {
+          const objects = active.getObjects();
+          c.discardActiveObject();
+          objects.forEach((obj) => c.remove(obj));
+        } else {
           c.remove(active);
           c.discardActiveObject();
-          c.renderAll();
+        }
+        c.renderAll();
+        pushCanvasState(c);
+      }
+
+      // Copy (Cmd/Ctrl+C)
+      if ((e.metaKey || e.ctrlKey) && e.key === "c" && !e.shiftKey) {
+        const canvasEl = canvasRef.current;
+        if (canvasEl && canvasEl.closest(".canvas-drawer")?.contains(document.activeElement as Node | null)) {
+          const active = c.getActiveObject();
+          if (!active) return;
+          if (active instanceof fabric.IText && active.isEditing) return;
+          e.preventDefault();
+          e.stopPropagation();
+          clipboard = [];
+          const objects =
+            active instanceof fabric.ActiveSelection
+              ? active.getObjects()
+              : [active];
+          let remaining = objects.length;
+          objects.forEach((obj) => {
+            obj.clone().then((cloned: fabric.FabricObject) => {
+              clipboard.push(cloned);
+              remaining--;
+              // All cloned — no action needed yet, paste will use clipboard
+            });
+          });
+        }
+      }
+
+      // Paste (Cmd/Ctrl+V)
+      if ((e.metaKey || e.ctrlKey) && e.key === "v" && !e.shiftKey) {
+        const canvasEl = canvasRef.current;
+        if (canvasEl && canvasEl.closest(".canvas-drawer")?.contains(document.activeElement as Node | null)) {
+          if (clipboard.length === 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          c.discardActiveObject();
+          const clones: fabric.FabricObject[] = [];
+          let remaining = clipboard.length;
+          clipboard.forEach((obj) => {
+            obj.clone().then((cloned: fabric.FabricObject) => {
+              cloned.set({
+                left: (cloned.left ?? 0) + 20,
+                top: (cloned.top ?? 0) + 20,
+              });
+              c.add(cloned);
+              clones.push(cloned);
+              remaining--;
+              if (remaining === 0) {
+                if (clones.length === 1) {
+                  c.setActiveObject(clones[0]);
+                } else {
+                  const sel = new fabric.ActiveSelection(clones, { canvas: c });
+                  c.setActiveObject(sel);
+                }
+                c.renderAll();
+                pushCanvasState(c);
+                // Update clipboard positions so next paste offsets further
+                clipboard = clones;
+              }
+            });
+          });
         }
       }
 
@@ -370,6 +515,7 @@ export function useCanvas() {
         const canvasEl = canvasRef.current;
         if (canvasEl && canvasEl.closest(".canvas-drawer")?.contains(document.activeElement as Node | null)) {
           e.preventDefault();
+          e.stopPropagation();
           const objs = c.getObjects();
           if (objs.length > 0) {
             c.discardActiveObject();
@@ -384,6 +530,7 @@ export function useCanvas() {
         const canvasEl = canvasRef.current;
         if (canvasEl && canvasEl.closest(".canvas-drawer")?.contains(document.activeElement as Node | null)) {
           e.preventDefault();
+          e.stopPropagation();
           undoCanvas(c);
         }
       }
@@ -392,36 +539,60 @@ export function useCanvas() {
         const canvasEl = canvasRef.current;
         if (canvasEl && canvasEl.closest(".canvas-drawer")?.contains(document.activeElement as Node | null)) {
           e.preventDefault();
+          e.stopPropagation();
           redoCanvas(c);
         }
       }
     };
 
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (!fabricRef.current) return;
+      if (e.key === " ") {
+        spacePressed.current = false;
+        const c = fabricRef.current;
+        const isSelect = activeToolRef.current === "select";
+        c.defaultCursor = isSelect ? "default" : "crosshair";
+        c.selection = isSelect;
+        c.forEachObject((obj) => {
+          obj.selectable = isSelect;
+          obj.evented = isSelect;
+        });
+      }
+    };
+
     document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("keyup", handleKeyUp);
 
-    // --- Zoom with Cmd/Ctrl + mouse wheel ---
+    // --- Zoom with Cmd/Ctrl + mouse wheel, pan with plain wheel ---
     const handleWheel = (e: WheelEvent) => {
-      if (!(e.metaKey || e.ctrlKey)) return;
       e.preventDefault();
-      e.stopPropagation();
 
-      const direction = e.deltaY < 0 ? 1 : -1;
-      const zoomFactor = direction > 0 ? 1.1 : 1 / 1.1;
-      let newZoom = canvas.getZoom() * zoomFactor;
-      newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+      if (e.metaKey || e.ctrlKey) {
+        // Zoom toward cursor
+        const direction = e.deltaY < 0 ? 1 : -1;
+        const zoomFactor = direction > 0 ? 1.1 : 1 / 1.1;
+        let newZoom = canvas.getZoom() * zoomFactor;
+        newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
 
-      // Compute scene point manually to avoid fabric's stale _absolutePointer cache
-      const rect = container!.getBoundingClientRect();
-      const x = (e.clientX - rect.left) / canvas.getRetinaScaling();
-      const y = (e.clientY - rect.top) / canvas.getRetinaScaling();
-      const vpt = canvas.viewportTransform;
-      const point = new fabric.Point(
-        (x - vpt[4]) / vpt[0],
-        (y - vpt[5]) / vpt[3]
-      );
-      canvas.zoomToPoint(point, newZoom);
-      canvas.renderAll();
-      useCanvasStore.getState().setZoomLevel(newZoom);
+        const rect = container!.getBoundingClientRect();
+        const x = (e.clientX - rect.left) / canvas.getRetinaScaling();
+        const y = (e.clientY - rect.top) / canvas.getRetinaScaling();
+        const vpt = canvas.viewportTransform;
+        const point = new fabric.Point(
+          (x - vpt[4]) / vpt[0],
+          (y - vpt[5]) / vpt[3]
+        );
+        canvas.zoomToPoint(point, newZoom);
+        canvas.renderAll();
+        useCanvasStore.getState().setZoomLevel(newZoom);
+      } else {
+        // Pan with scroll wheel
+        const vpt = canvas.viewportTransform;
+        vpt[4] -= e.deltaX;
+        vpt[5] -= e.deltaY;
+        canvas.setViewportTransform(vpt);
+        canvas.renderAll();
+      }
     };
 
     if (container) {
@@ -431,6 +602,7 @@ export function useCanvas() {
     return () => {
       observer.disconnect();
       document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("keyup", handleKeyUp);
       if (container) {
         container.removeEventListener("wheel", handleWheel);
         container.removeEventListener("drop", handleDrop);
@@ -467,8 +639,7 @@ export function useCanvas() {
     }
 
     const isSelect = activeTool === "select";
-    const hasMultiple = c.getObjects().length > 1;
-    c.selection = isSelect && hasMultiple;
+    c.selection = isSelect;
     c.forEachObject((obj) => {
       obj.selectable = isSelect;
       obj.evented = isSelect;

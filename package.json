@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "clean": "rm -rf dist src-tauri/target/release/bundle",
+    "tauri:build": "npm run clean && npm run tauri build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -22,6 +24,7 @@
     "fabric": "^6.6.1",
     "html2canvas": "^1.4.1",
     "lucide-react": "^0.475.0",
+    "marked": "^18.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-resizable-panels": "^2.1.7",

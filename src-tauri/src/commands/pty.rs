@@ -24,7 +24,10 @@ pub fn spawn_shell(
         .map_err(|e| e.to_string())?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    // Spawn as login shell (-l) so ~/.zshrc / ~/.zprofile are sourced,
+    // giving the user their full PATH (brew, pyenv, nvm, etc.)
     let mut cmd = CommandBuilder::new(&shell);
+    cmd.arg("-l");
     // Set working directory if provided (e.g., for duplicate tab)
     // CWD originates from a running process's lsof output, not user input —
     // validate only that it exists and is a directory.
@@ -40,13 +43,12 @@ pub fn spawn_shell(
     cmd.env("LANG", "en_US.UTF-8");
     cmd.env("LC_ALL", "en_US.UTF-8");
     cmd.env("LC_CTYPE", "en_US.UTF-8");
-    // Inherit HOME and PATH from the system
+    // HOME is needed for the login shell to find ~/.zshrc etc.
     if let Ok(home) = std::env::var("HOME") {
         cmd.env("HOME", &home);
     }
-    if let Ok(path) = std::env::var("PATH") {
-        cmd.env("PATH", &path);
-    }
+    // Don't pass Tauri's minimal PATH — the login shell will build
+    // the correct PATH from ~/.zshrc (brew shellenv, pyenv, nvm, etc.)
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
