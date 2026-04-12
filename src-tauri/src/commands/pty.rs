@@ -10,6 +10,7 @@ pub fn spawn_shell(
     session_id: String,
     cols: u16,
     rows: u16,
+    cwd: Option<String>,
 ) -> Result<(), String> {
     let pty_system = native_pty_system();
 
@@ -24,6 +25,16 @@ pub fn spawn_shell(
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let mut cmd = CommandBuilder::new(&shell);
+    // Set working directory if provided (e.g., for duplicate tab)
+    // CWD originates from a running process's lsof output, not user input —
+    // validate only that it exists and is a directory.
+    if let Some(ref dir) = cwd {
+        if let Ok(canonical) = std::fs::canonicalize(dir) {
+            if canonical.is_dir() {
+                cmd.cwd(&canonical);
+            }
+        }
+    }
     cmd.env("TERM", "xterm-256color");
     // Force UTF-8 locale — Tauri GUI apps do NOT inherit shell env on macOS
     cmd.env("LANG", "en_US.UTF-8");
@@ -107,12 +118,19 @@ pub fn spawn_shell(
     Ok(())
 }
 
+/// Maximum bytes per PTY write to prevent kernel buffer exhaustion
+const MAX_PTY_WRITE: usize = 65536;
+
 #[tauri::command]
 pub fn write_to_pty(
     state: State<'_, AppState>,
     session_id: String,
     data: String,
 ) -> Result<(), String> {
+    if data.len() > MAX_PTY_WRITE {
+        return Err(format!("Write payload too large: {} bytes", data.len()));
+    }
+
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
     let session = sessions
         .get_mut(&session_id)
@@ -134,6 +152,10 @@ pub fn resize_pty(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
+    if cols == 0 || rows == 0 {
+        return Err(format!("Invalid PTY size: {}x{}", cols, rows));
+    }
+
     let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
     let session = sessions.get(&session_id).ok_or("Session not found")?;
 
@@ -148,6 +170,39 @@ pub fn resize_pty(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_pty_cwd(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+    // Extract PID under a minimal lock scope — release before blocking on lsof
+    let pid = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        let session = sessions.get(&session_id).ok_or("Session not found")?;
+        session
+            .child
+            .process_id()
+            .ok_or("Cannot get child PID")?
+    };
+
+    // On macOS, use lsof to get the CWD of the child process
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .map_err(|e| format!("Failed to run lsof: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "lsof failed with exit code: {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find(|l| l.starts_with('n'))
+        .map(|l| l[1..].to_string())
+        .ok_or_else(|| "CWD not found in lsof output".to_string())
 }
 
 #[tauri::command]

@@ -59,7 +59,10 @@ export function useKeyboardShortcuts() {
         }
         case "w": {
           e.preventDefault();
-          if (activeTabId && tabs.length > 1) {
+          if (activeTabId) {
+            if (tabs.length === 1) {
+              addTab();
+            }
             removeTab(activeTabId);
           }
           break;

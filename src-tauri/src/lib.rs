@@ -15,9 +15,11 @@ pub fn run() {
             commands::pty::write_to_pty,
             commands::pty::resize_pty,
             commands::pty::kill_pty,
+            commands::pty::get_pty_cwd,
             commands::canvas::save_canvas,
             commands::canvas::load_canvas,
             commands::canvas::read_image_as_data_url,
+            commands::canvas::save_binary_file,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

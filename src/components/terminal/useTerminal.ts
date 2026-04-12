@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { terminalThemes } from "./themes";
@@ -11,7 +12,17 @@ import {
   useTerminalStore,
   registerTerminal,
   unregisterTerminal,
+  consumeSessionCwd,
 } from "../../stores/terminalStore";
+import type { PaneNode } from "../../types/terminal";
+
+function collectLeafSessionIds(node: PaneNode): string[] {
+  if (node.type === "leaf") return [node.sessionId];
+  return [
+    ...collectLeafSessionIds(node.children[0]),
+    ...collectLeafSessionIds(node.children[1]),
+  ];
+}
 
 // Shortcuts that should NOT be consumed by xterm (let them bubble to app)
 const INTERCEPTED_KEYS = new Set([
@@ -28,6 +39,11 @@ export function useTerminal(sessionId: string) {
   const unlistenDataRef = useRef<UnlistenFn | null>(null);
   const unlistenExitRef = useRef<UnlistenFn | null>(null);
   const observerRef = useRef<ResizeObserver | null>(null);
+  const imeHandlersRef = useRef<{
+    el: HTMLTextAreaElement;
+    onStart: () => void;
+    onEnd: (e: CompositionEvent) => void;
+  } | null>(null);
   const disposed = useRef(false);
 
   const init = useCallback(async () => {
@@ -84,6 +100,18 @@ export function useTerminal(sessionId: string) {
     });
 
     terminal.open(termRef.current);
+
+    // Load WebGL addon for GPU-accelerated, sharper text rendering
+    try {
+      const webglAddon = new WebglAddon();
+      webglAddon.onContextLoss(() => {
+        webglAddon.dispose();
+      });
+      terminal.loadAddon(webglAddon);
+    } catch {
+      // WebGL not available, fall back to canvas renderer (default)
+    }
+
     // Initial fit + delayed re-fit to handle containers that aren't fully laid out yet
     fitAddon.fit();
     requestAnimationFrame(() => fitAddon.fit());
@@ -95,9 +123,11 @@ export function useTerminal(sessionId: string) {
     // Register in instance registry
     registerTerminal(sessionId, terminal, searchAddon);
 
-    // ResizeObserver
+    // ResizeObserver — guard against fitting hidden terminals (display:none tabs)
     const observer = new ResizeObserver(() => {
-      fitAddon.fit();
+      if (termRef.current && termRef.current.offsetWidth > 0 && termRef.current.offsetHeight > 0) {
+        fitAddon.fit();
+      }
     });
     if (termRef.current) {
       observer.observe(termRef.current);
@@ -138,12 +168,14 @@ export function useTerminal(sessionId: string) {
       return;
     }
 
-    // Spawn shell
+    // Spawn shell (with optional cwd for duplicated tabs)
+    const cwd = consumeSessionCwd(sessionId);
     try {
       await invoke("spawn_shell", {
         sessionId,
         cols: terminal.cols,
         rows: terminal.rows,
+        cwd: cwd ?? null,
       });
     } catch (error) {
       console.error("Failed to spawn shell:", error);
@@ -164,19 +196,26 @@ export function useTerminal(sessionId: string) {
     );
 
     if (helperTextarea) {
-      helperTextarea.addEventListener("compositionstart", () => {
+      const onCompositionStart = () => {
         isComposing = true;
-      });
-
-      helperTextarea.addEventListener("compositionend", (e: CompositionEvent) => {
+      };
+      const onCompositionEnd = (e: CompositionEvent) => {
         isComposing = false;
+        if (disposed.current) return;
         if (e.data) {
           skipNextOnData = true;
           invoke("write_to_pty", { sessionId, data: e.data }).catch((err) => {
             console.error("Failed to write to PTY:", err);
           });
         }
-      });
+      };
+      helperTextarea.addEventListener("compositionstart", onCompositionStart);
+      helperTextarea.addEventListener("compositionend", onCompositionEnd);
+      imeHandlersRef.current = {
+        el: helperTextarea,
+        onStart: onCompositionStart,
+        onEnd: onCompositionEnd,
+      };
     }
 
     // Forward user input to PTY (skip during IME composition)
@@ -202,23 +241,36 @@ export function useTerminal(sessionId: string) {
     });
   }, [sessionId]);
 
-  // Main lifecycle
+  // Main lifecycle — defer init so React StrictMode cleanup cancels it
+  // before xterm is created, preventing disposed-terminal race conditions.
   useEffect(() => {
     disposed.current = false;
-    init();
+    const timer = setTimeout(() => {
+      init().catch((err) => {
+        if (!disposed.current) {
+          console.error("Terminal init failed:", err);
+        }
+      });
+    }, 0);
 
     return () => {
+      clearTimeout(timer);
       disposed.current = true;
       unlistenDataRef.current?.();
       unlistenExitRef.current?.();
       observerRef.current?.disconnect();
       observerRef.current = null;
+      // Remove IME composition listeners before disposing terminal
+      if (imeHandlersRef.current) {
+        const { el, onStart, onEnd } = imeHandlersRef.current;
+        el.removeEventListener("compositionstart", onStart);
+        el.removeEventListener("compositionend", onEnd);
+        imeHandlersRef.current = null;
+      }
       unregisterTerminal(sessionId);
       terminalRef.current?.dispose();
       terminalRef.current = null;
-      invoke("kill_pty", { sessionId }).catch((err) => {
-        console.error("Failed to kill PTY:", err);
-      });
+      invoke("kill_pty", { sessionId }).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
@@ -247,13 +299,19 @@ export function useTerminal(sessionId: string) {
   useEffect(() => {
     return useTerminalStore.subscribe((state, prev) => {
       if (state.activeTabId !== prev.activeTabId && terminalRef.current && fitAddonRef.current) {
+        // Only re-fit if THIS terminal belongs to the newly active tab
+        const activeTab = state.tabs.find((t) => t.id === state.activeTabId);
+        if (!activeTab) return;
+        const activeSessionIds = collectLeafSessionIds(activeTab.paneTree);
+        if (!activeSessionIds.includes(sessionId)) return;
+
         // Delay fit to allow DOM to update display:none → display:flex
         requestAnimationFrame(() => {
           fitAddonRef.current?.fit();
         });
       }
     });
-  }, []);
+  }, [sessionId]);
 
   const writeToPty = useCallback(
     (data: string) => {

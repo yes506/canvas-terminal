@@ -13,6 +13,21 @@ const undoStack: string[] = [];
 const redoStack: string[] = [];
 let historyLocked = false;
 
+export function clearCanvasHistory() {
+  undoStack.length = 0;
+  redoStack.length = 0;
+  historyLocked = false;
+  useCanvasStore.setState({ canUndo: false, canRedo: false });
+}
+
+export function lockHistory() {
+  historyLocked = true;
+}
+
+export function unlockHistory() {
+  historyLocked = false;
+}
+
 export function pushCanvasState(canvas: Canvas) {
   if (historyLocked) return;
   undoStack.push(JSON.stringify(canvas.toJSON()));
@@ -71,6 +86,8 @@ interface CanvasState {
   toggleDrawer: () => void;
   canUndo: boolean;
   canRedo: boolean;
+  zoomLevel: number;
+  setZoomLevel: (level: number) => void;
 }
 
 export const useCanvasStore = create<CanvasState>((set) => ({
@@ -88,4 +105,6 @@ export const useCanvasStore = create<CanvasState>((set) => ({
   toggleDrawer: () => set((s) => ({ drawerOpen: !s.drawerOpen })),
   canUndo: false,
   canRedo: false,
+  zoomLevel: 1,
+  setZoomLevel: (level) => set({ zoomLevel: level }),
 }));

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { invoke } from "@tauri-apps/api/core";
 import type { Terminal } from "@xterm/xterm";
 import type { SearchAddon } from "@xterm/addon-search";
 import type { Tab, PaneNode, PaneLeaf, ClosedTab } from "../types/terminal";
@@ -7,6 +8,15 @@ import { generateSessionId } from "../lib/sessionId";
 // Terminal instance registry
 const terminalInstances = new Map<string, Terminal>();
 const searchAddons = new Map<string, SearchAddon>();
+
+// Session CWD map — stores initial cwd for sessions spawned via duplicateTab
+const sessionCwdMap = new Map<string, string>();
+
+export function consumeSessionCwd(sessionId: string): string | undefined {
+  const cwd = sessionCwdMap.get(sessionId);
+  if (cwd) sessionCwdMap.delete(sessionId);
+  return cwd;
+}
 
 export function registerTerminal(id: string, term: Terminal, search: SearchAddon) {
   terminalInstances.set(id, term);
@@ -85,9 +95,11 @@ interface TerminalState {
   closedTabs: ClosedTab[];
 
   // Tab management
-  addTab: () => void;
+  addTab: (cwd?: string) => void;
+  duplicateTab: (tabId: string) => void;
   removeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
+  renameTab: (id: string, title: string) => void;
   reorderTab: (fromIndex: number, toIndex: number) => void;
   undoCloseTab: () => void;
 
@@ -119,8 +131,12 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   themeName: "monochrome",
   closedTabs: [],
 
-  addTab: () => {
+  addTab: (cwd?: string) => {
     const sessionId = generateSessionId();
+    // Store cwd so useTerminal can pass it to spawn_shell
+    if (cwd) {
+      sessionCwdMap.set(sessionId, cwd);
+    }
     const tabId = `tab-${Date.now()}`;
     const tab: Tab = {
       id: tabId,
@@ -133,6 +149,22 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       tabs: [...state.tabs, tab],
       activeTabId: tabId,
     }));
+  },
+
+  duplicateTab: (tabId: string) => {
+    const state = get();
+    const tab = state.tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+
+    // Get the CWD of the active pane's PTY session
+    invoke<string>("get_pty_cwd", { sessionId: tab.activePaneSessionId })
+      .then((cwd) => {
+        get().addTab(cwd);
+      })
+      .catch(() => {
+        // Fallback: open tab with default directory
+        get().addTab();
+      });
   },
 
   removeTab: (id) => {
@@ -159,6 +191,13 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   },
 
   setActiveTab: (id) => set({ activeTabId: id }),
+
+  renameTab: (id, title) =>
+    set((state) => ({
+      tabs: state.tabs.map((t) =>
+        t.id === id ? { ...t, title: title.trim() || t.title } : t
+      ),
+    })),
 
   reorderTab: (fromIndex, toIndex) =>
     set((state) => {
