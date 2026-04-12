@@ -6,7 +6,9 @@ import {
   pushCanvasState,
   undoCanvas,
   redoCanvas,
+  clearCanvasHistory,
 } from "../../stores/canvasStore";
+import { MIN_ZOOM, MAX_ZOOM } from "../../constants/canvas";
 import type { ShapeTool } from "../../types/canvas";
 
 const CANVAS_BG = "#2f2f2f";
@@ -397,16 +399,47 @@ export function useCanvas() {
 
     document.addEventListener("keydown", handleKeyDown);
 
+    // --- Zoom with Cmd/Ctrl + mouse wheel ---
+    const handleWheel = (e: WheelEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      e.preventDefault();
+      e.stopPropagation();
+
+      const direction = e.deltaY < 0 ? 1 : -1;
+      const zoomFactor = direction > 0 ? 1.1 : 1 / 1.1;
+      let newZoom = canvas.getZoom() * zoomFactor;
+      newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+
+      // Compute scene point manually to avoid fabric's stale _absolutePointer cache
+      const rect = container!.getBoundingClientRect();
+      const x = (e.clientX - rect.left) / canvas.getRetinaScaling();
+      const y = (e.clientY - rect.top) / canvas.getRetinaScaling();
+      const vpt = canvas.viewportTransform;
+      const point = new fabric.Point(
+        (x - vpt[4]) / vpt[0],
+        (y - vpt[5]) / vpt[3]
+      );
+      canvas.zoomToPoint(point, newZoom);
+      canvas.renderAll();
+      useCanvasStore.getState().setZoomLevel(newZoom);
+    };
+
+    if (container) {
+      container.addEventListener("wheel", handleWheel, { passive: false });
+    }
+
     return () => {
       observer.disconnect();
       document.removeEventListener("keydown", handleKeyDown);
       if (container) {
+        container.removeEventListener("wheel", handleWheel);
         container.removeEventListener("drop", handleDrop);
         container.removeEventListener("dragover", handleDragOver);
       }
       canvas.dispose();
       fabricRef.current = null;
       setFabricCanvasRef.current(null);
+      clearCanvasHistory();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finishPolyline]);
