@@ -1,206 +1,48 @@
 # Canvas Terminal
 
-A desktop terminal emulator with an integrated drawing canvas. Sketch diagrams, annotate ideas, and send visual prompts directly to AI CLI tools running in the terminal.
+🌐 **English** | [한국어](README.ko.md)
+
+**A terminal where your drawings become AI prompts.**
+
+Sketch a diagram, click Upload, and the AI CLI tool running in your terminal sees it. Ask it to respond, and the result renders back on the canvas. Canvas Terminal turns a visual idea into an AI conversation — no copy-paste, no file juggling.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Built with](https://img.shields.io/badge/built%20with-Tauri%20v2-blue.svg)
 
-## What is Canvas Terminal?
-
-Canvas Terminal combines a full-featured terminal emulator with a drawing board in a single desktop app. Instead of describing your ideas in text alone, you can sketch architecture diagrams, flowcharts, or UI wireframes and send them as image files to any AI CLI tool (Claude Code, Codex, Gemini CLI, etc.) running in the terminal.
-
-**The drawing becomes part of your prompt.**
-
-The app is split into two resizable panels: a collapsible **canvas** on the left and a **terminal** on the right. Drag the divider to adjust the layout to your needs.
+<!-- TODO: Replace with an actual screenshot or GIF of the app -->
+<!-- ![Canvas Terminal Screenshot](docs/screenshot.png) -->
 
 ---
 
-## Features
+## How It Works
 
-### Terminal
+```
++---------------------------+     +---------------------------+
+|        Canvas Panel       |     |      Terminal Panel       |
+|                           |     |                           |
+|  Draw shapes, diagrams,   |     |  Full PTY shell (zsh)     |
+|  wireframes, annotations  |     |  AI CLI tools running     |
+|                           |     |                           |
+|  [Upload] ───────────────────>  Path pasted into terminal   |
+|                           |     |  AI reads your drawing    |
+|                           |     |                           |
+|  <─────────────────── [Download] AI writes a response file  |
+|  Response rendered as     |     |                           |
+|  styled image on canvas   |     |                           |
++---------------------------+     +---------------------------+
+```
 
-#### Tabbed Sessions
-- Create, close, rename, and duplicate tabs
-- Drag-and-drop to reorder tabs
-- Jump to any tab with **Cmd+1** through **Cmd+9**
-- Cycle through tabs with **Cmd+Shift+[** and **Cmd+Shift+]**
-- Undo a closed tab within 5 seconds (**Cmd+Z**) — up to 5 tabs in history
-- Double-click a tab to rename it inline
-- Right-click a tab for a context menu (rename, duplicate)
+1. **Draw** something on the canvas — an architecture diagram, a UI wireframe, a flowchart.
+2. **Upload** — the canvas becomes a PNG. Its file path is pasted into the active terminal.
+3. **AI processes** — Claude Code, Gemini CLI, Codex, or any CLI tool reads the image.
+4. **Download** — the AI's response (Markdown, SVG, HTML, image, or plain text) is rendered back onto the canvas.
 
-#### Pane Splitting
-- Split any pane vertically (**Cmd+D**) or horizontally (**Cmd+Shift+D**)
-- Navigate between panes with **Cmd+Opt+Arrow** keys
-- Maximize a single pane to fill the tab (**Cmd+Shift+Enter**), toggle to restore
-- Click any pane to focus it
-
-#### Full PTY Shell
-- Spawns a login shell (zsh or bash) that sources your full RC files (~/.zshrc, etc.)
-- Inherits PATH, Homebrew, pyenv, nvm, and all environment variables
-- UTF-8 environment (LC_ALL, LANG, LC_CTYPE)
-- TERM=xterm-256color for full color support
-- Duplicate tab opens in the same working directory as the original
-
-#### Search
-- **Cmd+F** opens an inline find bar
-- Type to highlight matches in real-time
-- **Enter** / **Shift+Enter** to navigate forward/backward through results
-- **Esc** to dismiss
-
-#### Font Size & Zoom
-- **Cmd+=** / **Cmd+-** to increase/decrease font size (8pt to 28pt)
-- **Cmd+0** to reset to default (13pt)
-- Font size applies across all panes
-
-#### Themes
-Switch terminal colors with a single click. Six built-in themes:
-
-| Theme | Description |
-|-------|-------------|
-| Monochrome | Minimal grayscale (default) |
-| Catppuccin | Warm pastel tones |
-| Dracula | Classic dark vampire palette |
-| Tokyo Night | Cyberpunk neon |
-| Nord | Arctic cool blues |
-| Solarized Dark | Precise scientific palette |
-
-#### Clipboard
-- **Cmd+C** copies selected terminal text
-- **Cmd+V** pastes from clipboard using bracketed paste mode (prevents accidental command execution)
-
-#### Fullscreen
-- **Cmd+Enter** toggles native macOS fullscreen
-
-#### Custom Menu
-- **Cmd+W** closes the active **tab** (not the window) via a custom Tauri menu
-- Standard Edit menu (undo, redo, cut, copy, paste, select all)
-- Window menu (minimize, maximize)
+This creates a **visual feedback loop** between you, the canvas, and the AI. Works with any CLI tool that accepts image paths.
 
 ---
 
-### Canvas
-
-#### Drawing Tools
-
-| Tool | Description |
-|------|-------------|
-| **Select** | Click to select, drag to move. Multi-select with click-drag on empty area |
-| **Rectangle** | Draw axis-aligned rectangles |
-| **Circle** | Draw perfect circles |
-| **Triangle** | Draw triangles |
-| **Line** | Draw straight lines; click multiple times to create a polyline, double-click to finish |
-| **Arrow** | Lines with an arrowhead at the endpoint; supports multi-joint polylines |
-| **Leader Line** | Multi-segment polyline with a bent elbow and arrowhead — ideal for callout annotations. Click to place joints, double-click to finish |
-| **Text** | Add editable text boxes. Double-click any shape to add a label |
-| **Prompt Text** | Special text element for AI-oriented prompts — visually distinct from regular text |
-
-#### Leader Lines & Vertex Editing
-- Leader lines are multi-segment polylines with an arrowhead, commonly used for annotation callouts
-- After drawing, select a leader line (or any polyline/line) and **drag vertex handles** to reshape it
-- **Double-click** on a segment to **add a new midpoint**
-- **Double-click** on an existing vertex to **remove** it
-- Vertex handles render as white circles with a blue border for easy identification
-
-#### Colors
-- **Stroke** (border) and **Fill** (background) modes — toggle between them in the toolbar
-- 12-color palette: transparent, six grays (#666 to #fff), red, orange, yellow, green, blue, purple
-- Select an object and click a color to update it in real-time
-
-#### Images
-- Click the **image insert** button to open a file dialog
-- Supports PNG, JPG, JPEG, GIF, SVG, and WebP
-- Images are auto-scaled to fit (max 400px width)
-- Drag-and-drop positioning after insertion
-- Right-click an image for a context menu with **Save Image As...** to export it via a native save dialog
-
-#### Layer Management
-Right-click any object to access layer controls:
-- **Bring to Front** — move to the top of the z-order
-- **Bring Forward** — move up one layer
-- **Send Backwards** — move down one layer
-- **Send to Back** — move to the bottom
-
-#### Undo / Redo
-- 50-level history stack
-- Undo with the toolbar button or **Cmd+Z** (when canvas is focused)
-- Redo with the toolbar button or **Cmd+Shift+Z**
-
-#### Pan & Zoom
-- Scroll or trackpad-drag to pan the canvas
-- Pinch or trackpad-zoom to zoom in/out
-- Toolbar buttons for zoom in (1.2x), zoom out, and reset to 100%
-- Zoom level displayed as a percentage
-- Zoom range: 25% to 500%
-- Zooms toward the center of the viewport
-
-#### Canvas Snapshots
-- **Camera icon**: Capture only the canvas drawing area and insert it as an image on the canvas
-- **Monitor icon**: Capture the entire application window (canvas + terminal) and insert it on the canvas
-- Both use html2canvas at your device's pixel ratio for crisp output
-
-#### Save & Load
-- **Cmd+S**: Save the canvas to a `.canvas.json` file via a native save dialog
-- **Cmd+O**: Load a previously saved `.canvas.json` file
-- Files use fabric.js native JSON serialization — all shapes, positions, colors, and images are preserved
-
-#### Clear Canvas
-- Toolbar button with a confirmation prompt to delete all objects
-
----
-
-### Canvas-to-Terminal Integration
-
-The core feature that makes Canvas Terminal unique: your drawings become AI prompts.
-
-#### Export to Terminal
-1. Click the **Upload** button in the canvas toolbar
-2. The canvas is rendered as a PNG snapshot at your display's pixel ratio
-3. The snapshot is saved to `~/.cache/canvas-terminal/snapshot.png`
-4. The file path is written directly to the active terminal's stdin using **bracketed paste mode**
-5. The AI CLI tool receives the path and can read the image
-
-This works with any CLI tool that accepts file paths or image inputs.
-
-#### Import from Terminal
-1. Click the **Download** button in the canvas toolbar
-2. An instruction prompt is written to the terminal, asking the AI tool to write its output to a specific file
-3. The button animates while waiting — the app polls the import file every 1.5 seconds (up to 5 minutes)
-4. When the file appears, the app auto-detects the format and renders it on the canvas:
-
-| Format | Rendering |
-|--------|-----------|
-| PNG / JPEG | Inserted directly as an image |
-| SVG | Rasterized and inserted as an image |
-| HTML | Body content extracted, styled, and rendered as an image |
-| Markdown | Converted to styled HTML (headings, lists, code blocks, tables) and rendered |
-| Plain text | Displayed as a monospace code block |
-
-5. Click the animated button again to cancel waiting
-
-#### Response Styling
-Imported responses are rendered with a dark-themed style (600px width, 24px padding) using system fonts and Markdown-aware typography. Code blocks use SF Mono / Fira Code.
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|------------|
-| Desktop framework | [Tauri v2](https://v2.tauri.app/) (Rust backend, native macOS webview) |
-| Frontend | React 18 + TypeScript 5 |
-| Terminal emulation | [xterm.js](https://xtermjs.org/) with WebGL rendering, search, fit, web-links, and Unicode addons |
-| Canvas drawing | [Fabric.js 6](http://fabricjs.com/) |
-| State management | [Zustand](https://github.com/pmndrs/zustand) |
-| Build tool | [Vite](https://vitejs.dev/) |
-| Styling | [Tailwind CSS](https://tailwindcss.com/) |
-| Icons | [Lucide](https://lucide.dev/) |
-| Markdown parsing | [Marked](https://marked.js.org/) |
-| Window capture | [html2canvas](https://html2canvas.hertzen.com/) |
-
----
-
-## Installation
+## Quick Start
 
 ### Prerequisites
 
@@ -209,9 +51,9 @@ Imported responses are rendered with a dark-themed style (600px width, 24px padd
 | **Rust** | 1.70+ | [rustup.rs](https://rustup.rs/) |
 | **Node.js** | 18+ | [nodejs.org](https://nodejs.org/) |
 
-> **Note:** The Tauri CLI is included as an npm devDependency — no separate `cargo install` needed.
+> The Tauri CLI is included as an npm devDependency — no separate `cargo install` needed.
 
-### Quick Start (Build & Install)
+### Build & Install
 
 ```bash
 # 1. Install Rust (skip if already installed)
@@ -239,42 +81,116 @@ npm install
 npm run tauri dev    # Hot reload — frontend changes apply instantly
 ```
 
-### Available Scripts
-
 | Script | Description |
 |--------|-------------|
-| `npm run dev` | Start Vite dev server (frontend only) |
-| `npm run tauri dev` | Start the full app with hot reload |
-| `npm run tauri:build` | Clean build for production (generates .dmg) |
-| `npm run build` | Build frontend only (TypeScript + Vite) |
+| `npm run dev` | Vite dev server (frontend only) |
+| `npm run tauri dev` | Full app with hot reload |
+| `npm run tauri:build` | Production build (.dmg) |
+| `npm run build` | Frontend only (TypeScript + Vite) |
 | `npm run clean` | Remove dist and release bundles |
+
+---
+
+## Canvas-to-Terminal Integration
+
+The core feature that makes Canvas Terminal different from every other terminal emulator.
+
+### Export (Canvas → Terminal)
+
+1. Click the **Upload** button in the canvas toolbar
+2. Your drawing is rendered as a high-DPI PNG snapshot
+3. The file path is pasted into the terminal using **bracketed paste mode** (safe — won't accidentally execute)
+4. The AI CLI tool receives the path and reads the image
+
+### Import (Terminal → Canvas)
+
+1. Click the **Download** button in the canvas toolbar
+2. An instruction is sent to the terminal, asking the AI to write its output to a file
+3. The app polls for the response every 1.5 seconds (up to 5 minutes) — click again to cancel
+4. When the file appears, the format is auto-detected and rendered on the canvas:
+
+| Format | Rendering |
+|--------|-----------|
+| PNG / JPEG | Inserted directly as an image |
+| SVG | Rasterized and inserted as an image |
+| HTML | Body extracted, styled, and rendered as an image |
+| Markdown | Converted to styled HTML (headings, lists, code blocks, tables) |
+| Plain text | Displayed as a monospace code block |
+
+Responses are rendered in a dark-themed style with Markdown-aware typography. Code blocks use SF Mono / Fira Code.
+
+---
+
+## Features
+
+### Terminal
+
+The terminal is a full PTY shell — not a simplified emulator. It spawns a login shell (zsh/bash), sources your RC files, and inherits your entire environment (PATH, Homebrew, pyenv, nvm, etc.).
+
+- **Tabs** — create, close, rename (double-click), duplicate, reorder (drag). Undo a closed tab within 5 seconds (Cmd+Z, up to 5 in history)
+- **Pane splitting** — vertical (Cmd+D) or horizontal (Cmd+Shift+D), navigate with Cmd+Opt+Arrow, maximize a pane with Cmd+Shift+Enter
+- **Search** — Cmd+F for inline find with real-time highlighting
+- **Font zoom** — Cmd+= / Cmd+- (8pt to 28pt), Cmd+0 to reset
+- **6 themes** — Monochrome (default), Catppuccin, Dracula, Tokyo Night, Nord, Solarized Dark
+- **WebGL rendering** — GPU-accelerated text via xterm.js WebGL addon, with automatic canvas fallback
+- **IME support** — Korean, Japanese, and Chinese composition handled correctly (no double input)
+- **Shift+Enter** — sends a dedicated escape sequence recognized by Claude Code
+
+### Canvas
+
+A Fabric.js-powered drawing board designed for quick sketching, not pixel-perfect illustration.
+
+**Drawing tools:**
+
+| Tool | What it does |
+|------|-------------|
+| Select | Click to select, drag to move, area-select on empty space |
+| Rectangle / Circle / Triangle | Basic shapes |
+| Line | Straight lines or multi-point polylines (double-click to finish) |
+| Arrow | Lines with arrowheads, supports multi-joint polylines |
+| Leader Line | Bent annotation callouts with arrowheads — click to place joints |
+| Text | Editable text boxes. Double-click any shape to add a label |
+| Prompt Text | Visually distinct text for AI-oriented prompts |
+
+**Editing:**
+- **Vertex editing** — select a polyline and drag vertex handles (white circles with blue border) to reshape. Double-click a segment to add a midpoint, double-click a vertex to remove it
+- **Colors** — stroke and fill modes, 12-color palette
+- **Images** — insert PNG, JPG, GIF, SVG, WebP via file dialog. Right-click to save
+- **Layers** — right-click any object to bring forward/backward
+- **Undo/Redo** — 50-level history (Cmd+Z / Cmd+Shift+Z)
+- **Pan & Zoom** — trackpad or toolbar, 25% to 500%
+- **Snapshots** — capture canvas only (camera icon) or full app window (monitor icon) as on-canvas images
+- **Save/Load** — Cmd+S / Cmd+O for `.canvas.json` files (fabric.js JSON, version-controllable)
 
 ---
 
 ## Keyboard Shortcuts
 
-### Terminal
+<details>
+<summary><strong>Terminal shortcuts</strong></summary>
 
 | Shortcut | Action |
 |----------|--------|
 | Cmd+T | New tab |
 | Cmd+W | Close active tab |
-| Cmd+Z | Undo close tab (within 5 seconds) |
-| Cmd+1 through Cmd+9 | Jump to tab by number |
-| Cmd+Shift+[ | Previous tab |
-| Cmd+Shift+] | Next tab |
+| Cmd+Z | Undo close tab (within 5s) |
+| Cmd+1 – Cmd+9 | Jump to tab by number |
+| Cmd+Shift+[ / ] | Previous / next tab |
 | Cmd+D | Split pane vertically |
 | Cmd+Shift+D | Split pane horizontally |
 | Cmd+Opt+Arrow | Navigate between panes |
 | Cmd+Shift+Enter | Maximize / restore pane |
 | Cmd+C | Copy selected text |
-| Cmd+V | Paste from clipboard |
+| Cmd+V | Paste (bracketed paste mode) |
 | Cmd+F | Open find bar |
-| Cmd+= / Cmd+- | Zoom font in / out |
+| Cmd+= / Cmd+- | Font zoom in / out |
 | Cmd+0 | Reset font size |
 | Cmd+Enter | Toggle fullscreen |
 
-### Canvas
+</details>
+
+<details>
+<summary><strong>Canvas shortcuts</strong></summary>
 
 | Shortcut | Action |
 |----------|--------|
@@ -284,57 +200,45 @@ npm run tauri dev    # Hot reload — frontend changes apply instantly
 | Cmd+Shift+Z | Redo |
 | Cmd+A | Select all objects |
 | Delete / Backspace | Delete selected object |
-| Escape | Deselect or cancel current drawing |
+| Escape | Deselect or cancel drawing |
 | Enter | Finish polyline / leader line |
 | Double-click shape | Add or edit label |
 | Double-click segment | Add midpoint to polyline |
 | Double-click vertex | Remove vertex from polyline |
 
+</details>
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|------------|
+| Desktop framework | [Tauri v2](https://v2.tauri.app/) (Rust backend, native macOS webview) |
+| Frontend | React 18 + TypeScript 5 |
+| Terminal emulation | [xterm.js](https://xtermjs.org/) with WebGL, search, fit, web-links, Unicode addons |
+| Canvas drawing | [Fabric.js 6](http://fabricjs.com/) |
+| State management | [Zustand](https://github.com/pmndrs/zustand) |
+| Build tool | [Vite](https://vitejs.dev/) |
+| Styling | [Tailwind CSS](https://tailwindcss.com/) |
+| Icons | [Lucide](https://lucide.dev/) |
+| Markdown rendering | [Marked](https://marked.js.org/) |
+| Screen capture | [html2canvas](https://html2canvas.hertzen.com/) |
+
 ---
 
 ## Security
 
-Canvas Terminal restricts all file operations to your home directory and applies several safety measures:
+All file operations are restricted to your home directory.
 
-- **Path validation**: All read/write paths are canonicalized and checked against `$HOME`
-- **Symlink protection**: Files are opened with `O_NOFOLLOW`; symlink targets are validated
-- **File size limits**: 100 MB for canvas JSON, 50 MB for binary files, 20 MB for images
-- **Magic byte validation**: PNG and JPEG files are verified by header bytes before processing
-- **Input size limit**: Terminal write operations are capped at 65 KB per call
-- **SVG exclusion**: SVG files are not loaded as raw images to prevent XSS vectors
-- **IME-aware input**: Korean, Japanese, and Chinese composition events are handled correctly to prevent double input
-
----
-
-## Canvas File Format
-
-Drawings are saved as `.canvas.json` files using fabric.js native JSON serialization. These files capture all shapes, positions, colors, images, polyline vertices, and layer order. You can share `.canvas.json` files between machines or version-control them alongside your projects.
-
----
-
-## How It Works
-
-```
-+---------------------------+     +---------------------------+
-|        Canvas Panel       |     |      Terminal Panel       |
-|                           |     |                           |
-|  Draw shapes, lines,      |     |  Full PTY shell (zsh)     |
-|  leader lines, text,      |     |  Multiple tabs & panes    |
-|  prompt text, images      |     |  AI CLI tools running     |
-|                           |     |                           |
-|  [Export to Terminal] ------>    |  Receives image path      |
-|                           |     |  AI reads the image       |
-|  <------ [Import from Terminal] |  AI writes response file  |
-|  Renders response on      |     |                           |
-|  canvas as styled image   |     |                           |
-+---------------------------+     +---------------------------+
-```
-
-1. **Export**: Canvas is rendered as a PNG. The file path is pasted into the terminal via bracketed paste mode.
-2. **AI processes**: The CLI tool (Claude Code, Gemini CLI, etc.) reads the image and generates a response.
-3. **Import**: The response (text, Markdown, SVG, or image) is rendered back onto the canvas.
-
-This creates a visual feedback loop between you, the canvas, and the AI.
+- **Path validation** — all paths canonicalized and checked against `$HOME`
+- **Symlink protection** — `O_NOFOLLOW` flag; symlink targets re-validated
+- **File size limits** — 100 MB canvas JSON, 50 MB binary, 20 MB images
+- **Magic byte validation** — PNG and JPEG verified by header bytes before processing
+- **Input size limit** — terminal writes capped at 65 KB per call
+- **SVG exclusion** — SVG not loaded as raw images to prevent XSS vectors
+- **IME-aware input** — East Asian composition events handled correctly to prevent double input
+- **No GUI credential dialogs** — git/SSH prompts forced to terminal to prevent hangs in Tauri context
 
 ---
 
