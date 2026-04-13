@@ -4,7 +4,9 @@ import * as fabric from "fabric";
 import {
   Undo2, Redo2, Trash2, ZoomIn, ZoomOut, Camera, MonitorDown,
   ArrowDownToLine, ArrowDown, ArrowUpToLine, ArrowUp, Share2,
+  Download,
 } from "lucide-react";
+import { save } from "@tauri-apps/plugin-dialog";
 import html2canvas from "html2canvas";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -100,6 +102,30 @@ export function DrawingBoard() {
     },
     [fabricCanvas, layerMenu],
   );
+
+  const handleSaveImage = useCallback(async () => {
+    if (!layerMenu) return;
+    const target = layerMenu.target;
+    setLayerMenu(null);
+
+    // Get the image data URL from the fabric object
+    const dataUrl = target.toDataURL({ format: "png", multiplier: 1 });
+    const base64Data = dataUrl.replace(/^data:image\/\w+;base64,/, "");
+
+    const filePath = await save({
+      filters: [{ name: "PNG Image", extensions: ["png"] }],
+      defaultPath: "image.png",
+    });
+    if (!filePath) return;
+
+    try {
+      await invoke("save_binary_file", { path: filePath, base64Data });
+      setSnapshotToast(`Saved: ${filePath}`);
+      setTimeout(() => setSnapshotToast(null), 3000);
+    } catch (err) {
+      console.error("Save image failed:", err);
+    }
+  }, [layerMenu]);
 
   const handleClear = () => {
     if (!fabricCanvas) return;
@@ -295,7 +321,7 @@ export function DrawingBoard() {
       {/* Snapshot export toast */}
       {snapshotToast && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-surface-light/95 backdrop-blur border border-surface-lighter rounded-lg px-3 py-2 shadow z-10 text-xs text-text-muted max-w-[90%]">
-          <span className="text-green-400">Copied to clipboard:</span>{" "}
+          <span className="text-green-400">{snapshotToast.startsWith("Saved:") ? "" : "Copied to clipboard: "}</span>
           <code className="text-text">{snapshotToast}</code>
         </div>
       )}
@@ -335,6 +361,18 @@ export function DrawingBoard() {
             <ArrowDownToLine size={12} />
             Send to Back
           </button>
+          {layerMenu.target instanceof fabric.Image && (
+            <>
+              <div className="h-px bg-surface-lighter my-1" />
+              <button
+                className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-text hover:bg-surface-lighter transition-colors text-left"
+                onClick={handleSaveImage}
+              >
+                <Download size={12} />
+                Save Image As...
+              </button>
+            </>
+          )}
         </div>
       )}
     </div>

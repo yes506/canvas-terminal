@@ -3,6 +3,7 @@ import { writeText, readText } from "@tauri-apps/plugin-clipboard-manager";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useCanvasStore } from "../stores/canvasStore";
 import {
   useTerminalStore,
@@ -10,7 +11,43 @@ import {
   getActiveSessionId,
 } from "../stores/terminalStore";
 
+/** Close the active tab (shared by Cmd+W keydown and native menu event).
+ *  Debounced to prevent double-close if both the native menu accelerator and
+ *  the DOM keydown handler fire for the same keystroke. */
+let lastCloseAt = 0;
+function closeActiveTab() {
+  const now = Date.now();
+  if (now - lastCloseAt < 100) return;
+  lastCloseAt = now;
+
+  const { tabs, activeTabId, removeTab } = useTerminalStore.getState();
+  if (!activeTabId) return;
+  if (tabs.length === 1) {
+    try { getCurrentWindow().close().catch(() => {}); } catch { /* no Tauri */ }
+    return;
+  }
+  removeTab(activeTabId);
+}
+
 export function useKeyboardShortcuts() {
+  // Listen for the native menu "Close Tab" (Cmd+W) event from Tauri.
+  // On macOS the menu accelerator consumes the keystroke before it reaches the
+  // DOM, so the keydown handler below never fires for Cmd+W.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    listen("menu-close-tab", () => {
+      if (!cancelled) closeActiveTab();
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   useEffect(() => {
     const handleKeyDown = async (e: KeyboardEvent) => {
       // Never interfere with IME composition (Korean, Japanese, Chinese)
@@ -36,7 +73,6 @@ export function useKeyboardShortcuts() {
         tabs,
         activeTabId,
         addTab,
-        removeTab,
         setActiveTab,
         increaseFontSize,
         decreaseFontSize,
@@ -59,12 +95,7 @@ export function useKeyboardShortcuts() {
         }
         case "w": {
           e.preventDefault();
-          if (activeTabId) {
-            if (tabs.length === 1) {
-              addTab();
-            }
-            removeTab(activeTabId);
-          }
+          closeActiveTab();
           break;
         }
 

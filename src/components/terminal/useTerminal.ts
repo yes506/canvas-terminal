@@ -268,9 +268,15 @@ export function useTerminal(sessionId: string) {
         imeHandlersRef.current = null;
       }
       unregisterTerminal(sessionId);
-      terminalRef.current?.dispose();
+      // Defer terminal dispose outside React's commit phase so xterm's
+      // internal RAF callbacks don't throw during React's error handling,
+      // which would crash the entire component tree.
+      const term = terminalRef.current;
       terminalRef.current = null;
-      invoke("kill_pty", { sessionId }).catch(() => {});
+      if (term) {
+        setTimeout(() => { try { term.dispose(); } catch { /* xterm internal */ } }, 0);
+      }
+      try { invoke("kill_pty", { sessionId }).catch(() => {}); } catch { /* no Tauri */ }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
