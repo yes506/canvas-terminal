@@ -202,42 +202,52 @@ Imported responses are rendered with a dark-themed style (600px width, 24px padd
 
 ## Installation
 
-### Build from Source
+### Prerequisites
 
-**Prerequisites:**
-- [Rust](https://rustup.rs/) (1.70+)
-- [Node.js](https://nodejs.org/) (18+)
+| Tool | Version | Install |
+|------|---------|---------|
+| **Rust** | 1.70+ | [rustup.rs](https://rustup.rs/) |
+| **Node.js** | 18+ | [nodejs.org](https://nodejs.org/) |
+
+> **Note:** The Tauri CLI is included as an npm devDependency — no separate `cargo install` needed.
+
+### Quick Start (Build & Install)
 
 ```bash
-# 1. Install Rust (if not installed)
+# 1. Install Rust (skip if already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
-# 2. Install Tauri CLI
-cargo install tauri-cli
-
-# 3. Clone the repository
+# 2. Clone and enter the project
 git clone https://github.com/yes506/canvas-terminal.git
 cd canvas-terminal
 
-# 4. Install dependencies
+# 3. Install all dependencies (frontend + Tauri CLI)
 npm install
 
-# 5. Build for production
-cargo tauri build
+# 4. Build the production app
+npm run tauri:build
 
-# 6. Install the app
+# 5. Open the generated DMG and drag to Applications
 open src-tauri/target/release/bundle/dmg/Canvas\ Terminal_*.dmg
 ```
 
-Drag **Canvas Terminal** to your Applications folder from the opened DMG.
-
-### Development
+### Development Mode
 
 ```bash
 npm install
-cargo tauri dev    # Hot reload — frontend changes apply instantly
+npm run tauri dev    # Hot reload — frontend changes apply instantly
 ```
+
+### Available Scripts
+
+| Script | Description |
+|--------|-------------|
+| `npm run dev` | Start Vite dev server (frontend only) |
+| `npm run tauri dev` | Start the full app with hot reload |
+| `npm run tauri:build` | Clean build for production (generates .dmg) |
+| `npm run build` | Build frontend only (TypeScript + Vite) |
+| `npm run clean` | Remove dist and release bundles |
 
 ---
 
