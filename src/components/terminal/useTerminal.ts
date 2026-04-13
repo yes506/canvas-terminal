@@ -103,7 +103,7 @@ export function useTerminal(sessionId: string) {
 
     // Load WebGL addon for GPU-accelerated, sharper text rendering
     try {
-      const webglAddon = new WebglAddon();
+      const webglAddon = new WebglAddon(true /* preserveDrawingBuffer — needed for canvas capture */);
       webglAddon.onContextLoss(() => {
         webglAddon.dispose();
       });
@@ -231,13 +231,19 @@ export function useTerminal(sessionId: string) {
       });
     });
 
-    // Handle resize
+    // Handle resize — debounce to avoid flooding the backend with SIGWINCH
+    // during continuous resizes (e.g. dragging the canvas panel divider).
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     terminal.onResize(({ cols, rows }) => {
-      if (!disposed.current) {
-        invoke("resize_pty", { sessionId, cols, rows }).catch((err) => {
-          console.error("Failed to resize PTY:", err);
-        });
-      }
+      if (disposed.current) return;
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (!disposed.current) {
+          invoke("resize_pty", { sessionId, cols, rows }).catch((err) => {
+            console.error("Failed to resize PTY:", err);
+          });
+        }
+      }, 80);
     });
   }, [sessionId]);
 
