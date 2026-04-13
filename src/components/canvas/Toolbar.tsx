@@ -6,6 +6,8 @@ import {
   Minus,
   MoveRight,
   Type,
+  MessageSquareText,
+  CornerDownRight,
   ImagePlus,
   Upload,
   Download,
@@ -27,7 +29,9 @@ const tools: { tool: ShapeTool; icon: React.ReactNode; label: string }[] = [
   { tool: "triangle", icon: <Triangle size={16} />, label: "Triangle" },
   { tool: "line", icon: <Minus size={16} />, label: "Line" },
   { tool: "arrow", icon: <MoveRight size={16} />, label: "Arrow" },
+  { tool: "leaderLine", icon: <CornerDownRight size={16} />, label: "Leader Line" },
   { tool: "text", icon: <Type size={16} />, label: "Text" },
+  { tool: "promptText", icon: <MessageSquareText size={16} />, label: "Prompt Text" },
 ];
 
 interface ToolbarProps {
@@ -80,7 +84,7 @@ export function Toolbar({ onExportToTerminal, onImportIntoCanvas, isWaitingForIm
 
     if (!result) return;
 
-    // result is the full file path (e.g. /Users/donghyeon/Desktop/screenshot.png)
+    // result is the full file path (e.g. /path/to/screenshot.png)
     const fullPath = typeof result === "string" ? result : result;
 
     // Read the file via Rust and get base64 data

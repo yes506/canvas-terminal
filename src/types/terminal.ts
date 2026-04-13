@@ -1,9 +1,3 @@
-export interface TerminalSession {
-  id: string;
-  title: string;
-  active: boolean;
-}
-
 export type PaneNode = PaneLeaf | PaneSplit;
 
 export interface PaneLeaf {

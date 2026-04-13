@@ -5,6 +5,7 @@ import { PaneTree } from "./PaneTree";
 import { TerminalSearch } from "./TerminalSearch";
 import { ThemeSelector } from "../settings/ThemeSelector";
 import { Plus, X, PanelLeftOpen, PanelLeftClose, Copy, Pencil } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 interface ContextMenu {
   x: number;
@@ -83,8 +84,8 @@ export function TerminalTabs() {
   const handleClose = (e: React.MouseEvent, tabId: string) => {
     e.stopPropagation();
     if (tabs.length === 1) {
-      // Close last tab and open a fresh one
-      addTab();
+      try { getCurrentWindow().close().catch(() => {}); } catch { /* no Tauri */ }
+      return;
     }
     removeTab(tabId);
   };

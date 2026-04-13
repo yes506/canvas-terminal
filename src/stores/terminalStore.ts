@@ -12,6 +12,8 @@ const searchAddons = new Map<string, SearchAddon>();
 // Session CWD map — stores initial cwd for sessions spawned via duplicateTab
 const sessionCwdMap = new Map<string, string>();
 
+let nextTabId = 1;
+
 export function consumeSessionCwd(sessionId: string): string | undefined {
   const cwd = sessionCwdMap.get(sessionId);
   if (cwd) sessionCwdMap.delete(sessionId);
@@ -137,7 +139,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     if (cwd) {
       sessionCwdMap.set(sessionId, cwd);
     }
-    const tabId = `tab-${Date.now()}`;
+    const tabId = `tab-${nextTabId++}-${Date.now()}`;
     const tab: Tab = {
       id: tabId,
       title: `Terminal ${get().tabs.length + 1}`,
@@ -169,16 +171,18 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
   removeTab: (id) => {
     const state = get();
-    const tabToClose = state.tabs.find((t) => t.id === id);
-    const filtered = state.tabs.filter((t) => t.id !== id);
+    const idx = state.tabs.findIndex((t) => t.id === id);
+    if (idx === -1) return;
+
+    const tabToClose = state.tabs[idx];
+    const filtered = [...state.tabs];
+    filtered.splice(idx, 1);
 
     // Save to closed tabs stack for undo
-    const closedTabs = tabToClose
-      ? [
-          { tab: tabToClose, closedAt: Date.now() },
-          ...state.closedTabs,
-        ].slice(0, 5) // Keep max 5
-      : state.closedTabs;
+    const closedTabs = [
+      { tab: tabToClose, closedAt: Date.now() },
+      ...state.closedTabs,
+    ].slice(0, 5); // Keep max 5
 
     set({
       tabs: filtered,

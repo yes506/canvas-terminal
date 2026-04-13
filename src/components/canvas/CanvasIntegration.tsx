@@ -68,19 +68,26 @@ export function useCanvasIntegration() {
     if (!fabricCanvas || !activeSessionId) return;
     if (fabricCanvas.getObjects().length === 0) return;
 
-    const dataUrl = fabricCanvas.toDataURL({
-      format: "png",
-      quality: 1,
-      multiplier: window.devicePixelRatio,
-    });
-    const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
+    try {
+      const dataUrl = fabricCanvas.toDataURL({
+        format: "png",
+        quality: 1,
+        multiplier: window.devicePixelRatio,
+      });
+      const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
 
-    const savedPath = await invoke<string>("export_snapshot", { base64Data });
+      const savedPath = await invoke<string>("export_snapshot", { base64Data });
+      if (!savedPath) return;
 
-    await invoke("write_to_pty", {
-      sessionId: activeSessionId,
-      data: savedPath,
-    });
+      const pasteWrapped = `\x1b[200~${savedPath}\x1b[201~\r`;
+
+      await invoke("write_to_pty", {
+        sessionId: activeSessionId,
+        data: pasteWrapped,
+      });
+    } catch (err) {
+      console.error("exportToTerminal failed:", err);
+    }
   }, [fabricCanvas, activeSessionId]);
 
   const importIntoCanvas = useCallback(async () => {
