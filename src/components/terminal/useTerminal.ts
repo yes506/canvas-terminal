@@ -41,6 +41,8 @@ export function useTerminal(sessionId: string) {
   const observerRef = useRef<ResizeObserver | null>(null);
   const imeHandlersRef = useRef<{
     el: HTMLTextAreaElement;
+    nativeFocus: (opts?: FocusOptions) => void;
+    onFocus: () => void;
     onStart: () => void;
     onEnd: (e: CompositionEvent) => void;
   } | null>(null);
@@ -196,6 +198,26 @@ export function useTerminal(sessionId: string) {
     );
 
     if (helperTextarea) {
+      // Prevent WKWebView auto-scroll when xterm focuses the textarea.
+      // WKWebView scrolls the native NSScrollView to bring focused elements
+      // into view, bypassing CSS overflow. We fix this at the source by
+      // patching focus() to always use preventScroll:true (Safari 15+).
+      const nativeFocus = helperTextarea.focus.bind(helperTextarea);
+      helperTextarea.focus = (opts?: FocusOptions) => {
+        nativeFocus({ ...opts, preventScroll: true });
+      };
+
+      // Fallback: if WKWebView still scrolls (e.g. on programmatic focus
+      // from the native layer), reset scroll on the next animation frame.
+      const onFocus = () => {
+        requestAnimationFrame(() => {
+          document.documentElement.scrollTop = 0;
+          document.documentElement.scrollLeft = 0;
+          document.body.scrollTop = 0;
+          document.body.scrollLeft = 0;
+        });
+      };
+      helperTextarea.addEventListener("focus", onFocus);
       const onCompositionStart = () => {
         isComposing = true;
       };
@@ -213,6 +235,8 @@ export function useTerminal(sessionId: string) {
       helperTextarea.addEventListener("compositionend", onCompositionEnd);
       imeHandlersRef.current = {
         el: helperTextarea,
+        nativeFocus,
+        onFocus,
         onStart: onCompositionStart,
         onEnd: onCompositionEnd,
       };
@@ -266,9 +290,11 @@ export function useTerminal(sessionId: string) {
       unlistenExitRef.current?.();
       observerRef.current?.disconnect();
       observerRef.current = null;
-      // Remove IME composition listeners before disposing terminal
+      // Remove scroll-prevention and IME composition listeners
       if (imeHandlersRef.current) {
-        const { el, onStart, onEnd } = imeHandlersRef.current;
+        const { el, nativeFocus, onFocus, onStart, onEnd } = imeHandlersRef.current;
+        el.focus = nativeFocus; // restore original focus()
+        el.removeEventListener("focus", onFocus);
         el.removeEventListener("compositionstart", onStart);
         el.removeEventListener("compositionend", onEnd);
         imeHandlersRef.current = null;
