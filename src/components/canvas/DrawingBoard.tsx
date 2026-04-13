@@ -203,6 +203,9 @@ export function DrawingBoard() {
       const appRoot = document.querySelector<HTMLElement>("#root");
       if (!appRoot) return;
 
+      // html2canvas natively clones canvas elements via drawImage().
+      // For WebGL canvases (xterm.js), this requires preserveDrawingBuffer=true
+      // on the WebGL addon — see useTerminal.ts where it's enabled.
       const screenshot = await html2canvas(appRoot, {
         backgroundColor: null,
         scale: window.devicePixelRatio,

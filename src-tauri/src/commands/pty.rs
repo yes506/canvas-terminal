@@ -43,6 +43,12 @@ pub fn spawn_shell(
     cmd.env("LANG", "en_US.UTF-8");
     cmd.env("LC_ALL", "en_US.UTF-8");
     cmd.env("LC_CTYPE", "en_US.UTF-8");
+    // Force git/SSH to prompt via terminal, not GUI dialogs (Keychain, ssh-askpass).
+    // macOS GUI credential dialogs may hang in Tauri's app context because the
+    // dialog is hidden behind the window or fails to spawn entirely.
+    cmd.env("GIT_TERMINAL_PROMPT", "1");
+    cmd.env("SSH_ASKPASS", "");
+    cmd.env("GIT_ASKPASS", "");
     // HOME is needed for the login shell to find ~/.zshrc etc.
     if let Ok(home) = std::env::var("HOME") {
         cmd.env("HOME", &home);
@@ -67,28 +73,59 @@ pub fn spawn_shell(
                 Ok(n) => {
                     pending.extend_from_slice(&buf[..n]);
 
-                    // Find the last valid UTF-8 boundary in pending
-                    let valid_up_to = match std::str::from_utf8(&pending) {
-                        Ok(_) => pending.len(),
-                        Err(e) => e.valid_up_to(),
-                    };
+                    // Decode as much UTF-8 as possible, replacing invalid bytes
+                    // with U+FFFD so the reader never gets stuck on non-UTF-8
+                    // output (e.g. from git/SSH error messages, binary paths).
+                    let mut emit_buf = String::new();
+                    let mut pos = 0;
 
-                    if valid_up_to > 0 {
-                        // Safety: we just verified this slice is valid UTF-8
-                        let data = unsafe {
-                            std::str::from_utf8_unchecked(&pending[..valid_up_to])
-                        };
-                        let _ = app.emit(&format!("pty-data-{}", event_id), data);
+                    while pos < pending.len() {
+                        match std::str::from_utf8(&pending[pos..]) {
+                            Ok(s) => {
+                                emit_buf.push_str(s);
+                                pos = pending.len();
+                            }
+                            Err(e) => {
+                                let valid_end = pos + e.valid_up_to();
+                                if valid_end > pos {
+                                    // Safety: from_utf8 verified this slice
+                                    emit_buf.push_str(unsafe {
+                                        std::str::from_utf8_unchecked(&pending[pos..valid_end])
+                                    });
+                                }
+                                match e.error_len() {
+                                    Some(len) => {
+                                        // Definite invalid byte(s) — replace and skip
+                                        emit_buf.push('\u{FFFD}');
+                                        pos = valid_end + len;
+                                    }
+                                    None => {
+                                        // Incomplete sequence at end — wait for next read
+                                        pos = valid_end;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !emit_buf.is_empty() {
+                        let _ = app.emit(&format!("pty-data-{}", event_id), emit_buf.as_str());
                     }
 
                     // Keep only the incomplete trailing bytes for the next read
-                    if valid_up_to < pending.len() {
-                        let remaining = pending[valid_up_to..].to_vec();
+                    if pos < pending.len() {
+                        let remaining = pending[pos..].to_vec();
                         pending.clear();
                         pending = remaining;
                     } else {
                         pending.clear();
                     }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // EINTR — read was interrupted by a signal (e.g. SIGWINCH from
+                    // PTY resize). Just retry the read.
+                    continue;
                 }
                 Err(e) => {
                     // EIO (Linux), EBADF (macOS fd closed), ENOTTY — all expected on PTY close
@@ -138,10 +175,13 @@ pub fn write_to_pty(
         .get_mut(&session_id)
         .ok_or("Session not found")?;
 
-    session
-        .writer
-        .write_all(data.as_bytes())
-        .map_err(|e| e.to_string())?;
+    loop {
+        match session.writer.write_all(data.as_bytes()) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
     session.writer.flush().map_err(|e| e.to_string())?;
 
     Ok(())
