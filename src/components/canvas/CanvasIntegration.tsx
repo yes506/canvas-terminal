@@ -4,8 +4,6 @@ import * as fabric from "fabric";
 import { useTerminalStore, selectActiveSessionId } from "../../stores/terminalStore";
 import { useCanvasStore, pushCanvasState } from "../../stores/canvasStore";
 import { useCollaboratorStore } from "../../stores/collaboratorStore";
-import { executeCommand } from "../collaborator/commands";
-import { startImportForSession, type ImportPollHandle } from "../../lib/canvasOps";
 import { renderResponseToDataUrl } from "../../lib/responseRenderer";
 
 const POLL_INTERVAL_MS = 1500;
@@ -24,7 +22,7 @@ export function useCanvasIntegration() {
   const collabSessionId = useCollaboratorStore((s) => s.collabSessionId);
   const fabricCanvas = useCanvasStore((s) => s.fabricCanvas);
   const [isWaitingForImport, setIsWaitingForImport] = useState(false);
-  const importHandleRef = useRef<ImportPollHandle | null>(null);
+  const importHandleRef = useRef<{ cancel: () => void } | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const timeoutTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -77,9 +75,9 @@ export function useCanvasIntegration() {
     if (!fabricCanvas) return;
     if (fabricCanvas.getObjects().length === 0) return;
 
-    // Route through collaborator when active
+    // Route through collaborator command line when active
     if (collabSessionId) {
-      await executeCommand({ type: "canvas-export", raw: "/canvas-export" });
+      useCollaboratorStore.getState().setPendingInput("/canvas-export");
       return;
     }
 
@@ -114,53 +112,9 @@ export function useCanvasIntegration() {
       return;
     }
 
-    // Route through collaborator when active
+    // Route through collaborator command line when active
     if (collabSessionId) {
-      const agents = useCollaboratorStore.getState().agents;
-      const store = useCollaboratorStore.getState();
-      if (agents.length === 0) {
-        store.setStatus("No agents running.");
-        return;
-      }
-
-      setIsWaitingForImport(true);
-      const handles: ImportPollHandle[] = [];
-      let completed = 0;
-      const total = agents.length;
-
-      for (let i = 0; i < agents.length; i++) {
-        const agent = agents[i];
-        const suffix = agents.length > 1 ? String(i) : undefined;
-
-        try {
-          const handle = await startImportForSession(
-            agent.sessionId,
-            agent.tool,
-            (msg) => store.setStatus(msg),
-            () => {
-              completed++;
-              if (completed >= total) setIsWaitingForImport(false);
-            },
-            {
-              suffix,
-              sendFn: async (prompt) => {
-                await store.sendToAgent(agent.sessionId, prompt);
-              },
-            },
-          );
-          handles.push(handle);
-        } catch (err) {
-          store.setStatus(`Import failed: ${err}`);
-        }
-      }
-
-      if (handles.length === 0) {
-        setIsWaitingForImport(false);
-      } else {
-        importHandleRef.current = {
-          cancel: () => handles.forEach((h) => h.cancel()),
-        };
-      }
+      useCollaboratorStore.getState().setPendingInput("/canvas-import");
       return;
     }
 

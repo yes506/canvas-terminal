@@ -193,24 +193,18 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
 
     case "canvas-export": {
       try {
+        if (!cmd.target) {
+          status("Usage: /canvas-export @<agent>  (specify a target agent)");
+          break;
+        }
         const path = await exportCanvasSnapshot();
         if (!path) {
           status("Canvas is empty.");
           break;
         }
-        const targets: SpawnedAgent[] = [];
-        if (cmd.target) {
-          const agent = resolveAgent(cmd.target, store.agents);
-          if (!agent) {
-            status(`Agent "${cmd.target}" not found. Saved at ${path}`);
-            break;
-          }
-          targets.push(agent);
-        } else {
-          targets.push(...store.agents);
-        }
-        if (targets.length === 0) {
-          status(`No agents running. Snapshot saved at ${path}`);
+        const agent = resolveAgent(cmd.target, store.agents);
+        if (!agent) {
+          status(`Agent "${cmd.target}" not found. Saved at ${path}`);
           break;
         }
 
@@ -220,10 +214,8 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
           "Please analyze this image and respond.",
         ].join("\n");
 
-        for (const agent of targets) {
-          await store.sendToAgent(agent.sessionId, prompt);
-        }
-        status(`Canvas exported to ${targets.length} agent(s)`);
+        await store.sendToAgent(agent.sessionId, prompt);
+        status(`Canvas exported to ${toolLabel(agent.tool)}`);
       } catch (err) {
         status(`Export failed: ${err}`);
       }
@@ -232,66 +224,27 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
 
     case "canvas-import": {
       try {
-        const agents = store.agents;
-        const targets: SpawnedAgent[] = [];
-
-        if (cmd.target) {
-          if (cmd.target.toLowerCase() === "all") {
-            targets.push(...agents);
-          } else {
-            const agent = resolveAgent(cmd.target, agents);
-            if (!agent) {
-              status(`Agent "${cmd.target}" not found.`);
-              break;
-            }
-            targets.push(agent);
-          }
-        } else if (agents.length === 0) {
-          status("No agents running.");
+        if (!cmd.target) {
+          status("Usage: /canvas-import @<agent>  (specify a target agent)");
           break;
-        } else {
-          // Default: all agents
-          targets.push(...agents);
         }
-
-        if (targets.length === 0) {
-          status("No agents to import from.");
+        const agent = resolveAgent(cmd.target, store.agents);
+        if (!agent) {
+          status(`Agent "${cmd.target}" not found.`);
           break;
         }
 
-        let completed = 0;
-        const total = targets.length;
-
-        for (let i = 0; i < targets.length; i++) {
-          const agent = targets[i];
-          // Use per-agent suffix when multiple agents to avoid file clobbering
-          const suffix = targets.length > 1 ? String(i) : undefined;
-
-          await startImportForSession(
-            agent.sessionId,
-            agent.tool,
-            (msg) => {
-              const prefix = total > 1 ? `[${toolLabel(agent.tool)}] ` : "";
-              status(`${prefix}${msg}`);
+        await startImportForSession(
+          agent.sessionId,
+          agent.tool,
+          (msg) => status(msg),
+          () => {},
+          {
+            sendFn: async (prompt) => {
+              await store.sendToAgent(agent.sessionId, prompt);
             },
-            () => {
-              completed++;
-              if (completed >= total && total > 1) {
-                status(`All ${total} imports complete.`);
-              }
-            },
-            {
-              suffix,
-              sendFn: async (prompt) => {
-                await store.sendToAgent(agent.sessionId, prompt);
-              },
-            },
-          );
-        }
-
-        if (total > 1) {
-          status(`Import request sent to ${total} agents. Waiting for responses...`);
-        }
+          },
+        );
       } catch (err) {
         status(`Import failed: ${err}`);
       }

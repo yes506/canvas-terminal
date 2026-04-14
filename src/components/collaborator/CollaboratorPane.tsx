@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCollaboratorStore } from "../../stores/collaboratorStore";
-import { getActiveSessionId } from "../../stores/terminalStore";
+import { useTerminalStore, getActiveSessionId } from "../../stores/terminalStore";
 import { generateSessionId } from "../../lib/sessionId";
 import { AgentToolbar } from "./AgentToolbar";
 import { AgentMiniTerminal } from "./AgentMiniTerminal";
 import { InputPrompt } from "./InputPrompt";
-import { Zap, Cpu } from "lucide-react";
+import { Zap, Cpu, X } from "lucide-react";
 import type { ToolConfig } from "../../types/collaborator";
 
 interface Spawn {
@@ -77,10 +77,13 @@ export function CollaboratorPane() {
           {agents.length} agent{agents.length !== 1 ? "s" : ""}
         </span>
         <div className="flex-1" />
-        <span className="text-text-dim">
-          <kbd className="px-1 py-0.5 bg-surface rounded text-[10px]">Esc</kbd>{" "}
-          close
-        </span>
+        <button
+          className="p-0.5 rounded hover:bg-surface-lighter text-text-dim hover:text-text transition-colors"
+          onClick={() => useTerminalStore.getState().openCollaboratorSplit()}
+          title="Close collaborator"
+        >
+          <X size={14} />
+        </button>
       </div>
 
       {/* Tool launch buttons */}

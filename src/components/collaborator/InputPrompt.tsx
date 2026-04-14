@@ -16,6 +16,8 @@ const MAX_ROWS = 6;
 /** Pending message awaiting target selection. */
 interface PendingMessage {
   message: string;
+  /** When set, wraps the selected target into a command instead of plain send. */
+  commandPrefix?: string;
 }
 
 function targetHandle(agent: SpawnedAgent, allAgents: SpawnedAgent[]): string {
@@ -40,13 +42,24 @@ export function InputPrompt() {
   const pushHistory = useCollaboratorStore((s) => s.pushHistory);
   const navigateHistory = useCollaboratorStore((s) => s.navigateHistory);
   const agents = useCollaboratorStore((s) => s.agents);
+  const pendingInput = useCollaboratorStore((s) => s.pendingInput);
+  const setPendingInput = useCollaboratorStore((s) => s.setPendingInput);
+
+  // Consume externally-set pending input (e.g. from canvas toolbar)
+  useEffect(() => {
+    if (pendingInput !== null) {
+      setValue(pendingInput);
+      setPendingInput(null);
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }, [pendingInput, setPendingInput]);
 
   // Compute mention state
   const cursorPos = inputRef.current?.selectionStart ?? value.length;
   const mention = extractMentionQuery(value, cursorPos);
   const showMention = mention !== null && agents.length > 0;
 
-  // Build selector options: individual agents + "all"
+  // Build selector options: individual agents + "all" (skip "all" for canvas commands)
   const selectorOptions: Array<{
     label: string;
     detail?: string;
@@ -56,7 +69,7 @@ export function InputPrompt() {
     detail: targetHandle(a, agents),
     agent: a,
   }));
-  if (agents.length > 1) {
+  if (agents.length > 1 && !pending?.commandPrefix) {
     selectorOptions.push({ label: "All agents", detail: "@all", agent: null });
   }
   const showSelector = pending !== null && selectorOptions.length > 0;
@@ -112,16 +125,23 @@ export function InputPrompt() {
   const executeWithTarget = useCallback(
     async (option: { label: string; detail?: string; agent: SpawnedAgent | null }) => {
       if (!pending) return;
-      const msg = pending.message;
+      const { message: msg, commandPrefix } = pending;
       setPending(null);
 
-      const store = useCollaboratorStore.getState();
-      if (option.agent === null) {
-        // "All agents" selected
-        await store.broadcastToAll(msg);
+      if (commandPrefix && option.agent) {
+        // Canvas command with target — execute as a slash command
+        const handle = option.detail ?? `@${toolShortName(option.agent.tool)}`;
+        const fullCmd = `${commandPrefix} ${handle}`;
+        await executeCommand(parseInput(fullCmd));
       } else {
-        // Send directly to the specific agent
-        await store.sendToAgent(option.agent.sessionId, msg);
+        const store = useCollaboratorStore.getState();
+        if (option.agent === null) {
+          // "All agents" selected
+          await store.broadcastToAll(msg);
+        } else {
+          // Send directly to the specific agent
+          await store.sendToAgent(option.agent.sessionId, msg);
+        }
       }
       requestAnimationFrame(() => inputRef.current?.focus());
     },
@@ -158,6 +178,24 @@ export function InputPrompt() {
       }
       // Multiple agents — show target selector
       setPending({ message: cmd.message! });
+      return;
+    }
+
+    // Canvas commands without a target → show target selector
+    if ((cmd.type === "canvas-export" || cmd.type === "canvas-import") && !cmd.target) {
+      if (agents.length === 0) {
+        useCollaboratorStore.getState().setStatus("No agents running.");
+        return;
+      }
+      const prefix = cmd.type === "canvas-export" ? "/canvas-export" : "/canvas-import";
+      if (agents.length === 1) {
+        // Only one agent — execute directly
+        const handle = `@${toolShortName(agents[0].tool)}`;
+        await executeCommand(parseInput(`${prefix} ${handle}`));
+        return;
+      }
+      // Multiple agents — show target selector
+      setPending({ message: prefix, commandPrefix: prefix });
       return;
     }
 
