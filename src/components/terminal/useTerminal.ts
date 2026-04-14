@@ -26,7 +26,7 @@ function collectLeafSessionIds(node: PaneNode): string[] {
 
 // Shortcuts that should NOT be consumed by xterm (let them bubble to app)
 const INTERCEPTED_KEYS = new Set([
-  "t", "w", "f", "d", "z", "s", "o", "=", "-", "0",
+  "t", "w", "f", "d", "e", "z", "s", "o", "=", "-", "0",
   "1", "2", "3", "4", "5", "6", "7", "8", "9",
   "Enter",
 ]);
@@ -242,6 +242,9 @@ export function useTerminal(sessionId: string) {
       };
     }
 
+    // Track current line buffer for command detection
+    let lineBuffer = "";
+
     // Forward user input to PTY (skip during IME composition)
     terminal.onData((data) => {
       if (disposed.current) return;
@@ -250,6 +253,28 @@ export function useTerminal(sessionId: string) {
         return;
       }
       if (isComposing) return;
+
+      // Detect "collaborator" command: buffer input and check on Enter
+      if (data === "\r") {
+        if (lineBuffer.trim() === "collaborator") {
+          lineBuffer = "";
+          // Send Ctrl+U to clear the shell's input buffer (the individual
+          // characters were already forwarded), then Ctrl+C as fallback.
+          invoke("write_to_pty", { sessionId, data: "\x15" }).catch(() => {});
+          useTerminalStore.getState().openCollaboratorSplit();
+          return;
+        }
+        lineBuffer = "";
+      } else if (data === "\x7f") {
+        // Backspace — remove last character from buffer
+        lineBuffer = lineBuffer.slice(0, -1);
+      } else if (data.length === 1 && data >= " ") {
+        lineBuffer += data;
+      } else if (data === "\x03") {
+        // Ctrl+C — reset buffer
+        lineBuffer = "";
+      }
+
       invoke("write_to_pty", { sessionId, data }).catch((err) => {
         console.error("Failed to write to PTY:", err);
       });

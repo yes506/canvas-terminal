@@ -2,6 +2,7 @@ export type PaneNode = PaneLeaf | PaneSplit;
 
 export interface PaneLeaf {
   type: "leaf";
+  kind: "terminal" | "collaborator";
   sessionId: string;
 }
 

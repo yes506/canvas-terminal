@@ -78,12 +78,26 @@ function removeLeaf(node: PaneNode, targetSessionId: string): PaneNode | null {
   return { ...node, children: [left, right] };
 }
 
+function findLeafBySessionId(node: PaneNode, sessionId: string): PaneLeaf | null {
+  if (node.type === "leaf") return node.sessionId === sessionId ? node : null;
+  return findLeafBySessionId(node.children[0], sessionId) || findLeafBySessionId(node.children[1], sessionId);
+}
+
 function collectSessionIds(node: PaneNode): string[] {
   if (node.type === "leaf") return [node.sessionId];
   return [
     ...collectSessionIds(node.children[0]),
     ...collectSessionIds(node.children[1]),
   ];
+}
+
+/** Find a collaborator leaf anywhere in the pane tree. */
+export function findCollaboratorLeaf(node: PaneNode): PaneLeaf | null {
+  if (node.type === "leaf") return node.kind === "collaborator" ? node : null;
+  return (
+    findCollaboratorLeaf(node.children[0]) ||
+    findCollaboratorLeaf(node.children[1])
+  );
 }
 
 const UNDO_CLOSE_TIMEOUT = 5000;
@@ -98,6 +112,7 @@ interface TerminalState {
 
   // Tab management
   addTab: (cwd?: string) => void;
+  openCollaboratorSplit: () => void;
   duplicateTab: (tabId: string) => void;
   removeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
@@ -143,7 +158,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     const tab: Tab = {
       id: tabId,
       title: `Terminal ${get().tabs.length + 1}`,
-      paneTree: { type: "leaf", sessionId },
+      paneTree: { type: "leaf", kind: "terminal", sessionId },
       activePaneSessionId: sessionId,
       maximizedPaneSessionId: null,
     };
@@ -153,10 +168,101 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     }));
   },
 
+  openCollaboratorSplit: async () => {
+    const state = get();
+    const tab = state.tabs.find((t) => t.id === state.activeTabId);
+    if (!tab) return;
+
+    // Preserve CWD for all terminal panes before modifying the tree.
+    // Tree restructuring causes React to remount TerminalPane components,
+    // which kills the PTY and spawns a new shell — without saved CWD it
+    // defaults to the home directory.
+    const terminalSids = collectSessionIds(tab.paneTree).filter((sid) => {
+      const leaf = findLeafBySessionId(tab.paneTree, sid);
+      return leaf?.kind === "terminal";
+    });
+    await Promise.all(
+      terminalSids.map((sid) =>
+        invoke<string>("get_pty_cwd", { sessionId: sid })
+          .then((cwd) => sessionCwdMap.set(sid, cwd))
+          .catch(() => {}),
+      ),
+    );
+
+    // Re-read state after async CWD lookups (it may have changed)
+    const freshState = get();
+    const freshTab = freshState.tabs.find((t) => t.id === freshState.activeTabId);
+    if (!freshTab) return;
+
+    // Toggle: if a collaborator pane already exists in this tab, remove it
+    const existing = findCollaboratorLeaf(freshTab.paneTree);
+    if (existing) {
+      // If the collaborator is the only pane, do nothing
+      const allIds = collectSessionIds(freshTab.paneTree);
+      if (allIds.length <= 1) return;
+
+      const newTree = removeLeaf(freshTab.paneTree, existing.sessionId);
+      if (!newTree) return;
+
+      const remainingIds = collectSessionIds(newTree);
+      const newActive = remainingIds.includes(freshTab.activePaneSessionId)
+        ? freshTab.activePaneSessionId
+        : remainingIds[0];
+
+      set((s) => ({
+        tabs: s.tabs.map((t) =>
+          t.id === freshTab.id
+            ? {
+                ...t,
+                paneTree: newTree,
+                activePaneSessionId: newActive,
+                maximizedPaneSessionId: null,
+              }
+            : t,
+        ),
+      }));
+      return;
+    }
+
+    // Don't split if active pane is a collaborator (shouldn't happen, but guard)
+    const activeLeaf = findLeafBySessionId(freshTab.paneTree, freshTab.activePaneSessionId);
+    if (activeLeaf?.kind === "collaborator") return;
+
+    const collabSessionId = generateSessionId();
+    const newTree = findAndReplace(
+      freshTab.paneTree,
+      freshTab.activePaneSessionId,
+      (leaf) => ({
+        type: "split" as const,
+        direction: "horizontal" as const,
+        children: [
+          leaf,
+          { type: "leaf" as const, kind: "collaborator" as const, sessionId: collabSessionId },
+        ] as [PaneNode, PaneNode],
+      }),
+    );
+
+    // Keep focus on the terminal pane (not the collaborator)
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === freshTab.id
+          ? {
+              ...t,
+              paneTree: newTree,
+              maximizedPaneSessionId: null,
+            }
+          : t,
+      ),
+    }));
+  },
+
   duplicateTab: (tabId: string) => {
     const state = get();
     const tab = state.tabs.find((t) => t.id === tabId);
     if (!tab) return;
+
+    // Don't duplicate collaborator tabs (it's a singleton)
+    if (tab.paneTree.type === "leaf" && tab.paneTree.kind === "collaborator") return;
 
     // Get the CWD of the active pane's PTY session
     invoke<string>("get_pty_cwd", { sessionId: tab.activePaneSessionId })
@@ -232,6 +338,10 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     const tab = state.tabs.find((t) => t.id === state.activeTabId);
     if (!tab) return;
 
+    // Don't split collaborator panes
+    const activeLeaf = findLeafBySessionId(tab.paneTree, tab.activePaneSessionId);
+    if (activeLeaf?.kind === "collaborator") return;
+
     const newSessionId = generateSessionId();
     const newTree = findAndReplace(
       tab.paneTree,
@@ -241,7 +351,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
         direction,
         children: [
           leaf,
-          { type: "leaf" as const, sessionId: newSessionId },
+          { type: "leaf" as const, kind: "terminal" as const, sessionId: newSessionId },
         ] as [PaneNode, PaneNode],
       })
     );

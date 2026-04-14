@@ -3,6 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import * as fabric from "fabric";
 import { useTerminalStore, selectActiveSessionId } from "../../stores/terminalStore";
 import { useCanvasStore, pushCanvasState } from "../../stores/canvasStore";
+import { useCollaboratorStore } from "../../stores/collaboratorStore";
+import { executeCommand } from "../collaborator/commands";
+import { startImportForSession, type ImportPollHandle } from "../../lib/canvasOps";
 import { renderResponseToDataUrl } from "../../lib/responseRenderer";
 
 const POLL_INTERVAL_MS = 1500;
@@ -18,12 +21,18 @@ const IMPORT_PROMPT = [
 
 export function useCanvasIntegration() {
   const activeSessionId = useTerminalStore(selectActiveSessionId);
+  const collabSessionId = useCollaboratorStore((s) => s.collabSessionId);
   const fabricCanvas = useCanvasStore((s) => s.fabricCanvas);
   const [isWaitingForImport, setIsWaitingForImport] = useState(false);
+  const importHandleRef = useRef<ImportPollHandle | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const timeoutTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const stopPolling = useCallback(() => {
+    if (importHandleRef.current) {
+      importHandleRef.current.cancel();
+      importHandleRef.current = null;
+    }
     if (pollTimer.current) {
       clearInterval(pollTimer.current);
       pollTimer.current = null;
@@ -65,8 +74,16 @@ export function useCanvasIntegration() {
   );
 
   const exportToTerminal = useCallback(async () => {
-    if (!fabricCanvas || !activeSessionId) return;
+    if (!fabricCanvas) return;
     if (fabricCanvas.getObjects().length === 0) return;
+
+    // Route through collaborator when active
+    if (collabSessionId) {
+      await executeCommand({ type: "canvas-export", raw: "/canvas-export" });
+      return;
+    }
+
+    if (!activeSessionId) return;
 
     try {
       const dataUrl = fabricCanvas.toDataURL({
@@ -88,16 +105,46 @@ export function useCanvasIntegration() {
     } catch (err) {
       console.error("exportToTerminal failed:", err);
     }
-  }, [fabricCanvas, activeSessionId]);
+  }, [fabricCanvas, activeSessionId, collabSessionId]);
 
   const importIntoCanvas = useCallback(async () => {
-    if (!activeSessionId) return;
-
     // If already polling, cancel it
     if (isWaitingForImport) {
       stopPolling();
       return;
     }
+
+    // Route through collaborator when active
+    if (collabSessionId) {
+      const agents = useCollaboratorStore.getState().agents;
+      const setStatus = useCollaboratorStore.getState().setStatus;
+      let targetAgent;
+      if (agents.length === 0) {
+        setStatus("No agents running.");
+        return;
+      } else if (agents.length === 1) {
+        targetAgent = agents[0];
+      } else {
+        setStatus("Multiple agents. Specify via collaborator: /canvas-import @claude");
+        return;
+      }
+      setIsWaitingForImport(true);
+      try {
+        const handle = await startImportForSession(
+          targetAgent.sessionId,
+          targetAgent.tool,
+          (msg) => setStatus(msg),
+          () => setIsWaitingForImport(false),
+        );
+        importHandleRef.current = handle;
+      } catch (err) {
+        setIsWaitingForImport(false);
+        setStatus(`Import failed: ${err}`);
+      }
+      return;
+    }
+
+    if (!activeSessionId) return;
 
     try {
       // Get the import file path and current mtime baseline
@@ -127,6 +174,9 @@ export function useCanvasIntegration() {
           stopPolling();
           const [format, content] = await invoke<[string, string]>("read_import_file");
 
+          // Clean up the import file now that we've read it
+          invoke("cleanup_import_file").catch(() => {});
+
           let dataUrl: string;
           if (format === "png") {
             // Already a data URL for binary images (PNG/JPEG)
@@ -149,7 +199,7 @@ export function useCanvasIntegration() {
       console.error("Import into canvas failed:", err);
       stopPolling();
     }
-  }, [activeSessionId, isWaitingForImport, stopPolling, renderImportedImage]);
+  }, [activeSessionId, collabSessionId, isWaitingForImport, stopPolling, renderImportedImage]);
 
   return { exportToTerminal, importIntoCanvas, isWaitingForImport };
 }

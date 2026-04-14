@@ -3,12 +3,25 @@ import {
   PanelGroup,
   PanelResizeHandle,
 } from "react-resizable-panels";
-import type { PaneNode } from "../../types/terminal";
+import type { PaneNode, PaneLeaf } from "../../types/terminal";
 import { TerminalPane } from "./TerminalPane";
+import { CollaboratorPane } from "../collaborator/CollaboratorPane";
 import { useTerminalStore } from "../../stores/terminalStore";
 
 interface PaneTreeProps {
   node: PaneNode;
+}
+
+function findLeaf(node: PaneNode, sessionId: string): PaneLeaf | null {
+  if (node.type === "leaf") return node.sessionId === sessionId ? node : null;
+  return findLeaf(node.children[0], sessionId) || findLeaf(node.children[1], sessionId);
+}
+
+function renderLeaf(leaf: PaneLeaf) {
+  if (leaf.kind === "collaborator") {
+    return <CollaboratorPane />;
+  }
+  return <TerminalPane sessionId={leaf.sessionId} />;
 }
 
 export function PaneTree({ node }: PaneTreeProps) {
@@ -19,6 +32,8 @@ export function PaneTree({ node }: PaneTreeProps) {
 
   // If a pane is maximized, only render that pane
   if (maximizedId) {
+    const leaf = findLeaf(node, maximizedId);
+    if (leaf) return renderLeaf(leaf);
     return <TerminalPane sessionId={maximizedId} />;
   }
 
@@ -27,7 +42,7 @@ export function PaneTree({ node }: PaneTreeProps) {
 
 function PaneNode_({ node }: PaneTreeProps) {
   if (node.type === "leaf") {
-    return <TerminalPane sessionId={node.sessionId} />;
+    return renderLeaf(node);
   }
 
   const direction = node.direction === "horizontal" ? "vertical" : "horizontal";
