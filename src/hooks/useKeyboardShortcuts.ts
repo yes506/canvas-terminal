@@ -9,6 +9,7 @@ import {
   useTerminalStore,
   getTerminalInstance,
   getActiveSessionId,
+  findCollaboratorLeaf,
 } from "../stores/terminalStore";
 
 /** Close the active tab (shared by Cmd+W keydown and native menu event).
@@ -55,13 +56,20 @@ export function useKeyboardShortcuts() {
 
       const mod = e.metaKey || e.ctrlKey;
 
-      // Escape to close search (no mod needed)
+      // Escape to close search or collaborator (no mod needed)
       if (e.key === "Escape") {
-        const { searchVisible, setSearchVisible } = useTerminalStore.getState();
+        const { searchVisible, setSearchVisible, tabs, activeTabId } =
+          useTerminalStore.getState();
         if (searchVisible) {
           setSearchVisible(false);
           const sid = getActiveSessionId();
           if (sid) getTerminalInstance(sid)?.focus();
+          return;
+        }
+        // Close collaborator pane on Escape (only if one exists in active tab)
+        const activeTab = tabs.find((t) => t.id === activeTabId);
+        if (activeTab && findCollaboratorLeaf(activeTab.paneTree)) {
+          useTerminalStore.getState().openCollaboratorSplit(); // toggle off
         }
         return;
       }
@@ -87,6 +95,13 @@ export function useKeyboardShortcuts() {
       const activeSessionId = getActiveSessionId();
 
       switch (e.key) {
+        // --- Collaborator: Cmd+E ---
+        case "e": {
+          e.preventDefault();
+          useTerminalStore.getState().openCollaboratorSplit();
+          break;
+        }
+
         // --- Tab management ---
         case "t": {
           e.preventDefault();

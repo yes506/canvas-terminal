@@ -79,6 +79,7 @@ pub fn run() {
             commands::pty::resize_pty,
             commands::pty::kill_pty,
             commands::pty::get_pty_cwd,
+            commands::pty::inject_into_pty,
             commands::canvas::save_canvas,
             commands::canvas::load_canvas,
             commands::canvas::read_image_as_data_url,
@@ -86,6 +87,14 @@ pub fn run() {
             commands::canvas::export_snapshot,
             commands::canvas::check_import_file,
             commands::canvas::read_import_file,
+            commands::canvas::cleanup_snapshot,
+            commands::canvas::cleanup_import_file,
+            commands::memory::init_memory_dir,
+            commands::memory::write_memory_file,
+            commands::memory::read_memory_file,
+            commands::memory::delete_memory_file,
+            commands::memory::clear_memory_dir,
+            commands::memory::list_memory_files,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -94,6 +103,9 @@ pub fn run() {
                         sessions.clear();
                     }
                 }
+                // Clean up temporary canvas files
+                let _ = commands::canvas::cleanup_snapshot();
+                let _ = commands::canvas::cleanup_import_file();
             }
         })
         .run(tauri::generate_context!())

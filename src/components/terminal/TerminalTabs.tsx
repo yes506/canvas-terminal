@@ -4,7 +4,7 @@ import { useCanvasStore } from "../../stores/canvasStore";
 import { PaneTree } from "./PaneTree";
 import { TerminalSearch } from "./TerminalSearch";
 import { ThemeSelector } from "../settings/ThemeSelector";
-import { Plus, X, PanelLeftOpen, PanelLeftClose, Copy, Pencil } from "lucide-react";
+import { Plus, X, PanelLeftOpen, PanelLeftClose, Copy, Pencil, Zap } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 interface ContextMenu {
@@ -269,9 +269,12 @@ export function TerminalTabs() {
                 />
               ) : (
                 <span
-                  className="truncate max-w-[120px]"
+                  className="truncate max-w-[120px] flex items-center gap-1"
                   title="Double-click to rename"
                 >
+                  {tab.paneTree.type === "leaf" && tab.paneTree.kind === "collaborator" && (
+                    <Zap size={10} className="text-accent flex-shrink-0" />
+                  )}
                   {tab.title}
                 </span>
               )}
@@ -299,6 +302,7 @@ export function TerminalTabs() {
         <div className="flex-1" />
 
         <ThemeSelector />
+        <CollaboratorButton />
 
         {/* Floating drag preview */}
         {drag && tabRefsRef.current[drag.tabIndex] && (() => {
@@ -338,35 +342,41 @@ export function TerminalTabs() {
       </div>
 
       {/* Context menu */}
-      {contextMenu && (
-        <div
-          ref={contextMenuRef}
-          className="fixed z-50 bg-surface-light border border-surface-lighter rounded-lg shadow-lg py-1 min-w-[160px]"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-        >
-          <button
-            className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-text hover:bg-surface-lighter transition-colors text-left"
-            onClick={() => {
-              const tab = tabs.find((t) => t.id === contextMenu.tabId);
-              if (tab) handleDoubleClick(tab.id, tab.title);
-              setContextMenu(null);
-            }}
+      {contextMenu && (() => {
+        const ctxTab = tabs.find((t) => t.id === contextMenu.tabId);
+        const isCollaborator = ctxTab?.paneTree.type === "leaf" && ctxTab.paneTree.kind === "collaborator";
+        return (
+          <div
+            ref={contextMenuRef}
+            className="fixed z-50 bg-surface-light border border-surface-lighter rounded-lg shadow-lg py-1 min-w-[160px]"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
           >
-            <Pencil size={12} />
-            Rename Tab
-          </button>
-          <button
-            className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-text hover:bg-surface-lighter transition-colors text-left"
-            onClick={() => {
-              duplicateTab(contextMenu.tabId);
-              setContextMenu(null);
-            }}
-          >
-            <Copy size={12} />
-            Duplicate Tab
-          </button>
-        </div>
-      )}
+            <button
+              className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-text hover:bg-surface-lighter transition-colors text-left"
+              onClick={() => {
+                const tab = tabs.find((t) => t.id === contextMenu.tabId);
+                if (tab) handleDoubleClick(tab.id, tab.title);
+                setContextMenu(null);
+              }}
+            >
+              <Pencil size={12} />
+              Rename Tab
+            </button>
+            {!isCollaborator && (
+              <button
+                className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-text hover:bg-surface-lighter transition-colors text-left"
+                onClick={() => {
+                  duplicateTab(contextMenu.tabId);
+                  setContextMenu(null);
+                }}
+              >
+                <Copy size={12} />
+                Duplicate Tab
+              </button>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -381,6 +391,20 @@ function CanvasToggleButton() {
       title={drawerOpen ? "Close Canvas" : "Open Canvas"}
     >
       {drawerOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
+    </button>
+  );
+}
+
+function CollaboratorButton() {
+  const openCollaboratorSplit = useTerminalStore((s) => s.openCollaboratorSplit);
+
+  return (
+    <button
+      className="px-2 h-full text-text-muted hover:text-accent hover:bg-surface border-l border-surface-lighter transition-colors"
+      onClick={openCollaboratorSplit}
+      title="Open Collaborator (Cmd+E)"
+    >
+      <Zap size={14} />
     </button>
   );
 }

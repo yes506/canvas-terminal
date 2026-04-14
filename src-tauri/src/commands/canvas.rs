@@ -259,6 +259,27 @@ pub fn read_import_file() -> Result<(String, String), String> {
     Ok(("text".to_string(), text))
 }
 
+/// Remove the snapshot file after the AI tool has read it.
+#[tauri::command]
+pub fn cleanup_snapshot() -> Result<(), String> {
+    let home = get_home_dir()?;
+    let snapshot_path = home.join(".cache").join("canvas-terminal").join("snapshot.png");
+    if snapshot_path.exists() {
+        std::fs::remove_file(&snapshot_path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Remove the import file after it has been read onto the canvas.
+#[tauri::command]
+pub fn cleanup_import_file() -> Result<(), String> {
+    let import_path = get_import_path()?;
+    if import_path.exists() {
+        std::fs::remove_file(&import_path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn read_image_as_data_url(path: String) -> Result<String, String> {
     let safe_path = validate_read_path(&path)?;

@@ -247,6 +247,69 @@ pub fn get_pty_cwd(state: State<'_, AppState>, session_id: String) -> Result<Str
         .ok_or_else(|| "CWD not found in lsof output".to_string())
 }
 
+/// Normalise newlines inside the pasted text depending on the target CLI tool.
+/// Inside bracketed paste mode the text is treated as literal input by the CLI,
+/// so `\n` is the correct multiline separator.  Converting to `\r` would cause
+/// tools like Claude Code to interpret each line break as an Enter/submit,
+/// triggering premature submission of just the first line.
+fn format_for_tool(text: &str, tool: Option<&str>) -> String {
+    match tool {
+        Some("gemini_cli") => text.replace('\n', "\r"),
+        // Claude Code and Codex handle \n natively inside bracketed paste
+        _ => text.to_string(),
+    }
+}
+
+/// Inject text into a PTY session using bracketed paste mode so the CLI
+/// tool receives it as pasted input rather than typed keystrokes.
+/// An optional `tool` parameter adjusts newline formatting per CLI tool.
+#[tauri::command]
+pub fn inject_into_pty(
+    state: State<'_, AppState>,
+    session_id: String,
+    text: String,
+    tool: Option<String>,
+) -> Result<(), String> {
+    let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| format!("PTY session '{}' not found", session_id))?;
+
+    let formatted = format_for_tool(&text, tool.as_deref());
+
+    // Bracketed paste wraps the content so the CLI treats it as pasted text,
+    // not individual keystrokes.  The \r (Enter) is sent separately after a
+    // short delay so the CLI's event loop has time to process the paste-end
+    // marker before seeing the submit signal.
+    let paste = format!("\x1b[200~{}\x1b[201~", formatted);
+    session
+        .writer
+        .write_all(paste.as_bytes())
+        .map_err(|e| e.to_string())?;
+    session.writer.flush().map_err(|e| e.to_string())?;
+
+    // Release the lock before sleeping so other commands are not blocked.
+    drop(sessions);
+
+    // Small delay for the CLI event loop to consume the paste-end marker
+    // before the Enter keystroke arrives.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Re-acquire lock and send Enter
+    let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| format!("PTY session '{}' not found after delay", session_id))?;
+
+    session
+        .writer
+        .write_all(b"\r")
+        .map_err(|e| e.to_string())?;
+    session.writer.flush().map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn kill_pty(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
     // Remove session from map and release the lock BEFORE cleanup.
