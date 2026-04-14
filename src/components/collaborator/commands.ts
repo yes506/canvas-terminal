@@ -12,6 +12,7 @@ export interface ParsedCommand {
   type:
     | "send"
     | "broadcast"
+    | "needs-target"
     | "status"
     | "clear"
     | "help"
@@ -68,9 +69,9 @@ export function parseInput(input: string): ParsedCommand {
     return { type: "send", target, message, raw: trimmed };
   }
 
-  // Bare text → broadcast
+  // Bare text → needs target selection (no auto-broadcast)
   if (trimmed.length > 0) {
-    return { type: "broadcast", message: trimmed, raw: trimmed };
+    return { type: "needs-target", message: trimmed, raw: trimmed };
   }
 
   return { type: "unknown", raw: trimmed };
@@ -107,11 +108,12 @@ export function resolveAgent(
 
 export function getHelpText(): string {
   return [
-    "Type directly in each agent terminal. This prompt is for commands & broadcasts.",
+    "Type directly in each agent terminal. This prompt is for commands & targeted messages.",
     "",
     "Commands:",
-    "  @<agent> <msg>    Inject message into agent",
+    "  @<agent> <msg>    Send message to specific agent",
     "  @all <msg>        Broadcast to all agents",
+    "  <bare text>       Shows target selector before sending",
     "  /status           Show running agents",
     "  /help             Show help",
     "",
