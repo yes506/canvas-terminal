@@ -105,7 +105,7 @@ pub fn run() {
                 }
                 // Clean up temporary canvas files
                 let _ = commands::canvas::cleanup_snapshot();
-                let _ = commands::canvas::cleanup_import_file();
+                let _ = commands::canvas::cleanup_import_file(None);
             }
         })
         .run(tauri::generate_context!())

@@ -3,6 +3,7 @@ import {
   useCollaboratorStore,
   agentDisplayName,
   toolShortName,
+  toolLabel,
 } from "../../stores/collaboratorStore";
 import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps";
 import type { SpawnedAgent, TaskStatus } from "../../types/collaborator";
@@ -206,18 +207,21 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
         } else {
           targets.push(...store.agents);
         }
-        for (const agent of targets) {
-          await invoke("inject_into_pty", {
-            sessionId: agent.sessionId,
-            text: path,
-            tool: agent.tool,
-          });
+        if (targets.length === 0) {
+          status(`No agents running. Snapshot saved at ${path}`);
+          break;
         }
-        status(
-          targets.length > 0
-            ? `Canvas exported to ${targets.length} agent(s)`
-            : `Canvas exported: ${path}`,
-        );
+
+        const prompt = [
+          "[Canvas Terminal] A canvas snapshot has been exported for your reference.",
+          `Image path: ${path}`,
+          "Please analyze this image and respond.",
+        ].join("\n");
+
+        for (const agent of targets) {
+          await store.sendToAgent(agent.sessionId, prompt);
+        }
+        status(`Canvas exported to ${targets.length} agent(s)`);
       } catch (err) {
         status(`Export failed: ${err}`);
       }
@@ -227,29 +231,65 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
     case "canvas-import": {
       try {
         const agents = store.agents;
-        let targetAgent: SpawnedAgent | null = null;
+        const targets: SpawnedAgent[] = [];
 
         if (cmd.target) {
-          targetAgent = resolveAgent(cmd.target, agents);
-          if (!targetAgent) {
-            status(`Agent "${cmd.target}" not found.`);
-            break;
+          if (cmd.target.toLowerCase() === "all") {
+            targets.push(...agents);
+          } else {
+            const agent = resolveAgent(cmd.target, agents);
+            if (!agent) {
+              status(`Agent "${cmd.target}" not found.`);
+              break;
+            }
+            targets.push(agent);
           }
-        } else if (agents.length === 1) {
-          targetAgent = agents[0];
         } else if (agents.length === 0) {
           status("No agents running.");
           break;
         } else {
-          status("Multiple agents. Specify: /canvas-import @claude");
+          // Default: all agents
+          targets.push(...agents);
+        }
+
+        if (targets.length === 0) {
+          status("No agents to import from.");
           break;
         }
 
-        await startImportForSession(
-          targetAgent.sessionId,
-          targetAgent.tool,
-          (msg) => status(msg),
-        );
+        let completed = 0;
+        const total = targets.length;
+
+        for (let i = 0; i < targets.length; i++) {
+          const agent = targets[i];
+          // Use per-agent suffix when multiple agents to avoid file clobbering
+          const suffix = targets.length > 1 ? String(i) : undefined;
+
+          await startImportForSession(
+            agent.sessionId,
+            agent.tool,
+            (msg) => {
+              const prefix = total > 1 ? `[${toolLabel(agent.tool)}] ` : "";
+              status(`${prefix}${msg}`);
+            },
+            () => {
+              completed++;
+              if (completed >= total && total > 1) {
+                status(`All ${total} imports complete.`);
+              }
+            },
+            {
+              suffix,
+              sendFn: async (prompt) => {
+                await store.sendToAgent(agent.sessionId, prompt);
+              },
+            },
+          );
+        }
+
+        if (total > 1) {
+          status(`Import request sent to ${total} agents. Waiting for responses...`);
+        }
       } catch (err) {
         status(`Import failed: ${err}`);
       }

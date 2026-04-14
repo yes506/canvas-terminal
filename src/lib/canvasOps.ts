@@ -36,26 +36,44 @@ export interface ImportPollHandle {
   cancel: () => void;
 }
 
+export interface ImportOptions {
+  /** Per-agent suffix for unique import paths (multi-agent concurrent imports). */
+  suffix?: string;
+  /** Custom send function — routes through the collaborator store for context injection. */
+  sendFn?: (prompt: string) => Promise<void>;
+}
+
 /**
  * Send the import prompt to a PTY session and start polling for the response file.
  * When the AI tool writes its response, it's rendered onto the canvas.
+ *
+ * When `options.sendFn` is provided, the prompt is sent through the collaborator
+ * store (which prepends context headers) instead of raw `inject_into_pty`.
+ * When `options.suffix` is provided, a unique import path is used so multiple
+ * agents can write concurrently without clobbering each other's files.
  */
 export async function startImportForSession(
   sessionId: string,
   tool: string | null,
   onStatus: (msg: string) => void,
   onDone?: () => void,
+  options?: ImportOptions,
 ): Promise<ImportPollHandle> {
+  const suffix = options?.suffix;
+  const checkArgs = suffix != null ? { suffix } : {};
+
   const [importPath, baselineMtime] = await invoke<[string, number | null]>(
     "check_import_file",
+    checkArgs,
   );
 
   // Send the prompt with the import path to the agent
-  await invoke("inject_into_pty", {
-    sessionId,
-    text: IMPORT_PROMPT + importPath,
-    tool,
-  });
+  const prompt = IMPORT_PROMPT + importPath;
+  if (options?.sendFn) {
+    await options.sendFn(prompt);
+  } else {
+    await invoke("inject_into_pty", { sessionId, text: prompt, tool });
+  }
   onStatus(`Import prompt sent. Waiting for file at ${importPath}...`);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -74,15 +92,19 @@ export async function startImportForSession(
     try {
       const [, currentMtime] = await invoke<[string, number | null]>(
         "check_import_file",
+        checkArgs,
       );
       if (currentMtime === null) return;
       if (baselineMtime !== null && currentMtime <= baselineMtime) return;
 
       stop();
-      const [format, content] = await invoke<[string, string]>("read_import_file");
+      const [format, content] = await invoke<[string, string]>(
+        "read_import_file",
+        checkArgs,
+      );
 
       // Clean up the import file now that we've read it
-      invoke("cleanup_import_file").catch(() => {});
+      invoke("cleanup_import_file", checkArgs).catch(() => {});
 
       let dataUrl: string;
       if (format === "png") {

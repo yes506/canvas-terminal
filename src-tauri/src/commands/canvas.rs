@@ -198,18 +198,28 @@ pub fn export_snapshot(base64_data: String) -> Result<String, String> {
     Ok(snapshot_path.to_string_lossy().to_string())
 }
 
-fn get_import_path() -> Result<std::path::PathBuf, String> {
+fn get_import_path(suffix: Option<&str>) -> Result<std::path::PathBuf, String> {
     let home = get_home_dir()?;
     let cache_dir = home.join(".cache").join("canvas-terminal");
     std::fs::create_dir_all(&cache_dir)
         .map_err(|e| format!("Failed to create cache directory: {}", e))?;
-    Ok(cache_dir.join("import"))
+    match suffix {
+        Some(s) => {
+            // Validate suffix to prevent path traversal
+            if s.contains('/') || s.contains('\\') || s.contains("..") || s.is_empty() {
+                return Err("Invalid import suffix".to_string());
+            }
+            Ok(cache_dir.join(format!("import-{}", s)))
+        }
+        None => Ok(cache_dir.join("import")),
+    }
 }
 
 /// Returns (absolute_path, modified_epoch_ms) for the import file, or (path, null) if it doesn't exist.
+/// Optional `suffix` allows per-agent import paths for multi-agent concurrent imports.
 #[tauri::command]
-pub fn check_import_file() -> Result<(String, Option<u64>), String> {
-    let import_path = get_import_path()?;
+pub fn check_import_file(suffix: Option<String>) -> Result<(String, Option<u64>), String> {
+    let import_path = get_import_path(suffix.as_deref())?;
     let path_str = import_path.to_string_lossy().to_string();
 
     match std::fs::metadata(&import_path) {
@@ -230,8 +240,8 @@ pub fn check_import_file() -> Result<(String, Option<u64>), String> {
 /// format: "png" → content is a data:image/png;base64 URL
 /// format: "text" → content is raw text (markdown, SVG, HTML, plain text, etc.)
 #[tauri::command]
-pub fn read_import_file() -> Result<(String, String), String> {
-    let import_path = get_import_path()?;
+pub fn read_import_file(suffix: Option<String>) -> Result<(String, String), String> {
+    let import_path = get_import_path(suffix.as_deref())?;
 
     let metadata = std::fs::metadata(&import_path).map_err(|e| e.to_string())?;
     if metadata.len() > MAX_IMAGE_READ_SIZE {
@@ -272,8 +282,8 @@ pub fn cleanup_snapshot() -> Result<(), String> {
 
 /// Remove the import file after it has been read onto the canvas.
 #[tauri::command]
-pub fn cleanup_import_file() -> Result<(), String> {
-    let import_path = get_import_path()?;
+pub fn cleanup_import_file(suffix: Option<String>) -> Result<(), String> {
+    let import_path = get_import_path(suffix.as_deref())?;
     if import_path.exists() {
         std::fs::remove_file(&import_path).map_err(|e| e.to_string())?;
     }

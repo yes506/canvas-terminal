@@ -117,29 +117,49 @@ export function useCanvasIntegration() {
     // Route through collaborator when active
     if (collabSessionId) {
       const agents = useCollaboratorStore.getState().agents;
-      const setStatus = useCollaboratorStore.getState().setStatus;
-      let targetAgent;
+      const store = useCollaboratorStore.getState();
       if (agents.length === 0) {
-        setStatus("No agents running.");
-        return;
-      } else if (agents.length === 1) {
-        targetAgent = agents[0];
-      } else {
-        setStatus("Multiple agents. Specify via collaborator: /canvas-import @claude");
+        store.setStatus("No agents running.");
         return;
       }
+
       setIsWaitingForImport(true);
-      try {
-        const handle = await startImportForSession(
-          targetAgent.sessionId,
-          targetAgent.tool,
-          (msg) => setStatus(msg),
-          () => setIsWaitingForImport(false),
-        );
-        importHandleRef.current = handle;
-      } catch (err) {
+      const handles: ImportPollHandle[] = [];
+      let completed = 0;
+      const total = agents.length;
+
+      for (let i = 0; i < agents.length; i++) {
+        const agent = agents[i];
+        const suffix = agents.length > 1 ? String(i) : undefined;
+
+        try {
+          const handle = await startImportForSession(
+            agent.sessionId,
+            agent.tool,
+            (msg) => store.setStatus(msg),
+            () => {
+              completed++;
+              if (completed >= total) setIsWaitingForImport(false);
+            },
+            {
+              suffix,
+              sendFn: async (prompt) => {
+                await store.sendToAgent(agent.sessionId, prompt);
+              },
+            },
+          );
+          handles.push(handle);
+        } catch (err) {
+          store.setStatus(`Import failed: ${err}`);
+        }
+      }
+
+      if (handles.length === 0) {
         setIsWaitingForImport(false);
-        setStatus(`Import failed: ${err}`);
+      } else {
+        importHandleRef.current = {
+          cancel: () => handles.forEach((h) => h.cancel()),
+        };
       }
       return;
     }
