@@ -2,9 +2,9 @@
 
 🌐 **English** | [한국어](README.ko.md)
 
-**A terminal where your drawings become AI prompts.**
+**A terminal where your drawings become AI prompts, and multiple AI CLIs can collaborate side by side.**
 
-Sketch a diagram, click Upload, and the AI CLI tool running in your terminal sees it. Ask it to respond, and the result renders back on the canvas. Canvas Terminal turns a visual idea into an AI conversation — no copy-paste, no file juggling.
+Sketch a diagram, click Upload, and the AI CLI tool running in your terminal sees it. Ask it to respond, and the result renders back on the canvas. Open the Collaborator pane, launch multiple agent terminals, and coordinate them with shared task and memory files. Canvas Terminal turns a visual idea into an AI conversation — no copy-paste, no file juggling.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
@@ -39,6 +39,77 @@ Sketch a diagram, click Upload, and the AI CLI tool running in your terminal see
 4. **Download** — the AI's response (Markdown, SVG, HTML, image, or plain text) is rendered back onto the canvas.
 
 This creates a **visual feedback loop** between you, the canvas, and the AI. Works with any CLI tool that accepts image paths.
+
+---
+
+## What's New
+
+- **Collaborator pane** for running Claude Code, Codex CLI, and Gemini CLI in parallel
+- **Shared memory workspace** at `~/.cache/canvas-terminal/collab-memory` for conversation logs, task files, and context
+- **Agent command prompt** with `@mentions`, broadcasts, task tracking, and memory file management
+- **Canvas routing for agents** so `/canvas-export` and `/canvas-import` work directly with spawned collaborators
+- **Automatic agent output capture** that flushes readable terminal output into the shared collaboration log
+
+---
+
+## Collaborator Workflow
+
+The collaborator is a dedicated split pane for multi-agent sessions.
+
+### Open It
+
+- Click the **zap** button in the tab bar
+- Press `Cmd+E`
+- Or type `collaborator` directly in a terminal and press Enter
+
+### Launch Agents
+
+The collaborator toolbar can spawn:
+
+- **Claude Code**
+- **Codex CLI**
+- **Gemini CLI**
+
+Each agent runs in its own PTY-backed mini terminal and inherits the active terminal's working directory when possible.
+
+### Send Commands
+
+Use the input prompt at the bottom of the collaborator pane:
+
+| Input | Action |
+|------|--------|
+| `@claude fix this bug` | Send a message to one agent |
+| `@all investigate startup latency` | Broadcast to all running agents |
+| `/status` | Show active agents |
+| `/help` | Show command help |
+| `/canvas-export` | Export the current canvas to all agents |
+| `/canvas-import @claude` | Ask one agent to write a response file and import it back |
+| `/context <text>` | Append shared context |
+| `/memory list` | List files in shared memory |
+| `/memory read <path>` | Read a shared-memory file |
+| `/memory delete <path>` | Delete a shared-memory file |
+| `/memory clear` | Clear the shared memory directory |
+| `/task list` | List collaboration tasks |
+| `/task add <title> | <objective> [@agent]` | Create a task |
+| `/task <id> status <pending|in-progress|completed|blocked>` | Update task state |
+| `/task <id> assign @<agent>` | Reassign a task |
+| `/task <id> done [notes]` | Mark a task complete |
+
+### Shared Memory Files
+
+Canvas Terminal creates a collaboration workspace under:
+
+```text
+~/.cache/canvas-terminal/collab-memory
+```
+
+Typical files:
+
+- `conversation-<session>.md` — append-only conversation and task reports
+- `tasks.md` — generated task definitions for active collaboration
+- `context.md` — optional shared context for all agents
+
+These files are designed for agent-to-agent handoff and are protected by path validation, size limits, and symlink checks in the Tauri backend.
 
 ---
 
@@ -87,6 +158,7 @@ npm run tauri dev    # Hot reload — frontend changes apply instantly
 | `npm run tauri dev` | Full app with hot reload |
 | `npm run tauri:build` | Production build (.dmg) |
 | `npm run build` | Frontend only (TypeScript + Vite) |
+| `npm run preview` | Preview the built frontend |
 | `npm run clean` | Remove dist and release bundles |
 
 ---
@@ -135,6 +207,19 @@ The terminal is a full PTY shell — not a simplified emulator. It spawns a logi
 - **WebGL rendering** — GPU-accelerated text via xterm.js WebGL addon, with automatic canvas fallback
 - **IME support** — Korean, Japanese, and Chinese composition handled correctly (no double input)
 - **Shift+Enter** — sends a dedicated escape sequence recognized by Claude Code
+- **Collaborator toggle** — open a multi-agent split without leaving the current tab
+
+### Collaborator
+
+The collaborator is a PTY-backed multi-agent workspace embedded inside the terminal layout.
+
+- **Three launch targets** — Claude Code, Codex CLI, Gemini CLI
+- **Parallel agent terminals** — spawn multiple instances of the same tool, with indexed targeting like `@claude1` and `@claude2`
+- **Shared task protocol** — built-in task creation, assignment, status updates, and completion logging
+- **Shared memory backend** — task files, conversation logs, and optional context persisted under `~/.cache/canvas-terminal/collab-memory`
+- **Agent output capture** — strips ANSI sequences and appends readable output to the collaboration log
+- **Canvas-aware commands** — export the current drawing to one or many agents and import an agent-generated response back into the canvas
+- **Prompt ergonomics** — history navigation, multi-line input with `Shift+Enter`, and `@mention` autocomplete
 
 ### Canvas
 
@@ -185,7 +270,9 @@ A Fabric.js-powered drawing board designed for quick sketching, not pixel-perfec
 | Cmd+F | Open find bar |
 | Cmd+= / Cmd+- | Font zoom in / out |
 | Cmd+0 | Reset font size |
+| Cmd+E | Toggle collaborator split |
 | Cmd+Enter | Toggle fullscreen |
+| Type `collaborator` + Enter | Open collaborator from the shell |
 
 </details>
 
@@ -229,13 +316,14 @@ A Fabric.js-powered drawing board designed for quick sketching, not pixel-perfec
 
 ## Security
 
-All file operations are restricted to your home directory.
+All file operations are restricted to your home directory or the app-managed collaboration cache.
 
 - **Path validation** — all paths canonicalized and checked against `$HOME`
 - **Symlink protection** — `O_NOFOLLOW` flag; symlink targets re-validated
 - **File size limits** — 100 MB canvas JSON, 50 MB binary, 20 MB images
 - **Magic byte validation** — PNG and JPEG verified by header bytes before processing
 - **Input size limit** — terminal writes capped at 65 KB per call
+- **Collaboration memory guardrails** — shared memory files reject traversal, absolute paths, oversized reads, and symlink writes
 - **SVG exclusion** — SVG not loaded as raw images to prevent XSS vectors
 - **IME-aware input** — East Asian composition events handled correctly to prevent double input
 - **No GUI credential dialogs** — git/SSH prompts forced to terminal to prevent hangs in Tauri context
