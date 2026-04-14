@@ -57,7 +57,8 @@ export function useKeyboardShortcuts() {
       const mod = e.metaKey || e.ctrlKey;
 
       // Escape to close search or collaborator (no mod needed)
-      if (e.key === "Escape") {
+      // Skip if already handled (e.g. by agent picker dropdown in InputPrompt)
+      if (e.key === "Escape" && !e.defaultPrevented) {
         const { searchVisible, setSearchVisible, tabs, activeTabId } =
           useTerminalStore.getState();
         if (searchVisible) {
