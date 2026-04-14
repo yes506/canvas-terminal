@@ -72,6 +72,8 @@ The collaborator toolbar can spawn:
 
 Each agent runs in its own PTY-backed mini terminal and inherits the active terminal's working directory when possible.
 
+When multiple sessions of the same tool are running, the target selector disambiguates them with labels like `Claude Code #1`, `Claude Code #2`, plus matching handles such as `@claude1` and `@claude2`.
+
 ### Send Commands
 
 Use the input prompt at the bottom of the collaborator pane:
@@ -79,11 +81,13 @@ Use the input prompt at the bottom of the collaborator pane:
 | Input | Action |
 |------|--------|
 | `@claude fix this bug` | Send a message to one agent |
-| `@all investigate startup latency` | Broadcast to all running agents |
+| `plain message` | If one agent is running, send directly. If multiple agents are running, open a target selector before sending |
+| `@all investigate startup latency` | Explicitly broadcast to all running agents |
 | `/status` | Show active agents |
 | `/help` | Show command help |
 | `/canvas-export` | Export the current canvas to all agents |
-| `/canvas-import @claude` | Ask one agent to write a response file and import it back |
+| `/canvas-import` | Ask all running agents to write responses and import each result back onto the canvas |
+| `/canvas-import @claude` | Ask one specific agent to write a response file and import it back |
 | `/context <text>` | Append shared context |
 | `/memory list` | List files in shared memory |
 | `/memory read <path>` | Read a shared-memory file |
@@ -191,6 +195,8 @@ The core feature that makes Canvas Terminal different from every other terminal 
 
 Responses are rendered in a dark-themed style with Markdown-aware typography. Code blocks use SF Mono / Fira Code.
 
+When the collaborator pane is active, canvas import/export routes through the collaborator workflow. Export sends an instructive prompt to the selected agent or agents, and import can poll multiple agents concurrently so their results appear on the canvas independently as they arrive.
+
 ---
 
 ## Features
@@ -219,7 +225,7 @@ The collaborator is a PTY-backed multi-agent workspace embedded inside the termi
 - **Shared memory backend** — task files, conversation logs, and optional context persisted under `~/.cache/canvas-terminal/collab-memory`
 - **Agent output capture** — strips ANSI sequences and appends readable output to the collaboration log
 - **Canvas-aware commands** — export the current drawing to one or many agents and import an agent-generated response back into the canvas
-- **Prompt ergonomics** — history navigation, multi-line input with `Shift+Enter`, and `@mention` autocomplete
+- **Prompt ergonomics** — history navigation, multi-line input with `Shift+Enter`, `@mention` autocomplete, and a target selector for untargeted prompts
 
 ### Canvas
 

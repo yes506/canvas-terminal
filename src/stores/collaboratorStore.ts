@@ -198,6 +198,8 @@ interface CollaboratorState {
   logEntries: LogEntry[];
   /** Structured tasks for multi-agent collaboration. */
   tasks: CollabTask[];
+  /** Prefilled input value set externally (e.g. canvas toolbar). */
+  pendingInput: string | null;
 
   // Session lifecycle
   startSession: (id: string) => void;
@@ -220,6 +222,9 @@ interface CollaboratorState {
     role: LogEntry["role"],
     content: string,
   ) => void;
+
+  // Input prefill
+  setPendingInput: (input: string | null) => void;
 
   // Task management
   addTask: (opts: {
@@ -293,6 +298,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   collabSessionId: null,
   logEntries: [],
   tasks: [],
+  pendingInput: null,
 
   // -- Session lifecycle --------------------------------------------------
 
@@ -413,6 +419,10 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       );
     }
   },
+
+  // -- Input prefill -------------------------------------------------------
+
+  setPendingInput: (input) => set({ pendingInput: input }),
 
   // -- Task management ----------------------------------------------------
 

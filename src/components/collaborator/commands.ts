@@ -3,6 +3,7 @@ import {
   useCollaboratorStore,
   agentDisplayName,
   toolShortName,
+  toolLabel,
 } from "../../stores/collaboratorStore";
 import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps";
 import type { SpawnedAgent, TaskStatus } from "../../types/collaborator";
@@ -11,6 +12,7 @@ export interface ParsedCommand {
   type:
     | "send"
     | "broadcast"
+    | "needs-target"
     | "status"
     | "clear"
     | "help"
@@ -67,9 +69,9 @@ export function parseInput(input: string): ParsedCommand {
     return { type: "send", target, message, raw: trimmed };
   }
 
-  // Bare text → broadcast
+  // Bare text → needs target selection (no auto-broadcast)
   if (trimmed.length > 0) {
-    return { type: "broadcast", message: trimmed, raw: trimmed };
+    return { type: "needs-target", message: trimmed, raw: trimmed };
   }
 
   return { type: "unknown", raw: trimmed };
@@ -106,11 +108,12 @@ export function resolveAgent(
 
 export function getHelpText(): string {
   return [
-    "Type directly in each agent terminal. This prompt is for commands & broadcasts.",
+    "Type directly in each agent terminal. This prompt is for commands & targeted messages.",
     "",
     "Commands:",
-    "  @<agent> <msg>    Inject message into agent",
+    "  @<agent> <msg>    Send message to specific agent",
     "  @all <msg>        Broadcast to all agents",
+    "  <bare text>       Shows target selector before sending",
     "  /status           Show running agents",
     "  /help             Show help",
     "",
@@ -190,34 +193,29 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
 
     case "canvas-export": {
       try {
+        if (!cmd.target) {
+          status("Usage: /canvas-export @<agent>  (specify a target agent)");
+          break;
+        }
         const path = await exportCanvasSnapshot();
         if (!path) {
           status("Canvas is empty.");
           break;
         }
-        const targets: SpawnedAgent[] = [];
-        if (cmd.target) {
-          const agent = resolveAgent(cmd.target, store.agents);
-          if (!agent) {
-            status(`Agent "${cmd.target}" not found. Saved at ${path}`);
-            break;
-          }
-          targets.push(agent);
-        } else {
-          targets.push(...store.agents);
+        const agent = resolveAgent(cmd.target, store.agents);
+        if (!agent) {
+          status(`Agent "${cmd.target}" not found. Saved at ${path}`);
+          break;
         }
-        for (const agent of targets) {
-          await invoke("inject_into_pty", {
-            sessionId: agent.sessionId,
-            text: path,
-            tool: agent.tool,
-          });
-        }
-        status(
-          targets.length > 0
-            ? `Canvas exported to ${targets.length} agent(s)`
-            : `Canvas exported: ${path}`,
-        );
+
+        const prompt = [
+          "[Canvas Terminal] A canvas snapshot has been exported for your reference.",
+          `Image path: ${path}`,
+          "Please analyze this image and respond.",
+        ].join("\n");
+
+        await store.sendToAgent(agent.sessionId, prompt);
+        status(`Canvas exported to ${toolLabel(agent.tool)}`);
       } catch (err) {
         status(`Export failed: ${err}`);
       }
@@ -226,29 +224,26 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
 
     case "canvas-import": {
       try {
-        const agents = store.agents;
-        let targetAgent: SpawnedAgent | null = null;
-
-        if (cmd.target) {
-          targetAgent = resolveAgent(cmd.target, agents);
-          if (!targetAgent) {
-            status(`Agent "${cmd.target}" not found.`);
-            break;
-          }
-        } else if (agents.length === 1) {
-          targetAgent = agents[0];
-        } else if (agents.length === 0) {
-          status("No agents running.");
+        if (!cmd.target) {
+          status("Usage: /canvas-import @<agent>  (specify a target agent)");
           break;
-        } else {
-          status("Multiple agents. Specify: /canvas-import @claude");
+        }
+        const agent = resolveAgent(cmd.target, store.agents);
+        if (!agent) {
+          status(`Agent "${cmd.target}" not found.`);
           break;
         }
 
         await startImportForSession(
-          targetAgent.sessionId,
-          targetAgent.tool,
+          agent.sessionId,
+          agent.tool,
           (msg) => status(msg),
+          () => {},
+          {
+            sendFn: async (prompt) => {
+              await store.sendToAgent(agent.sessionId, prompt);
+            },
+          },
         );
       } catch (err) {
         status(`Import failed: ${err}`);
