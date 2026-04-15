@@ -1,5 +1,7 @@
 import { useRef, useEffect } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useCollaboratorStore, mentionableNames, toolLabel } from "../../stores/collaboratorStore";
+import { useCollabSessionId } from "./CollabSessionContext";
 import { TOOL_CONFIGS } from "../../types/collaborator";
 
 interface AtMentionProps {
@@ -17,7 +19,10 @@ function colorForName(name: string): string {
 }
 
 export function AtMention({ query, selectedIndex, onSelect }: AtMentionProps) {
-  const agents = useCollaboratorStore((s) => s.agents);
+  const collabSessionId = useCollabSessionId();
+  const agents = useCollaboratorStore(
+    useShallow((s) => s.agents.filter((a) => a.collabSessionId === collabSessionId)),
+  );
   const listRef = useRef<HTMLDivElement>(null);
 
   // Build options: filtered mentionable names + "all"

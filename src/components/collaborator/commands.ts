@@ -143,13 +143,17 @@ export function getStatusText(agents: SpawnedAgent[]): string {
 // Command Execution
 // ---------------------------------------------------------------------------
 
-export async function executeCommand(cmd: ParsedCommand): Promise<void> {
+export async function executeCommand(cmd: ParsedCommand, collabSessionId?: string): Promise<void> {
   const store = useCollaboratorStore.getState();
-  const status = (msg: string | null) => store.setStatus(msg);
+  const status = (msg: string | null) => store.setStatus(msg, collabSessionId);
+  // Scope agents to the current collaborator session when available
+  const scopedAgents = collabSessionId
+    ? store.agents.filter((a) => a.collabSessionId === collabSessionId)
+    : store.agents;
 
   switch (cmd.type) {
     case "status": {
-      status(getStatusText(store.agents));
+      status(getStatusText(scopedAgents));
       break;
     }
 
@@ -165,14 +169,14 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
 
     case "send": {
       if (!cmd.target || !cmd.message) break;
-      const agent = resolveAgent(cmd.target, store.agents);
+      const agent = resolveAgent(cmd.target, scopedAgents);
       if (!agent) {
         status(`Agent "${cmd.target}" not found.`);
         break;
       }
       const lower = cmd.target.toLowerCase();
       if (!/\d$/.test(cmd.target)) {
-        const matches = store.agents.filter((a) =>
+        const matches = scopedAgents.filter((a) =>
           toolShortName(a.tool).includes(lower),
         );
         if (matches.length > 1) {
@@ -187,7 +191,7 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
 
     case "broadcast": {
       if (!cmd.message) break;
-      await store.broadcastToAll(cmd.message);
+      await store.broadcastToAll(cmd.message, collabSessionId);
       break;
     }
 
@@ -202,7 +206,7 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
           status("Canvas is empty.");
           break;
         }
-        const agent = resolveAgent(cmd.target, store.agents);
+        const agent = resolveAgent(cmd.target, scopedAgents);
         if (!agent) {
           status(`Agent "${cmd.target}" not found. Saved at ${path}`);
           break;
@@ -228,7 +232,7 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
           status("Usage: /canvas-import @<agent>  (specify a target agent)");
           break;
         }
-        const agent = resolveAgent(cmd.target, store.agents);
+        const agent = resolveAgent(cmd.target, scopedAgents);
         if (!agent) {
           status(`Agent "${cmd.target}" not found.`);
           break;
@@ -258,14 +262,18 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
             relativePath: "context.md",
           });
           status("Shared context cleared.");
-          store.appendLog("system", "Context cleared");
+          if (collabSessionId) {
+            store.appendLog("system", "Context cleared", collabSessionId);
+          }
         } else if (cmd.message) {
           await invoke<string>("write_memory_file", {
             relativePath: "context.md",
             content: cmd.message,
           });
           status("Shared context updated.");
-          store.appendLog("system", `Context set: ${cmd.message}`);
+          if (collabSessionId) {
+            store.appendLog("system", `Context set: ${cmd.message}`, collabSessionId);
+          }
         } else {
           const content = await invoke<string | null>("read_memory_file", {
             relativePath: "context.md",
@@ -284,7 +292,11 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
 
         // /task  or  /task list
         if (sub === "" || sub === "list") {
-          const tasks = store.getTasks();
+          if (!collabSessionId) {
+            status("Task commands require a collaborator session.");
+            break;
+          }
+          const tasks = store.getTasks(collabSessionId);
           if (tasks.length === 0) {
             status("No tasks. Create one: /task add <title> | <objective> [@agent]");
           } else {
@@ -300,6 +312,10 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
 
         // /task add <title> | <objective> [@agent]
         if (sub.startsWith("add ") || sub === "add") {
+          if (!collabSessionId) {
+            status("Task commands require a collaborator session.");
+            break;
+          }
           const body = sub.slice("add".length).trim();
           if (!body) {
             status("Usage: /task add <title> | <objective> [@agent]");
@@ -332,7 +348,7 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
             objective = rest;
           }
 
-          const task = store.addTask({ title, objective, assignee });
+          const task = store.addTask({ title, objective, assignee }, collabSessionId);
           status(`Task created: ${task.id} — "${task.title}"${assignee ? ` → ${assignee}` : ""}`);
           break;
         }
@@ -340,18 +356,22 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
         // /task <id> status <status>
         const statusMatch = sub.match(/^(\S+)\s+status\s+(\S+)$/);
         if (statusMatch) {
+          if (!collabSessionId) {
+            status("Task commands require a collaborator session.");
+            break;
+          }
           const [, taskId, newStatus] = statusMatch;
           const valid = ["pending", "in-progress", "completed", "blocked"];
           if (!valid.includes(newStatus)) {
             status(`Invalid status. Use: ${valid.join(", ")}`);
             break;
           }
-          const task = store.getTasks().find((t) => t.id === taskId || t.id.startsWith(taskId));
+          const task = store.getTasks(collabSessionId).find((t) => t.id === taskId || t.id.startsWith(taskId));
           if (!task) {
             status(`Task not found: ${taskId}`);
             break;
           }
-          store.updateTask(task.id, { status: newStatus as TaskStatus });
+          store.updateTask(task.id, { status: newStatus as TaskStatus }, collabSessionId);
           status(`Task ${task.id} → ${newStatus}`);
           break;
         }
@@ -359,13 +379,17 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
         // /task <id> assign @<agent>
         const assignMatch = sub.match(/^(\S+)\s+assign\s+@(\S+)$/);
         if (assignMatch) {
+          if (!collabSessionId) {
+            status("Task commands require a collaborator session.");
+            break;
+          }
           const [, taskId, agent] = assignMatch;
-          const task = store.getTasks().find((t) => t.id === taskId || t.id.startsWith(taskId));
+          const task = store.getTasks(collabSessionId).find((t) => t.id === taskId || t.id.startsWith(taskId));
           if (!task) {
             status(`Task not found: ${taskId}`);
             break;
           }
-          store.updateTask(task.id, { assignee: `@${agent}` });
+          store.updateTask(task.id, { assignee: `@${agent}` }, collabSessionId);
           status(`Task ${task.id} assigned to @${agent}`);
           break;
         }
@@ -373,8 +397,12 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
         // /task <id> done [notes]
         const doneMatch = sub.match(/^(\S+)\s+done(?:\s+(.+))?$/s);
         if (doneMatch) {
+          if (!collabSessionId) {
+            status("Task commands require a collaborator session.");
+            break;
+          }
           const [, taskId, notes] = doneMatch;
-          const task = store.getTasks().find((t) => t.id === taskId || t.id.startsWith(taskId));
+          const task = store.getTasks(collabSessionId).find((t) => t.id === taskId || t.id.startsWith(taskId));
           if (!task) {
             status(`Task not found: ${taskId}`);
             break;
@@ -382,7 +410,7 @@ export async function executeCommand(cmd: ParsedCommand): Promise<void> {
           store.updateTask(task.id, {
             status: "completed",
             completionNotes: notes?.trim() ?? null,
-          });
+          }, collabSessionId);
           status(`Task ${task.id} completed${notes ? ` — ${notes.trim()}` : ""}`);
           break;
         }

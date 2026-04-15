@@ -65,6 +65,8 @@ pub fn run() {
         .setup(|app| {
             let menu = build_menu(app)?;
             app.set_menu(menu)?;
+            // Remove only stale session directories from dead processes.
+            let _ = commands::memory::clear_stale_sessions();
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -106,6 +108,8 @@ pub fn run() {
                 // Clean up temporary canvas files
                 let _ = commands::canvas::cleanup_snapshot();
                 let _ = commands::canvas::cleanup_import_file(None);
+                // Wipe shared collaborator memory on window close
+                let _ = commands::memory::clear_memory_dir();
             }
         })
         .run(tauri::generate_context!())
