@@ -4,9 +4,11 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useShallow } from "zustand/react/shallow";
 import { terminalThemes } from "../terminal/themes";
 import { useTerminalStore } from "../../stores/terminalStore";
 import { useCollaboratorStore, agentDisplayName, toolLabel } from "../../stores/collaboratorStore";
+import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture } from "../../lib/agentOutputCapture";
 import type { ToolConfig } from "../../types/collaborator";
 import { X } from "lucide-react";
@@ -28,6 +30,7 @@ export function AgentMiniTerminal({
   cwd,
   onClose,
 }: AgentMiniTerminalProps) {
+  const collabSessionId = useCollabSessionId();
   const termRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -263,6 +266,7 @@ export function AgentMiniTerminal({
         sessionId,
         tool: tool.id,
         status: "running",
+        collabSessionId,
       });
 
       // Handle resize
@@ -317,7 +321,7 @@ export function AgentMiniTerminal({
         }, 0);
       }
     };
-  }, [sessionId, tool.command, cwd]);
+  }, [sessionId, tool.command, cwd, collabSessionId]);
 
   // React to theme changes
   useEffect(() => {
@@ -343,8 +347,10 @@ export function AgentMiniTerminal({
   const agent = useCollaboratorStore((s) =>
     s.agents.find((a) => a.sessionId === sessionId),
   );
-  const allAgents = useCollaboratorStore((s) => s.agents);
-  const displayName = agent ? agentDisplayName(agent, allAgents) : tool.label;
+  const sessionAgents = useCollaboratorStore(
+    useShallow((s) => s.agents.filter((a) => a.collabSessionId === collabSessionId)),
+  );
+  const displayName = agent ? agentDisplayName(agent, sessionAgents) : tool.label;
   const isExited = agent?.status === "exited";
 
   return (

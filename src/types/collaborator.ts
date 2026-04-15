@@ -17,6 +17,8 @@ export interface SpawnedAgent {
   sessionId: string;
   tool: ToolId;
   status: "spawning" | "running" | "exited";
+  /** Which collaborator pane owns this agent. */
+  collabSessionId: string;
 }
 
 // ---------------------------------------------------------------------------

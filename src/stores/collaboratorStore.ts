@@ -109,7 +109,7 @@ You are a participant agent in a multi-agent collaboration session. You MUST fol
 6. **Signal blockers**: If you are blocked on another agent's work, explicitly state the blocking task ID and what you need.
 
 ### File Conventions
-- \`tasks.md\` — **READ ONLY**. System-managed task definitions. Do not write to this file.
+- Task definitions file shown in the \`[Task definitions: ...]\` header — **READ ONLY**. Do not write to it directly.
 - \`conversation-*.md\` — Conversation log. Read for context, **append your task report here** when done.
 - \`context.md\` — Shared context. Read for additional instructions.
 
@@ -169,6 +169,42 @@ function formatTaskSummaryForPrompt(tasks: CollabTask[]): string {
 
 let taskCounter = 0;
 
+function taskFileRelativePath(collabSessionId: string): string {
+  return `tasks-${collabSessionId}.md`;
+}
+
+function ensureSessionMemoryFiles(collabSessionId: string): void {
+  const conversationPath = `conversation-${collabSessionId}.md`;
+  invoke<string | null>("read_memory_file", {
+    relativePath: conversationPath,
+  })
+    .then((existing) => {
+      if (existing === null) {
+        return invoke("write_memory_file", {
+          relativePath: conversationPath,
+          content: "# Collaborator Conversation Log\n",
+        });
+      }
+      return null;
+    })
+    .catch(() => {});
+
+  const tasksPath = taskFileRelativePath(collabSessionId);
+  invoke<string | null>("read_memory_file", {
+    relativePath: tasksPath,
+  })
+    .then((existing) => {
+      if (existing === null) {
+        return invoke("write_memory_file", {
+          relativePath: tasksPath,
+          content: formatTasksMarkdown([]),
+        });
+      }
+      return null;
+    })
+    .catch(() => {});
+}
+
 // ---------------------------------------------------------------------------
 // Shared memory helpers
 // ---------------------------------------------------------------------------
@@ -188,22 +224,19 @@ async function getMemoryDir(): Promise<string> {
 
 interface CollaboratorState {
   agents: SpawnedAgent[];
-  statusMessage: string | null;
+  statusMessages: Record<string, string>;
   inputHistory: string[];
   historyIndex: number;
-
-  /** Current collaborator session id — null when not mounted. */
-  collabSessionId: string | null;
-  /** In-memory conversation log entries. */
-  logEntries: LogEntry[];
-  /** Structured tasks for multi-agent collaboration. */
-  tasks: CollabTask[];
-  /** Prefilled input value set externally (e.g. canvas toolbar). */
-  pendingInput: string | null;
+  /** In-memory conversation log entries, keyed by collaborator session. */
+  logEntriesBySession: Record<string, LogEntry[]>;
+  /** Structured tasks for multi-agent collaboration, keyed by collaborator session. */
+  tasksBySession: Record<string, CollabTask[]>;
+  /** Prefilled input value set externally (e.g. canvas toolbar), keyed by collabSessionId. */
+  pendingInputs: Record<string, string>;
 
   // Session lifecycle
   startSession: (id: string) => void;
-  endSession: () => void;
+  endSession: (forSession: string) => void;
 
   // Agent lifecycle
   addAgent: (agent: SpawnedAgent) => void;
@@ -212,19 +245,23 @@ interface CollaboratorState {
     sessionId: string,
     status: SpawnedAgent["status"],
   ) => void;
-  killAllAgents: () => Promise<void>;
+  killAllAgents: (forSession?: string) => Promise<void>;
+  /** Return agents belonging to a specific collaborator session. */
+  getSessionAgents: (forSession: string) => SpawnedAgent[];
 
   // Messaging
   sendToAgent: (sessionId: string, content: string) => Promise<void>;
-  broadcastToAll: (content: string) => Promise<void>;
-  setStatus: (msg: string | null) => void;
+  broadcastToAll: (content: string, forSession?: string) => Promise<void>;
+  setStatus: (msg: string | null, forSession?: string) => void;
+  getStatus: (forSession: string) => string | null;
   appendLog: (
     role: LogEntry["role"],
     content: string,
+    forSession: string,
   ) => void;
 
-  // Input prefill
-  setPendingInput: (input: string | null) => void;
+  // Input prefill (scoped per collaborator session)
+  setPendingInput: (collabSessionId: string, input: string | null) => void;
 
   // Task management
   addTask: (opts: {
@@ -234,13 +271,14 @@ interface CollaboratorState {
     deliverables?: string[];
     assignee?: string | null;
     dependencies?: string[];
-  }) => CollabTask;
+  }, forSession: string) => CollabTask;
   updateTask: (
     taskId: string,
     updates: Partial<Pick<CollabTask, "status" | "assignee" | "completionNotes">>,
+    forSession: string,
   ) => void;
-  getTasks: () => CollabTask[];
-  persistTasks: () => Promise<void>;
+  getTasks: (forSession: string) => CollabTask[];
+  persistTasks: (forSession: string) => Promise<void>;
 
   // Input history
   pushHistory: (input: string) => void;
@@ -262,9 +300,10 @@ async function prependContextHeader(
     parts.push(
       `[Conversation log: ${dir}/conversation-${collabSessionId}.md]`,
     );
+    parts.push(`[Task definitions: ${dir}/${taskFileRelativePath(collabSessionId)}]`);
+  } else {
+    parts.push(`[Task definitions: ${dir}/tasks.md]`);
   }
-
-  parts.push(`[Task definitions: ${dir}/tasks.md]`);
 
   try {
     const content = await invoke<string | null>("read_memory_file", {
@@ -292,24 +331,45 @@ async function prependContextHeader(
 
 export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   agents: [],
-  statusMessage: null,
+  statusMessages: {},
   inputHistory: [],
   historyIndex: -1,
-  collabSessionId: null,
-  logEntries: [],
-  tasks: [],
-  pendingInput: null,
+  logEntriesBySession: {},
+  tasksBySession: {},
+  pendingInputs: {},
 
   // -- Session lifecycle --------------------------------------------------
 
   startSession: (id) => {
-    taskCounter = 0;
-    set({ collabSessionId: id, logEntries: [], agents: [], tasks: [], statusMessage: null });
+    set((s) => ({
+      logEntriesBySession: s.logEntriesBySession[id]
+        ? s.logEntriesBySession
+        : { ...s.logEntriesBySession, [id]: [] },
+      tasksBySession: s.tasksBySession[id]
+        ? s.tasksBySession
+        : { ...s.tasksBySession, [id]: [] },
+      statusMessages: s.statusMessages[id]
+        ? s.statusMessages
+        : s.statusMessages,
+      agents: s.agents.filter((a) => a.collabSessionId !== id),
+    }));
+    ensureSessionMemoryFiles(id);
   },
 
-  endSession: () => {
-    taskCounter = 0;
-    set({ collabSessionId: null, logEntries: [], agents: [], tasks: [], statusMessage: null });
+  endSession: (forSession) => {
+    set((s) => {
+      const { [forSession]: _status, ...statusMessages } = s.statusMessages;
+      const { [forSession]: _logs, ...logEntriesBySession } = s.logEntriesBySession;
+      const { [forSession]: _tasks, ...tasksBySession } = s.tasksBySession;
+      const { [forSession]: _pending, ...pendingInputs } = s.pendingInputs;
+      return {
+        statusMessages,
+        logEntriesBySession,
+        tasksBySession,
+        pendingInputs,
+        agents: s.agents.filter((a) => a.collabSessionId !== forSession),
+      };
+    });
   },
 
   // -- Agent lifecycle ----------------------------------------------------
@@ -330,9 +390,11 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     }));
   },
 
-  killAllAgents: async () => {
+  killAllAgents: async (forSession) => {
     const { agents } = get();
-    for (const agent of agents) {
+    const sid = forSession;
+    const toKill = sid ? agents.filter((a) => a.collabSessionId === sid) : agents;
+    for (const agent of toKill) {
       try {
         await invoke("kill_pty", { sessionId: agent.sessionId });
       } catch {
@@ -340,40 +402,71 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       }
     }
     taskCounter = 0;
-    set({ agents: [], tasks: [] });
-    try {
-      await invoke("clear_memory_dir");
-    } catch {
-      // Non-critical
+    if (sid) {
+      set((s) => ({
+        agents: s.agents.filter((a) => a.collabSessionId !== sid),
+      }));
+    } else {
+      set({ agents: [] });
     }
+    if (sid) {
+      try {
+        await invoke("delete_memory_file", {
+          relativePath: `conversation-${sid}.md`,
+        });
+      } catch {
+        // Non-critical — file may not exist
+      }
+      try {
+        await invoke("delete_memory_file", {
+          relativePath: taskFileRelativePath(sid),
+        });
+      } catch {
+        // Non-critical — file may not exist
+      }
+    }
+  },
+
+  getSessionAgents: (forSession) => {
+    return get().agents.filter((a) => a.collabSessionId === forSession);
   },
 
   // -- Messaging ----------------------------------------------------------
 
   sendToAgent: async (sessionId, content) => {
     try {
-      const { agents, collabSessionId, tasks } = get();
+      const { agents, tasksBySession } = get();
       const agent = agents.find((a) => a.sessionId === sessionId);
       const tool = agent?.tool ?? null;
-      const text = await prependContextHeader(content, collabSessionId, tasks);
+      const agentCollabId = agent?.collabSessionId ?? null;
+      const sessionTasks = agentCollabId ? (tasksBySession[agentCollabId] ?? []) : [];
+      const text = await prependContextHeader(content, agentCollabId, sessionTasks);
       await invoke("inject_into_pty", { sessionId, text, tool });
       const label = agent ? toolLabel(agent.tool) : sessionId;
-      set({ statusMessage: `Sent to ${label}` });
-      get().appendLog("user", `@${agent ? toolShortName(agent.tool) : "?"} ${content}`);
+      if (agentCollabId) {
+        get().setStatus(`Sent to ${label}`, agentCollabId);
+        get().appendLog("user", `@${agent ? toolShortName(agent.tool) : "?"} ${content}`, agentCollabId);
+      }
     } catch (err) {
-      set({ statusMessage: `Error: ${err}` });
+      const { agents } = get();
+      const agent = agents.find((a) => a.sessionId === sessionId);
+      if (agent?.collabSessionId) {
+        get().setStatus(`Error: ${err}`, agent.collabSessionId);
+      }
     }
   },
 
-  broadcastToAll: async (content) => {
-    const { agents, collabSessionId, tasks } = get();
-    if (agents.length === 0) {
-      set({ statusMessage: "No agents running. Launch a tool first." });
+  broadcastToAll: async (content, forSession) => {
+    const { agents, tasksBySession } = get();
+    const sid = forSession ?? null;
+    const targetAgents = sid ? agents.filter((a) => a.collabSessionId === sid) : agents;
+    if (targetAgents.length === 0) {
+      if (sid) get().setStatus("No agents running. Launch a tool first.", sid);
       return;
     }
-    const text = await prependContextHeader(content, collabSessionId, tasks);
+    const text = await prependContextHeader(content, sid, sid ? (tasksBySession[sid] ?? []) : []);
     let sent = 0;
-    for (const agent of agents) {
+    for (const agent of targetAgents) {
       try {
         await invoke("inject_into_pty", {
           sessionId: agent.sessionId,
@@ -385,48 +478,68 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         // Skip failed
       }
     }
-    set({
-      statusMessage: `Broadcast sent to ${sent} agent${sent !== 1 ? "s" : ""}`,
-    });
-    get().appendLog("user", `@all ${content}`);
+    if (sid) {
+      get().setStatus(`Broadcast sent to ${sent} agent${sent !== 1 ? "s" : ""}`, sid);
+      get().appendLog("user", `@all ${content}`, sid);
+    }
   },
 
-  setStatus: (msg) => set({ statusMessage: msg }),
+  setStatus: (msg, forSession) => {
+    if (!forSession) return;
+    set((s) => {
+      if (msg === null) {
+        const { [forSession]: _, ...rest } = s.statusMessages;
+        return { statusMessages: rest };
+      }
+      return { statusMessages: { ...s.statusMessages, [forSession]: msg } };
+    });
+  },
 
-  appendLog: (role, content) => {
+  getStatus: (forSession) => get().statusMessages[forSession] ?? null,
+
+  appendLog: (role, content, forSession) => {
     const entry: LogEntry = { time: nowTime(), role, content };
-    const entries = [...get().logEntries, entry];
-    set({ logEntries: entries });
+    set((s) => ({
+      logEntriesBySession: {
+        ...s.logEntriesBySession,
+        [forSession]: [...(s.logEntriesBySession[forSession] ?? []), entry],
+      },
+    }));
 
     // Persist by reading existing file first, then appending.
     // This preserves any content agents wrote directly to the file
     // (e.g. task reports appended via their own tools).
     // Writes are serialized via conversationWriteChain to prevent races.
-    const { collabSessionId } = get();
-    if (collabSessionId) {
-      const relPath = `conversation-${collabSessionId}.md`;
-      const newBlock = formatLogEntry(entry);
-      conversationWriteChain = conversationWriteChain.then(() =>
-        invoke<string | null>("read_memory_file", { relativePath: relPath })
-          .then((existing) => {
-            const base = existing ?? "# Collaborator Conversation Log\n";
-            return invoke("write_memory_file", {
-              relativePath: relPath,
-              content: base + "\n" + newBlock,
-            });
-          })
-          .catch(() => {}),
-      );
-    }
+    const relPath = `conversation-${forSession}.md`;
+    const newBlock = formatLogEntry(entry);
+    conversationWriteChain = conversationWriteChain.then(() =>
+      invoke<string | null>("read_memory_file", { relativePath: relPath })
+        .then((existing) => {
+          const base = existing ?? "# Collaborator Conversation Log\n";
+          return invoke("write_memory_file", {
+            relativePath: relPath,
+            content: base + "\n" + newBlock,
+          });
+        })
+        .catch(() => {}),
+    );
   },
 
   // -- Input prefill -------------------------------------------------------
 
-  setPendingInput: (input) => set({ pendingInput: input }),
+  setPendingInput: (collabSessionId, input) => {
+    set((s) => {
+      if (input === null) {
+        const { [collabSessionId]: _, ...rest } = s.pendingInputs;
+        return { pendingInputs: rest };
+      }
+      return { pendingInputs: { ...s.pendingInputs, [collabSessionId]: input } };
+    });
+  },
 
   // -- Task management ----------------------------------------------------
 
-  addTask: (opts) => {
+  addTask: (opts, forSession) => {
     taskCounter++;
     const now = new Date().toISOString();
     const task: CollabTask = {
@@ -442,34 +555,42 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       createdAt: now,
       updatedAt: now,
     };
-    set((s) => ({ tasks: [...s.tasks, task] }));
-    get().appendLog("system", `Task created: ${task.id} — ${task.title}`);
-    get().persistTasks();
+    set((s) => ({
+      tasksBySession: {
+        ...s.tasksBySession,
+        [forSession]: [...(s.tasksBySession[forSession] ?? []), task],
+      },
+    }));
+    get().appendLog("system", `Task created: ${task.id} — ${task.title}`, forSession);
+    get().persistTasks(forSession);
     return task;
   },
 
-  updateTask: (taskId, updates) => {
+  updateTask: (taskId, updates, forSession) => {
     set((s) => ({
-      tasks: s.tasks.map((t) =>
-        t.id === taskId
-          ? { ...t, ...updates, updatedAt: new Date().toISOString() }
-          : t,
-      ),
+      tasksBySession: {
+        ...s.tasksBySession,
+        [forSession]: (s.tasksBySession[forSession] ?? []).map((t) =>
+          t.id === taskId
+            ? { ...t, ...updates, updatedAt: new Date().toISOString() }
+            : t,
+        ),
+      },
     }));
-    const task = get().tasks.find((t) => t.id === taskId);
+    const task = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
     if (task) {
-      get().appendLog("system", `Task updated: ${taskId} → ${task.status}`);
+      get().appendLog("system", `Task updated: ${taskId} → ${task.status}`, forSession);
     }
-    get().persistTasks();
+    get().persistTasks(forSession);
   },
 
-  getTasks: () => get().tasks,
+  getTasks: (forSession) => get().tasksBySession[forSession] ?? [],
 
-  persistTasks: async () => {
-    const { tasks } = get();
+  persistTasks: async (forSession) => {
+    const tasks = get().tasksBySession[forSession] ?? [];
     try {
       await invoke("write_memory_file", {
-        relativePath: "tasks.md",
+        relativePath: taskFileRelativePath(forSession),
         content: formatTasksMarkdown(tasks),
       });
     } catch {

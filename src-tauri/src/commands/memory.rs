@@ -5,12 +5,35 @@ use std::path::PathBuf;
 /// Maximum memory file size (10 MB)
 const MAX_MEMORY_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-fn get_memory_dir() -> Result<PathBuf, String> {
+fn get_memory_root() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     let dir = home.join(".cache").join("canvas-terminal").join("collab-memory");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create memory directory: {}", e))?;
     Ok(dir)
+}
+
+fn get_memory_dir() -> Result<PathBuf, String> {
+    let root = get_memory_root()?;
+    let dir = root.join(format!("session-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create session memory directory: {}", e))?;
+    Ok(dir)
+}
+
+fn parse_session_pid(path: &std::path::Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let pid = name.strip_prefix("session-")?;
+    pid.parse::<u32>().ok()
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    // kill(pid, 0) checks for process existence without sending a signal.
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Validate that a relative path doesn't escape the memory directory.
@@ -153,7 +176,7 @@ pub fn delete_memory_file(relative_path: String) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Remove the entire shared memory directory (all files).
+/// Remove the current app process's shared memory directory (all files).
 #[tauri::command]
 pub fn clear_memory_dir() -> Result<(), String> {
     let dir = get_memory_dir()?;
@@ -163,6 +186,34 @@ pub fn clear_memory_dir() -> Result<(), String> {
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Failed to recreate memory directory: {}", e))?;
     }
+    Ok(())
+}
+
+/// Remove session directories whose owning process is no longer alive.
+/// Called on app launch to clean up stale dirs from previous/crashed processes
+/// without touching live app instances.
+pub fn clear_stale_sessions() -> Result<(), String> {
+    let root = get_memory_root()?;
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(&root).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(pid) = parse_session_pid(&path) else {
+            continue;
+        };
+        if is_process_alive(pid) {
+            continue;
+        }
+        std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+    }
+
     Ok(())
 }
 

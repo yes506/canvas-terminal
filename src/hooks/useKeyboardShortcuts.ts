@@ -9,7 +9,6 @@ import {
   useTerminalStore,
   getTerminalInstance,
   getActiveSessionId,
-  findCollaboratorLeaf,
 } from "../stores/terminalStore";
 
 /** Close the active tab (shared by Cmd+W keydown and native menu event).
@@ -56,21 +55,16 @@ export function useKeyboardShortcuts() {
 
       const mod = e.metaKey || e.ctrlKey;
 
-      // Escape to close search or collaborator (no mod needed)
+      // Escape to close search (no mod needed)
       // Skip if already handled (e.g. by agent picker dropdown in InputPrompt)
       if (e.key === "Escape" && !e.defaultPrevented) {
-        const { searchVisible, setSearchVisible, tabs, activeTabId } =
+        const { searchVisible, setSearchVisible } =
           useTerminalStore.getState();
         if (searchVisible) {
           setSearchVisible(false);
           const sid = getActiveSessionId();
           if (sid) getTerminalInstance(sid)?.focus();
           return;
-        }
-        // Close collaborator pane on Escape (only if one exists in active tab)
-        const activeTab = tabs.find((t) => t.id === activeTabId);
-        if (activeTab && findCollaboratorLeaf(activeTab.paneTree)) {
-          useTerminalStore.getState().openCollaboratorSplit(); // toggle off
         }
         return;
       }
@@ -199,7 +193,10 @@ export function useKeyboardShortcuts() {
         }
 
         // --- Copy / Paste ---
+        // Skip when a text input/textarea is focused — let native behavior handle it
         case "c": {
+          const el = document.activeElement;
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) break;
           if (!activeSessionId) break;
           const term = getTerminalInstance(activeSessionId);
           if (!term) break;
@@ -211,6 +208,8 @@ export function useKeyboardShortcuts() {
           break;
         }
         case "v": {
+          const el = document.activeElement;
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) break;
           e.preventDefault();
           if (!activeSessionId) break;
           try {

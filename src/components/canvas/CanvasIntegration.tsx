@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as fabric from "fabric";
-import { useTerminalStore, selectActiveSessionId } from "../../stores/terminalStore";
+import { useTerminalStore, selectActiveSessionId, findCollaboratorLeaf } from "../../stores/terminalStore";
 import { useCanvasStore, pushCanvasState } from "../../stores/canvasStore";
 import { useCollaboratorStore } from "../../stores/collaboratorStore";
 import { renderResponseToDataUrl } from "../../lib/responseRenderer";
@@ -19,7 +19,14 @@ const IMPORT_PROMPT = [
 
 export function useCanvasIntegration() {
   const activeSessionId = useTerminalStore(selectActiveSessionId);
-  const collabSessionId = useCollaboratorStore((s) => s.collabSessionId);
+  // Derive collabSessionId from the active tab's pane tree so it targets
+  // the correct collaborator pane (not a stale global value).
+  const collabSessionId = useTerminalStore((s) => {
+    const tab = s.tabs.find((t) => t.id === s.activeTabId);
+    if (!tab) return null;
+    const leaf = findCollaboratorLeaf(tab.paneTree);
+    return leaf?.sessionId ?? null;
+  });
   const fabricCanvas = useCanvasStore((s) => s.fabricCanvas);
   const [isWaitingForImport, setIsWaitingForImport] = useState(false);
   const importHandleRef = useRef<{ cancel: () => void } | null>(null);
@@ -77,7 +84,7 @@ export function useCanvasIntegration() {
 
     // Route through collaborator command line when active
     if (collabSessionId) {
-      useCollaboratorStore.getState().setPendingInput("/canvas-export");
+      useCollaboratorStore.getState().setPendingInput(collabSessionId, "/canvas-export");
       return;
     }
 
@@ -114,7 +121,7 @@ export function useCanvasIntegration() {
 
     // Route through collaborator command line when active
     if (collabSessionId) {
-      useCollaboratorStore.getState().setPendingInput("/canvas-import");
+      useCollaboratorStore.getState().setPendingInput(collabSessionId, "/canvas-import");
       return;
     }
 

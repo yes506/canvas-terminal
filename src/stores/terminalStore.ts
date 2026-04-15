@@ -4,6 +4,7 @@ import type { Terminal } from "@xterm/xterm";
 import type { SearchAddon } from "@xterm/addon-search";
 import type { Tab, PaneNode, PaneLeaf, ClosedTab } from "../types/terminal";
 import { generateSessionId } from "../lib/sessionId";
+import { destroySession as destroyManagedSession } from "../lib/terminalManager";
 
 // Terminal instance registry
 const terminalInstances = new Map<string, Terminal>();
@@ -168,30 +169,9 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     }));
   },
 
-  openCollaboratorSplit: async () => {
+  openCollaboratorSplit: () => {
     const state = get();
-    const tab = state.tabs.find((t) => t.id === state.activeTabId);
-    if (!tab) return;
-
-    // Preserve CWD for all terminal panes before modifying the tree.
-    // Tree restructuring causes React to remount TerminalPane components,
-    // which kills the PTY and spawns a new shell — without saved CWD it
-    // defaults to the home directory.
-    const terminalSids = collectSessionIds(tab.paneTree).filter((sid) => {
-      const leaf = findLeafBySessionId(tab.paneTree, sid);
-      return leaf?.kind === "terminal";
-    });
-    await Promise.all(
-      terminalSids.map((sid) =>
-        invoke<string>("get_pty_cwd", { sessionId: sid })
-          .then((cwd) => sessionCwdMap.set(sid, cwd))
-          .catch(() => {}),
-      ),
-    );
-
-    // Re-read state after async CWD lookups (it may have changed)
-    const freshState = get();
-    const freshTab = freshState.tabs.find((t) => t.id === freshState.activeTabId);
+    const freshTab = state.tabs.find((t) => t.id === state.activeTabId);
     if (!freshTab) return;
 
     // Toggle: if a collaborator pane already exists in this tab, remove it
@@ -281,6 +261,16 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     if (idx === -1) return;
 
     const tabToClose = state.tabs[idx];
+
+    // Destroy managed terminal sessions for all terminal panes in this tab
+    const allLeaves = collectSessionIds(tabToClose.paneTree);
+    for (const sid of allLeaves) {
+      const leaf = findLeafBySessionId(tabToClose.paneTree, sid);
+      if (leaf?.kind === "terminal") {
+        destroyManagedSession(sid);
+      }
+    }
+
     const filtered = [...state.tabs];
     filtered.splice(idx, 1);
 
@@ -379,6 +369,12 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     if (allIds.length <= 1) {
       get().removeTab(tab.id);
       return;
+    }
+
+    // Destroy managed terminal session if this is a terminal pane
+    const leaf = findLeafBySessionId(tab.paneTree, sessionId);
+    if (leaf?.kind === "terminal") {
+      destroyManagedSession(sessionId);
     }
 
     const newTree = removeLeaf(tab.paneTree, sessionId);

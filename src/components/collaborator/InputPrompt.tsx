@@ -1,10 +1,12 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { useShallow } from "zustand/react/shallow";
 import {
   useCollaboratorStore,
   mentionableNames,
   agentDisplayName,
   toolShortName,
 } from "../../stores/collaboratorStore";
+import { useCollabSessionId } from "./CollabSessionContext";
 import { parseInput, executeCommand } from "./commands";
 import { AtMention, extractMentionQuery } from "./AtMention";
 import type { SpawnedAgent } from "../../types/collaborator";
@@ -34,6 +36,7 @@ function targetHandle(agent: SpawnedAgent, allAgents: SpawnedAgent[]): string {
 }
 
 export function InputPrompt() {
+  const collabSessionId = useCollabSessionId();
   const [value, setValue] = useState("");
   const [mentionIndex, setMentionIndex] = useState(0);
   const [pending, setPending] = useState<PendingMessage | null>(null);
@@ -41,18 +44,20 @@ export function InputPrompt() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const pushHistory = useCollaboratorStore((s) => s.pushHistory);
   const navigateHistory = useCollaboratorStore((s) => s.navigateHistory);
-  const agents = useCollaboratorStore((s) => s.agents);
-  const pendingInput = useCollaboratorStore((s) => s.pendingInput);
+  const agents = useCollaboratorStore(
+    useShallow((s) => s.agents.filter((a) => a.collabSessionId === collabSessionId)),
+  );
+  const pendingInput = useCollaboratorStore((s) => s.pendingInputs[collabSessionId] ?? null);
   const setPendingInput = useCollaboratorStore((s) => s.setPendingInput);
 
   // Consume externally-set pending input (e.g. from canvas toolbar)
   useEffect(() => {
     if (pendingInput !== null) {
       setValue(pendingInput);
-      setPendingInput(null);
+      setPendingInput(collabSessionId, null);
       requestAnimationFrame(() => inputRef.current?.focus());
     }
-  }, [pendingInput, setPendingInput]);
+  }, [pendingInput, setPendingInput, collabSessionId]);
 
   // Compute mention state
   const cursorPos = inputRef.current?.selectionStart ?? value.length;
@@ -60,11 +65,15 @@ export function InputPrompt() {
   const showMention = mention !== null && agents.length > 0;
 
   // Build selector options: individual agents + "all" (skip "all" for canvas commands)
+  // Sort by sessionId to match the numbering used in agentDisplayName/targetHandle.
+  const sortedAgents = [...agents].sort((a, b) =>
+    a.sessionId.localeCompare(b.sessionId),
+  );
   const selectorOptions: Array<{
     label: string;
     detail?: string;
     agent: SpawnedAgent | null;
-  }> = agents.map((a) => ({
+  }> = sortedAgents.map((a) => ({
     label: agentDisplayName(a, agents),
     detail: targetHandle(a, agents),
     agent: a,
@@ -132,12 +141,12 @@ export function InputPrompt() {
         // Canvas command with target — execute as a slash command
         const handle = option.detail ?? `@${toolShortName(option.agent.tool)}`;
         const fullCmd = `${commandPrefix} ${handle}`;
-        await executeCommand(parseInput(fullCmd));
+        await executeCommand(parseInput(fullCmd), collabSessionId);
       } else {
         const store = useCollaboratorStore.getState();
         if (option.agent === null) {
-          // "All agents" selected
-          await store.broadcastToAll(msg);
+          // "All agents" selected — scoped to this collaborator pane
+          await store.broadcastToAll(msg, collabSessionId);
         } else {
           // Send directly to the specific agent
           await store.sendToAgent(option.agent.sessionId, msg);
@@ -145,7 +154,7 @@ export function InputPrompt() {
       }
       requestAnimationFrame(() => inputRef.current?.focus());
     },
-    [pending],
+    [pending, collabSessionId],
   );
 
   /** Dismiss the selector and return the message to the input. */
@@ -168,7 +177,7 @@ export function InputPrompt() {
 
     if (cmd.type === "needs-target") {
       if (agents.length === 0) {
-        useCollaboratorStore.getState().setStatus("No agents running.");
+        useCollaboratorStore.getState().setStatus("No agents running.", collabSessionId);
         return;
       }
       if (agents.length === 1) {
@@ -184,14 +193,14 @@ export function InputPrompt() {
     // Canvas commands without a target → show target selector
     if ((cmd.type === "canvas-export" || cmd.type === "canvas-import") && !cmd.target) {
       if (agents.length === 0) {
-        useCollaboratorStore.getState().setStatus("No agents running.");
+        useCollaboratorStore.getState().setStatus("No agents running.", collabSessionId);
         return;
       }
       const prefix = cmd.type === "canvas-export" ? "/canvas-export" : "/canvas-import";
       if (agents.length === 1) {
         // Only one agent — execute directly
         const handle = `@${toolShortName(agents[0].tool)}`;
-        await executeCommand(parseInput(`${prefix} ${handle}`));
+        await executeCommand(parseInput(`${prefix} ${handle}`), collabSessionId);
         return;
       }
       // Multiple agents — show target selector
@@ -199,8 +208,8 @@ export function InputPrompt() {
       return;
     }
 
-    await executeCommand(cmd);
-  }, [value, pushHistory, agents]);
+    await executeCommand(cmd, collabSessionId);
+  }, [value, pushHistory, agents, collabSessionId]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
