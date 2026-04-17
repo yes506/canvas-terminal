@@ -144,7 +144,7 @@ interface TerminalState {
 export const useTerminalStore = create<TerminalState>((set, get) => ({
   tabs: [],
   activeTabId: null,
-  fontSize: 13,
+  fontSize: 12,
   searchVisible: false,
   themeName: "monochrome",
   closedTabs: [],
@@ -462,7 +462,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     set((state) => ({ fontSize: Math.min(state.fontSize + 1, 28) })),
   decreaseFontSize: () =>
     set((state) => ({ fontSize: Math.max(state.fontSize - 1, 8) })),
-  resetFontSize: () => set({ fontSize: 13 }),
+  resetFontSize: () => set({ fontSize: 12 }),
 
   toggleSearch: () => set((state) => ({ searchVisible: !state.searchVisible })),
   setSearchVisible: (visible) => set({ searchVisible: visible }),

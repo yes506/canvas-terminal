@@ -17,7 +17,7 @@ body,
   overflow: clip;
   background: #1a1a1a;
   color: #e0e0e0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans CJK KR", monospace;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }

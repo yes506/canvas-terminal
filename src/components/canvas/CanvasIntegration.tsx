@@ -29,15 +29,10 @@ export function useCanvasIntegration() {
   });
   const fabricCanvas = useCanvasStore((s) => s.fabricCanvas);
   const [isWaitingForImport, setIsWaitingForImport] = useState(false);
-  const importHandleRef = useRef<{ cancel: () => void } | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const timeoutTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const stopPolling = useCallback(() => {
-    if (importHandleRef.current) {
-      importHandleRef.current.cancel();
-      importHandleRef.current = null;
-    }
     if (pollTimer.current) {
       clearInterval(pollTimer.current);
       pollTimer.current = null;

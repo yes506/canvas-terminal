@@ -42,9 +42,11 @@ export interface ManagedTerminal {
     el: HTMLTextAreaElement;
     nativeFocus: (opts?: FocusOptions) => void;
     onFocus: () => void;
-    onStart: () => void;
-    onEnd: (e: CompositionEvent) => void;
   } | null;
+  rebindIme: (() => void) | null;
+  docKeyDown: ((e: KeyboardEvent) => void) | null;
+  docInput: ((e: Event) => void) | null;
+  imeOverlayEl: HTMLSpanElement | null;
   disposed: boolean;
 }
 
@@ -89,6 +91,9 @@ function ensureGlobalSubscriptions() {
       for (const s of sessions.values()) {
         if (!s.disposed) {
           s.terminal.options.fontSize = state.fontSize;
+          if (s.imeOverlayEl) {
+            s.imeOverlayEl.style.fontSize = `${state.fontSize}px`;
+          }
           // Only fit if in a visible slot — avoid resizing to 1x1 when parked
           if (s.containerEl.offsetWidth > 0 && s.containerEl.offsetHeight > 0) {
             s.fitAddon.fit();
@@ -146,7 +151,7 @@ export async function createSession(
 
   const terminal = new Terminal({
     theme,
-    fontFamily: "'JetBrains Mono', 'Fira Code', 'SF Mono', Menlo, monospace",
+    fontFamily: "'JetBrainsMono Nerd Font Mono', 'Noto Sans Mono CJK KR', 'D2Coding', 'JetBrains Mono', Menlo, monospace",
     fontSize,
     lineHeight: 1.2,
     cursorBlink: true,
@@ -166,6 +171,10 @@ export async function createSession(
 
   // Let app-level shortcuts bubble past xterm
   terminal.attachCustomKeyEventHandler((e) => {
+    // Return true so xterm does NOT call preventDefault() on IME key
+    // events.  preventDefault() blocks the browser from initiating IME
+    // composition entirely.  The triggerDataEvent patch below handles
+    // suppressing any output xterm's _handleKey produces for IME keys.
     if (e.isComposing || e.keyCode === 229) return true;
 
     // Shift+Enter → CSI u escape sequence
@@ -214,6 +223,10 @@ export async function createSession(
     unlistenExit: null,
     observer: null,
     imeHandlers: null,
+    rebindIme: null,
+    docKeyDown: null,
+    docInput: null,
+    imeOverlayEl: null,
     disposed: false,
   };
 
@@ -277,15 +290,304 @@ export async function createSession(
 
   // Track line buffer for "collaborator" command detection
   let lineBuffer = "";
+  // ---------------------------------------------------------------------------
+  // Korean IME handling for WKWebView (Tauri on macOS)
+  //
+  // WKWebView has two critical differences from standard browsers:
+  //   1. Event order: input fires BEFORE keydown (reversed from spec)
+  //   2. No composition events: uses insertText + insertReplacementText
+  //      instead of compositionstart/compositionupdate/compositionend
+  //
+  // Strategy:
+  //   - Patch triggerDataEvent to defer Korean chars by 20ms (allows
+  //     keydown(229) to set isComposing before we commit)
+  //   - Track textarea value during composition; show a DOM overlay
+  //     at the cursor position for visual feedback
+  //   - Flush the composed text to PTY when a non-229 keydown arrives
+  // ---------------------------------------------------------------------------
   let isComposing = false;
-  let skipNextOnData = false;
+  let imeStartPos = 0;       // textarea position where current composition began
+  let imeFlushGen = 0;       // generation counter to prevent deferred duplicates
+  let imeFragment = "";      // current composing fragment (for flush on Enter)
 
-  // IME composition handling for CJK input
-  const helperTextarea = containerEl.querySelector<HTMLTextAreaElement>(
-    ".xterm-helper-textarea",
-  );
+  // DOM-based composition overlay — font must match xterm.js renderer exactly.
+  // Appended to .xterm-screen so positioning is relative to the cell grid,
+  // not the padded container div.
+  const overlayEl = document.createElement("span");
+  overlayEl.style.cssText =
+    `position:absolute;color:inherit;` +
+    `font-family:${terminal.options.fontFamily ?? "monospace"};` +
+    `font-size:${terminal.options.fontSize ?? 12}px;` +
+    `font-weight:${terminal.options.fontWeight ?? "normal"};` +
+    `-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;` +
+    `pointer-events:none;` +
+    `z-index:10;white-space:pre;display:none;padding:0;margin:0;`;
+  // Fake cursor bar — rendered to the right of composing text
+  const fakeCursorEl = document.createElement("span");
+  fakeCursorEl.style.cssText =
+    `display:inline-block;width:2px;vertical-align:top;` +
+    `animation:ime-cursor-blink 1s step-end infinite;`;
+  overlayEl.appendChild(fakeCursorEl);
+  // Inject blink keyframes if not already present
+  if (!document.getElementById("ime-cursor-blink-style")) {
+    const styleEl = document.createElement("style");
+    styleEl.id = "ime-cursor-blink-style";
+    styleEl.textContent = `@keyframes ime-cursor-blink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }`;
+    document.head.appendChild(styleEl);
+  }
+  const screenEl = containerEl.querySelector(".xterm-screen") as HTMLElement | null;
+  if (screenEl) {
+    screenEl.style.position = "relative";
+    screenEl.appendChild(overlayEl);
+  } else {
+    containerEl.style.position = "relative";
+    containerEl.appendChild(overlayEl);
+  }
+  managed.imeOverlayEl = overlayEl;
 
-  if (helperTextarea) {
+  // Hide real cursor during composition by directly setting the internal
+  // isCursorHidden flag on xterm.js's core service. This is more reliable
+  // than DECTCEM (\x1b[?25l]) because:
+  //   1. DECTCEM goes through the async input handler — the shell can send
+  //      \x1b[?25h (show cursor) in its prompt, overriding our hide.
+  //   2. cursorWidth has a minimum clamp of 1 in OptionsService.
+  // Direct flag access mirrors how iTerm2 handles it: the renderer checks
+  // coreService.isCursorHidden synchronously before drawing the cursor.
+  let cursorHidden = false;
+  const core = (terminal as any)._core;
+  // Intercept shell escape sequences that try to show the cursor during
+  // composition. We replace the isCursorHidden property with a getter/setter
+  // that ignores writes while composition is active.
+  let cursorHiddenLock = false;
+  if (core?.coreService) {
+    const cs = core.coreService;
+    let _realHidden = cs.isCursorHidden;
+    Object.defineProperty(cs, "isCursorHidden", {
+      get() { return cursorHiddenLock ? true : _realHidden; },
+      set(v: boolean) {
+        if (!cursorHiddenLock) _realHidden = v;
+      },
+      configurable: true,
+    });
+  }
+
+  const hideCursor = () => {
+    if (!cursorHidden) {
+      cursorHiddenLock = true;
+      terminal.options.cursorBlink = false;
+      cursorHidden = true;
+    }
+  };
+
+  const restoreCursor = () => {
+    if (cursorHidden) {
+      cursorHiddenLock = false;
+      terminal.options.cursorBlink = true;
+      cursorHidden = false;
+    }
+  };
+
+  // Check if a character is full-width (CJK, etc.) — occupies 2 terminal cells.
+  const isFullWidth = (ch: string) => {
+    const cp = ch.codePointAt(0) ?? 0;
+    return (cp >= 0x1100 && cp <= 0x115F) ||  // Hangul Jamo
+           (cp >= 0x2E80 && cp <= 0x303E) ||  // CJK Radicals, Kangxi, CJK Symbols
+           (cp >= 0x3040 && cp <= 0x33BF) ||  // Hiragana, Katakana, CJK Compat
+           (cp >= 0x3400 && cp <= 0x4DBF) ||  // CJK Unified Ext A
+           (cp >= 0x4E00 && cp <= 0xA4CF) ||  // CJK Unified, Yi
+           (cp >= 0xA960 && cp <= 0xA97C) ||  // Hangul Jamo Extended-A
+           (cp >= 0xAC00 && cp <= 0xD7AF) ||  // Hangul Syllables
+           (cp >= 0xD7B0 && cp <= 0xD7FF) ||  // Hangul Jamo Extended-B
+           (cp >= 0xF900 && cp <= 0xFAFF) ||  // CJK Compat Ideographs
+           (cp >= 0xFE30 && cp <= 0xFE6F) ||  // CJK Compat Forms
+           (cp >= 0xFF01 && cp <= 0xFF60) ||  // Fullwidth Forms
+           (cp >= 0xFFE0 && cp <= 0xFFE6) ||  // Fullwidth Signs
+           (cp >= 0x20000 && cp <= 0x2FA1F);  // CJK Ext B-F, Compat Supplement
+  };
+
+  const showOverlay = (text: string) => {
+    imeFragment = text;
+    // Remove old character spans and text nodes, keep fakeCursorEl
+    while (overlayEl.firstChild && overlayEl.firstChild !== fakeCursorEl) {
+      overlayEl.removeChild(overlayEl.firstChild);
+    }
+    if (!fakeCursorEl.parentNode) overlayEl.appendChild(fakeCursorEl);
+    const dims = (terminal as any)._core?._renderService?.dimensions;
+    if (dims) {
+      const cx = terminal.buffer.active.cursorX;
+      const cy = terminal.buffer.active.cursorY;
+      const cellW = dims.css.cell.width;
+      const cellH = dims.css.cell.height;
+      const cursorColor = terminal.options.theme?.cursor ?? "#ffffff";
+      overlayEl.style.fontSize = `${terminal.options.fontSize ?? 12}px`;
+      overlayEl.style.lineHeight = `${cellH}px`;
+      overlayEl.style.height = `${cellH}px`;
+      overlayEl.style.left = `${cx * cellW}px`;
+      overlayEl.style.top = `${cy * cellH}px`;
+      // Render each character in a fixed-width span matching the cell grid.
+      // CJK characters occupy 2 cells; ASCII occupies 1 cell.
+      // Each span has an opaque background matching the terminal theme to
+      // visually cover the WebGL-rendered cursor underneath.
+      const bg = terminal.options.theme?.background ?? "#1a1a1a";
+      const fg = terminal.options.theme?.foreground ?? "#e0e0e0";
+      overlayEl.style.color = fg;
+      for (const ch of text) {
+        const charSpan = document.createElement("span");
+        charSpan.textContent = ch;
+        const w = isFullWidth(ch) ? cellW * 2 : cellW;
+        charSpan.style.cssText = `display:inline-block;width:${w}px;height:${cellH}px;text-align:center;background:${bg};`;
+        overlayEl.insertBefore(charSpan, fakeCursorEl);
+      }
+      fakeCursorEl.style.height = `${cellH}px`;
+      fakeCursorEl.style.backgroundColor = cursorColor;
+    }
+    overlayEl.style.display = text ? "" : "none";
+    if (text) hideCursor();
+  };
+
+  const clearOverlay = () => {
+    while (overlayEl.firstChild && overlayEl.firstChild !== fakeCursorEl) {
+      overlayEl.removeChild(overlayEl.firstChild);
+    }
+    overlayEl.style.display = "none";
+    imeFragment = "";
+    restoreCursor();
+  };
+
+  // Detect committed text via compositionend. When the IME commits a
+  // syllable at a boundary (e.g., "복" committed when user types "ㅈ"),
+  // compositionend fires with e.data="복". Send it to the PTY since
+  // triggerDataEvent is suppressed during composition.
+  // Guard: only send if imeFragment is non-empty (prevents double-send
+  // when our docKeyDown handler already flushed on Enter/Esc/Tab).
+  const onCompositionEnd = (e: CompositionEvent) => {
+    if (e.data && isComposing && imeFragment) {
+      invoke("write_to_pty", { sessionId, data: e.data }).catch(() => {});
+      imeFragment = "";
+    }
+  };
+  terminal.textarea?.addEventListener("compositionend", onCompositionEnd);
+
+  // Reset composition on blur (prevents permanently stuck isComposing).
+  const onTextareaBlur = () => {
+    if (isComposing) {
+      const composed = imeFragment;
+      clearOverlay();
+      if (composed) {
+        invoke("write_to_pty", { sessionId, data: composed }).catch(() => {});
+      }
+      isComposing = false;
+      imeFlushGen++;
+    }
+  };
+  terminal.textarea?.addEventListener("blur", onTextareaBlur);
+
+  // Track composition state via input events (for overlay updates)
+  const docInput = (e: Event) => {
+    if (e.target !== terminal.textarea || !isComposing) return;
+    const ie = e as InputEvent;
+    if (ie.inputType === "insertReplacementText" || ie.inputType === "insertText") {
+      const ta = terminal.textarea;
+      if (ta) {
+        showOverlay(ta.value.substring(imeStartPos));
+      }
+    }
+  };
+  document.addEventListener("input", docInput, true);
+
+  // Document-level keydown (capture) — manages isComposing flag and flush.
+  const docKeyDown = (e: KeyboardEvent) => {
+    if (e.target !== terminal.textarea) return;
+    const isEnter = e.key === "Enter" || e.code === "Enter";
+    const isTerminating = isEnter || e.key === "Escape" || e.code === "Escape" ||
+                          e.key === "Tab" || e.code === "Tab";
+    if (e.keyCode === 229 && !isTerminating) {
+      if (!isComposing) {
+        imeStartPos = Math.max(0, (terminal.textarea?.value.length ?? 1) - 1);
+      }
+      isComposing = true;
+      const ta = terminal.textarea;
+      if (ta) {
+        showOverlay(ta.value.substring(imeStartPos));
+      }
+    } else if (!e.isComposing || isTerminating) {
+      if (isComposing) {
+        // Flush only the current composing fragment — committed characters
+        // already passed through triggerDataEvent to the PTY.
+        const composed = imeFragment;
+        clearOverlay();
+        // Send composed text + terminating key in ONE write to
+        // guarantee ordering (async invoke could reorder otherwise).
+        const keySuffix = isTerminating
+          ? (isEnter ? "\r" : e.key === "Escape" || e.code === "Escape" ? "\x1b" : "\t")
+          : "";
+        const data = composed + keySuffix;
+        if (data) {
+          invoke("write_to_pty", { sessionId, data }).catch(() => {});
+          for (const ch of composed) {
+            if (ch === "\r") lineBuffer = "";
+            else if (ch >= " ") lineBuffer += ch;
+          }
+          if (isEnter) lineBuffer = "";
+        }
+        imeFlushGen++;
+        if (isTerminating) {
+          e.stopImmediatePropagation();
+          e.preventDefault();
+        }
+      }
+      isComposing = false;
+    }
+  };
+  document.addEventListener("keydown", docKeyDown, true);
+  managed.docKeyDown = docKeyDown;
+  managed.docInput = docInput;
+
+  // Patch triggerDataEvent — suppress during composition, defer Korean chars.
+  const xtermCore = (terminal as any)._core;
+  if (xtermCore?.coreService?.triggerDataEvent) {
+    const origTrigger = xtermCore.coreService.triggerDataEvent.bind(
+      xtermCore.coreService,
+    );
+    const reKorean = /[\u1100-\u11FF\u3131-\u318E\uAC00-\uD7A3]/;
+
+    xtermCore.coreService.triggerDataEvent = (
+      data: string,
+      wasUserInput?: boolean,
+    ) => {
+      // Suppress all triggerDataEvent during composition. Committed
+      // characters are sent by the compositionend listener instead.
+      if (isComposing) return;
+      // WKWebView fires input BEFORE keydown for IME. Defer Korean
+      // chars by 20ms so keydown(229) can set isComposing first.
+      if (data.length === 1 && reKorean.test(data)) {
+        const gen = imeFlushGen;
+        setTimeout(() => {
+          if (!isComposing && gen === imeFlushGen) {
+            origTrigger(data, wasUserInput);
+          }
+        }, 20);
+        return;
+      }
+      origTrigger(data, wasUserInput);
+    };
+  }
+
+  const bindImeHandlers = () => {
+    const helperTextarea =
+      terminal.textarea ??
+      containerEl.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+
+    if (!helperTextarea || managed.disposed) return;
+    if (managed.imeHandlers?.el === helperTextarea) return;
+
+    if (managed.imeHandlers) {
+      const { el, nativeFocus, onFocus } = managed.imeHandlers;
+      el.focus = nativeFocus;
+      el.removeEventListener("focus", onFocus);
+      managed.imeHandlers = null;
+    }
+
     const nativeFocus = helperTextarea.focus.bind(helperTextarea);
     helperTextarea.focus = (opts?: FocusOptions) => {
       nativeFocus({ ...opts, preventScroll: true });
@@ -301,43 +603,21 @@ export async function createSession(
     };
     helperTextarea.addEventListener("focus", onFocus);
 
-    const onCompositionStart = () => {
-      isComposing = true;
-    };
-    const onCompositionEnd = (e: CompositionEvent) => {
-      isComposing = false;
-      if (managed.disposed) return;
-      if (e.data) {
-        skipNextOnData = true;
-        for (const ch of e.data) {
-          if (ch === "\r") {
-            lineBuffer = "";
-          } else if (ch >= " ") {
-            lineBuffer += ch;
-          }
-        }
-        invoke("write_to_pty", { sessionId, data: e.data }).catch(() => {});
-      }
-    };
-    helperTextarea.addEventListener("compositionstart", onCompositionStart);
-    helperTextarea.addEventListener("compositionend", onCompositionEnd);
     managed.imeHandlers = {
       el: helperTextarea,
       nativeFocus,
       onFocus,
-      onStart: onCompositionStart,
-      onEnd: onCompositionEnd,
     };
-  }
+  };
+
+  managed.rebindIme = bindImeHandlers;
+  bindImeHandlers();
 
   // Forward user input to PTY
   terminal.onData((data) => {
     if (managed.disposed) return;
-    if (skipNextOnData) {
-      skipNextOnData = false;
-      return;
-    }
-    if (isComposing) return;
+    // isComposing guard handled at triggerDataEvent level;
+    // onData only fires when triggerDataEvent was NOT suppressed.
 
     // Detect "collaborator" command
     if (data === "\r") {
@@ -383,9 +663,11 @@ export function reparentTo(sessionId: string, parentEl: HTMLElement): void {
   if (!s || s.disposed) return;
 
   parentEl.appendChild(s.containerEl);
+  s.rebindIme?.();
 
   // Fit after layout settles
   requestAnimationFrame(() => {
+    s.rebindIme?.();
     if (!s.disposed && s.containerEl.offsetWidth > 0 && s.containerEl.offsetHeight > 0) {
       s.fitAddon.fit();
     }
@@ -421,13 +703,21 @@ function cleanupManaged(s: ManagedTerminal, sessionId: string): void {
   s.unlistenExit?.();
   s.observer?.disconnect();
 
+  // Remove document-level IME listeners
+  if (s.docInput) {
+    document.removeEventListener("input", s.docInput, true);
+    s.docInput = null;
+  }
+  if (s.docKeyDown) {
+    document.removeEventListener("keydown", s.docKeyDown, true);
+    s.docKeyDown = null;
+  }
+
   // Remove IME listeners
   if (s.imeHandlers) {
-    const { el, nativeFocus, onFocus, onStart, onEnd } = s.imeHandlers;
+    const { el, nativeFocus, onFocus } = s.imeHandlers;
     el.focus = nativeFocus;
     el.removeEventListener("focus", onFocus);
-    el.removeEventListener("compositionstart", onStart);
-    el.removeEventListener("compositionend", onEnd);
     s.imeHandlers = null;
   }
 

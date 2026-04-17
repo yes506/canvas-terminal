@@ -216,7 +216,6 @@ pub fn clear_stale_sessions() -> Result<(), String> {
 
     Ok(())
 }
-
 /// List all files in the shared memory directory (recursive).
 /// Returns relative paths.
 #[tauri::command]

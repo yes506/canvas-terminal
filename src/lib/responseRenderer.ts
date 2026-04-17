@@ -61,8 +61,8 @@ const RENDER_STYLES = `
   h1, h2, h3, h4, h5, h6 { color: #e0e0e0; margin: 0.6em 0 0.3em; }
   h1 { font-size: 1.5em; } h2 { font-size: 1.3em; } h3 { font-size: 1.15em; }
   p { margin: 0.4em 0; }
-  pre { background: #2d2d2d; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 0.5em 0; white-space: pre-wrap; word-break: break-word; font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: 13px; }
-  code { background: #2d2d2d; padding: 2px 5px; border-radius: 3px; font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: 0.9em; }
+  pre { background: #2d2d2d; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 0.5em 0; white-space: pre-wrap; word-break: break-word; font-family: 'JetBrainsMono Nerd Font Mono', 'Noto Sans Mono CJK KR', 'D2Coding', 'JetBrains Mono', monospace; font-size: 13px; }
+  code { background: #2d2d2d; padding: 2px 5px; border-radius: 3px; font-family: 'JetBrainsMono Nerd Font Mono', 'Noto Sans Mono CJK KR', 'D2Coding', 'JetBrains Mono', monospace; font-size: 0.9em; }
   pre code { background: none; padding: 0; }
   ul, ol { padding-left: 1.5em; margin: 0.4em 0; }
   li { margin: 0.2em 0; }
