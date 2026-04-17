@@ -1,7 +1,7 @@
 {
   "name": "canvas-terminal",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,11 @@
     "clean": "rm -rf dist src-tauri/target/release/bundle",
     "tauri:build": "npm run clean && npm run tauri build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "version:check": "./scripts/bump-version.sh",
+    "version:patch": "./scripts/bump-version.sh patch",
+    "version:minor": "./scripts/bump-version.sh minor",
+    "version:major": "./scripts/bump-version.sh major"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -1,15 +1,23 @@
-import { useRef, useCallback } from "react";
+import { useRef, useCallback, useEffect } from "react";
 import { DrawingBoard } from "./components/canvas/DrawingBoard";
 import { Toolbar } from "./components/canvas/Toolbar";
 import { TerminalTabs } from "./components/terminal/TerminalTabs";
 import { useCanvasIntegration } from "./components/canvas/CanvasIntegration";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useCanvasStore } from "./stores/canvasStore";
+import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export default function App() {
   const { exportToTerminal, importIntoCanvas, isWaitingForImport } = useCanvasIntegration();
   const drawerOpen = useCanvasStore((s) => s.drawerOpen);
   useKeyboardShortcuts();
+
+  useEffect(() => {
+    getVersion().then((version) => {
+      getCurrentWindow().setTitle(`Canvas Terminal v${version}`);
+    });
+  }, []);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasPanelRef = useRef<HTMLDivElement>(null);
