@@ -270,7 +270,6 @@ pub fn read_import_file(suffix: Option<String>) -> Result<(String, String), Stri
 }
 
 /// Remove the snapshot file after the AI tool has read it.
-#[tauri::command]
 pub fn cleanup_snapshot() -> Result<(), String> {
     let home = get_home_dir()?;
     let snapshot_path = home.join(".cache").join("canvas-terminal").join("snapshot.png");

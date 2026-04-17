@@ -409,7 +409,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           }
           store.updateTask(task.id, {
             status: "completed",
-            completionNotes: notes?.trim() ?? null,
+            conclusion: notes?.trim() ?? null,
           }, collabSessionId);
           status(`Task ${task.id} completed${notes ? ` — ${notes.trim()}` : ""}`);
           break;

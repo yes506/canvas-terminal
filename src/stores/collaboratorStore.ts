@@ -98,33 +98,34 @@ let conversationWriteChain: Promise<unknown> = Promise.resolve();
 const TASK_PROTOCOL = `
 ## Agent Task Protocol
 
-You are a participant agent in a multi-agent collaboration session. You MUST follow these rules:
+You are a participant in a multi-agent collaboration.
 
 ### Rules
-1. **Read before acting**: Before starting work, read the conversation log in the shared memory directory to understand prior context and other agents' work.
-2. **Claim your task**: If a task is assigned to you, update its status in your response.
-3. **Log on completion**: When your turn completes, you MUST **append** your task completion report to the conversation log file (the \`conversation-*.md\` file listed above). Do NOT create separate task report files.
-4. **Be self-contained**: Include enough detail in your outputs that any other agent can understand what you did without needing to ask.
-5. **Reference by task ID**: When referring to other tasks, use the task ID (e.g. "task-1-...").
-6. **Signal blockers**: If you are blocked on another agent's work, explicitly state the blocking task ID and what you need.
+1. **Read before acting**: Read the conversation log and \`context.md\` (if present) in the shared memory directory to understand prior context and other agents' work.
+2. **Be self-contained**: Include enough detail that any other agent can understand what you did.
+3. **Reference by task ID** (e.g. "task-1-...").
+4. **Signal blockers**: State the blocking task ID and what you need.
+5. **Signal completion**: When done, write a JSON file to the shared memory directory to signal task completion. The system will automatically update the task and generate a report in the conversation log.
+
+\`\`\`bash
+cat > SHARED_MEMORY_DIR/TASK_ID.done.json << 'EOF'
+{
+  "task_id": "TASK_ID",
+  "status": "completed",
+  "reasoning": "Why this approach, alternatives considered, trade-offs",
+  "conclusion": "What was decided/done (1-3 sentences)",
+  "output": "file paths, artifacts, or key results"
+}
+EOF
+\`\`\`
+
+Replace \`SHARED_MEMORY_DIR\` with the path shown above and \`TASK_ID\` with your assigned task ID.
 
 ### File Conventions
-- Task definitions file shown in the \`[Task definitions: ...]\` header — **READ ONLY**. Do not write to it directly.
-- \`conversation-*.md\` — Conversation log. Read for context, **append your task report here** when done.
-- \`context.md\` — Shared context. Read for additional instructions.
-
-### Task Completion Report Format
-Append to the conversation log file:
-
-\`\`\`
-## [HH:MM:SS] Agent — Task Report
-# [TASK_ID] — [STATUS: completed|blocked|in-progress]
-**Agent**: [your name]
-**Reasoning**: [Detailed reasoning process — explain WHY you chose this approach, what alternatives you considered, what trade-offs you weighed, and how you arrived at your decisions. This is the most important section.]
-**Summary**: [1-3 sentences of what you did]
-**Output**: [file paths, artifacts, or key results]
-**Blockers**: [none, or description of what's blocking]
-\`\`\`
+- \`conversation-*.md\` — **Read only** for context. Do NOT write to it directly. The system appends task reports automatically when task status changes.
+- Task definitions file — **READ ONLY**.
+- \`context.md\` — Shared context (if present).
+- Shared memory directory — Write files here to share artifacts with other agents.
 `.trim();
 
 /** Format tasks array into a markdown document for shared memory. */
@@ -145,7 +146,9 @@ function formatTasksMarkdown(tasks: CollabTask[]): string {
     if (t.dependencies.length > 0) {
       lines.push(`**Dependencies**: ${t.dependencies.join(", ")}`);
     }
-    if (t.completionNotes) lines.push(`**Completion Notes**: ${t.completionNotes}`);
+    if (t.reasoning) lines.push(`**Reasoning**: ${t.reasoning}`);
+    if (t.conclusion) lines.push(`**Conclusion**: ${t.conclusion}`);
+    if (t.output) lines.push(`**Output**: ${t.output}`);
     lines.push(`**Created**: ${t.createdAt}`);
     lines.push(`**Updated**: ${t.updatedAt}`);
     lines.push("");
@@ -274,7 +277,7 @@ interface CollaboratorState {
   }, forSession: string) => CollabTask;
   updateTask: (
     taskId: string,
-    updates: Partial<Pick<CollabTask, "status" | "assignee" | "completionNotes">>,
+    updates: Partial<Pick<CollabTask, "status" | "assignee" | "reasoning" | "conclusion" | "output">>,
     forSession: string,
   ) => void;
   getTasks: (forSession: string) => CollabTask[];
@@ -283,6 +286,69 @@ interface CollaboratorState {
   // Input history
   pushHistory: (input: string) => void;
   navigateHistory: (direction: "up" | "down") => string | null;
+}
+
+/**
+ * Scan shared memory for task completion signal files (*.done.json).
+ * Agents write these files to signal task completion with structured data.
+ *
+ * Expected format:
+ * ```json
+ * {
+ *   "task_id": "task-1-...",
+ *   "status": "completed",
+ *   "reasoning": "...",
+ *   "conclusion": "...",
+ *   "output": "..."
+ * }
+ * ```
+ */
+export async function scanForTaskCompletions(forSession: string): Promise<void> {
+  try {
+    const files = await invoke<string[]>("list_memory_files");
+    const doneFiles = files.filter((f) => f.endsWith(".done.json"));
+    if (doneFiles.length === 0) return;
+
+    const store = useCollaboratorStore.getState();
+    const tasks = store.getTasks(forSession);
+    if (tasks.length === 0) return;
+
+    for (const relPath of doneFiles) {
+      try {
+        const raw = await invoke<string | null>("read_memory_file", { relativePath: relPath });
+        if (!raw) continue;
+        const data = JSON.parse(raw) as {
+          task_id?: string;
+          status?: string;
+          reasoning?: string;
+          conclusion?: string;
+          output?: string;
+        };
+        if (!data.task_id) continue;
+
+        // Find matching task
+        const task = tasks.find((t) => t.id === data.task_id || t.id.startsWith(data.task_id!));
+        if (!task) continue;
+        // Skip if already in terminal state
+        if (task.status === "completed" || task.status === "blocked") continue;
+
+        const status = data.status === "blocked" ? "blocked" : "completed";
+        store.updateTask(task.id, {
+          status: status as CollabTask["status"],
+          reasoning: data.reasoning ?? null,
+          conclusion: data.conclusion ?? null,
+          output: data.output ?? null,
+        }, forSession);
+
+        // Delete the signal file after processing
+        await invoke("delete_memory_file", { relativePath: relPath });
+      } catch {
+        // Skip malformed files
+      }
+    }
+  } catch {
+    // Non-critical
+  }
 }
 
 /** Build context header prepended to every message sent to agents. */
@@ -439,7 +505,23 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       const agent = agents.find((a) => a.sessionId === sessionId);
       const tool = agent?.tool ?? null;
       const agentCollabId = agent?.collabSessionId ?? null;
-      const sessionTasks = agentCollabId ? (tasksBySession[agentCollabId] ?? []) : [];
+      // Auto-create a task if none exist for this session
+      if (agentCollabId) {
+        const existing = tasksBySession[agentCollabId] ?? [];
+        const hasActiveTask = existing.some((t) =>
+          t.assignee === `@${agent ? toolShortName(agent.tool) : "?"}` &&
+          (t.status === "pending" || t.status === "in-progress"),
+        );
+        if (!hasActiveTask) {
+          const title = content.length > 60 ? content.substring(0, 57) + "..." : content;
+          get().addTask({
+            title,
+            objective: content,
+            assignee: `@${agent ? toolShortName(agent.tool) : "?"}`,
+          }, agentCollabId);
+        }
+      }
+      const sessionTasks = agentCollabId ? (get().tasksBySession[agentCollabId] ?? []) : [];
       const text = await prependContextHeader(content, agentCollabId, sessionTasks);
       await invoke("inject_into_pty", { sessionId, text, tool });
       const label = agent ? toolLabel(agent.tool) : sessionId;
@@ -464,7 +546,26 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       if (sid) get().setStatus("No agents running. Launch a tool first.", sid);
       return;
     }
-    const text = await prependContextHeader(content, sid, sid ? (tasksBySession[sid] ?? []) : []);
+    // Auto-create tasks for each agent if none exist
+    if (sid) {
+      for (const agent of targetAgents) {
+        const existing = tasksBySession[sid] ?? [];
+        const mention = `@${toolShortName(agent.tool)}`;
+        const hasActiveTask = existing.some((t) =>
+          t.assignee === mention &&
+          (t.status === "pending" || t.status === "in-progress"),
+        );
+        if (!hasActiveTask) {
+          const title = content.length > 60 ? content.substring(0, 57) + "..." : content;
+          get().addTask({
+            title,
+            objective: content,
+            assignee: mention,
+          }, sid);
+        }
+      }
+    }
+    const text = await prependContextHeader(content, sid, sid ? (get().tasksBySession[sid] ?? []) : []);
     let sent = 0;
     for (const agent of targetAgents) {
       try {
@@ -551,7 +652,9 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       assignee: opts.assignee ?? null,
       dependencies: opts.dependencies ?? [],
       status: "pending",
-      completionNotes: null,
+      reasoning: null,
+      conclusion: null,
+      output: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -567,6 +670,9 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   },
 
   updateTask: (taskId, updates, forSession) => {
+    const prevTask = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
+    const prevStatus = prevTask?.status;
+
     set((s) => ({
       tasksBySession: {
         ...s.tasksBySession,
@@ -579,7 +685,22 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     }));
     const task = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
     if (task) {
-      get().appendLog("system", `Task updated: ${taskId} → ${task.status}`, forSession);
+      // Append a structured task report when status changes to a terminal state
+      const isTerminal = task.status === "completed" || task.status === "blocked";
+      const statusChanged = task.status !== prevStatus;
+      if (isTerminal && statusChanged) {
+        const report = [
+          `# ${task.id} — ${task.status}`,
+          `**Agent**: ${task.assignee ?? "unassigned"}`,
+          `**Subject**: ${task.title}`,
+          task.reasoning ? `**Reasoning**: ${task.reasoning}` : null,
+          task.conclusion ? `**Conclusion**: ${task.conclusion}` : null,
+          task.output ? `**Output**: ${task.output}` : null,
+        ].filter(Boolean).join("\n");
+        get().appendLog("system", `Task Report\n${report}`, forSession);
+      } else {
+        get().appendLog("system", `Task updated: ${taskId} → ${task.status}`, forSession);
+      }
     }
     get().persistTasks(forSession);
   },

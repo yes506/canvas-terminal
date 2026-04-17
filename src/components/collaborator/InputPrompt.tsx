@@ -213,6 +213,9 @@ export function InputPrompt() {
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      // Never interfere with IME composition (Korean, Japanese, Chinese)
+      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+
       // --- Target selector is visible ---
       if (showSelector) {
         if (e.key === "ArrowUp") {

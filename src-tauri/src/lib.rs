@@ -89,7 +89,6 @@ pub fn run() {
             commands::canvas::export_snapshot,
             commands::canvas::check_import_file,
             commands::canvas::read_import_file,
-            commands::canvas::cleanup_snapshot,
             commands::canvas::cleanup_import_file,
             commands::memory::init_memory_dir,
             commands::memory::write_memory_file,

@@ -7,7 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useShallow } from "zustand/react/shallow";
 import { terminalThemes } from "../terminal/themes";
 import { useTerminalStore } from "../../stores/terminalStore";
-import { useCollaboratorStore, agentDisplayName, toolLabel } from "../../stores/collaboratorStore";
+import { useCollaboratorStore, agentDisplayName, toolLabel, scanForTaskCompletions } from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture } from "../../lib/agentOutputCapture";
 import type { ToolConfig } from "../../types/collaborator";
@@ -41,10 +41,11 @@ export function AgentMiniTerminal({
     el: HTMLTextAreaElement;
     nativeFocus: (opts?: FocusOptions) => void;
     onFocus: () => void;
-    onStart: () => void;
-    onEnd: (e: CompositionEvent) => void;
   } | null>(null);
   const captureRef = useRef<ReturnType<typeof createOutputCapture> | null>(null);
+  const docKeyDownRef = useRef<((e: KeyboardEvent) => void) | null>(null);
+  const docInputRef = useRef<((e: Event) => void) | null>(null);
+  const imeOverlayRef = useRef<HTMLSpanElement | null>(null);
   const disposed = useRef(false);
   const [focused, setFocused] = useState(false);
 
@@ -60,7 +61,7 @@ export function AgentMiniTerminal({
       const terminal = new Terminal({
         theme,
         fontFamily:
-          "'JetBrains Mono', 'Fira Code', 'SF Mono', Menlo, monospace",
+          "'JetBrainsMono Nerd Font Mono', 'Noto Sans Mono CJK KR', 'D2Coding', 'JetBrains Mono', Menlo, monospace",
         fontSize: Math.max(fontSize - 2, 9),
         lineHeight: 1.15,
         cursorBlink: true,
@@ -106,12 +107,14 @@ export function AgentMiniTerminal({
       if (termRef.current) observer.observe(termRef.current);
       observerRef.current = observer;
 
-      // Set up output capture (no longer logs raw terminal output to conversation log;
-      // only user prompts and tasks are persisted there)
       const capture = createOutputCapture({
         agentLabel: toolLabel(tool.id),
         onFlush: () => {
-          // Intentionally no-op: conversation log only tracks user prompts and tasks
+          // After agent output settles, check for task completion signals.
+          // Agents write *.done.json files to shared memory to signal completion.
+          if (collabSessionId) {
+            scanForTaskCompletions(collabSessionId);
+          }
         },
       });
       captureRef.current = capture;
@@ -178,6 +181,9 @@ export function AgentMiniTerminal({
 
       // Let app-level shortcuts bubble past xterm
       terminal.attachCustomKeyEventHandler((e) => {
+        // Return true so xterm does NOT call preventDefault() on IME
+        // key events — preventDefault() blocks the IME from composing.
+        // The triggerDataEvent patch handles suppressing IME output.
         if (e.isComposing || e.keyCode === 229) return true;
         // Shift+Enter → CSI u escape for tools like Claude Code
         if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey) {
@@ -196,9 +202,227 @@ export function AgentMiniTerminal({
         return true;
       });
 
-      // IME composition handling for CJK input
+      // IME composition handling for CJK input (WKWebView)
+      // See terminalManager.ts for detailed explanation.
       let isComposing = false;
-      let skipNextOnData = false;
+      let imeStartPos = 0;
+      let imeFlushGen = 0;
+      let imeFragment = "";
+
+      const overlayEl = document.createElement("span");
+      overlayEl.style.cssText =
+        `position:absolute;color:inherit;` +
+        `font-family:${terminal.options.fontFamily ?? "monospace"};` +
+        `font-size:${terminal.options.fontSize ?? 10}px;` +
+        `font-weight:${terminal.options.fontWeight ?? "normal"};` +
+        `-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;` +
+        `pointer-events:none;` +
+        `z-index:10;white-space:pre;display:none;padding:0;margin:0;`;
+      // Fake cursor bar — rendered to the right of composing text
+      const fakeCursorEl = document.createElement("span");
+      fakeCursorEl.style.cssText =
+        `display:inline-block;width:2px;vertical-align:top;` +
+        `animation:ime-cursor-blink 1s step-end infinite;`;
+      overlayEl.appendChild(fakeCursorEl);
+      if (!document.getElementById("ime-cursor-blink-style")) {
+        const styleEl = document.createElement("style");
+        styleEl.id = "ime-cursor-blink-style";
+        styleEl.textContent = `@keyframes ime-cursor-blink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }`;
+        document.head.appendChild(styleEl);
+      }
+      const screenEl = termRef.current?.querySelector(".xterm-screen") as HTMLElement | null;
+      if (screenEl) {
+        screenEl.style.position = "relative";
+        screenEl.appendChild(overlayEl);
+        imeOverlayRef.current = overlayEl;
+      } else if (termRef.current) {
+        termRef.current.style.position = "relative";
+        termRef.current.appendChild(overlayEl);
+        imeOverlayRef.current = overlayEl;
+      }
+      let cursorHidden = false;
+      const core = (terminal as any)._core;
+      let cursorHiddenLock = false;
+      if (core?.coreService) {
+        const cs = core.coreService;
+        let _realHidden = cs.isCursorHidden;
+        Object.defineProperty(cs, "isCursorHidden", {
+          get() { return cursorHiddenLock ? true : _realHidden; },
+          set(v: boolean) {
+            if (!cursorHiddenLock) _realHidden = v;
+          },
+          configurable: true,
+        });
+      }
+
+      const hideCursor = () => {
+        if (!cursorHidden) {
+          cursorHiddenLock = true;
+          terminal.options.cursorBlink = false;
+          cursorHidden = true;
+        }
+      };
+
+      const restoreCursor = () => {
+        if (cursorHidden) {
+          cursorHiddenLock = false;
+          terminal.options.cursorBlink = true;
+          cursorHidden = false;
+        }
+      };
+
+      const isFullWidth = (ch: string) => {
+        const cp = ch.codePointAt(0) ?? 0;
+        return (cp >= 0x1100 && cp <= 0x115F) ||
+               (cp >= 0x2E80 && cp <= 0x303E) ||
+               (cp >= 0x3040 && cp <= 0x33BF) ||
+               (cp >= 0x3400 && cp <= 0x4DBF) ||
+               (cp >= 0x4E00 && cp <= 0xA4CF) ||
+               (cp >= 0xA960 && cp <= 0xA97C) ||
+               (cp >= 0xAC00 && cp <= 0xD7AF) ||
+               (cp >= 0xD7B0 && cp <= 0xD7FF) ||
+               (cp >= 0xF900 && cp <= 0xFAFF) ||
+               (cp >= 0xFE30 && cp <= 0xFE6F) ||
+               (cp >= 0xFF01 && cp <= 0xFF60) ||
+               (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+               (cp >= 0x20000 && cp <= 0x2FA1F);
+      };
+
+      const showOverlay = (text: string) => {
+        imeFragment = text;
+        while (overlayEl.firstChild && overlayEl.firstChild !== fakeCursorEl) {
+          overlayEl.removeChild(overlayEl.firstChild);
+        }
+        if (!fakeCursorEl.parentNode) overlayEl.appendChild(fakeCursorEl);
+        const dims = (terminal as any)._core?._renderService?.dimensions;
+        if (dims) {
+          const cx = terminal.buffer.active.cursorX;
+          const cy = terminal.buffer.active.cursorY;
+          const cellW = dims.css.cell.width;
+          const cellH = dims.css.cell.height;
+          const cursorColor = terminal.options.theme?.cursor ?? "#ffffff";
+          overlayEl.style.fontSize = `${terminal.options.fontSize ?? 10}px`;
+          overlayEl.style.lineHeight = `${cellH}px`;
+          overlayEl.style.height = `${cellH}px`;
+          overlayEl.style.left = `${cx * cellW}px`;
+          overlayEl.style.top = `${cy * cellH}px`;
+          const bg = terminal.options.theme?.background ?? "#1a1a1a";
+          const fg = terminal.options.theme?.foreground ?? "#e0e0e0";
+          overlayEl.style.color = fg;
+          for (const ch of text) {
+            const charSpan = document.createElement("span");
+            charSpan.textContent = ch;
+            const w = isFullWidth(ch) ? cellW * 2 : cellW;
+            charSpan.style.cssText = `display:inline-block;width:${w}px;height:${cellH}px;text-align:center;background:${bg};`;
+            overlayEl.insertBefore(charSpan, fakeCursorEl);
+          }
+          fakeCursorEl.style.height = `${cellH}px`;
+          fakeCursorEl.style.backgroundColor = cursorColor;
+        }
+        overlayEl.style.display = text ? "" : "none";
+        if (text) hideCursor();
+      };
+      const clearOverlay = () => {
+        while (overlayEl.firstChild && overlayEl.firstChild !== fakeCursorEl) {
+          overlayEl.removeChild(overlayEl.firstChild);
+        }
+        overlayEl.style.display = "none";
+        imeFragment = "";
+        restoreCursor();
+      };
+
+      // Detect committed text via compositionend. When the IME commits a
+      // syllable at a boundary, send it to PTY (triggerDataEvent is suppressed).
+      const onCompositionEnd = (e: CompositionEvent) => {
+        if (e.data && isComposing && imeFragment) {
+          invoke("write_to_pty", { sessionId, data: e.data }).catch(() => {});
+          imeFragment = "";
+        }
+      };
+      terminal.textarea?.addEventListener("compositionend", onCompositionEnd);
+
+      const onTextareaBlur = () => {
+        if (isComposing) {
+          const composed = imeFragment;
+          clearOverlay();
+          if (composed) invoke("write_to_pty", { sessionId, data: composed }).catch(() => {});
+          isComposing = false;
+          imeFlushGen++;
+        }
+      };
+      terminal.textarea?.addEventListener("blur", onTextareaBlur);
+
+      const docInput = (e: Event) => {
+        const ta = termRef.current?.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement | null;
+        if (e.target !== ta || !isComposing) return;
+        const ie = e as InputEvent;
+        if (ie.inputType === "insertReplacementText" || ie.inputType === "insertText") {
+          if (ta) showOverlay(ta.value.substring(imeStartPos));
+        }
+      };
+      document.addEventListener("input", docInput, true);
+      docInputRef.current = docInput;
+
+      const docKeyDown = (e: KeyboardEvent) => {
+        const ta = termRef.current?.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement | null;
+        if (e.target !== ta) return;
+        const isEnter = e.key === "Enter" || e.code === "Enter";
+        const isTerminating = isEnter || e.key === "Escape" || e.code === "Escape" ||
+                              e.key === "Tab" || e.code === "Tab";
+        if (e.keyCode === 229 && !isTerminating) {
+          if (!isComposing) {
+            imeStartPos = Math.max(0, (ta?.value.length ?? 1) - 1);
+          }
+          isComposing = true;
+          if (ta) showOverlay(ta.value.substring(imeStartPos));
+        } else if (!e.isComposing || isTerminating) {
+          if (isComposing) {
+            // Flush only the current composing fragment — committed characters
+            // already passed through triggerDataEvent to the PTY.
+            const composed = imeFragment;
+            clearOverlay();
+            const keySuffix = isTerminating
+              ? (isEnter ? "\r" : e.key === "Escape" || e.code === "Escape" ? "\x1b" : "\t")
+              : "";
+            const data = composed + keySuffix;
+            if (data) {
+              invoke("write_to_pty", { sessionId, data }).catch(() => {});
+            }
+            imeFlushGen++;
+            if (isTerminating) {
+              e.stopImmediatePropagation();
+              e.preventDefault();
+            }
+          }
+          isComposing = false;
+        }
+      };
+      document.addEventListener("keydown", docKeyDown, true);
+      docKeyDownRef.current = docKeyDown;
+
+      // Patch triggerDataEvent to suppress/defer during IME composition
+      const xtermCore = (terminal as any)._core;
+      if (xtermCore?.coreService?.triggerDataEvent) {
+        const origTrigger = xtermCore.coreService.triggerDataEvent.bind(
+          xtermCore.coreService,
+        );
+        const reKorean = /[\u1100-\u11FF\u3131-\u318E\uAC00-\uD7A3]/;
+        xtermCore.coreService.triggerDataEvent = (
+          data: string,
+          wasUserInput?: boolean,
+        ) => {
+          if (isComposing) return;
+          if (data.length === 1 && reKorean.test(data)) {
+            const gen = imeFlushGen;
+            setTimeout(() => {
+              if (!isComposing && gen === imeFlushGen) origTrigger(data, wasUserInput);
+            }, 20);
+            return;
+          }
+          origTrigger(data, wasUserInput);
+        };
+      }
+
       const helperTextarea = termRef.current?.querySelector<HTMLTextAreaElement>(
         ".xterm-helper-textarea"
       );
@@ -218,32 +442,16 @@ export function AgentMiniTerminal({
           });
         };
         helperTextarea.addEventListener("focus", onFocus);
-
-        const onCompositionStart = () => { isComposing = true; };
-        const onCompositionEnd = (e: CompositionEvent) => {
-          isComposing = false;
-          if (disposed.current) return;
-          if (e.data) {
-            skipNextOnData = true;
-            invoke("write_to_pty", { sessionId, data: e.data }).catch(() => {});
-          }
-        };
-        helperTextarea.addEventListener("compositionstart", onCompositionStart);
-        helperTextarea.addEventListener("compositionend", onCompositionEnd);
         imeHandlersRef.current = {
           el: helperTextarea,
           nativeFocus,
           onFocus,
-          onStart: onCompositionStart,
-          onEnd: onCompositionEnd,
         };
       }
 
       // Forward user keystrokes to PTY
       terminal.onData((data) => {
         if (disposed.current) return;
-        if (skipNextOnData) { skipNextOnData = false; return; }
-        if (isComposing) return;
         invoke("write_to_pty", { sessionId, data }).catch(() => {});
       });
 
@@ -294,13 +502,21 @@ export function AgentMiniTerminal({
       observerRef.current?.disconnect();
       observerRef.current = null;
 
+      // Remove document-level IME listeners
+      if (docInputRef.current) {
+        document.removeEventListener("input", docInputRef.current, true);
+        docInputRef.current = null;
+      }
+      if (docKeyDownRef.current) {
+        document.removeEventListener("keydown", docKeyDownRef.current, true);
+        docKeyDownRef.current = null;
+      }
+
       // Remove IME composition listeners
       if (imeHandlersRef.current) {
-        const { el, nativeFocus, onFocus, onStart, onEnd } = imeHandlersRef.current;
+        const { el, nativeFocus, onFocus } = imeHandlersRef.current;
         el.focus = nativeFocus;
         el.removeEventListener("focus", onFocus);
-        el.removeEventListener("compositionstart", onStart);
-        el.removeEventListener("compositionend", onEnd);
         imeHandlersRef.current = null;
       }
 
@@ -338,7 +554,11 @@ export function AgentMiniTerminal({
   useEffect(() => {
     return useTerminalStore.subscribe((state, prev) => {
       if (state.fontSize !== prev.fontSize && terminalRef.current) {
-        terminalRef.current.options.fontSize = Math.max(state.fontSize - 2, 9);
+        const newSize = Math.max(state.fontSize - 2, 9);
+        terminalRef.current.options.fontSize = newSize;
+        if (imeOverlayRef.current) {
+          imeOverlayRef.current.style.fontSize = `${newSize}px`;
+        }
         fitAddonRef.current?.fit();
       }
     });

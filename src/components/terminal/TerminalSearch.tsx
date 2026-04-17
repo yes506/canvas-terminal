@@ -38,6 +38,9 @@ export function TerminalSearch() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Never interfere with IME composition (Korean, Japanese, Chinese)
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+
     if (e.key === "Enter") {
       e.preventDefault();
       if (e.shiftKey) findPrev();

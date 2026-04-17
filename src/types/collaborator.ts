@@ -44,8 +44,12 @@ export interface CollabTask {
   dependencies: string[];
   /** Current status */
   status: TaskStatus;
-  /** Free-form notes (agents append here when their turn completes) */
-  completionNotes: string | null;
+  /** Detailed reasoning — why this approach, alternatives considered, trade-offs */
+  reasoning: string | null;
+  /** Conclusion — what was decided/done (1-3 sentences) */
+  conclusion: string | null;
+  /** Output — file paths, artifacts, or key results produced */
+  output: string | null;
   /** ISO timestamp of creation */
   createdAt: string;
   /** ISO timestamp of last update */
