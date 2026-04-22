@@ -13,13 +13,15 @@ export function stripAnsi(raw: string): string {
 }
 
 /**
- * Creates a buffered output capture for a single agent session.
- *
- * - `feed(data)` accepts raw PTY data (with ANSI codes).
- * - After `quietMs` of silence the buffer is flushed via `onFlush`.
- * - `flush()` forces an immediate flush (call on agent exit).
- * - `dispose()` cleans up timers.
+ * Patterns that indicate the CLI tool has finished responding and is waiting
+ * for the next prompt.  When detected at the tail of the buffer we flush
+ * immediately rather than waiting for the full quietMs timeout.
  */
+const RESPONSE_DONE_PATTERNS = [
+  /(?:^|\n)(?:\w+\s)?>\s*$/,  // CLI prompt: "> ", "gemini > ", "codex > " (rejects ">>>")
+  /(?:^|\n)\$\s*$/,            // shell prompt at line start
+];
+
 export function createOutputCapture(opts: {
   agentLabel: string;
   quietMs?: number;
@@ -30,6 +32,8 @@ export function createOutputCapture(opts: {
 
   let buffer = "";
   let timer: ReturnType<typeof setTimeout> | null = null;
+  /** Whether we've received substantial content (not just a prompt echo). */
+  let hasContent = false;
 
   function doFlush() {
     if (timer) {
@@ -38,6 +42,7 @@ export function createOutputCapture(opts: {
     }
     const text = buffer.trim();
     buffer = "";
+    hasContent = false;
     if (text.length > 0) {
       // Truncate very long outputs to keep the log manageable
       const truncated =
@@ -54,19 +59,39 @@ export function createOutputCapture(opts: {
 
     buffer += clean;
 
+    // Track whether we have meaningful content (more than just whitespace/prompt)
+    if (clean.trim().length > 5) {
+      hasContent = true;
+    }
+
     // Auto-flush if buffer is getting large
     if (buffer.length >= maxChars) {
       doFlush();
       return;
     }
 
+    // If we have substantial content and see a prompt pattern at the tail,
+    // use a shorter timeout to flush sooner — the agent is likely done.
+    const tail = buffer.slice(-100);
+    const atPrompt = hasContent && RESPONSE_DONE_PATTERNS.some((re) => re.test(tail));
+
     // Reset debounce timer
     if (timer) clearTimeout(timer);
-    timer = setTimeout(doFlush, quietMs);
+    timer = setTimeout(doFlush, atPrompt ? Math.min(quietMs, 800) : quietMs);
   }
 
   function flush() {
     doFlush();
+  }
+
+  /** Silently discard buffered data without calling onFlush. */
+  function reset() {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    buffer = "";
+    hasContent = false;
   }
 
   function dispose() {
@@ -77,5 +102,5 @@ export function createOutputCapture(opts: {
     buffer = "";
   }
 
-  return { feed, flush, dispose };
+  return { feed, flush, reset, dispose };
 }

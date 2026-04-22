@@ -96,7 +96,10 @@ function ensureGlobalSubscriptions() {
           }
           // Only fit if in a visible slot — avoid resizing to 1x1 when parked
           if (s.containerEl.offsetWidth > 0 && s.containerEl.offsetHeight > 0) {
+            const buf = s.terminal.buffer.active;
+            const wasAtBottom = buf.viewportY >= buf.baseY;
             s.fitAddon.fit();
+            if (wasAtBottom) s.terminal.scrollToBottom();
           }
         }
       }
@@ -236,7 +239,10 @@ export async function createSession(
   // ResizeObserver — observes containerEl (moves with it across reparents)
   const observer = new ResizeObserver(() => {
     if (!managed.disposed && containerEl.offsetWidth > 0 && containerEl.offsetHeight > 0) {
+      const buf = terminal.buffer.active;
+      const wasAtBottom = buf.viewportY >= buf.baseY;
       fitAddon.fit();
+      if (wasAtBottom) terminal.scrollToBottom();
     }
   });
   observer.observe(containerEl);
@@ -511,7 +517,13 @@ export async function createSession(
         showOverlay(ta.value.substring(imeStartPos));
       }
     } else if (!e.isComposing || isTerminating) {
-      if (isComposing) {
+      // Modifier keys (Shift, Ctrl, Alt, Meta) never terminate IME composition.
+      // In WKWebView, Shift keydown during Korean IME may fire with
+      // isComposing=false and keyCode!=229, which would incorrectly flush
+      // the composing consonant (e.g. ㄱ) before the Shift+vowel combines (e.g. 계).
+      const isModifier = e.key === "Shift" || e.key === "Control" ||
+                         e.key === "Alt" || e.key === "Meta";
+      if (isComposing && !isModifier) {
         // Flush only the current composing fragment — committed characters
         // already passed through triggerDataEvent to the PTY.
         const composed = imeFragment;
@@ -536,7 +548,7 @@ export async function createSession(
           e.preventDefault();
         }
       }
-      isComposing = false;
+      if (!isModifier) isComposing = false;
     }
   };
   document.addEventListener("keydown", docKeyDown, true);
@@ -669,7 +681,10 @@ export function reparentTo(sessionId: string, parentEl: HTMLElement): void {
   requestAnimationFrame(() => {
     s.rebindIme?.();
     if (!s.disposed && s.containerEl.offsetWidth > 0 && s.containerEl.offsetHeight > 0) {
+      const buf = s.terminal.buffer.active;
+      const wasAtBottom = buf.viewportY >= buf.baseY;
       s.fitAddon.fit();
+      if (wasAtBottom) s.terminal.scrollToBottom();
     }
   });
 }

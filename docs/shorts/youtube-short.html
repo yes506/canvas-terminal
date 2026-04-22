@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Canvas Terminal — YouTube Short</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+    :root {
+      --bg: #0a0e17;
+      --surface: #111827;
+      --border: rgba(255,255,255,0.06);
+      --text: #f0f4ff;
+      --muted: #7b8ba5;
+      --cyan: #22d3ee;
+      --blue: #3b82f6;
+      --violet: #8b5cf6;
+      --lime: #a3e635;
+      --amber: #fbbf24;
+      --pink: #f472b6;
+      --red: #ef4444;
+      --dur: 26s;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #050810;
+      font-family: 'Inter', system-ui, sans-serif;
+      color: var(--text);
+      overflow: hidden;
+    }
+
+    /* ─── 9:16 Frame ─── */
+    .frame {
+      position: relative;
+      width: 1080px;
+      height: 1920px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    /* ─── Animated background ─── */
+    .bg-aurora {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      z-index: 0;
+    }
+
+    .bg-aurora .orb {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(120px);
+      opacity: 0.4;
+      animation: drift 8s ease-in-out infinite alternate;
+    }
+
+    .bg-aurora .orb:nth-child(1) {
+      width: 600px; height: 600px;
+      background: rgba(59,130,246,0.5);
+      top: -100px; right: -200px;
+      animation-delay: 0s;
+    }
+
+    .bg-aurora .orb:nth-child(2) {
+      width: 500px; height: 500px;
+      background: rgba(139,92,246,0.4);
+      bottom: 200px; left: -150px;
+      animation-delay: -3s;
+    }
+
+    .bg-aurora .orb:nth-child(3) {
+      width: 400px; height: 400px;
+      background: rgba(34,211,238,0.3);
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      animation-delay: -5s;
+    }
+
+    @keyframes drift {
+      0% { transform: translate(0, 0) scale(1); }
+      100% { transform: translate(40px, -30px) scale(1.15); }
+    }
+
+    /* Dot grid */
+    .dot-grid {
+      position: absolute;
+      inset: 0;
+      background-image: radial-gradient(rgba(255,255,255,0.07) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: radial-gradient(ellipse 70% 50% at 50% 40%, black, transparent);
+      z-index: 1;
+    }
+
+    /* ─── Scene System ─── */
+    .scene {
+      position: absolute;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 60px 64px;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    /* Scene 1: 0s–5.5s */
+    .scene[data-scene="1"] {
+      animation: scene-in-out var(--dur) linear infinite;
+      animation-delay: 0s;
+    }
+
+    /* Scene 2: 5s–11s */
+    .scene[data-scene="2"] {
+      animation: scene-in-out var(--dur) linear infinite;
+      animation-delay: -5s;
+    }
+
+    /* Scene 3: 10.5s–17s */
+    .scene[data-scene="3"] {
+      animation: scene-in-out var(--dur) linear infinite;
+      animation-delay: -10.5s;
+    }
+
+    /* Scene 4: 16.5s–22s */
+    .scene[data-scene="4"] {
+      animation: scene-in-out var(--dur) linear infinite;
+      animation-delay: -16.5s;
+    }
+
+    /* Scene 5: 21.5s–26s */
+    .scene[data-scene="5"] {
+      animation: scene-in-out var(--dur) linear infinite;
+      animation-delay: -21.5s;
+    }
+
+    @keyframes scene-in-out {
+      0%   { opacity: 0; transform: translateY(60px) scale(0.95); }
+      1.5% { opacity: 1; transform: translateY(0) scale(1); }
+      19%  { opacity: 1; transform: translateY(0) scale(1); }
+      21%  { opacity: 0; transform: translateY(-40px) scale(0.97); }
+      100% { opacity: 0; transform: translateY(60px) scale(0.95); }
+    }
+
+    /* ─── Common Elements ─── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 22px;
+      border-radius: 999px;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .badge.cyan {
+      background: rgba(34,211,238,0.12);
+      border: 1.5px solid rgba(34,211,238,0.3);
+      color: var(--cyan);
+    }
+
+    .badge.violet {
+      background: rgba(139,92,246,0.12);
+      border: 1.5px solid rgba(139,92,246,0.3);
+      color: var(--violet);
+    }
+
+    .badge.lime {
+      background: rgba(163,230,53,0.12);
+      border: 1.5px solid rgba(163,230,53,0.3);
+      color: var(--lime);
+    }
+
+    .badge.pink {
+      background: rgba(244,114,182,0.12);
+      border: 1.5px solid rgba(244,114,182,0.3);
+      color: var(--pink);
+    }
+
+    .badge.blue {
+      background: rgba(59,130,246,0.12);
+      border: 1.5px solid rgba(59,130,246,0.3);
+      color: var(--blue);
+    }
+
+    h1, h2 {
+      font-weight: 800;
+      line-height: 0.95;
+      letter-spacing: -0.035em;
+      margin-top: 32px;
+      text-align: center;
+    }
+
+    h1 { font-size: 88px; }
+    h2 { font-size: 80px; }
+
+    .gradient-text {
+      background: linear-gradient(135deg, var(--cyan), var(--blue), var(--violet));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .sub {
+      margin-top: 24px;
+      font-size: 32px;
+      line-height: 1.4;
+      color: var(--muted);
+      text-align: center;
+      max-width: 800px;
+    }
+
+    /* ─── SCENE 1: Hero + App Window ─── */
+    .app-window {
+      margin-top: 48px;
+      width: 100%;
+      border: 1.5px solid var(--border);
+      border-radius: 32px;
+      background: rgba(17,24,39,0.85);
+      backdrop-filter: blur(20px);
+      overflow: hidden;
+      box-shadow: 0 40px 100px rgba(0,0,0,0.5);
+    }
+
+    .titlebar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 16px 22px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .titlebar .dots { display: flex; gap: 8px; }
+    .titlebar .dots span {
+      width: 13px; height: 13px;
+      border-radius: 50%;
+    }
+    .titlebar .dots span:nth-child(1) { background: #ef4444; }
+    .titlebar .dots span:nth-child(2) { background: #fbbf24; }
+    .titlebar .dots span:nth-child(3) { background: #22c55e; }
+    .titlebar .label {
+      flex: 1;
+      text-align: center;
+      font-size: 18px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .split-view {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      height: 680px;
+    }
+
+    .canvas-side {
+      position: relative;
+      border-right: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .canvas-board {
+      width: 88%;
+      height: 88%;
+      border-radius: 20px;
+      background: #f8faff;
+      position: relative;
+      overflow: hidden;
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.08);
+    }
+
+    /* Animated drawing shapes */
+    .draw-rect {
+      position: absolute;
+      top: 60px; left: 50px;
+      width: 180px; height: 100px;
+      border: 3.5px solid #3b82f6;
+      border-radius: 16px;
+      animation: draw-in 1.2s ease-out forwards;
+      animation-delay: 0.8s;
+      opacity: 0;
+    }
+
+    .draw-circle {
+      position: absolute;
+      bottom: 120px; right: 60px;
+      width: 120px; height: 120px;
+      border: 3.5px solid #8b5cf6;
+      border-radius: 50%;
+      animation: draw-in 1.2s ease-out forwards;
+      animation-delay: 1.4s;
+      opacity: 0;
+    }
+
+    .draw-arrow {
+      position: absolute;
+      top: 150px; left: 220px;
+      animation: draw-in 0.8s ease-out forwards;
+      animation-delay: 2s;
+      opacity: 0;
+    }
+
+    .draw-text {
+      position: absolute;
+      top: 30px; left: 55px;
+      font: 700 16px 'JetBrains Mono', monospace;
+      color: #1e3a5f;
+      animation: draw-in 0.6s ease-out forwards;
+      animation-delay: 0.5s;
+      opacity: 0;
+    }
+
+    .draw-prompt-text {
+      position: absolute;
+      bottom: 40px; left: 30px;
+      padding: 14px 16px;
+      border-radius: 14px;
+      background: #0f172a;
+      color: #a5b4fc;
+      font: 600 14px/1.3 'JetBrains Mono', monospace;
+      max-width: 260px;
+      animation: draw-in 0.8s ease-out forwards;
+      animation-delay: 2.4s;
+      opacity: 0;
+    }
+
+    @keyframes draw-in {
+      0% { opacity: 0; transform: scale(0.7); }
+      60% { opacity: 1; transform: scale(1.05); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    .terminal-side {
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .term-inner {
+      flex: 1;
+      border-radius: 16px;
+      background: #0c1220;
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+
+    .term-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .term-tab {
+      padding: 12px 18px;
+      font-size: 16px;
+      font-weight: 500;
+      color: var(--muted);
+      border-right: 1px solid var(--border);
+    }
+
+    .term-tab.active {
+      color: var(--text);
+      background: rgba(255,255,255,0.03);
+      border-bottom: 2px solid var(--cyan);
+    }
+
+    .term-body {
+      padding: 18px;
+      font: 500 17px/1.65 'JetBrains Mono', monospace;
+      color: #c8d6f0;
+    }
+
+    .term-line {
+      opacity: 0;
+      animation: type-line 0.4s ease-out forwards;
+    }
+
+    .term-line:nth-child(1) { animation-delay: 1s; }
+    .term-line:nth-child(2) { animation-delay: 1.8s; }
+    .term-line:nth-child(3) { animation-delay: 2.6s; }
+    .term-line:nth-child(4) { animation-delay: 3.2s; }
+
+    @keyframes type-line {
+      0% { opacity: 0; transform: translateX(-8px); }
+      100% { opacity: 1; transform: translateX(0); }
+    }
+
+    .c-lime { color: var(--lime); }
+    .c-cyan { color: var(--cyan); }
+    .c-amber { color: var(--amber); }
+    .c-pink { color: var(--pink); }
+    .c-blue { color: var(--blue); }
+    .c-violet { color: var(--violet); }
+    .c-muted { color: var(--muted); }
+
+    /* Upload/Download animated arrows */
+    .flow-arrows {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 5;
+      display: flex;
+      flex-direction: column;
+      gap: 40px;
+      align-items: center;
+    }
+
+    .flow-arrow {
+      padding: 10px 16px;
+      border-radius: 999px;
+      font: 700 15px 'JetBrains Mono', monospace;
+      animation: pulse-glow 2s ease-in-out infinite;
+    }
+
+    .flow-arrow.up {
+      background: rgba(34,211,238,0.15);
+      border: 1.5px solid rgba(34,211,238,0.4);
+      color: var(--cyan);
+    }
+
+    .flow-arrow.down {
+      background: rgba(163,230,53,0.15);
+      border: 1.5px solid rgba(163,230,53,0.4);
+      color: var(--lime);
+      animation-delay: -1s;
+    }
+
+    @keyframes pulse-glow {
+      0%, 100% { opacity: 0.7; transform: scale(0.95); }
+      50% { opacity: 1; transform: scale(1.05); }
+    }
+
+    /* ─── SCENE 2: Visual Feedback Loop ─── */
+    .loop-diagram {
+      margin-top: 48px;
+      width: 100%;
+      position: relative;
+    }
+
+    .loop-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      align-items: center;
+    }
+
+    .loop-step {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      width: 100%;
+      padding: 28px 32px;
+      border: 1.5px solid var(--border);
+      border-radius: 28px;
+      background: rgba(17,24,39,0.7);
+      backdrop-filter: blur(12px);
+    }
+
+    .loop-step + .loop-connector {
+      width: 4px;
+      height: 36px;
+      background: linear-gradient(180deg, var(--cyan), var(--violet));
+      border-radius: 4px;
+      opacity: 0.5;
+    }
+
+    .loop-num {
+      width: 52px; height: 52px;
+      border-radius: 16px;
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      font-size: 24px;
+      flex-shrink: 0;
+    }
+
+    .loop-num.n1 { background: rgba(34,211,238,0.15); color: var(--cyan); }
+    .loop-num.n2 { background: rgba(59,130,246,0.15); color: var(--blue); }
+    .loop-num.n3 { background: rgba(139,92,246,0.15); color: var(--violet); }
+    .loop-num.n4 { background: rgba(163,230,53,0.15); color: var(--lime); }
+
+    .loop-content h3 {
+      font-size: 30px;
+      font-weight: 700;
+    }
+
+    .loop-content p {
+      font-size: 22px;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+
+    .loop-return {
+      margin-top: 24px;
+      padding: 16px 28px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, rgba(34,211,238,0.12), rgba(139,92,246,0.12));
+      border: 1.5px solid rgba(34,211,238,0.2);
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--cyan);
+      text-align: center;
+      animation: pulse-glow 3s ease-in-out infinite;
+    }
+
+    /* ─── SCENE 3: Multi-Agent Collaborator ─── */
+    .agent-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 16px;
+      width: 100%;
+      margin-top: 40px;
+    }
+
+    .agent-card {
+      border: 1.5px solid var(--border);
+      border-radius: 24px;
+      background: rgba(17,24,39,0.8);
+      backdrop-filter: blur(12px);
+      overflow: hidden;
+    }
+
+    .agent-header {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 22px;
+    }
+
+    .agent-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      animation: blink-dot 2s ease-in-out infinite;
+    }
+
+    .agent-dot.green { background: #22c55e; }
+    .agent-dot.blue { background: #3b82f6; animation-delay: -0.7s; }
+    .agent-dot.violet { background: #8b5cf6; animation-delay: -1.4s; }
+
+    @keyframes blink-dot {
+      0%, 100% { opacity: 0.4; }
+      50% { opacity: 1; }
+    }
+
+    .agent-body {
+      padding: 16px 18px;
+      font: 500 16px/1.6 'JetBrains Mono', monospace;
+      color: #b0c4e0;
+      min-height: 200px;
+    }
+
+    .mention-bar {
+      margin-top: 20px;
+      width: 100%;
+      padding: 18px 24px;
+      border: 1.5px solid var(--border);
+      border-radius: 20px;
+      background: rgba(17,24,39,0.7);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font: 500 22px 'JetBrains Mono', monospace;
+      color: var(--muted);
+    }
+
+    .mention-bar .at {
+      color: var(--cyan);
+      font-weight: 700;
+    }
+
+    .mention-bar .typed {
+      color: var(--text);
+      border-right: 2px solid var(--cyan);
+      padding-right: 2px;
+      animation: blink-cursor 1s step-end infinite;
+    }
+
+    @keyframes blink-cursor {
+      50% { border-color: transparent; }
+    }
+
+    /* Features strip */
+    .features-strip {
+      margin-top: 28px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .feat-chip {
+      padding: 12px 20px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    /* ─── SCENE 4: Terminal Power ─── */
+    .power-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      width: 100%;
+      margin-top: 40px;
+    }
+
+    .power-card {
+      padding: 28px;
+      border: 1.5px solid var(--border);
+      border-radius: 24px;
+      background: rgba(17,24,39,0.7);
+      backdrop-filter: blur(12px);
+    }
+
+    .power-card .icon {
+      font-size: 42px;
+      margin-bottom: 16px;
+    }
+
+    .power-card h3 {
+      font-size: 26px;
+      font-weight: 700;
+    }
+
+    .power-card p {
+      font-size: 20px;
+      color: var(--muted);
+      margin-top: 8px;
+      line-height: 1.35;
+    }
+
+    .tech-row {
+      margin-top: 28px;
+      display: flex;
+      gap: 14px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .tech-pill {
+      padding: 14px 22px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      font: 600 20px 'JetBrains Mono', monospace;
+      color: var(--text);
+    }
+
+    /* ─── SCENE 5: CTA ─── */
+    .cta-block {
+      margin-top: 40px;
+      width: 100%;
+      text-align: center;
+    }
+
+    .repo-url {
+      margin-top: 32px;
+      padding: 28px 32px;
+      border-radius: 24px;
+      background: rgba(34,211,238,0.06);
+      border: 2px solid rgba(34,211,238,0.25);
+      font: 700 28px 'JetBrains Mono', monospace;
+      color: var(--cyan);
+      word-break: break-all;
+      animation: pulse-border 2.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse-border {
+      0%, 100% { border-color: rgba(34,211,238,0.25); box-shadow: 0 0 0 0 rgba(34,211,238,0); }
+      50% { border-color: rgba(34,211,238,0.5); box-shadow: 0 0 40px rgba(34,211,238,0.12); }
+    }
+
+    .cta-tags {
+      margin-top: 28px;
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .cta-tag {
+      padding: 12px 20px;
+      border-radius: 14px;
+      font-size: 22px;
+      font-weight: 700;
+    }
+
+    .cta-tag.t1 { background: rgba(34,211,238,0.1); color: var(--cyan); }
+    .cta-tag.t2 { background: rgba(59,130,246,0.1); color: var(--blue); }
+    .cta-tag.t3 { background: rgba(139,92,246,0.1); color: var(--violet); }
+    .cta-tag.t4 { background: rgba(163,230,53,0.1); color: var(--lime); }
+
+    .star-cta {
+      margin-top: 36px;
+      display: inline-flex;
+      align-items: center;
+      gap: 14px;
+      padding: 20px 40px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--cyan), var(--blue));
+      color: #000;
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      animation: cta-pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes cta-pulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.04); }
+    }
+
+    /* Logo */
+    .logo-mark {
+      width: 80px; height: 80px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, var(--cyan), var(--blue), var(--violet));
+      display: grid;
+      place-items: center;
+      margin: 0 auto 16px;
+      box-shadow: 0 8px 32px rgba(34,211,238,0.3);
+    }
+
+    .logo-mark svg {
+      width: 44px; height: 44px;
+    }
+
+    /* Bottom caption bar */
+    .caption-bar {
+      position: absolute;
+      bottom: 48px;
+      left: 48px; right: 48px;
+      padding: 18px 24px;
+      border-radius: 20px;
+      background: rgba(10,14,23,0.85);
+      backdrop-filter: blur(14px);
+      border: 1px solid var(--border);
+      font-size: 26px;
+      font-weight: 500;
+      color: var(--text);
+      text-align: center;
+      z-index: 20;
+      animation: caption-cycle var(--dur) linear infinite;
+    }
+
+    .caption-bar .caption-text {
+      display: none;
+    }
+
+    .caption-bar .caption-text:nth-child(1) { animation: caption-vis var(--dur) linear infinite; animation-delay: 0s; }
+    .caption-bar .caption-text:nth-child(2) { animation: caption-vis var(--dur) linear infinite; animation-delay: -5s; }
+    .caption-bar .caption-text:nth-child(3) { animation: caption-vis var(--dur) linear infinite; animation-delay: -10.5s; }
+    .caption-bar .caption-text:nth-child(4) { animation: caption-vis var(--dur) linear infinite; animation-delay: -16.5s; }
+    .caption-bar .caption-text:nth-child(5) { animation: caption-vis var(--dur) linear infinite; animation-delay: -21.5s; }
+
+    @keyframes caption-vis {
+      0%, 1%   { display: block; opacity: 0; }
+      2%, 19%  { display: block; opacity: 1; }
+      21%, 100%{ display: block; opacity: 0; }
+    }
+
+    /* We can't animate display, use position trick */
+    .caption-bar .caption-text {
+      display: block;
+      position: absolute;
+      inset: 18px 24px;
+      opacity: 0;
+    }
+
+    /* Scanline effect */
+    .scanline {
+      position: absolute;
+      inset: 0;
+      z-index: 30;
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 3px,
+        rgba(0,0,0,0.015) 3px,
+        rgba(0,0,0,0.015) 4px
+      );
+    }
+
+    /* Vignette */
+    .vignette {
+      position: absolute;
+      inset: 0;
+      z-index: 25;
+      pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.4));
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <!-- Background effects -->
+    <div class="bg-aurora">
+      <div class="orb"></div>
+      <div class="orb"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="dot-grid"></div>
+    <div class="scanline"></div>
+    <div class="vignette"></div>
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- SCENE 1 — Hero: Canvas + Terminal (0s–5.5s) -->
+    <!-- ═══════════════════════════════════════════ -->
+    <section class="scene" data-scene="1">
+      <div class="badge cyan">Canvas + Terminal</div>
+      <h1>Your sketch<br/>becomes the<br/><span class="gradient-text">AI prompt.</span></h1>
+      <p class="sub">Draw. Upload. Let the AI see your diagram and respond — visually.</p>
+
+      <div class="app-window">
+        <div class="titlebar">
+          <div class="dots"><span></span><span></span><span></span></div>
+          <span class="label">Canvas Terminal</span>
+          <div style="width:50px"></div>
+        </div>
+        <div class="split-view">
+          <div class="canvas-side">
+            <div class="canvas-board">
+              <div class="draw-text">Architecture</div>
+              <div class="draw-rect"></div>
+              <div class="draw-circle"></div>
+              <div class="draw-arrow">
+                <svg width="80" height="100" viewBox="0 0 80 100" fill="none">
+                  <path d="M10 10 L60 80" stroke="#3b82f6" stroke-width="3" stroke-linecap="round"/>
+                  <path d="M48 72 L60 80 L50 68" stroke="#3b82f6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <div class="draw-prompt-text">"review this architecture"</div>
+            </div>
+            <div class="flow-arrows">
+              <div class="flow-arrow up">Upload &#x2192;</div>
+              <div class="flow-arrow down">&#x2190; Download</div>
+            </div>
+          </div>
+          <div class="terminal-side">
+            <div class="term-inner">
+              <div class="term-tabs">
+                <div class="term-tab active">claude-code</div>
+                <div class="term-tab">zsh</div>
+              </div>
+              <div class="term-body">
+                <div class="term-line"><span class="c-lime">$</span> claude "analyze this diagram"</div>
+                <div class="term-line"><span class="c-cyan">[image]</span> architecture sketch loaded</div>
+                <div class="term-line">Generating response...</div>
+                <div class="term-line"><span class="c-amber">Done:</span> result rendered on canvas</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- SCENE 2 — Visual Feedback Loop (5s–11s) -->
+    <!-- ═══════════════════════════════════════════ -->
+    <section class="scene" data-scene="2">
+      <div class="badge violet">Visual Feedback Loop</div>
+      <h2>No copy-paste.<br/><span class="gradient-text">No file juggling.</span></h2>
+      <p class="sub">A continuous loop between your canvas and any AI CLI tool.</p>
+
+      <div class="loop-diagram">
+        <div class="loop-steps">
+          <div class="loop-step">
+            <div class="loop-num n1">1</div>
+            <div class="loop-content">
+              <h3>Draw</h3>
+              <p>Sketch diagrams, wireframes, flowcharts on the canvas</p>
+            </div>
+          </div>
+          <div class="loop-connector"></div>
+          <div class="loop-step">
+            <div class="loop-num n2">2</div>
+            <div class="loop-content">
+              <h3>Upload</h3>
+              <p>Canvas becomes PNG, path pasted via bracketed paste</p>
+            </div>
+          </div>
+          <div class="loop-connector"></div>
+          <div class="loop-step">
+            <div class="loop-num n3">3</div>
+            <div class="loop-content">
+              <h3>AI Processes</h3>
+              <p>Claude Code, Gemini CLI, Codex — any CLI reads it</p>
+            </div>
+          </div>
+          <div class="loop-connector"></div>
+          <div class="loop-step">
+            <div class="loop-num n4">4</div>
+            <div class="loop-content">
+              <h3>Download</h3>
+              <p>MD, HTML, SVG, or image renders back onto canvas</p>
+            </div>
+          </div>
+        </div>
+        <div class="loop-return">&#x21BB; Iterate &mdash; refine your drawing, re-upload, repeat</div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- SCENE 3 — Multi-Agent Collaborator (10.5s–17s) -->
+    <!-- ═══════════════════════════════════════════ -->
+    <section class="scene" data-scene="3">
+      <div class="badge lime">Collaborator</div>
+      <h2>Run <span class="gradient-text">3 AI agents</span><br/>side by side.</h2>
+      <p class="sub">Parallel terminals with @mentions, shared memory, and task routing.</p>
+
+      <div class="agent-grid">
+        <div class="agent-card">
+          <div class="agent-header">
+            <div class="agent-dot green"></div>
+            @claude
+          </div>
+          <div class="agent-body">
+            <div><span class="c-lime">$</span> claude</div>
+            <div><span class="c-cyan">[task]</span> analyze auth</div>
+            <div>Reviewing code...</div>
+            <div><span class="c-amber">Found</span> 3 issues</div>
+            <div>Report saved</div>
+          </div>
+        </div>
+        <div class="agent-card">
+          <div class="agent-header">
+            <div class="agent-dot blue"></div>
+            @codex
+          </div>
+          <div class="agent-body">
+            <div><span class="c-lime">$</span> codex</div>
+            <div><span class="c-blue">[import]</span> canvas</div>
+            <div>Profiling flow...</div>
+            <div><span class="c-amber">Fix</span> applied</div>
+            <div>Tests pass <span class="c-lime">&#x2713;</span></div>
+          </div>
+        </div>
+        <div class="agent-card">
+          <div class="agent-header">
+            <div class="agent-dot violet"></div>
+            @gemini
+          </div>
+          <div class="agent-body">
+            <div><span class="c-lime">$</span> gemini</div>
+            <div><span class="c-violet">[review]</span> diff</div>
+            <div>Comparing...</div>
+            <div><span class="c-amber">LGTM</span></div>
+            <div>Report appended</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="mention-bar">
+        <span class="at">@all</span>
+        <span class="typed">compare your findings and summarize</span>
+      </div>
+
+      <div class="features-strip">
+        <div class="feat-chip">Shared Memory</div>
+        <div class="feat-chip">Task Protocol</div>
+        <div class="feat-chip">ANSI-stripped Logs</div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- SCENE 4 — Terminal Power (16.5s–22s) -->
+    <!-- ═══════════════════════════════════════════ -->
+    <section class="scene" data-scene="4">
+      <div class="badge pink">Native Terminal</div>
+      <h2>Not a toy.<br/><span class="gradient-text">A real terminal.</span></h2>
+      <p class="sub">Full PTY shell with GPU-accelerated rendering and 6 themes.</p>
+
+      <div class="power-grid">
+        <div class="power-card">
+          <div class="icon">&#x2261;</div>
+          <h3>Tab & Pane</h3>
+          <p>Split, reorder, duplicate. Undo close within 5s.</p>
+        </div>
+        <div class="power-card">
+          <div class="icon">&#x26A1;</div>
+          <h3>WebGL Render</h3>
+          <p>GPU-accelerated text with automatic canvas fallback.</p>
+        </div>
+        <div class="power-card">
+          <div class="icon">&#x1F3A8;</div>
+          <h3>6 Themes</h3>
+          <p>Monochrome, Catppuccin, Dracula, Tokyo Night, Nord, Solarized.</p>
+        </div>
+        <div class="power-card">
+          <div class="icon">&#x1F30F;</div>
+          <h3>IME Support</h3>
+          <p>Korean, Japanese, Chinese input handled natively.</p>
+        </div>
+      </div>
+
+      <div class="tech-row">
+        <div class="tech-pill">Tauri v2</div>
+        <div class="tech-pill">React 18</div>
+        <div class="tech-pill">xterm.js</div>
+        <div class="tech-pill">Fabric.js</div>
+        <div class="tech-pill">Zustand</div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════ -->
+    <!-- SCENE 5 — CTA (21.5s–26s) -->
+    <!-- ═══════════════════════════════════════════ -->
+    <section class="scene" data-scene="5">
+      <div class="logo-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7" rx="1"/>
+          <rect x="14" y="3" width="7" height="7" rx="1"/>
+          <rect x="3" y="14" width="7" height="7" rx="1"/>
+          <path d="M14 14h7v7h-7z" stroke-dasharray="3 3"/>
+          <path d="M10 6.5h4M6.5 10v4"/>
+        </svg>
+      </div>
+      <h2>Sketch. Route.<br/><span class="gradient-text">Collaborate. Ship.</span></h2>
+      <p class="sub">Turn visual ideas into AI conversations.<br/>Open source on GitHub.</p>
+
+      <div class="cta-block">
+        <div class="repo-url">github.com/yes506/canvas-terminal</div>
+
+        <div class="cta-tags">
+          <div class="cta-tag t1">macOS</div>
+          <div class="cta-tag t2">MIT License</div>
+          <div class="cta-tag t3">Tauri v2</div>
+          <div class="cta-tag t4">Open Source</div>
+        </div>
+
+        <div class="star-cta">&#x2B50; Star on GitHub</div>
+      </div>
+    </section>
+
+    <!-- Bottom caption bar -->
+    <div class="caption-bar">
+      <div class="caption-text">Draw on canvas &#x2192; AI reads your sketch &#x2192; response rendered back</div>
+      <div class="caption-text">No copy-paste. Upload, process, download. Visual feedback loop.</div>
+      <div class="caption-text">Claude Code + Codex + Gemini CLI running in parallel terminals</div>
+      <div class="caption-text">Full PTY shell &bull; WebGL rendering &bull; 6 themes &bull; IME support</div>
+      <div class="caption-text">github.com/yes506/canvas-terminal &bull; Open Source &bull; MIT</div>
+    </div>
+  </div>
+</body>
+</html>

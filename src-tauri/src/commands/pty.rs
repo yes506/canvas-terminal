@@ -310,6 +310,42 @@ pub fn inject_into_pty(
     Ok(())
 }
 
+/// List directory entries for file/directory autocomplete.
+/// Expands `~` to the home directory. Returns a sorted list of
+/// `[name, is_dir, full_path]` triples.
+#[tauri::command]
+pub fn list_directory(path: String) -> Result<Vec<(String, bool, String)>, String> {
+    let expanded = if path.starts_with('~') {
+        let home = dirs::home_dir().ok_or("Cannot resolve home directory")?;
+        home.join(path.strip_prefix("~/").unwrap_or(""))
+    } else {
+        std::path::PathBuf::from(&path)
+    };
+
+    let dir = if expanded.is_dir() {
+        expanded
+    } else {
+        expanded.parent().unwrap_or(&expanded).to_path_buf()
+    };
+
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+
+    let mut result: Vec<(String, bool, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip hidden files unless the query specifically starts with '.'
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let full_path = entry.path().to_string_lossy().to_string();
+        result.push((name, is_dir, full_path));
+    }
+    result.sort_by(|a, b| {
+        // Directories first, then alphabetical
+        b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+
+    Ok(result)
+}
+
 #[tauri::command]
 pub fn kill_pty(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
     // Remove session from map and release the lock BEFORE cleanup.

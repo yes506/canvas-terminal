@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import * as fabric from "fabric";
 import { useTerminalStore, selectActiveSessionId, findCollaboratorLeaf } from "../../stores/terminalStore";
 import { useCanvasStore, pushCanvasState } from "../../stores/canvasStore";
+import { exportCanvasToDataUrl } from "../../lib/canvasOps";
 import { useCollaboratorStore } from "../../stores/collaboratorStore";
 import { renderResponseToDataUrl } from "../../lib/responseRenderer";
 
@@ -86,11 +87,7 @@ export function useCanvasIntegration() {
     if (!activeSessionId) return;
 
     try {
-      const dataUrl = fabricCanvas.toDataURL({
-        format: "png",
-        quality: 1,
-        multiplier: window.devicePixelRatio,
-      });
+      const dataUrl = exportCanvasToDataUrl(fabricCanvas);
       const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
 
       const savedPath = await invoke<string>("export_snapshot", { base64Data });

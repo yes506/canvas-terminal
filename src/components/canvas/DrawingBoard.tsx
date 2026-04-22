@@ -10,6 +10,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import html2canvas from "html2canvas";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { exportCanvasToDataUrl } from "../../lib/canvasOps";
 import {
   useCanvasStore,
   undoCanvas,
@@ -157,6 +158,8 @@ export function DrawingBoard() {
     }
     fabricCanvas.renderAll();
     setZoomLevel(newZoom);
+    const vpt = fabricCanvas.viewportTransform;
+    useCanvasStore.getState().setViewportPan(vpt[4], vpt[5]);
   };
 
   const addImageToCanvas = (dataUrl: string) => {
@@ -182,11 +185,7 @@ export function DrawingBoard() {
     isCapturing.current = true;
 
     try {
-      const dataUrl = fabricCanvas.toDataURL({
-        format: "png",
-        quality: 1,
-        multiplier: window.devicePixelRatio,
-      });
+      const dataUrl = exportCanvasToDataUrl(fabricCanvas);
       addImageToCanvas(dataUrl);
     } catch (err) {
       console.error("Canvas capture failed:", err);
@@ -225,11 +224,7 @@ export function DrawingBoard() {
   const handleExportForAI = async () => {
     if (!fabricCanvas) return;
 
-    const dataUrl = fabricCanvas.toDataURL({
-      format: "png",
-      quality: 1,
-      multiplier: window.devicePixelRatio,
-    });
+    const dataUrl = exportCanvasToDataUrl(fabricCanvas);
 
     // Strip the data:image/png;base64, prefix
     const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");

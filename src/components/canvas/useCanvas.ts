@@ -335,7 +335,7 @@ export function useCanvas() {
   const initCanvas = useCallback(() => {
     if (!canvasRef.current || fabricRef.current) return;
 
-    const canvas = new Canvas(canvasRef.current, {
+      const canvas = new Canvas(canvasRef.current, {
       backgroundColor: CANVAS_BG,
       selection: false,
       preserveObjectStacking: true,
@@ -374,6 +374,7 @@ export function useCanvas() {
 
         c.setViewportTransform([newZoom, 0, 0, newZoom, panX, panY]);
         useCanvasStore.getState().setZoomLevel(newZoom);
+        useCanvasStore.getState().setViewportPan(panX, panY);
       }
 
       prevSize.current = { width, height };
@@ -468,8 +469,9 @@ export function useCanvas() {
     // --- Mouse handlers ---
 
     canvas.on("mouse:down", (opt: TPointerEventInfo<TPointerEvent>) => {
-      // Pan with space+click or middle mouse button
       const rawEvent = opt.e as MouseEvent;
+
+      // Pan with space+click or middle mouse button
       if (spacePressed.current || rawEvent.button === 1) {
         isPanning.current = true;
         lastPanPoint.current = { x: rawEvent.clientX, y: rawEvent.clientY };
@@ -607,6 +609,7 @@ export function useCanvas() {
         vpt[5] += e.clientY - lastPanPoint.current.y;
         canvas.setViewportTransform(vpt);
         lastPanPoint.current = { x: e.clientX, y: e.clientY };
+        useCanvasStore.getState().setViewportPan(vpt[4], vpt[5]);
         return;
       }
 
@@ -816,10 +819,15 @@ export function useCanvas() {
         }
       }
 
+      // Guard: only handle canvas shortcuts when focus is inside the canvas area
+      const canvasDrawer = canvasRef.current?.closest(".canvas-drawer");
+      const focusInCanvas = canvasDrawer?.contains(document.activeElement as Node | null);
+
       // Arrow keys = move selected object(s), Shift = 10px steps
       if (
         ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)
       ) {
+        if (!focusInCanvas) return;
         const active = c.getActiveObject();
         if (!active) return;
         if (active instanceof fabric.IText && active.isEditing) return;
@@ -845,6 +853,7 @@ export function useCanvas() {
       }
 
       if (e.key === "Delete" || e.key === "Backspace") {
+        if (!focusInCanvas) return;
         const active = c.getActiveObject();
         if (!active) return;
         if (active instanceof fabric.IText && active.isEditing) return;
@@ -937,6 +946,10 @@ export function useCanvas() {
       }
 
       if (e.key === "Escape") {
+        if (isDrawing.current) {
+          isDrawing.current = false;
+          activeShape.current = null;
+        }
         c.discardActiveObject();
         c.renderAll();
         setActiveToolRef.current("select");
@@ -1030,12 +1043,15 @@ export function useCanvas() {
         canvas.zoomToPoint(point, newZoom);
         canvas.renderAll();
         useCanvasStore.getState().setZoomLevel(newZoom);
+        const updatedVpt = canvas.viewportTransform;
+        useCanvasStore.getState().setViewportPan(updatedVpt[4], updatedVpt[5]);
       } else {
         const vpt = canvas.viewportTransform;
         vpt[4] -= e.deltaX;
         vpt[5] -= e.deltaY;
         canvas.setViewportTransform(vpt);
         canvas.renderAll();
+        useCanvasStore.getState().setViewportPan(vpt[4], vpt[5]);
       }
     };
 

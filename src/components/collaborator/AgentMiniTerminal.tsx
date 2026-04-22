@@ -9,7 +9,7 @@ import { terminalThemes } from "../terminal/themes";
 import { useTerminalStore } from "../../stores/terminalStore";
 import { useCollaboratorStore, agentDisplayName, toolLabel, scanForTaskCompletions } from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
-import { createOutputCapture } from "../../lib/agentOutputCapture";
+import { createOutputCapture, stripAnsi } from "../../lib/agentOutputCapture";
 import type { ToolConfig } from "../../types/collaborator";
 import { X } from "lucide-react";
 
@@ -46,6 +46,7 @@ export function AgentMiniTerminal({
   const docKeyDownRef = useRef<((e: KeyboardEvent) => void) | null>(null);
   const docInputRef = useRef<((e: Event) => void) | null>(null);
   const imeOverlayRef = useRef<HTMLSpanElement | null>(null);
+  const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disposed = useRef(false);
   const [focused, setFocused] = useState(false);
 
@@ -84,7 +85,10 @@ export function AgentMiniTerminal({
       }
 
       fitAddon.fit();
-      requestAnimationFrame(() => fitAddon.fit());
+      requestAnimationFrame(() => {
+        fitAddon.fit();
+        terminal.scrollToBottom();
+      });
 
       terminalRef.current = terminal;
       fitAddonRef.current = fitAddon;
@@ -101,7 +105,10 @@ export function AgentMiniTerminal({
           termRef.current.offsetWidth > 0 &&
           termRef.current.offsetHeight > 0
         ) {
+          const buf = terminal.buffer.active;
+          const wasAtBottom = buf.viewportY >= buf.baseY;
           fitAddon.fit();
+          if (wasAtBottom) terminal.scrollToBottom();
         }
       });
       if (termRef.current) observer.observe(termRef.current);
@@ -376,7 +383,13 @@ export function AgentMiniTerminal({
           isComposing = true;
           if (ta) showOverlay(ta.value.substring(imeStartPos));
         } else if (!e.isComposing || isTerminating) {
-          if (isComposing) {
+          // Modifier keys (Shift, Ctrl, Alt, Meta) never terminate IME composition.
+          // In WKWebView, Shift keydown during Korean IME may fire with
+          // isComposing=false and keyCode!=229, which would incorrectly flush
+          // the composing consonant (e.g. ㄱ) before the Shift+vowel combines (e.g. 계).
+          const isModifier = e.key === "Shift" || e.key === "Control" ||
+                             e.key === "Alt" || e.key === "Meta";
+          if (isComposing && !isModifier) {
             // Flush only the current composing fragment — committed characters
             // already passed through triggerDataEvent to the PTY.
             const composed = imeFragment;
@@ -394,7 +407,7 @@ export function AgentMiniTerminal({
               e.preventDefault();
             }
           }
-          isComposing = false;
+          if (!isModifier) isComposing = false;
         }
       };
       document.addEventListener("keydown", docKeyDown, true);
@@ -469,13 +482,68 @@ export function AgentMiniTerminal({
         // Shell may have exited already
       }
 
-      // Register in store
+      // Register in store as "spawning" — not ready for messages yet.
+      // The readiness detector below will set status to "running" and flush
+      // any queued messages once the CLI tool's prompt appears.
       useCollaboratorStore.getState().addAgent({
         sessionId,
         tool: tool.id,
-        status: "running",
+        status: "spawning",
         collabSessionId,
       });
+
+      // ---- CLI readiness detection ----
+      // Watch PTY output for prompt patterns indicating the CLI is ready for input.
+      // Each CLI tool shows a prompt when ready (e.g. "> " for Claude, "❯ " for Codex).
+      const READY_PATTERNS = [
+        />\s*$/,       // Claude Code prompt: "> "
+        /❯\s*$/,      // Codex CLI prompt
+        /\$\s*$/,      // Generic shell prompt
+      ];
+      let readyDetected = false;
+      // We accumulate a small tail buffer to match prompt patterns
+      let readyBuf = "";
+      const READY_BUF_MAX = 200;
+      // Also use a fallback timer in case prompt pattern isn't matched
+      readyTimeoutRef.current = setTimeout(() => {
+        if (!readyDetected && !disposed.current) {
+          readyDetected = true;
+          const store = useCollaboratorStore.getState();
+          store.setAgentStatus(sessionId, "running");
+          store.flushPendingMessages(sessionId);
+        }
+      }, 8000); // 8s fallback — if CLI doesn't show a recognizable prompt
+
+      const checkReady = (raw: string) => {
+        if (readyDetected) return;
+        readyBuf += stripAnsi(raw);
+        if (readyBuf.length > READY_BUF_MAX) {
+          readyBuf = readyBuf.slice(-READY_BUF_MAX);
+        }
+        const tail = readyBuf.slice(-80);
+        if (READY_PATTERNS.some((re) => re.test(tail))) {
+          readyDetected = true;
+          if (readyTimeoutRef.current) clearTimeout(readyTimeoutRef.current);
+          const store = useCollaboratorStore.getState();
+          store.setAgentStatus(sessionId, "running");
+          store.flushPendingMessages(sessionId);
+        }
+      };
+
+      // Tap into the existing data listener to also check readiness
+      const origDataUnlisten = unlistenDataRef.current;
+      unlistenDataRef.current = await listen<string>(
+        `pty-data-${sessionId}`,
+        (event) => {
+          if (!disposed.current) {
+            terminal.write(event.payload);
+            capture.feed(event.payload);
+            checkReady(event.payload);
+          }
+        },
+      );
+      // Unlisten the original listener that was set up before
+      origDataUnlisten?.();
 
       // Handle resize
       let resizeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -492,6 +560,10 @@ export function AgentMiniTerminal({
 
     return () => {
       clearTimeout(timer);
+      if (readyTimeoutRef.current) {
+        clearTimeout(readyTimeoutRef.current);
+        readyTimeoutRef.current = null;
+      }
       disposed.current = true;
       // Flush remaining output and clean up capture
       captureRef.current?.flush();
@@ -559,7 +631,10 @@ export function AgentMiniTerminal({
         if (imeOverlayRef.current) {
           imeOverlayRef.current.style.fontSize = `${newSize}px`;
         }
+        const buf = terminalRef.current.buffer.active;
+        const wasAtBottom = buf.viewportY >= buf.baseY;
         fitAddonRef.current?.fit();
+        if (wasAtBottom) terminalRef.current.scrollToBottom();
       }
     });
   }, []);
@@ -572,13 +647,14 @@ export function AgentMiniTerminal({
   );
   const displayName = agent ? agentDisplayName(agent, sessionAgents) : tool.label;
   const isExited = agent?.status === "exited";
+  const isSpawning = agent?.status === "spawning";
 
   return (
     <div className={`flex flex-col h-full min-h-0 border rounded-md overflow-hidden ${focused ? "border-accent" : "border-surface-lighter"}`}>
       {/* Agent header */}
       <div className="flex items-center gap-2 px-2 py-1 bg-surface-light border-b border-surface-lighter text-xs shrink-0">
         <span
-          className={`w-1.5 h-1.5 rounded-full shrink-0 ${isExited ? "bg-gray-500" : "bg-green-400"}`}
+          className={`w-1.5 h-1.5 rounded-full shrink-0 ${isExited ? "bg-gray-500" : isSpawning ? "bg-yellow-400 animate-pulse" : "bg-green-400"}`}
         />
         <span className={`font-bold ${tool.colorClass} truncate`}>
           {displayName}

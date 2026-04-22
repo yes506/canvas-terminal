@@ -228,14 +228,20 @@ async function getMemoryDir(): Promise<string> {
 interface CollaboratorState {
   agents: SpawnedAgent[];
   statusMessages: Record<string, string>;
-  inputHistory: string[];
-  historyIndex: number;
+  /** Input history per collaborator session. */
+  inputHistoryBySession: Record<string, string[]>;
+  /** Current history navigation index per session (-1 = not navigating). */
+  historyIndexBySession: Record<string, number>;
+  /** Saves the in-progress input when the user starts navigating history, per session. */
+  draftInputBySession: Record<string, string>;
   /** In-memory conversation log entries, keyed by collaborator session. */
   logEntriesBySession: Record<string, LogEntry[]>;
   /** Structured tasks for multi-agent collaboration, keyed by collaborator session. */
   tasksBySession: Record<string, CollabTask[]>;
   /** Prefilled input value set externally (e.g. canvas toolbar), keyed by collabSessionId. */
   pendingInputs: Record<string, string>;
+  /** Messages queued while an agent is still spawning (keyed by agent sessionId). */
+  pendingMessagesByAgent: Record<string, string[]>;
 
   // Session lifecycle
   startSession: (id: string) => void;
@@ -248,6 +254,8 @@ interface CollaboratorState {
     sessionId: string,
     status: SpawnedAgent["status"],
   ) => void;
+  /** Flush queued messages for an agent that has become ready. */
+  flushPendingMessages: (sessionId: string) => Promise<void>;
   killAllAgents: (forSession?: string) => Promise<void>;
   /** Return agents belonging to a specific collaborator session. */
   getSessionAgents: (forSession: string) => SpawnedAgent[];
@@ -284,8 +292,8 @@ interface CollaboratorState {
   persistTasks: (forSession: string) => Promise<void>;
 
   // Input history
-  pushHistory: (input: string) => void;
-  navigateHistory: (direction: "up" | "down") => string | null;
+  pushHistory: (input: string, forSession: string) => void;
+  navigateHistory: (direction: "up" | "down", forSession: string, currentInput?: string) => string | null;
 }
 
 /**
@@ -398,11 +406,13 @@ async function prependContextHeader(
 export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   agents: [],
   statusMessages: {},
-  inputHistory: [],
-  historyIndex: -1,
+  inputHistoryBySession: {},
+  historyIndexBySession: {},
+  draftInputBySession: {},
   logEntriesBySession: {},
   tasksBySession: {},
   pendingInputs: {},
+  pendingMessagesByAgent: {},
 
   // -- Session lifecycle --------------------------------------------------
 
@@ -428,11 +438,17 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       const { [forSession]: _logs, ...logEntriesBySession } = s.logEntriesBySession;
       const { [forSession]: _tasks, ...tasksBySession } = s.tasksBySession;
       const { [forSession]: _pending, ...pendingInputs } = s.pendingInputs;
+      const { [forSession]: _hist, ...inputHistoryBySession } = s.inputHistoryBySession;
+      const { [forSession]: _idx, ...historyIndexBySession } = s.historyIndexBySession;
+      const { [forSession]: _draft, ...draftInputBySession } = s.draftInputBySession;
       return {
         statusMessages,
         logEntriesBySession,
         tasksBySession,
         pendingInputs,
+        inputHistoryBySession,
+        historyIndexBySession,
+        draftInputBySession,
         agents: s.agents.filter((a) => a.collabSessionId !== forSession),
       };
     });
@@ -445,7 +461,13 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   },
 
   removeAgent: (sessionId) => {
-    set((s) => ({ agents: s.agents.filter((a) => a.sessionId !== sessionId) }));
+    set((s) => {
+      const { [sessionId]: _, ...pendingMessagesByAgent } = s.pendingMessagesByAgent;
+      return {
+        agents: s.agents.filter((a) => a.sessionId !== sessionId),
+        pendingMessagesByAgent,
+      };
+    });
   },
 
   setAgentStatus: (sessionId, status) => {
@@ -454,6 +476,22 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         a.sessionId === sessionId ? { ...a, status } : a,
       ),
     }));
+  },
+
+  flushPendingMessages: async (sessionId) => {
+    const queue = get().pendingMessagesByAgent[sessionId];
+    if (!queue || queue.length === 0) return;
+
+    // Clear the queue first to avoid double-flushing
+    set((s) => {
+      const { [sessionId]: _, ...rest } = s.pendingMessagesByAgent;
+      return { pendingMessagesByAgent: rest };
+    });
+
+    // Send each queued message
+    for (const content of queue) {
+      await get().sendToAgent(sessionId, content);
+    }
   },
 
   killAllAgents: async (forSession) => {
@@ -505,6 +543,22 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       const agent = agents.find((a) => a.sessionId === sessionId);
       const tool = agent?.tool ?? null;
       const agentCollabId = agent?.collabSessionId ?? null;
+
+      // Queue message if agent is still starting up
+      if (agent?.status === "spawning") {
+        set((s) => ({
+          pendingMessagesByAgent: {
+            ...s.pendingMessagesByAgent,
+            [sessionId]: [...(s.pendingMessagesByAgent[sessionId] ?? []), content],
+          },
+        }));
+        if (agentCollabId) {
+          get().setStatus("Agent starting up, message queued...", agentCollabId);
+          get().appendLog("system", `Message queued (agent starting): ${content.length > 80 ? content.substring(0, 77) + "..." : content}`, agentCollabId);
+        }
+        return;
+      }
+
       // Auto-create a task if none exist for this session
       if (agentCollabId) {
         const existing = tasksBySession[agentCollabId] ?? [];
@@ -568,6 +622,17 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     const text = await prependContextHeader(content, sid, sid ? (get().tasksBySession[sid] ?? []) : []);
     let sent = 0;
     for (const agent of targetAgents) {
+      // Queue for agents that are still starting up
+      if (agent.status === "spawning") {
+        set((s) => ({
+          pendingMessagesByAgent: {
+            ...s.pendingMessagesByAgent,
+            [agent.sessionId]: [...(s.pendingMessagesByAgent[agent.sessionId] ?? []), content],
+          },
+        }));
+        sent++;
+        continue;
+      }
       try {
         await invoke("inject_into_pty", {
           sessionId: agent.sessionId,
@@ -721,33 +786,51 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
 
   // -- Input history ------------------------------------------------------
 
-  pushHistory: (input) => {
+  pushHistory: (input, forSession) => {
     set((s) => ({
-      inputHistory: [...s.inputHistory, input],
-      historyIndex: -1,
+      inputHistoryBySession: {
+        ...s.inputHistoryBySession,
+        [forSession]: [...(s.inputHistoryBySession[forSession] ?? []), input],
+      },
+      historyIndexBySession: { ...s.historyIndexBySession, [forSession]: -1 },
+      draftInputBySession: { ...s.draftInputBySession, [forSession]: "" },
     }));
   },
 
-  navigateHistory: (direction) => {
-    const { inputHistory, historyIndex } = get();
+  navigateHistory: (direction, forSession, currentInput) => {
+    const s = get();
+    const inputHistory = s.inputHistoryBySession[forSession] ?? [];
+    const historyIndex = s.historyIndexBySession[forSession] ?? -1;
     if (inputHistory.length === 0) return null;
 
     let newIndex: number;
     if (direction === "up") {
-      newIndex =
-        historyIndex === -1
-          ? inputHistory.length - 1
-          : Math.max(0, historyIndex - 1);
+      // Save the current input as draft when first entering history
+      if (historyIndex === -1) {
+        set((prev) => ({
+          draftInputBySession: { ...prev.draftInputBySession, [forSession]: currentInput ?? "" },
+        }));
+        newIndex = inputHistory.length - 1;
+      } else {
+        newIndex = Math.max(0, historyIndex - 1);
+      }
     } else {
       if (historyIndex === -1) return null;
       newIndex = historyIndex + 1;
       if (newIndex >= inputHistory.length) {
-        set({ historyIndex: -1 });
-        return "";
+        // Navigated past the end — restore the draft
+        const draftInput = get().draftInputBySession[forSession] ?? "";
+        set((prev) => ({
+          historyIndexBySession: { ...prev.historyIndexBySession, [forSession]: -1 },
+          draftInputBySession: { ...prev.draftInputBySession, [forSession]: "" },
+        }));
+        return draftInput;
       }
     }
 
-    set({ historyIndex: newIndex });
+    set((prev) => ({
+      historyIndexBySession: { ...prev.historyIndexBySession, [forSession]: newIndex },
+    }));
     return inputHistory[newIndex] ?? null;
   },
 }));

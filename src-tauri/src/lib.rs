@@ -82,6 +82,7 @@ pub fn run() {
             commands::pty::kill_pty,
             commands::pty::get_pty_cwd,
             commands::pty::inject_into_pty,
+            commands::pty::list_directory,
             commands::canvas::save_canvas,
             commands::canvas::load_canvas,
             commands::canvas::read_image_as_data_url,
@@ -99,6 +100,7 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                // Main window destroyed — full cleanup
                 if let Some(state) = window.try_state::<AppState>() {
                     if let Ok(mut sessions) = state.sessions.lock() {
                         sessions.clear();
