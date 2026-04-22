@@ -34,9 +34,9 @@ export function parseInput(input: string): ParsedCommand {
   if (trimmed === "/clear") return { type: "clear", raw: trimmed };
   if (trimmed === "/help") return { type: "help", raw: trimmed };
 
-  const canvasExportMatch = trimmed.match(/^\/canvas-export(?:\s+@(\S+))?$/);
+  const canvasExportMatch = trimmed.match(/^\/canvas-export(?:\s+@(\S+))?(?:\s+([\s\S]+))?$/);
   if (canvasExportMatch) {
-    return { type: "canvas-export", target: canvasExportMatch[1], raw: trimmed };
+    return { type: "canvas-export", target: canvasExportMatch[1], message: canvasExportMatch[2]?.trim(), raw: trimmed };
   }
   const canvasImportMatch = trimmed.match(/^\/canvas-import(?:\s+@(\S+))?$/);
   if (canvasImportMatch) {
@@ -212,11 +212,16 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           break;
         }
 
-        const prompt = [
+        const lines = [
           "[Canvas Terminal] A canvas snapshot has been exported for your reference.",
           `Image path: ${path}`,
-          "Please analyze this image and respond.",
-        ].join("\n");
+        ];
+        if (cmd.message) {
+          lines.push(cmd.message);
+        } else {
+          lines.push("Please analyze this image and respond.");
+        }
+        const prompt = lines.join("\n");
 
         await store.sendToAgent(agent.sessionId, prompt);
         status(`Canvas exported to ${toolLabel(agent.tool)}`);

@@ -88,6 +88,9 @@ interface CanvasState {
   canRedo: boolean;
   zoomLevel: number;
   setZoomLevel: (level: number) => void;
+  /** Viewport pan offset — updated on pan/zoom for overlay positioning */
+  viewportPan: { x: number; y: number };
+  setViewportPan: (x: number, y: number) => void;
 }
 
 export const useCanvasStore = create<CanvasState>((set) => ({
@@ -107,4 +110,10 @@ export const useCanvasStore = create<CanvasState>((set) => ({
   canRedo: false,
   zoomLevel: 1,
   setZoomLevel: (level) => set({ zoomLevel: level }),
+  viewportPan: { x: 0, y: 0 },
+  setViewportPan: (x, y) =>
+    set((s) => {
+      if (s.viewportPan.x === x && s.viewportPan.y === y) return s;
+      return { viewportPan: { x, y } };
+    }),
 }));

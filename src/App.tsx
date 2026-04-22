@@ -30,7 +30,8 @@ export default function App() {
     const onMouseMove = (ev: MouseEvent) => {
       if (!dragging.current || !containerRef.current || !canvasPanelRef.current) return;
       const containerWidth = containerRef.current.getBoundingClientRect().width;
-      const newWidth = Math.max(280, Math.min(ev.clientX, containerWidth * 0.6));
+      // Allow canvas to expand up to full width (minus 48px minimum for terminal visibility)
+      const newWidth = Math.max(280, Math.min(ev.clientX, containerWidth - 48));
       canvasPanelRef.current.style.width = `${newWidth}px`;
     };
 
@@ -45,16 +46,25 @@ export default function App() {
   }, []);
 
   return (
-    <div ref={containerRef} className="flex h-screen w-screen bg-surface overflow-hidden">
+    <div ref={containerRef} className="flex h-screen w-screen overflow-hidden" style={{ background: "transparent" }}>
       {/* Canvas panel — always mounted, width controlled by CSS */}
       <div
         ref={canvasPanelRef}
         className="flex flex-shrink-0 h-full overflow-hidden"
-        style={{ width: drawerOpen ? "35%" : 0, minWidth: drawerOpen ? 280 : 0 }}
+        style={{
+          background: "transparent",
+          width: drawerOpen ? "35%" : 0,
+          minWidth: drawerOpen ? 280 : 0,
+        }}
       >
         <Toolbar onExportToTerminal={exportToTerminal} onImportIntoCanvas={importIntoCanvas} isWaitingForImport={isWaitingForImport} />
-        <div className="flex-1 h-full min-w-0 border-r border-surface-lighter">
-          <DrawingBoard />
+        <div
+          className="flex-1 h-full min-w-0 border-r border-surface-lighter"
+          style={{ background: "#2f2f2f" }}
+        >
+          <div className="h-full w-full">
+            <DrawingBoard />
+          </div>
         </div>
       </div>
 
@@ -67,7 +77,7 @@ export default function App() {
       )}
 
       {/* Terminal — always mounted, never re-created */}
-      <div className="flex-1 h-full min-w-0">
+      <div className="flex-1 h-full min-w-0 bg-surface">
         <TerminalTabs />
       </div>
     </div>

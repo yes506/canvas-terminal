@@ -9,6 +9,7 @@ import {
 import { useCollabSessionId } from "./CollabSessionContext";
 import { parseInput, executeCommand } from "./commands";
 import { AtMention, extractMentionQuery } from "./AtMention";
+import { FileCompletion, escapeShellPath, extractFileQuery } from "./FileCompletion";
 import type { SpawnedAgent } from "../../types/collaborator";
 
 const BASE_HEIGHT = 28; // single-line height in px
@@ -39,9 +40,12 @@ export function InputPrompt() {
   const collabSessionId = useCollabSessionId();
   const [value, setValue] = useState("");
   const [mentionIndex, setMentionIndex] = useState(0);
+  const [fileIndex, setFileIndex] = useState(0);
+  const [fileEntryCount, setFileEntryCount] = useState(0);
   const [pending, setPending] = useState<PendingMessage | null>(null);
   const [selectorIndex, setSelectorIndex] = useState(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileSelectRef = useRef<((confirmDir?: boolean) => void) | null>(null);
   const pushHistory = useCollaboratorStore((s) => s.pushHistory);
   const navigateHistory = useCollaboratorStore((s) => s.navigateHistory);
   const agents = useCollaboratorStore(
@@ -59,9 +63,11 @@ export function InputPrompt() {
     }
   }, [pendingInput, setPendingInput, collabSessionId]);
 
-  // Compute mention state
+  // Compute mention and file-completion state
   const cursorPos = inputRef.current?.selectionStart ?? value.length;
-  const mention = extractMentionQuery(value, cursorPos);
+  const fileQuery = extractFileQuery(value, cursorPos);
+  const mention = fileQuery ? null : extractMentionQuery(value, cursorPos);
+  const showFile = fileQuery !== null;
   const showMention = mention !== null && agents.length > 0;
 
   // Build selector options: individual agents + "all" (skip "all" for canvas commands)
@@ -98,6 +104,16 @@ export function InputPrompt() {
     setMentionIndex(0);
   }, [mention?.query]);
 
+  // Reset file index when file query changes
+  useEffect(() => {
+    setFileIndex(0);
+  }, [fileQuery?.query]);
+
+  // Track file entry count for keyboard bounds (updated by FileCompletion via callback)
+  const handleFileEntryCount = useCallback((count: number) => {
+    setFileEntryCount(count);
+  }, []);
+
   // Reset selector index when pending changes
   useEffect(() => {
     setSelectorIndex(0);
@@ -113,6 +129,42 @@ export function InputPrompt() {
   const rows = Math.min(lineCount, MAX_ROWS);
   const textareaHeight =
     rows <= 1 ? BASE_HEIGHT : BASE_HEIGHT + (rows - 1) * LINE_HEIGHT;
+
+  const insertFilePath = useCallback(
+    (fullPath: string, isDir: boolean, confirmSelect?: boolean) => {
+      if (!fileQuery) return;
+      if (isDir && !confirmSelect) {
+        // Tab on directory — descend into it, keep @ trigger and dropdown open
+        const before = value.slice(0, fileQuery.start);
+        const after = value.slice(cursorPos);
+        const escapedPath = escapeShellPath(fullPath);
+        const dirPath = escapedPath.endsWith("/") ? escapedPath : `${escapedPath}/`;
+        const newValue = `${before}@${dirPath}${after}`;
+        setValue(newValue);
+        const newPos = fileQuery.start + 1 + dirPath.length;
+        requestAnimationFrame(() => {
+          inputRef.current?.setSelectionRange(newPos, newPos);
+          inputRef.current?.focus();
+        });
+      } else {
+        // Enter on any entry, or file selected — insert full path and close dropdown
+        const before = value.slice(0, fileQuery.start);
+        const after = value.slice(cursorPos);
+        const escapedPath = escapeShellPath(fullPath);
+        // Append trailing / for directories so the path is unambiguous
+        const suffix = isDir ? "/" : "";
+        const newValue = `${before}${escapedPath}${suffix} ${after}`;
+        setValue(newValue);
+        const newPos = fileQuery.start + escapedPath.length + suffix.length + 1;
+        requestAnimationFrame(() => {
+          inputRef.current?.setSelectionRange(newPos, newPos);
+          inputRef.current?.focus();
+        });
+      }
+      setFileIndex(0);
+    },
+    [fileQuery, value, cursorPos],
+  );
 
   const insertMention = useCallback(
     (name: string) => {
@@ -138,9 +190,12 @@ export function InputPrompt() {
       setPending(null);
 
       if (commandPrefix && option.agent) {
-        // Canvas command with target — execute as a slash command
+        // Canvas command with target — insert @handle right after the slash command
         const handle = option.detail ?? `@${toolShortName(option.agent.tool)}`;
-        const fullCmd = `${commandPrefix} ${handle}`;
+        const spaceIdx = commandPrefix.indexOf(" ", 1);
+        const baseCmd = spaceIdx > 0 ? commandPrefix.slice(0, spaceIdx) : commandPrefix;
+        const trailing = spaceIdx > 0 ? commandPrefix.slice(spaceIdx) : "";
+        const fullCmd = `${baseCmd} ${handle}${trailing}`;
         await executeCommand(parseInput(fullCmd), collabSessionId);
       } else {
         const store = useCollaboratorStore.getState();
@@ -170,7 +225,7 @@ export function InputPrompt() {
     const trimmed = value.trim();
     if (!trimmed) return;
 
-    pushHistory(trimmed);
+    pushHistory(trimmed, collabSessionId);
     setValue("");
 
     const cmd = parseInput(trimmed);
@@ -197,14 +252,15 @@ export function InputPrompt() {
         return;
       }
       const prefix = cmd.type === "canvas-export" ? "/canvas-export" : "/canvas-import";
+      const suffix = cmd.message ? ` ${cmd.message}` : "";
       if (agents.length === 1) {
         // Only one agent — execute directly
         const handle = `@${toolShortName(agents[0].tool)}`;
-        await executeCommand(parseInput(`${prefix} ${handle}`), collabSessionId);
+        await executeCommand(parseInput(`${prefix} ${handle}${suffix}`), collabSessionId);
         return;
       }
-      // Multiple agents — show target selector
-      setPending({ message: prefix, commandPrefix: prefix });
+      // Multiple agents — show target selector (preserve user message in commandPrefix)
+      setPending({ message: `${prefix}${suffix}`, commandPrefix: `${prefix}${suffix}` });
       return;
     }
 
@@ -247,6 +303,38 @@ export function InputPrompt() {
           return;
         }
         return;
+      }
+
+      // When file completion dropdown is visible, intercept navigation keys
+      if (showFile && fileEntryCount > 0) {
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setFileIndex((i) => (i > 0 ? i - 1 : fileEntryCount - 1));
+          return;
+        }
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setFileIndex((i) => (i < fileEntryCount - 1 ? i + 1 : 0));
+          return;
+        }
+        if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+          e.preventDefault();
+          // Enter = confirm selection (insert path, close dropdown)
+          // Tab   = navigate into directory (keep dropdown open)
+          const confirmDir = e.key === "Enter";
+          fileSelectRef.current?.(confirmDir);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          // Remove the @path text to dismiss
+          if (fileQuery) {
+            const before = value.slice(0, fileQuery.start);
+            const after = value.slice(cursorPos);
+            setValue(before + after);
+          }
+          return;
+        }
       }
 
       // When mention dropdown is visible, intercept navigation keys
@@ -299,11 +387,11 @@ export function InputPrompt() {
       } else if (e.key === "ArrowUp" && !value.includes("\n")) {
         // Only navigate history when input is single-line
         e.preventDefault();
-        const prev = navigateHistory("up");
+        const prev = navigateHistory("up", collabSessionId, value);
         if (prev !== null) setValue(prev);
       } else if (e.key === "ArrowDown" && !value.includes("\n")) {
         e.preventDefault();
-        const next = navigateHistory("down");
+        const next = navigateHistory("down", collabSessionId);
         if (next !== null) setValue(next);
       }
     },
@@ -313,6 +401,9 @@ export function InputPrompt() {
       selectorIndex,
       executeWithTarget,
       dismissSelector,
+      showFile,
+      fileEntryCount,
+      fileQuery,
       showMention,
       filteredCount,
       mentionIndex,
@@ -355,6 +446,17 @@ export function InputPrompt() {
             </button>
           ))}
         </div>
+      )}
+
+      {/* File path completion dropdown */}
+      {showFile && !showSelector && fileQuery && (
+        <FileCompletion
+          query={fileQuery.query}
+          selectedIndex={fileIndex}
+          onSelect={insertFilePath}
+          onEntryCount={handleFileEntryCount}
+          selectRef={fileSelectRef}
+        />
       )}
 
       {/* @ mention dropdown */}

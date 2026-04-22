@@ -22,14 +22,44 @@ export async function exportCanvasSnapshot(): Promise<string | null> {
   const fabricCanvas = useCanvasStore.getState().fabricCanvas;
   if (!fabricCanvas || fabricCanvas.getObjects().length === 0) return null;
 
-  const dataUrl = fabricCanvas.toDataURL({
-    format: "png",
-    quality: 1,
-    multiplier: window.devicePixelRatio,
-  });
+  const dataUrl = exportCanvasToDataUrl(fabricCanvas);
   const base64Data = dataUrl.replace(/^data:image\/png;base64,/, "");
   const savedPath = await invoke<string>("export_snapshot", { base64Data });
   return savedPath || null;
+}
+
+/**
+ * Export the full canvas content as a data URL, ignoring viewport pan/zoom.
+ * Calculates the bounding box of all objects and exports exactly that region.
+ */
+export function exportCanvasToDataUrl(fabricCanvas: fabric.Canvas): string {
+  const savedVpt = [...fabricCanvas.viewportTransform] as typeof fabricCanvas.viewportTransform;
+  fabricCanvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+
+  try {
+    const objects = fabricCanvas.getObjects();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const obj of objects) {
+      const br = obj.getBoundingRect();
+      minX = Math.min(minX, br.left);
+      minY = Math.min(minY, br.top);
+      maxX = Math.max(maxX, br.left + br.width);
+      maxY = Math.max(maxY, br.top + br.height);
+    }
+
+    const padding = 20;
+    return fabricCanvas.toDataURL({
+      format: "png",
+      quality: 1,
+      multiplier: window.devicePixelRatio,
+      left: minX - padding,
+      top: minY - padding,
+      width: maxX - minX + padding * 2,
+      height: maxY - minY + padding * 2,
+    });
+  } finally {
+    fabricCanvas.setViewportTransform(savedVpt);
+  }
 }
 
 export interface ImportPollHandle {
