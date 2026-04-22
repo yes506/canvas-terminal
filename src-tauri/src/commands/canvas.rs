@@ -290,6 +290,36 @@ pub fn cleanup_import_file(suffix: Option<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn read_document_as_base64(path: String) -> Result<String, String> {
+    let safe_path = validate_read_path(&path)?;
+
+    // Allow document formats
+    let ext = safe_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let allowed = [
+        "pdf", "docx", "xlsx", "xls", "csv", "tsv", "hwp", "hwpx",
+    ];
+    if !allowed.contains(&ext.as_str()) {
+        return Err(format!("Document type not permitted: {}", ext));
+    }
+
+    let metadata = std::fs::metadata(&safe_path).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_IMAGE_READ_SIZE {
+        return Err(format!("Document too large: {} bytes", metadata.len()));
+    }
+
+    let mut file = std::fs::File::open(&safe_path).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+    Ok(b64)
+}
+
+#[tauri::command]
 pub fn read_image_as_data_url(path: String) -> Result<String, String> {
     let safe_path = validate_read_path(&path)?;
 
