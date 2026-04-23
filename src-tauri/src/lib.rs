@@ -86,6 +86,7 @@ pub fn run() {
             commands::canvas::save_canvas,
             commands::canvas::load_canvas,
             commands::canvas::read_image_as_data_url,
+            commands::canvas::read_document_as_base64,
             commands::canvas::save_binary_file,
             commands::canvas::export_snapshot,
             commands::canvas::check_import_file,

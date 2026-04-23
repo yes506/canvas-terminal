@@ -55,7 +55,7 @@ function toHtml(content: string, format: ResponseFormat): string {
   }
 }
 
-const RENDER_STYLES = `
+export const RENDER_STYLES = `
   * { margin: 0; padding: 0; box-sizing: border-box; }
   :root { color: #d4d4d4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.6; }
   h1, h2, h3, h4, h5, h6 { color: #e0e0e0; margin: 0.6em 0 0.3em; }
