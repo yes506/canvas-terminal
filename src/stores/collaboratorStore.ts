@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import type { SpawnedAgent, ToolId, CollabTask } from "../types/collaborator";
+import type { SpawnedAgent, SpawnedAgentInit, ToolId, CollabTask } from "../types/collaborator";
 import { TOOL_CONFIGS } from "../types/collaborator";
+import { muteCapture } from "../lib/agentOutputCapture";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -21,46 +22,43 @@ export function toolShortName(tool: ToolId): string {
   return cfg?.command ?? tool;
 }
 
-/** Build a display name that disambiguates multiple sessions of the same tool. */
-export function agentDisplayName(
-  agent: SpawnedAgent,
-  allAgents: SpawnedAgent[],
-): string {
-  const sameToolAgents = allAgents
-    .filter((a) => a.tool === agent.tool)
-    .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
-  const base = toolLabel(agent.tool);
-
-  if (sameToolAgents.length <= 1) return base;
-
-  const index =
-    sameToolAgents.findIndex((a) => a.sessionId === agent.sessionId) + 1;
-  return `${base} #${index}`;
+/** Return the stored display name for an agent. */
+export function agentDisplayName(agent: SpawnedAgent): string {
+  return agent.displayName;
 }
 
 /**
  * Build the list of @-mentionable names from the current agent set.
- * Returns entries like ["claude", "codex"] or ["claude1", "claude2", "codex"].
+ * Derives directly from stored handles: ["claude1", "codex1", "claude2"].
  */
 export function mentionableNames(agents: SpawnedAgent[]): string[] {
-  const names: string[] = [];
-  const byTool = new Map<ToolId, SpawnedAgent[]>();
-  for (const a of agents) {
-    const list = byTool.get(a.tool) ?? [];
-    list.push(a);
-    byTool.set(a.tool, list);
-  }
-  for (const [tool, list] of byTool) {
-    const short = toolShortName(tool);
-    if (list.length === 1) {
-      names.push(short);
-    } else {
-      list
-        .sort((a, b) => a.sessionId.localeCompare(b.sessionId))
-        .forEach((_, i) => names.push(`${short}${i + 1}`));
+  return agents.map((a) => a.handle);
+}
+
+/** Return the stored @-mention handle for an agent. */
+export function agentMentionName(agent: SpawnedAgent): string {
+  return agent.handle;
+}
+
+// ---------------------------------------------------------------------------
+// Per-tool ordinal counter — monotonic, never reuses ordinals
+// ---------------------------------------------------------------------------
+
+const toolOrdinalCounters = new Map<string, number>();
+
+function nextOrdinal(collabSessionId: string, tool: ToolId): number {
+  const key = `${collabSessionId}:${tool}`;
+  const next = (toolOrdinalCounters.get(key) ?? 0) + 1;
+  toolOrdinalCounters.set(key, next);
+  return next;
+}
+
+function resetOrdinalCounters(forSession: string): void {
+  for (const key of toolOrdinalCounters.keys()) {
+    if (key.startsWith(`${forSession}:`)) {
+      toolOrdinalCounters.delete(key);
     }
   }
-  return names;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +68,7 @@ export function mentionableNames(agents: SpawnedAgent[]): string[] {
 interface LogEntry {
   time: string; // HH:MM:SS
   role: "user" | "system" | "agent";
+  agent?: string; // e.g. "@claude2" — only set when role === "agent"
   content: string;
 }
 
@@ -82,8 +81,10 @@ function nowTime(): string {
 }
 
 function formatLogEntry(e: LogEntry): string {
-  const tag =
-    e.role === "user" ? "User" : e.role === "agent" ? "Agent" : "System";
+  let tag: string;
+  if (e.role === "user") tag = "User";
+  else if (e.role === "agent") tag = e.agent ?? "Agent";
+  else tag = "System";
   return `## [${e.time}] ${tag}\n${e.content}\n`;
 }
 
@@ -111,6 +112,7 @@ You are a participant in a multi-agent collaboration.
 cat > SHARED_MEMORY_DIR/TASK_ID.done.json << 'EOF'
 {
   "task_id": "TASK_ID",
+  "author": "YOUR_IDENTITY",
   "status": "completed",
   "reasoning": "Why this approach, alternatives considered, trade-offs",
   "conclusion": "What was decided/done (1-3 sentences)",
@@ -119,7 +121,7 @@ cat > SHARED_MEMORY_DIR/TASK_ID.done.json << 'EOF'
 EOF
 \`\`\`
 
-Replace \`SHARED_MEMORY_DIR\` with the path shown above and \`TASK_ID\` with your assigned task ID.
+Replace \`SHARED_MEMORY_DIR\` with the path shown above, \`TASK_ID\` with your assigned task ID, and \`YOUR_IDENTITY\` with your agent identity (shown in the header above, e.g. @claude1).
 
 ### File Conventions
 - \`conversation-*.md\` — **Read only** for context. Do NOT write to it directly. The system appends task reports automatically when task status changes.
@@ -146,6 +148,7 @@ function formatTasksMarkdown(tasks: CollabTask[]): string {
     if (t.dependencies.length > 0) {
       lines.push(`**Dependencies**: ${t.dependencies.join(", ")}`);
     }
+    if (t.completedBy) lines.push(`**Completed By**: ${t.completedBy}`);
     if (t.reasoning) lines.push(`**Reasoning**: ${t.reasoning}`);
     if (t.conclusion) lines.push(`**Conclusion**: ${t.conclusion}`);
     if (t.output) lines.push(`**Output**: ${t.output}`);
@@ -248,7 +251,7 @@ interface CollaboratorState {
   endSession: (forSession: string) => void;
 
   // Agent lifecycle
-  addAgent: (agent: SpawnedAgent) => void;
+  addAgent: (agent: SpawnedAgentInit) => void;
   removeAgent: (sessionId: string) => void;
   setAgentStatus: (
     sessionId: string,
@@ -269,6 +272,7 @@ interface CollaboratorState {
     role: LogEntry["role"],
     content: string,
     forSession: string,
+    agentName?: string,
   ) => void;
 
   // Input prefill (scoped per collaborator session)
@@ -285,7 +289,7 @@ interface CollaboratorState {
   }, forSession: string) => CollabTask;
   updateTask: (
     taskId: string,
-    updates: Partial<Pick<CollabTask, "status" | "assignee" | "reasoning" | "conclusion" | "output">>,
+    updates: Partial<Pick<CollabTask, "status" | "assignee" | "reasoning" | "conclusion" | "output" | "completedBy">>,
     forSession: string,
   ) => void;
   getTasks: (forSession: string) => CollabTask[];
@@ -328,6 +332,8 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
         const data = JSON.parse(raw) as {
           task_id?: string;
           status?: string;
+          author?: string;
+          agent?: string;
           reasoning?: string;
           conclusion?: string;
           output?: string;
@@ -346,6 +352,7 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
           reasoning: data.reasoning ?? null,
           conclusion: data.conclusion ?? null,
           output: data.output ?? null,
+          completedBy: data.author ?? data.agent ?? null,
         }, forSession);
 
         // Delete the signal file after processing
@@ -364,6 +371,7 @@ async function prependContextHeader(
   text: string,
   collabSessionId: string | null,
   tasks: CollabTask[],
+  agentIdentity?: string | null,
 ): Promise<string> {
   const dir = await getMemoryDir();
   const parts: string[] = [];
@@ -393,6 +401,11 @@ async function prependContextHeader(
   parts.push(
     "[To share notes with other agents, write files to the shared memory directory above.]",
   );
+
+  // Inject agent identity so each agent knows who it is
+  if (agentIdentity) {
+    parts.push(`[Your identity: You are @${agentIdentity}. Use this name when authoring files or referencing yourself in logs.]`);
+  }
 
   // Inject task protocol and active task summary
   parts.push(TASK_PROTOCOL);
@@ -433,6 +446,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   },
 
   endSession: (forSession) => {
+    resetOrdinalCounters(forSession);
     set((s) => {
       const { [forSession]: _status, ...statusMessages } = s.statusMessages;
       const { [forSession]: _logs, ...logEntriesBySession } = s.logEntriesBySession;
@@ -456,7 +470,15 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
 
   // -- Agent lifecycle ----------------------------------------------------
 
-  addAgent: (agent) => {
+  addAgent: (raw) => {
+    const ordinal = nextOrdinal(raw.collabSessionId, raw.tool);
+    const short = toolShortName(raw.tool);
+    const agent: SpawnedAgent = {
+      ...raw,
+      ordinal,
+      handle: `${short}${ordinal}`,
+      displayName: `${toolLabel(raw.tool)} #${ordinal}`,
+    };
     set((s) => ({ agents: [...s.agents, agent] }));
   },
 
@@ -507,10 +529,12 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     }
     taskCounter = 0;
     if (sid) {
+      resetOrdinalCounters(sid);
       set((s) => ({
         agents: s.agents.filter((a) => a.collabSessionId !== sid),
       }));
     } else {
+      toolOrdinalCounters.clear();
       set({ agents: [] });
     }
     if (sid) {
@@ -543,6 +567,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       const agent = agents.find((a) => a.sessionId === sessionId);
       const tool = agent?.tool ?? null;
       const agentCollabId = agent?.collabSessionId ?? null;
+      const mention = agent ? agent.handle : "?";
 
       // Queue message if agent is still starting up
       if (agent?.status === "spawning") {
@@ -554,7 +579,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         }));
         if (agentCollabId) {
           get().setStatus("Agent starting up, message queued...", agentCollabId);
-          get().appendLog("system", `Message queued (agent starting): ${content.length > 80 ? content.substring(0, 77) + "..." : content}`, agentCollabId);
         }
         return;
       }
@@ -563,7 +587,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       if (agentCollabId) {
         const existing = tasksBySession[agentCollabId] ?? [];
         const hasActiveTask = existing.some((t) =>
-          t.assignee === `@${agent ? toolShortName(agent.tool) : "?"}` &&
+          t.assignee === `@${mention}` &&
           (t.status === "pending" || t.status === "in-progress"),
         );
         if (!hasActiveTask) {
@@ -571,17 +595,18 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
           get().addTask({
             title,
             objective: content,
-            assignee: `@${agent ? toolShortName(agent.tool) : "?"}`,
+            assignee: `@${mention}`,
           }, agentCollabId);
         }
       }
       const sessionTasks = agentCollabId ? (get().tasksBySession[agentCollabId] ?? []) : [];
-      const text = await prependContextHeader(content, agentCollabId, sessionTasks);
+      const text = await prependContextHeader(content, agentCollabId, sessionTasks, mention);
+      // Mute the output capture to suppress the echoed prompt from being logged
+      muteCapture(sessionId, 1500);
       await invoke("inject_into_pty", { sessionId, text, tool });
       const label = agent ? toolLabel(agent.tool) : sessionId;
       if (agentCollabId) {
         get().setStatus(`Sent to ${label}`, agentCollabId);
-        get().appendLog("user", `@${agent ? toolShortName(agent.tool) : "?"} ${content}`, agentCollabId);
       }
     } catch (err) {
       const { agents } = get();
@@ -604,7 +629,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     if (sid) {
       for (const agent of targetAgents) {
         const existing = tasksBySession[sid] ?? [];
-        const mention = `@${toolShortName(agent.tool)}`;
+        const mention = `@${agent.handle}`;
         const hasActiveTask = existing.some((t) =>
           t.assignee === mention &&
           (t.status === "pending" || t.status === "in-progress"),
@@ -619,7 +644,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         }
       }
     }
-    const text = await prependContextHeader(content, sid, sid ? (get().tasksBySession[sid] ?? []) : []);
+    const sessionTasks = sid ? (get().tasksBySession[sid] ?? []) : [];
     let sent = 0;
     for (const agent of targetAgents) {
       // Queue for agents that are still starting up
@@ -634,6 +659,11 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         continue;
       }
       try {
+        // Each agent gets its own identity injected into the context header
+        const identity = agent.handle;
+        const text = await prependContextHeader(content, sid, sessionTasks, identity);
+        // Mute the output capture to suppress the echoed prompt from being logged
+        muteCapture(agent.sessionId, 1500);
         await invoke("inject_into_pty", {
           sessionId: agent.sessionId,
           text,
@@ -646,7 +676,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     }
     if (sid) {
       get().setStatus(`Broadcast sent to ${sent} agent${sent !== 1 ? "s" : ""}`, sid);
-      get().appendLog("user", `@all ${content}`, sid);
     }
   },
 
@@ -663,8 +692,8 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
 
   getStatus: (forSession) => get().statusMessages[forSession] ?? null,
 
-  appendLog: (role, content, forSession) => {
-    const entry: LogEntry = { time: nowTime(), role, content };
+  appendLog: (role, content, forSession, agentName) => {
+    const entry: LogEntry = { time: nowTime(), role, content, agent: agentName };
     set((s) => ({
       logEntriesBySession: {
         ...s.logEntriesBySession,
@@ -720,6 +749,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       reasoning: null,
       conclusion: null,
       output: null,
+      completedBy: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -756,7 +786,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       if (isTerminal && statusChanged) {
         const report = [
           `# ${task.id} — ${task.status}`,
-          `**Agent**: ${task.assignee ?? "unassigned"}`,
+          `**Agent**: ${task.completedBy ?? task.assignee ?? "unassigned"}`,
           `**Subject**: ${task.title}`,
           task.reasoning ? `**Reasoning**: ${task.reasoning}` : null,
           task.conclusion ? `**Conclusion**: ${task.conclusion}` : null,

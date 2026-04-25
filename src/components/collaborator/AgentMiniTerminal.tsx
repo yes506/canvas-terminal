@@ -4,12 +4,12 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useShallow } from "zustand/react/shallow";
 import { terminalThemes } from "../terminal/themes";
 import { useTerminalStore } from "../../stores/terminalStore";
-import { useCollaboratorStore, agentDisplayName, toolLabel, scanForTaskCompletions } from "../../stores/collaboratorStore";
+import { useCollaboratorStore, agentDisplayName, scanForTaskCompletions } from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
-import { createOutputCapture, stripAnsi } from "../../lib/agentOutputCapture";
+import { createOutputCapture, stripAnsi, registerCapture, unregisterCapture } from "../../lib/agentOutputCapture";
+import { isEnvBootstrapped } from "../../lib/terminalManager";
 import type { ToolConfig } from "../../types/collaborator";
 import { X } from "lucide-react";
 
@@ -53,7 +53,7 @@ export function AgentMiniTerminal({
   useEffect(() => {
     disposed.current = false;
 
-    const timer = setTimeout(async () => {
+    const initTerminal = async () => {
       if (!termRef.current || terminalRef.current) return;
 
       const { fontSize, themeName } = useTerminalStore.getState();
@@ -115,16 +115,17 @@ export function AgentMiniTerminal({
       observerRef.current = observer;
 
       const capture = createOutputCapture({
-        agentLabel: toolLabel(tool.id),
-        onFlush: () => {
-          // After agent output settles, check for task completion signals.
-          // Agents write *.done.json files to shared memory to signal completion.
+        agentLabel: tool.label,
+        onFlush: (_label, _text) => {
           if (collabSessionId) {
+            // Only scan for task completion signals — do NOT log raw PTY output
+            // to the conversation file. Only task reports belong there.
             scanForTaskCompletions(collabSessionId);
           }
         },
       });
       captureRef.current = capture;
+      registerCapture(sessionId, capture);
 
       // Listen for PTY output
       unlistenDataRef.current = await listen<string>(
@@ -167,21 +168,39 @@ export function AgentMiniTerminal({
         return;
       }
 
-      // Spawn shell
+      // Spawn the CLI tool — try direct process first, fall back to shell
+      const [program, ...programArgs] = tool.command.split(/\s+/);
+      let spawnedViaShell = false;
+
       try {
-        await invoke("spawn_shell", {
+        await invoke("spawn_process", {
           sessionId,
+          program,
+          args: programArgs.length > 0 ? programArgs : null,
+          extraEnv: null,
+          cwd: cwd ?? null,
           cols: terminal.cols,
           rows: terminal.rows,
-          cwd: cwd ?? null,
         });
-      } catch (err) {
-        if (!disposed.current) {
-          terminal.write(
-            `\r\n\x1b[31m[Failed to start shell: ${err}]\x1b[0m\r\n`,
-          );
+      } catch {
+        // Fallback: spawn shell then type the command
+        spawnedViaShell = true;
+        try {
+          await invoke("spawn_shell", {
+            sessionId,
+            cols: terminal.cols,
+            rows: terminal.rows,
+            cwd: cwd ?? null,
+            login: !isEnvBootstrapped(),
+          });
+        } catch (shellErr) {
+          if (!disposed.current) {
+            terminal.write(
+              `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
+            );
+          }
+          return;
         }
-        return;
       }
 
       if (disposed.current) return;
@@ -472,14 +491,16 @@ export function AgentMiniTerminal({
       terminal.textarea?.addEventListener("focus", () => setFocused(true));
       terminal.textarea?.addEventListener("blur", () => setFocused(false));
 
-      // Run the AI CLI tool command
-      try {
-        await invoke("write_to_pty", {
-          sessionId,
-          data: tool.command + "\n",
-        });
-      } catch {
-        // Shell may have exited already
+      // If we fell back to shell spawn, type the CLI tool command into the shell
+      if (spawnedViaShell) {
+        try {
+          await invoke("write_to_pty", {
+            sessionId,
+            data: tool.command + "\n",
+          });
+        } catch {
+          // Shell may have exited already
+        }
       }
 
       // Register in store as "spawning" — not ready for messages yet.
@@ -498,7 +519,8 @@ export function AgentMiniTerminal({
       const READY_PATTERNS = [
         />\s*$/,       // Claude Code prompt: "> "
         /❯\s*$/,      // Codex CLI prompt
-        /\$\s*$/,      // Generic shell prompt
+        /✦\s*$/,      // Gemini CLI prompt
+        />>>\s*$/,     // Gemini CLI alternate prompt
       ];
       let readyDetected = false;
       // We accumulate a small tail buffer to match prompt patterns
@@ -512,7 +534,7 @@ export function AgentMiniTerminal({
           store.setAgentStatus(sessionId, "running");
           store.flushPendingMessages(sessionId);
         }
-      }, 8000); // 8s fallback — if CLI doesn't show a recognizable prompt
+      }, 5000); // 5s fallback — if CLI doesn't show a recognizable prompt
 
       const checkReady = (raw: string) => {
         if (readyDetected) return;
@@ -556,10 +578,11 @@ export function AgentMiniTerminal({
           }
         }, 80);
       });
-    }, 0);
+    };
+
+    initTerminal();
 
     return () => {
-      clearTimeout(timer);
       if (readyTimeoutRef.current) {
         clearTimeout(readyTimeoutRef.current);
         readyTimeoutRef.current = null;
@@ -569,6 +592,7 @@ export function AgentMiniTerminal({
       captureRef.current?.flush();
       captureRef.current?.dispose();
       captureRef.current = null;
+      unregisterCapture(sessionId);
       unlistenDataRef.current?.();
       unlistenExitRef.current?.();
       observerRef.current?.disconnect();
@@ -609,7 +633,11 @@ export function AgentMiniTerminal({
         }, 0);
       }
     };
-  }, [sessionId, tool.command, cwd, collabSessionId]);
+    // cwd intentionally excluded — it may update asynchronously after mount
+    // (Step 3: non-blocking CWD). Including it would destroy and recreate the
+    // terminal when CWD resolves. The initial cwd value at mount time is sufficient.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, tool.command, collabSessionId]);
 
   // React to theme changes
   useEffect(() => {
@@ -642,10 +670,7 @@ export function AgentMiniTerminal({
   const agent = useCollaboratorStore((s) =>
     s.agents.find((a) => a.sessionId === sessionId),
   );
-  const sessionAgents = useCollaboratorStore(
-    useShallow((s) => s.agents.filter((a) => a.collabSessionId === collabSessionId)),
-  );
-  const displayName = agent ? agentDisplayName(agent, sessionAgents) : tool.label;
+  const displayName = agent ? agentDisplayName(agent) : tool.label;
   const isExited = agent?.status === "exited";
   const isSpawning = agent?.status === "spawning";
 

@@ -4,7 +4,6 @@ import {
   useCollaboratorStore,
   mentionableNames,
   agentDisplayName,
-  toolShortName,
 } from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
 import { parseInput, executeCommand } from "./commands";
@@ -23,17 +22,8 @@ interface PendingMessage {
   commandPrefix?: string;
 }
 
-function targetHandle(agent: SpawnedAgent, allAgents: SpawnedAgent[]): string {
-  const sameToolAgents = allAgents
-    .filter((a) => a.tool === agent.tool)
-    .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
-  const short = toolShortName(agent.tool);
-
-  if (sameToolAgents.length <= 1) return `@${short}`;
-
-  const index =
-    sameToolAgents.findIndex((a) => a.sessionId === agent.sessionId) + 1;
-  return `@${short}${index}`;
+function targetHandle(agent: SpawnedAgent): string {
+  return `@${agent.handle}`;
 }
 
 export function InputPrompt() {
@@ -70,21 +60,21 @@ export function InputPrompt() {
   const showFile = fileQuery !== null;
   const showMention = mention !== null && agents.length > 0;
 
-  // Build selector options: individual agents + "all" (skip "all" for canvas commands)
-  // Sort by sessionId to match the numbering used in agentDisplayName/targetHandle.
-  const sortedAgents = [...agents].sort((a, b) =>
-    a.sessionId.localeCompare(b.sessionId),
-  );
+  // Build selector options: individual agents + "all" when the pending command supports broadcast.
+  // Sort by ordinal for consistent ordering in the selector.
+  const sortedAgents = [...agents].sort((a, b) => a.ordinal - b.ordinal || a.tool.localeCompare(b.tool));
   const selectorOptions: Array<{
     label: string;
     detail?: string;
     agent: SpawnedAgent | null;
   }> = sortedAgents.map((a) => ({
-    label: agentDisplayName(a, agents),
-    detail: targetHandle(a, agents),
+    label: agentDisplayName(a),
+    detail: targetHandle(a),
     agent: a,
   }));
-  if (agents.length > 1 && !pending?.commandPrefix) {
+  const allowAllSelectorOption =
+    !pending?.commandPrefix || !pending.commandPrefix.startsWith("/canvas-import");
+  if (agents.length > 1 && allowAllSelectorOption) {
     selectorOptions.push({ label: "All agents", detail: "@all", agent: null });
   }
   const showSelector = pending !== null && selectorOptions.length > 0;
@@ -124,11 +114,37 @@ export function InputPrompt() {
     inputRef.current?.focus();
   }, []);
 
-  // Auto-resize textarea height
-  const lineCount = value.split("\n").length;
-  const rows = Math.min(lineCount, MAX_ROWS);
-  const textareaHeight =
-    rows <= 1 ? BASE_HEIGHT : BASE_HEIGHT + (rows - 1) * LINE_HEIGHT;
+  // Auto-resize textarea height based on scrollHeight (handles soft wraps + hard newlines)
+  const MAX_HEIGHT = BASE_HEIGHT + (MAX_ROWS - 1) * LINE_HEIGHT;
+  const [textareaHeight, setTextareaHeight] = useState(BASE_HEIGHT);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    // Reset to minimum so scrollHeight reflects actual content
+    el.style.height = `${BASE_HEIGHT}px`;
+    const needed = Math.min(el.scrollHeight, MAX_HEIGHT);
+    el.style.height = `${needed}px`;
+    el.style.overflowY = el.scrollHeight > MAX_HEIGHT ? "auto" : "hidden";
+    setTextareaHeight(needed);
+  }, [value]);
+
+  // Re-measure when the container width changes (soft wraps change without text change)
+  useEffect(() => {
+    const el = inputRef.current?.parentElement;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      const ta = inputRef.current;
+      if (!ta) return;
+      ta.style.height = `${BASE_HEIGHT}px`;
+      const needed = Math.min(ta.scrollHeight, MAX_HEIGHT);
+      ta.style.height = `${needed}px`;
+      ta.style.overflowY = ta.scrollHeight > MAX_HEIGHT ? "auto" : "hidden";
+      setTextareaHeight(needed);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const insertFilePath = useCallback(
     (fullPath: string, isDir: boolean, confirmSelect?: boolean) => {
@@ -189,9 +205,11 @@ export function InputPrompt() {
       const { message: msg, commandPrefix } = pending;
       setPending(null);
 
-      if (commandPrefix && option.agent) {
-        // Canvas command with target — insert @handle right after the slash command
-        const handle = option.detail ?? `@${toolShortName(option.agent.tool)}`;
+      if (commandPrefix) {
+        // Canvas command with target — insert @handle or @all right after the slash command
+        const handle = option.agent
+          ? (option.detail ?? `@${option.agent.handle}`)
+          : "@all";
         const spaceIdx = commandPrefix.indexOf(" ", 1);
         const baseCmd = spaceIdx > 0 ? commandPrefix.slice(0, spaceIdx) : commandPrefix;
         const trailing = spaceIdx > 0 ? commandPrefix.slice(spaceIdx) : "";
@@ -245,17 +263,34 @@ export function InputPrompt() {
       return;
     }
 
-    // Canvas commands without a target → show target selector
-    if ((cmd.type === "canvas-export" || cmd.type === "canvas-import") && !cmd.target) {
+    // Canvas export without a target → show target selector (not auto-broadcast)
+    if (cmd.type === "canvas-export" && !cmd.target) {
       if (agents.length === 0) {
         useCollaboratorStore.getState().setStatus("No agents running.", collabSessionId);
         return;
       }
-      const prefix = cmd.type === "canvas-export" ? "/canvas-export" : "/canvas-import";
+      const prefix = "/canvas-export";
+      const suffix = cmd.message ? ` ${cmd.message}` : "";
+      if (agents.length === 1) {
+        const handle = agents[0].handle;
+        await executeCommand(parseInput(`${prefix} ${handle}${suffix}`), collabSessionId);
+        return;
+      }
+      setPending({ message: `${prefix}${suffix}`, commandPrefix: `${prefix}${suffix}` });
+      return;
+    }
+
+    // Canvas import without a target → show target selector
+    if (cmd.type === "canvas-import" && !cmd.target) {
+      if (agents.length === 0) {
+        useCollaboratorStore.getState().setStatus("No agents running.", collabSessionId);
+        return;
+      }
+      const prefix = "/canvas-import";
       const suffix = cmd.message ? ` ${cmd.message}` : "";
       if (agents.length === 1) {
         // Only one agent — execute directly
-        const handle = `@${toolShortName(agents[0].tool)}`;
+        const handle = agents[0].handle;
         await executeCommand(parseInput(`${prefix} ${handle}${suffix}`), collabSessionId);
         return;
       }

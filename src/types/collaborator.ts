@@ -13,12 +13,23 @@ export const TOOL_CONFIGS: ToolConfig[] = [
   { id: "gemini_cli", label: "Gemini CLI", command: "gemini", colorClass: "text-blue-400" },
 ];
 
-export interface SpawnedAgent {
+/** Raw spawn facts passed by AgentMiniTerminal to addAgent(). Identity fields are computed by the store. */
+export interface SpawnedAgentInit {
   sessionId: string;
   tool: ToolId;
   status: "spawning" | "running" | "exited";
   /** Which collaborator pane owns this agent. */
   collabSessionId: string;
+}
+
+/** Fully materialized agent with stored identity. */
+export interface SpawnedAgent extends SpawnedAgentInit {
+  /** Monotonic per-tool ordinal within this collab session (1, 2, 3...). Always >= 1. */
+  ordinal: number;
+  /** Canonical @-mention handle. Always indexed: "claude1", "codex1", "gemini2", etc. */
+  handle: string;
+  /** Human-readable display name. Always indexed: "Claude Code #1", "Codex CLI #2", etc. */
+  displayName: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +61,8 @@ export interface CollabTask {
   conclusion: string | null;
   /** Output — file paths, artifacts, or key results produced */
   output: string | null;
+  /** Who actually completed this task (from .done.json author field). Distinct from assignee. */
+  completedBy: string | null;
   /** ISO timestamp of creation */
   createdAt: string;
   /** ISO timestamp of last update */

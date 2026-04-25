@@ -20,6 +20,8 @@ interface Spawn {
   sessionId: string;
   tool: ToolConfig;
   cwd: string | null;
+  /** True once the initial CWD has been resolved (or failed). */
+  cwdReady: boolean;
 }
 
 export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
@@ -52,23 +54,40 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Spawn a new agent
-  const handleSpawn = useCallback(async (tool: ToolConfig) => {
-    // Resolve CWD from the active terminal pane
-    let cwd: string | null = null;
-    try {
-      const activeSession = getActiveSessionId();
-      if (activeSession) {
-        cwd = await invoke<string>("get_pty_cwd", {
-          sessionId: activeSession,
-        });
-      }
-    } catch {
-      // Fall back to null (home directory)
-    }
-
+  // Spawn a new agent — show UI tile immediately, resolve CWD before starting PTY
+  const handleSpawn = useCallback((tool: ToolConfig) => {
     const sessionId = generateSessionId();
-    setSpawns((prev) => [...prev, { sessionId, tool, cwd }]);
+    // Add spawn immediately for instant UI feedback (tile visible, but PTY waits for CWD)
+    setSpawns((prev) => [...prev, { sessionId, tool, cwd: null, cwdReady: false }]);
+
+    // Resolve CWD asynchronously with a timeout, then mark ready so AgentMiniTerminal mounts.
+    // If lsof stalls or takes too long, proceed with null cwd (home directory) after 2s.
+    (async () => {
+      let resolved: string | null = null;
+      try {
+        const activeSession = getActiveSessionId();
+        if (activeSession) {
+          const cwdPromise = invoke<string>("get_pty_cwd", {
+            sessionId: activeSession,
+          });
+          const timeoutPromise = new Promise<null>((resolve) =>
+            setTimeout(() => resolve(null), 2000),
+          );
+          resolved = await Promise.race([cwdPromise, timeoutPromise]);
+        }
+      } catch {
+        // Fall back to null (home directory)
+      }
+      if (mountedRef.current) {
+        setSpawns((prev) =>
+          prev.map((s) =>
+            s.sessionId === sessionId
+              ? { ...s, cwd: resolved, cwdReady: true }
+              : s,
+          ),
+        );
+      }
+    })();
   }, []);
 
   // Close a single agent
@@ -122,15 +141,32 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                     : `repeat(${Math.ceil(spawns.length / 2)}, 1fr)`,
               }}
             >
-              {spawns.map((spawn) => (
-                <AgentMiniTerminal
-                  key={spawn.sessionId}
-                  sessionId={spawn.sessionId}
-                  tool={spawn.tool}
-                  cwd={spawn.cwd}
-                  onClose={handleClose}
-                />
-              ))}
+              {spawns.map((spawn) =>
+                spawn.cwdReady ? (
+                  <AgentMiniTerminal
+                    key={spawn.sessionId}
+                    sessionId={spawn.sessionId}
+                    tool={spawn.tool}
+                    cwd={spawn.cwd}
+                    onClose={handleClose}
+                  />
+                ) : (
+                  <div
+                    key={spawn.sessionId}
+                    className="flex flex-col h-full min-h-0 border rounded-md overflow-hidden border-surface-lighter"
+                  >
+                    <div className="flex items-center gap-2 px-2 py-1 bg-surface-light border-b border-surface-lighter text-xs shrink-0">
+                      <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-yellow-400 animate-pulse" />
+                      <span className={`font-bold ${spawn.tool.colorClass} truncate`}>
+                        {spawn.tool.label}
+                      </span>
+                    </div>
+                    <div className="flex-1 flex items-center justify-center text-text-dim text-xs font-mono">
+                      Starting...
+                    </div>
+                  </div>
+                ),
+              )}
             </div>
           )}
         </div>

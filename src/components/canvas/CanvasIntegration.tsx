@@ -78,9 +78,16 @@ export function useCanvasIntegration() {
     if (!fabricCanvas) return;
     if (fabricCanvas.getObjects().length === 0) return;
 
-    // Route through collaborator command line when active
+    // Route through collaborator command line when active — prefill the
+    // command and let the user choose a target (@agent or @all).
+    // If only one agent is running, auto-target it for convenience.
     if (collabSessionId) {
-      useCollaboratorStore.getState().setPendingInput(collabSessionId, "/canvas-export");
+      const store = useCollaboratorStore.getState();
+      const agents = store.getSessionAgents(collabSessionId);
+      const prefill = agents.length === 1
+        ? `/canvas-export ${agents[0].handle} `
+        : "/canvas-export ";
+      store.setPendingInput(collabSessionId, prefill);
       return;
     }
 

@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   useCollaboratorStore,
   agentDisplayName,
-  toolShortName,
   toolLabel,
 } from "../../stores/collaboratorStore";
 import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps";
@@ -34,11 +33,11 @@ export function parseInput(input: string): ParsedCommand {
   if (trimmed === "/clear") return { type: "clear", raw: trimmed };
   if (trimmed === "/help") return { type: "help", raw: trimmed };
 
-  const canvasExportMatch = trimmed.match(/^\/canvas-export(?:\s+@(\S+))?(?:\s+([\s\S]+))?$/);
+  const canvasExportMatch = trimmed.match(/^\/canvas-export(?:\s+@?(\S+))?(?:\s+([\s\S]+))?$/);
   if (canvasExportMatch) {
     return { type: "canvas-export", target: canvasExportMatch[1], message: canvasExportMatch[2]?.trim(), raw: trimmed };
   }
-  const canvasImportMatch = trimmed.match(/^\/canvas-import(?:\s+@(\S+))?$/);
+  const canvasImportMatch = trimmed.match(/^\/canvas-import(?:\s+@?(\S+))?$/);
   if (canvasImportMatch) {
     return { type: "canvas-import", target: canvasImportMatch[1], raw: trimmed };
   }
@@ -83,27 +82,16 @@ export function resolveAgent(
 ): SpawnedAgent | null {
   const lower = target.toLowerCase();
 
-  // Indexed targeting: @claude1, @claude2, @codex2, etc.
-  const indexMatch = lower.match(/^([a-z]+?)(\d+)$/);
-  if (indexMatch) {
-    const toolPrefix = indexMatch[1];
-    const oneBasedIdx = parseInt(indexMatch[2], 10);
-    const sameToolAgents = agents
-      .filter((a) => toolShortName(a.tool).startsWith(toolPrefix))
-      .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
-    if (oneBasedIdx >= 1 && oneBasedIdx <= sameToolAgents.length) {
-      return sameToolAgents[oneBasedIdx - 1];
-    }
-    return null;
-  }
+  // Exact handle match (primary resolution path)
+  const exactMatch = agents.find((a) => a.handle === lower);
+  if (exactMatch) return exactMatch;
 
-  // Match by tool short name
-  return (
-    agents.find((a) => toolShortName(a.tool) === lower) ??
-    agents.find((a) => toolShortName(a.tool).includes(lower)) ??
-    agents.find((a) => a.sessionId === target) ??
-    null
-  );
+  // Prefix match: "@claude" → first agent whose handle starts with "claude"
+  const prefixMatch = agents.find((a) => a.handle.startsWith(lower));
+  if (prefixMatch) return prefixMatch;
+
+  // Fallback: sessionId match
+  return agents.find((a) => a.sessionId === target) ?? null;
 }
 
 export function getHelpText(): string {
@@ -120,7 +108,7 @@ export function getHelpText(): string {
     "Tasks: /task list  /task add <title> | <objective> [@agent]",
     "       /task <id> status <pending|in-progress|completed|blocked>",
     "       /task <id> assign @<agent>  /task <id> done [notes]",
-    "Canvas: /canvas-export [@a]  /canvas-import [@a]",
+    "Canvas: /canvas-export [agent] (no target = all)  /canvas-import [agent]",
     "Memory: /context <text>  /memory list|read|delete|clear",
     "Agents: @claude @codex @gemini  Indexed: @claude1 @claude2",
   ].join("\n");
@@ -132,7 +120,7 @@ export function getStatusText(agents: SpawnedAgent[]): string {
   }
   const lines = [`${agents.length} agent${agents.length !== 1 ? "s" : ""}:`];
   for (const a of agents) {
-    const name = agentDisplayName(a, agents);
+    const name = agentDisplayName(a);
     const statusTag = a.status === "exited" ? " [exited]" : "";
     lines.push(`  ${name}${statusTag}`);
   }
@@ -177,11 +165,11 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
       const lower = cmd.target.toLowerCase();
       if (!/\d$/.test(cmd.target)) {
         const matches = scopedAgents.filter((a) =>
-          toolShortName(a.tool).includes(lower),
+          a.handle.startsWith(lower),
         );
         if (matches.length > 1) {
           status(
-            `Multiple ${cmd.target} sessions. Use @${cmd.target}1, @${cmd.target}2. Sent to first.`,
+            `Multiple ${cmd.target} sessions. Use @${matches[0].handle}, @${matches[1].handle}. Sent to first.`,
           );
         }
       }
@@ -197,18 +185,10 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
 
     case "canvas-export": {
       try {
-        if (!cmd.target) {
-          status("Usage: /canvas-export @<agent>  (specify a target agent)");
-          break;
-        }
+        const target = cmd.target ?? "all";
         const path = await exportCanvasSnapshot();
         if (!path) {
           status("Canvas is empty.");
-          break;
-        }
-        const agent = resolveAgent(cmd.target, scopedAgents);
-        if (!agent) {
-          status(`Agent "${cmd.target}" not found. Saved at ${path}`);
           break;
         }
 
@@ -223,6 +203,22 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
         }
         const prompt = lines.join("\n");
 
+        if (target.toLowerCase() === "all") {
+          if (scopedAgents.length === 0) {
+            status(`Canvas exported at ${path}. No agents running to broadcast.`);
+            break;
+          }
+          await store.broadcastToAll(prompt, collabSessionId);
+          status(`Canvas broadcast to ${scopedAgents.length} agent${scopedAgents.length !== 1 ? "s" : ""}`);
+          break;
+        }
+
+        const agent = resolveAgent(target, scopedAgents);
+        if (!agent) {
+          status(`Agent "${target}" not found. Saved at ${path}`);
+          break;
+        }
+
         await store.sendToAgent(agent.sessionId, prompt);
         status(`Canvas exported to ${toolLabel(agent.tool)}`);
       } catch (err) {
@@ -234,7 +230,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
     case "canvas-import": {
       try {
         if (!cmd.target) {
-          status("Usage: /canvas-import @<agent>  (specify a target agent)");
+          status("Usage: /canvas-import <agent>  (specify a target agent)");
           break;
         }
         const agent = resolveAgent(cmd.target, scopedAgents);
@@ -267,18 +263,12 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             relativePath: "context.md",
           });
           status("Shared context cleared.");
-          if (collabSessionId) {
-            store.appendLog("system", "Context cleared", collabSessionId);
-          }
         } else if (cmd.message) {
           await invoke<string>("write_memory_file", {
             relativePath: "context.md",
             content: cmd.message,
           });
           status("Shared context updated.");
-          if (collabSessionId) {
-            store.appendLog("system", `Context set: ${cmd.message}`, collabSessionId);
-          }
         } else {
           const content = await invoke<string | null>("read_memory_file", {
             relativePath: "context.md",
