@@ -85,9 +85,9 @@ Use the input prompt at the bottom of the collaborator pane:
 | `@all investigate startup latency` | Explicitly broadcast to all running agents |
 | `/status` | Show active agents |
 | `/help` | Show command help |
-| `/canvas-export` | Export the current canvas to all agents |
-| `/canvas-import` | Ask all running agents to write responses and import each result back onto the canvas |
-| `/canvas-import @claude` | Ask one specific agent to write a response file and import it back |
+| `/canvas-export [msg]` | Export canvas and show target selector (or send to sole agent) |
+| `/canvas-export @agent [msg]` | Export canvas to a specific agent with optional prompt |
+| `/canvas-import @agent` | Ask a specific agent to write a response file and import it back |
 | `/context <text>` | Append shared context |
 | `/memory list` | List files in shared memory |
 | `/memory read <path>` | Read a shared-memory file |

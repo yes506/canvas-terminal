@@ -85,7 +85,7 @@ export function useCanvasIntegration() {
       const store = useCollaboratorStore.getState();
       const agents = store.getSessionAgents(collabSessionId);
       const prefill = agents.length === 1
-        ? `/canvas-export ${agents[0].handle} `
+        ? `/canvas-export @${agents[0].handle} `
         : "/canvas-export ";
       store.setPendingInput(collabSessionId, prefill);
       return;

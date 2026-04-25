@@ -85,9 +85,9 @@ Collaborator 패널 하단 입력창에서 다음과 같이 사용할 수 있습
 | `@all investigate startup latency` | 실행 중인 모든 에이전트에 명시적으로 브로드캐스트 |
 | `/status` | 활성 에이전트 목록 표시 |
 | `/help` | 명령 도움말 표시 |
-| `/canvas-export` | 현재 캔버스를 모든 에이전트에 내보내기 |
-| `/canvas-import` | 실행 중인 모든 에이전트가 응답을 쓰도록 요청하고, 각 결과를 다시 캔버스로 가져오기 |
-| `/canvas-import @claude` | 특정 에이전트 하나가 응답 파일을 쓰게 하고 다시 캔버스로 가져오기 |
+| `/canvas-export [메시지]` | 캔버스를 내보내고 대상 선택기 표시 (에이전트 1개면 자동 전송) |
+| `/canvas-export @agent [메시지]` | 특정 에이전트에 캔버스를 내보내기 (프롬프트 첨부 가능) |
+| `/canvas-import @agent` | 특정 에이전트가 응답 파일을 쓰게 하고 다시 캔버스로 가져오기 |
 | `/context <text>` | 공유 컨텍스트 추가 |
 | `/memory list` | 공유 메모리 파일 목록 표시 |
 | `/memory read <path>` | 공유 메모리 파일 읽기 |

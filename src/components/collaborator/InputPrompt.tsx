@@ -273,7 +273,7 @@ export function InputPrompt() {
       const suffix = cmd.message ? ` ${cmd.message}` : "";
       if (agents.length === 1) {
         const handle = agents[0].handle;
-        await executeCommand(parseInput(`${prefix} ${handle}${suffix}`), collabSessionId);
+        await executeCommand(parseInput(`${prefix} @${handle}${suffix}`), collabSessionId);
         return;
       }
       setPending({ message: `${prefix}${suffix}`, commandPrefix: `${prefix}${suffix}` });
@@ -291,7 +291,7 @@ export function InputPrompt() {
       if (agents.length === 1) {
         // Only one agent — execute directly
         const handle = agents[0].handle;
-        await executeCommand(parseInput(`${prefix} ${handle}${suffix}`), collabSessionId);
+        await executeCommand(parseInput(`${prefix} @${handle}${suffix}`), collabSessionId);
         return;
       }
       // Multiple agents — show target selector (preserve user message in commandPrefix)

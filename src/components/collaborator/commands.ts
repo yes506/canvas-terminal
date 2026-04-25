@@ -33,13 +33,22 @@ export function parseInput(input: string): ParsedCommand {
   if (trimmed === "/clear") return { type: "clear", raw: trimmed };
   if (trimmed === "/help") return { type: "help", raw: trimmed };
 
-  const canvasExportMatch = trimmed.match(/^\/canvas-export(?:\s+@?(\S+))?(?:\s+([\s\S]+))?$/);
+  // Canvas export: require explicit @target to distinguish agent handle from prompt message.
+  // Branch 1: /canvas-export @target [message] → groups 1,2
+  // Branch 2: /canvas-export message (no @)   → group 3
+  const canvasExportMatch = trimmed.match(/^\/canvas-export(?:\s+@(\S+)(?:\s+([\s\S]+))?|\s+([\s\S]+))?$/);
   if (canvasExportMatch) {
-    return { type: "canvas-export", target: canvasExportMatch[1], message: canvasExportMatch[2]?.trim(), raw: trimmed };
+    return {
+      type: "canvas-export",
+      target: canvasExportMatch[1],
+      message: (canvasExportMatch[2] ?? canvasExportMatch[3])?.trim(),
+      raw: trimmed,
+    };
   }
-  const canvasImportMatch = trimmed.match(/^\/canvas-import(?:\s+@?(\S+))?$/);
+  // Canvas import: require explicit @target (same fix as export)
+  const canvasImportMatch = trimmed.match(/^\/canvas-import(?:\s+@(\S+))?(?:\s+([\s\S]+))?$/);
   if (canvasImportMatch) {
-    return { type: "canvas-import", target: canvasImportMatch[1], raw: trimmed };
+    return { type: "canvas-import", target: canvasImportMatch[1], message: canvasImportMatch[2]?.trim(), raw: trimmed };
   }
 
   if (trimmed === "/context" || trimmed.startsWith("/context ")) {
@@ -108,7 +117,7 @@ export function getHelpText(): string {
     "Tasks: /task list  /task add <title> | <objective> [@agent]",
     "       /task <id> status <pending|in-progress|completed|blocked>",
     "       /task <id> assign @<agent>  /task <id> done [notes]",
-    "Canvas: /canvas-export [agent] (no target = all)  /canvas-import [agent]",
+    "Canvas: /canvas-export [msg]  /canvas-export @agent [msg]  /canvas-import @agent",
     "Memory: /context <text>  /memory list|read|delete|clear",
     "Agents: @claude @codex @gemini  Indexed: @claude1 @claude2",
   ].join("\n");
@@ -230,7 +239,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
     case "canvas-import": {
       try {
         if (!cmd.target) {
-          status("Usage: /canvas-import <agent>  (specify a target agent)");
+          status("Usage: /canvas-import @<agent>  (specify a target agent)");
           break;
         }
         const agent = resolveAgent(cmd.target, scopedAgents);
