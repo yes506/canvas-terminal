@@ -1,0 +1,94 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            arch_label: apple-silicon
+          - name: intel
+            runner: macos-13
+            target: x86_64-apple-darwin
+            arch_label: intel
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        run: npx tauri build --target ${{ matrix.target }}
+
+      - name: Rename DMG with architecture label
+        run: |
+          DMG_FILE=$(find src-tauri/target/${{ matrix.target }}/release/bundle/dmg -name '*.dmg' | head -1)
+          if [ -z "$DMG_FILE" ]; then
+            echo "ERROR: No DMG file found"
+            exit 1
+          fi
+          BASENAME=$(basename "$DMG_FILE" .dmg)
+          VERSION="${BASENAME##*_}"
+          NEW_NAME="Canvas-Terminal_${VERSION}_${{ matrix.arch_label }}.dmg"
+          cp "$DMG_FILE" "$NEW_NAME"
+          echo "DMG_PATH=$NEW_NAME" >> $GITHUB_ENV
+          echo "Built: $NEW_NAME"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.arch_label }}
+          path: ${{ env.DMG_PATH }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all DMG artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.dmg
+          generate_release_notes: true
+          draft: false
+          prerelease: false
