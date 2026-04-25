@@ -29,12 +29,16 @@ impl Drop for PtySession {
 
 pub struct AppState {
     pub sessions: Mutex<HashMap<String, PtySession>>,
+    /// Cached shell environment — resolved once via login shell, reused for all PTYs.
+    /// None = not yet bootstrapped. Some(map) = ready.
+    pub cached_env: Mutex<Option<HashMap<String, String>>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            cached_env: Mutex::new(None),
         }
     }
 }

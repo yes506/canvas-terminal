@@ -53,6 +53,34 @@ export interface ManagedTerminal {
 const sessions = new Map<string, ManagedTerminal>();
 
 // ---------------------------------------------------------------------------
+// Env bootstrap — resolve login-shell environment once, reuse for all PTYs
+// ---------------------------------------------------------------------------
+
+let envBootstrapped = false;
+
+/** Returns true if cached env is available, false if fallback to login shell is needed. */
+export async function ensureEnvBootstrapped(): Promise<boolean> {
+  if (envBootstrapped) return true;
+  try {
+    await invoke("bootstrap_env", { force: false });
+    envBootstrapped = true;
+    return true;
+  } catch (err) {
+    console.warn("Failed to bootstrap env, will use login shell:", err);
+    return false;
+  }
+}
+
+export function isEnvBootstrapped(): boolean {
+  return envBootstrapped;
+}
+
+// Fire-and-forget eager bootstrap so the first terminal tab is fast
+invoke("bootstrap_env", { force: false }).then(() => {
+  envBootstrapped = true;
+}).catch(() => {});
+
+// ---------------------------------------------------------------------------
 // Hidden host element — offscreen parking lot for terminal DOM elements
 // ---------------------------------------------------------------------------
 
@@ -277,13 +305,17 @@ export async function createSession(
     return null;
   }
 
-  // Spawn shell
+  // Ensure env is cached before spawning — fall back to login shell if bootstrap failed
+  const hasCachedEnv = await ensureEnvBootstrapped();
+
+  // Spawn shell: use cached env (login: false) when available, login shell as fallback
   try {
     await invoke("spawn_shell", {
       sessionId,
       cols: terminal.cols,
       rows: terminal.rows,
       cwd: opts?.cwd ?? null,
+      login: !hasCachedEnv,
     });
   } catch (error) {
     terminal.write(

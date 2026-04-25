@@ -76,7 +76,9 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::pty::bootstrap_env,
             commands::pty::spawn_shell,
+            commands::pty::spawn_process,
             commands::pty::write_to_pty,
             commands::pty::resize_pty,
             commands::pty::kill_pty,
