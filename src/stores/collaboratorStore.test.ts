@@ -6,10 +6,13 @@ import {
   scanForTaskCompletions,
   formatTaskSummaryForAgent,
   _resetWriteStateForTests,
+  _isRenamePendingForTests,
   RECENT_OUTCOME_TTL_MS,
   STATUS_TTL_MS,
+  slugify,
 } from "./collaboratorStore";
-import type { CollabTask } from "../types/collaborator";
+import type { CollabTask, SpawnedAgent } from "../types/collaborator";
+import { parseInput, resolveAgent, executeCommand } from "../components/collaborator/commands";
 import { useTerminalStore } from "./terminalStore";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -256,6 +259,148 @@ describe("task-23 — robustness fixes (empty completedBy, footer auto-clear)", 
     expect(reportEntry?.content).toContain("**Agent**: @codex1");
     // Negative: the bug would have produced "**Agent**: " (empty after the colon).
     expect(reportEntry?.content).not.toMatch(/\*\*Agent\*\*:\s*\n/);
+  });
+
+  // ── task-12 / task-5 follow-up: handle+nickname surfacing in writers ──
+  // Covers two related concerns surfaced by peer review:
+  //   1. (codex1 task-7 + codex2 task-9) `buildNicknameIndex` previously
+  //      indexed exited agents, so persisted task/report formatting could
+  //      still render `@handle (nickname)` for dead agents — contradicting
+  //      the documented "fall back to bare @handle when the agent has
+  //      exited" invariant.
+  //   2. (claude2 task-8) The slim-header identity line had a direct test
+  //      assertion for the new `@<handle> (<nickname>)` format, but the
+  //      `formatTasksMarkdown` Assignee/Completed By decoration and the
+  //      conversation-log Task Report / Task created lines did not.
+  it("Task Report `**Agent**:` line decorates a live agent with its nickname", () => {
+    const store = useCollaboratorStore.getState();
+    useCollaboratorStore.setState({
+      agents: [{
+        sessionId: "pty-codex1",
+        tool: "codex_cli",
+        status: "running",
+        collabSessionId: SESSION,
+        ordinal: 1,
+        handle: "codex1",
+        nickname: "reviewer-1",
+        nicknameSlug: "reviewer-1",
+        nameHistory: [{ nickname: "reviewer-1", setAt: "2024-01-01T00:00:00.000Z", setBy: "user" }],
+      }],
+    });
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@codex1" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@codex1" }, SESSION);
+
+    const logEntries = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    const reportEntry = logEntries.find((e) => e.content.startsWith("Task Report\n"));
+    expect(reportEntry?.content).toContain("**Agent**: @codex1 (reviewer-1)");
+  });
+
+  it("Task Report `**Agent**:` line falls back to bare @handle when the agent has exited", () => {
+    // The PTY exit path calls setAgentStatus(sessionId, "exited") but
+    // leaves the agent in store.agents. Before the buildNicknameIndex
+    // status filter, this dead agent's nickname still leaked into the
+    // Task Report — codex1 task-7 + codex2 task-9 cross-validated finding.
+    const store = useCollaboratorStore.getState();
+    useCollaboratorStore.setState({
+      agents: [{
+        sessionId: "pty-codex1",
+        tool: "codex_cli",
+        status: "exited",
+        collabSessionId: SESSION,
+        ordinal: 1,
+        handle: "codex1",
+        nickname: "reviewer-1",
+        nicknameSlug: "reviewer-1",
+        nameHistory: [{ nickname: "reviewer-1", setAt: "2024-01-01T00:00:00.000Z", setBy: "user" }],
+      }],
+    });
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@codex1" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@codex1" }, SESSION);
+
+    const logEntries = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    const reportEntry = logEntries.find((e) => e.content.startsWith("Task Report\n"));
+    expect(reportEntry?.content).toContain("**Agent**: @codex1");
+    // Negative: the leak bug would have produced "@codex1 (reviewer-1)".
+    expect(reportEntry?.content).not.toContain("(reviewer-1)");
+  });
+
+  it("`Task created:` log line decorates the assignee with its nickname for a live agent", () => {
+    const store = useCollaboratorStore.getState();
+    useCollaboratorStore.setState({
+      agents: [{
+        sessionId: "pty-claude2",
+        tool: "claude_code",
+        status: "running",
+        collabSessionId: SESSION,
+        ordinal: 2,
+        handle: "claude2",
+        nickname: "reviewer-2",
+        nicknameSlug: "reviewer-2",
+        nameHistory: [{ nickname: "reviewer-2", setAt: "2024-01-01T00:00:00.000Z", setBy: "user" }],
+      }],
+    });
+    store.addTask({ objective: "x", title: "y", assignee: "@claude2" }, SESSION);
+
+    const logEntries = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    const created = logEntries.find((e) => e.content.startsWith("Task created:"));
+    expect(created?.content).toContain("→ @claude2 (reviewer-2)");
+  });
+
+  it("formatTasksMarkdown writes `**Assignee**: @handle (nickname)` for live agents and bare handle for exited ones", async () => {
+    // Drive the persisted-tasks writer through persistTasks and inspect
+    // the write_memory_file payload so we cover both producer paths
+    // (formatTasksMarkdown + buildNicknameIndex status filter) without
+    // exporting either helper.
+    const writeCalls: { relativePath: string; content: string }[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "write_memory_file") {
+        const a = args as { relativePath: string; content: string };
+        writeCalls.push({ relativePath: a.relativePath, content: a.content });
+      }
+      return null;
+    });
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-claude2",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: SESSION,
+          ordinal: 2,
+          handle: "claude2",
+          nickname: "reviewer-2",
+          nicknameSlug: "reviewer-2",
+          nameHistory: [{ nickname: "reviewer-2", setAt: "2024-01-01T00:00:00.000Z", setBy: "user" }],
+        },
+        {
+          sessionId: "pty-codex1",
+          tool: "codex_cli",
+          status: "exited",
+          collabSessionId: SESSION,
+          ordinal: 1,
+          handle: "codex1",
+          nickname: "reviewer-1",
+          nicknameSlug: "reviewer-1",
+          nameHistory: [{ nickname: "reviewer-1", setAt: "2024-01-01T00:00:00.000Z", setBy: "user" }],
+        },
+      ],
+    });
+    const store = useCollaboratorStore.getState();
+    store.addTask({ objective: "live", title: "live", assignee: "@claude2" }, SESSION);
+    store.addTask({ objective: "exited", title: "exited", assignee: "@codex1" }, SESSION);
+    await store.persistTasks(SESSION);
+
+    // Each addTask + the explicit persistTasks below trigger their own
+    // write_memory_file call. We want the latest one — the snapshot that
+    // contains BOTH tasks — so use the trailing write rather than the
+    // first (which was scheduled by the first addTask and only carries
+    // the "live" task).
+    const tasksWrite = [...writeCalls].reverse().find((c) => c.relativePath.endsWith(".md") && c.content.includes("# Collaboration Tasks"));
+    expect(tasksWrite).toBeDefined();
+    expect(tasksWrite?.content).toContain("**Assignee**: @claude2 (reviewer-2)");
+    expect(tasksWrite?.content).toContain("**Assignee**: @codex1");
+    // Exited agent's nickname must NOT decorate its assignee line.
+    expect(tasksWrite?.content).not.toContain("@codex1 (reviewer-1)");
   });
 
   it("setStatus auto-clears after STATUS_TTL_MS (so footer messages don't go stale)", () => {
@@ -507,7 +652,9 @@ describe("task-38 — sendToAgent/broadcast bump `assignedAt` on existing active
         collabSessionId: SESSION,
         ordinal: 1,
         handle: "claude1",
-        displayName: "Claude Code #1",
+        nickname: "Claude Code #1",
+        nicknameSlug: "claude-code-1",
+        nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
       }],
     });
     const backlog = store.addTask({ objective: "later", title: "backlog", assignee: "@claude1" }, SESSION);
@@ -700,7 +847,9 @@ describe("task-45 — sendToAgent bumps the freshest active task, not the oldest
         collabSessionId: SESSION,
         ordinal: 1,
         handle: "claude1",
-        displayName: "Claude Code #1",
+        nickname: "Claude Code #1",
+        nicknameSlug: "claude-code-1",
+        nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
       }],
     });
     const store = useCollaboratorStore.getState();
@@ -894,7 +1043,9 @@ describe("task-45 — sendToAgent bumps the freshest active task, not the oldest
         collabSessionId: SESSION,
         ordinal: 1,
         handle: "claude1",
-        displayName: "Claude Code #1",
+        nickname: "Claude Code #1",
+        nicknameSlug: "claude-code-1",
+        nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
       }],
     });
     const store = useCollaboratorStore.getState();
@@ -1085,7 +1236,9 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
         collabSessionId: SESSION,
         ordinal: 1,
         handle: "claude1",
-        displayName: "Claude Code #1",
+        nickname: "Claude Code #1",
+        nicknameSlug: "claude-code-1",
+        nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
       }],
     });
   });
@@ -1156,8 +1309,8 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
     // Seed two agents in the same session
     useCollaboratorStore.setState({
       agents: [
-        { sessionId: "pty-1", tool: "claude_code", status: "running", collabSessionId: SESSION, ordinal: 1, handle: "claude1", displayName: "Claude Code #1" },
-        { sessionId: "pty-2", tool: "codex_cli", status: "running", collabSessionId: SESSION, ordinal: 1, handle: "codex1", displayName: "Codex CLI #1" },
+        { sessionId: "pty-1", tool: "claude_code", status: "running", collabSessionId: SESSION, ordinal: 1, handle: "claude1", nickname: "Claude Code #1", nicknameSlug: "claude-code-1", nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }] },
+        { sessionId: "pty-2", tool: "codex_cli", status: "running", collabSessionId: SESSION, ordinal: 1, handle: "codex1", nickname: "Codex CLI #1", nicknameSlug: "codex-cli-1", nameHistory: [{ nickname: "Codex CLI #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }] },
       ],
     });
     const store = useCollaboratorStore.getState();
@@ -1421,7 +1574,9 @@ describe("slim-header correctness (B1 + B2)", () => {
         collabSessionId: SESSION,
         ordinal: 1,
         handle: "claude1",
-        displayName: "Claude Code #1",
+        nickname: "Claude Code #1",
+        nicknameSlug: "claude-code-1",
+        nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
       }],
     });
   });
@@ -1549,8 +1704,657 @@ describe("slim-header correctness (B1 + B2)", () => {
     expect(slim).not.toContain("[Read-discipline:");
     // But the rest of the slim header must still be intact.
     expect(slim).toContain("[Protocol reminder:");
-    expect(slim).toContain("[You are @claude1]");
+    // Identity line now carries the nickname alongside the canonical handle
+    // (task-5: surface both in system prompt + task/conversation files).
+    expect(slim).toContain("[You are @claude1 (Claude Code #1)]");
     expect(slim).toContain("second"); // user content reaches the agent
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR-A — agent identity rename
+// ---------------------------------------------------------------------------
+
+describe("slugify", () => {
+  it("collapses whitespace + punctuation runs to single -", () => {
+    expect(slugify("Bug Hunter")).toBe("bug-hunter");
+    expect(slugify("  spaced  out  ")).toBe("spaced-out");
+    expect(slugify("bug--hunter")).toBe("bug-hunter");
+    expect(slugify("Claude Code #1")).toBe("claude-code-1");
+  });
+
+  it("drops symbols including emoji (\\p{S})", () => {
+    // Pure-emoji is rejected at validation; slugify alone returns "".
+    expect(slugify("🐛")).toBe("");
+    // Embedded emoji is stripped, surrounding letters survive.
+    expect(slugify("🐛 Bug Hunter")).toBe("bug-hunter");
+    // Math/currency symbols collapse.
+    expect(slugify("C++ Developer")).toBe("c-developer");
+  });
+
+  it("preserves CJK letters (\\p{L})", () => {
+    expect(slugify("버그 헌터")).toBe("버그-헌터"); // Korean
+    expect(slugify("バグ ハンター")).toBe("バグ-ハンター"); // Japanese
+  });
+
+  it("normalizes case and NFKC", () => {
+    expect(slugify("CLAUDE")).toBe("claude");
+    // NFKC: full-width digit → ASCII digit
+    expect(slugify("Claude １")).toBe("claude-1");
+  });
+});
+
+describe("renameAgent — validation", () => {
+  const SESSION = "collab-rename-validation";
+  beforeEach(() => {
+    _resetWriteStateForTests();
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Claude Code #1",
+          nicknameSlug: "claude-code-1",
+          nameHistory: [
+            { nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" },
+          ],
+        },
+      ],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [SESSION]: [] },
+      logEntriesBySession: { [SESSION]: [] },
+    });
+  });
+
+  it("rejects empty / too-long / pure-symbol nicknames as invalid", () => {
+    const r1 = useCollaboratorStore.getState().renameAgent("pty-1", "");
+    expect(r1).toMatchObject({ ok: false, reason: "invalid" });
+
+    const r2 = useCollaboratorStore.getState().renameAgent("pty-1", "x".repeat(33));
+    expect(r2).toMatchObject({ ok: false, reason: "invalid" });
+
+    // Pure-emoji slugifies to "" → rejected with the no-letter/digit message.
+    const r3 = useCollaboratorStore.getState().renameAgent("pty-1", "🐛");
+    expect(r3).toMatchObject({ ok: false, reason: "invalid" });
+    if (!r3.ok) {
+      expect(r3.message).toContain("letter or number");
+    }
+  });
+
+  it("rejects 'all' / 'all agents' as reserved", () => {
+    expect(useCollaboratorStore.getState().renameAgent("pty-1", "all"))
+      .toMatchObject({ ok: false, reason: "reserved" });
+    expect(useCollaboratorStore.getState().renameAgent("pty-1", "All Agents"))
+      .toMatchObject({ ok: false, reason: "reserved" });
+  });
+
+  it("rejects unknown sessionId as not-found", () => {
+    expect(useCollaboratorStore.getState().renameAgent("pty-missing", "Bug Hunter"))
+      .toMatchObject({ ok: false, reason: "not-found" });
+  });
+
+  it("no-op short-circuits when nickname unchanged (no rename event logged)", () => {
+    const before = useCollaboratorStore.getState().agents[0];
+    const result = useCollaboratorStore.getState().renameAgent("pty-1", "Claude Code #1");
+    expect(result).toEqual({ ok: true });
+    const after = useCollaboratorStore.getState().agents[0];
+    // History MUST NOT grow on no-op.
+    expect(after.nameHistory).toHaveLength(1);
+    expect(after.nickname).toBe(before.nickname);
+  });
+});
+
+describe("renameAgent — collisions (live agents own the namespace)", () => {
+  const SESSION = "collab-collisions";
+
+  beforeEach(() => {
+    _resetWriteStateForTests();
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-A",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Bug Hunter",
+          nicknameSlug: "bug-hunter",
+          nameHistory: [
+            { nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" },
+            { nickname: "Bug Hunter", setAt: "2024-01-02T00:00:00.000Z", setBy: "user" },
+          ],
+        },
+        {
+          sessionId: "pty-B",
+          tool: "codex_cli",
+          status: "running",
+          collabSessionId: SESSION,
+          ordinal: 1,
+          handle: "codex1",
+          nickname: "Codex CLI #1",
+          nicknameSlug: "codex-cli-1",
+          nameHistory: [
+            { nickname: "Codex CLI #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" },
+          ],
+        },
+      ],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [SESSION]: [] },
+      logEntriesBySession: { [SESSION]: [] },
+    });
+  });
+
+  it("rejects rename to another live agent's nickname (case-insensitive)", () => {
+    expect(useCollaboratorStore.getState().renameAgent("pty-B", "Bug Hunter"))
+      .toMatchObject({ ok: false, reason: "duplicate" });
+    expect(useCollaboratorStore.getState().renameAgent("pty-B", "BUG HUNTER"))
+      .toMatchObject({ ok: false, reason: "duplicate" });
+  });
+
+  it("rejects rename whose slug equals another live agent's slug (codex1 C1-1)", () => {
+    // bug-hunter (A's nicknameSlug) === slugify("bug-hunter") === slugify("Bug-Hunter")
+    expect(useCollaboratorStore.getState().renameAgent("pty-B", "bug-hunter"))
+      .toMatchObject({ ok: false, reason: "duplicate" });
+    expect(useCollaboratorStore.getState().renameAgent("pty-B", "Bug.Hunter"))
+      .toMatchObject({ ok: false, reason: "duplicate" });
+  });
+
+  it("rejects rename to another live agent's handle (claude2 N1)", () => {
+    expect(useCollaboratorStore.getState().renameAgent("pty-B", "claude1"))
+      .toMatchObject({ ok: false, reason: "duplicate" });
+  });
+
+  it("ALLOWS rename when the conflicting agent is exited (live agents own the namespace)", () => {
+    // Mark pty-A exited.
+    useCollaboratorStore.setState((s) => ({
+      agents: s.agents.map((a) => (a.sessionId === "pty-A" ? { ...a, status: "exited" } : a)),
+    }));
+    // pty-B may now take "Bug Hunter" — A is no longer in the live namespace.
+    const result = useCollaboratorStore.getState().renameAgent("pty-B", "Bug Hunter");
+    expect(result).toEqual({ ok: true });
+    const after = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-B");
+    expect(after?.nickname).toBe("Bug Hunter");
+    expect(after?.nicknameSlug).toBe("bug-hunter");
+  });
+});
+
+describe("renameAgent — handle invariance and history append", () => {
+  const SESSION = "collab-rename-history";
+
+  beforeEach(() => {
+    _resetWriteStateForTests();
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Claude Code #1",
+          nicknameSlug: "claude-code-1",
+          nameHistory: [
+            { nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" },
+          ],
+        },
+      ],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [SESSION]: [] },
+      logEntriesBySession: { [SESSION]: [] },
+    });
+  });
+
+  it("preserves handle on successful rename and appends nameHistory", () => {
+    const result = useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    expect(result).toEqual({ ok: true });
+    const a = useCollaboratorStore.getState().agents[0];
+    // Handle is the immutable join key — must NEVER change.
+    expect(a.handle).toBe("claude1");
+    expect(a.nickname).toBe("Bug Hunter");
+    expect(a.nicknameSlug).toBe("bug-hunter");
+    expect(a.nameHistory).toHaveLength(2);
+    expect(a.nameHistory[1]).toMatchObject({ nickname: "Bug Hunter", setBy: "user" });
+  });
+
+  it("regression guard — pre-rename tasks remain routable to the renamed agent", () => {
+    const store = useCollaboratorStore.getState();
+    // Assign a task BEFORE rename.
+    store.addTask({ title: "earlier", objective: "earlier", assignee: "@claude1" }, SESSION);
+    // Now rename.
+    const r = store.renameAgent("pty-1", "Bug Hunter");
+    expect(r).toEqual({ ok: true });
+    // The pre-rename task still references @claude1 (the immutable handle).
+    // findFreshestActiveTaskForMention's strict literal compare must find it.
+    const tasks = store.getTasks(SESSION);
+    expect(tasks[0].assignee).toBe("@claude1");
+    // The agent's handle is unchanged so the indicator's lookup still hits.
+    const a = useCollaboratorStore.getState().agents[0];
+    expect(a.handle).toBe("claude1");
+  });
+
+  it("clears contextSentByAgent on rename (forces full-header re-emit on next send)", () => {
+    useCollaboratorStore.setState((s) => ({
+      contextSentByAgent: { ...s.contextSentByAgent, "pty-1": true },
+    }));
+    expect(useCollaboratorStore.getState().contextSentByAgent["pty-1"]).toBe(true);
+    const r = useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    expect(r).toEqual({ ok: true });
+    // Key was destructured out — undefined now.
+    expect(useCollaboratorStore.getState().contextSentByAgent["pty-1"]).toBeUndefined();
+  });
+
+  it("appends a system entry to the conversation log on rename", () => {
+    useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    const logs = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    const renameLog = logs.find((e) => e.role === "system" && e.content.includes("renamed"));
+    expect(renameLog).toBeDefined();
+    expect(renameLog?.content).toContain("@claude1");
+    expect(renameLog?.content).toContain("Bug Hunter");
+  });
+});
+
+describe("renamePendingByAgent — internal state lifecycle", () => {
+  // Direct-state assertions per claude3 V6-3 / I7-3. The set is module-private;
+  // these tests use _isRenamePendingForTests so a future refactor that drops
+  // a cleanup site or moves the .add() above the no-op gate is caught.
+  const SESSION = "collab-pending-state";
+
+  beforeEach(() => {
+    _resetWriteStateForTests();
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Claude Code #1",
+          nicknameSlug: "claude-code-1",
+          nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
+        },
+      ],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [SESSION]: [] },
+      logEntriesBySession: { [SESSION]: [] },
+    });
+  });
+
+  it("renameAgent adds to renamePendingByAgent on actual change", () => {
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+    useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+  });
+
+  it("no-op rename does NOT add to renamePendingByAgent (claude2 G2)", () => {
+    useCollaboratorStore.getState().renameAgent("pty-1", "Claude Code #1");
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+  });
+
+  it("validation failure (reserved 'all') does NOT add to renamePendingByAgent", () => {
+    const r = useCollaboratorStore.getState().renameAgent("pty-1", "all");
+    expect(r.ok).toBe(false);
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+  });
+
+  it("removeAgent clears renamePendingByAgent entry", () => {
+    useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+    useCollaboratorStore.getState().removeAgent("pty-1");
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+  });
+
+  it("_resetWriteStateForTests clears the set (cleanup site 4)", () => {
+    useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+    _resetWriteStateForTests();
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+  });
+
+  it("killAllAgents clears renamePendingByAgent (cleanup site 2)", async () => {
+    useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+    await useCollaboratorStore.getState().killAllAgents(SESSION);
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+  });
+
+  it("endSession clears renamePendingByAgent (cleanup site 3)", () => {
+    useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+    useCollaboratorStore.getState().endSession(SESSION);
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+  });
+});
+
+describe("renamePendingByAgent — consume path (claude2 G7 / claude3 I8-2)", () => {
+  // Integration tests using the inject mock to verify the post-rename
+  // useFullHeader flow. These directly enforce the v6 §3 race-mitigation
+  // design — without them, dropping the `renamePending ||` clause from the
+  // useFullHeader calc would silently break with no test failure.
+  const SESSION = "collab-consume";
+  const injectCalls = () =>
+    vi.mocked(invoke).mock.calls
+      .filter((c) => c[0] === "inject_into_pty")
+      .map((c) => (c[1] as { text: string }).text);
+
+  beforeEach(() => {
+    _resetWriteStateForTests();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(async () => null);
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Claude Code #1",
+          nicknameSlug: "claude-code-1",
+          nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
+        },
+      ],
+      // Simulate an agent already past first-send.
+      contextSentByAgent: { "pty-1": true },
+      pendingMessagesByAgent: {},
+      tasksBySession: { [SESSION]: [] },
+      logEntriesBySession: { [SESSION]: [] },
+    });
+  });
+  afterEach(() => {
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  it("after rename, sendToAgent's NEXT send uses the FULL header", async () => {
+    const store = useCollaboratorStore.getState();
+    store.renameAgent("pty-1", "Bug Hunter");
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+
+    await store.sendToAgent("pty-1", "hello");
+
+    const calls = injectCalls();
+    expect(calls.length).toBe(1);
+    // Full header carries the TASK_PROTOCOL block; slim header does not.
+    expect(calls[0]).toContain("Agent Task Protocol");
+    // Consumed on success (PAIRED INVARIANT).
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+  });
+
+  it("after rename, broadcastToAll's NEXT send uses the FULL header (claude2 B1)", async () => {
+    const store = useCollaboratorStore.getState();
+    store.renameAgent("pty-1", "Bug Hunter");
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+
+    await store.broadcastToAll("hello", SESSION);
+
+    const calls = injectCalls();
+    expect(calls.length).toBe(1);
+    expect(calls[0]).toContain("Agent Task Protocol");
+    expect(_isRenamePendingForTests("pty-1")).toBe(false);
+  });
+
+  it("two sends after one rename: first uses FULL, second uses SLIM (consume worked)", async () => {
+    const store = useCollaboratorStore.getState();
+    store.renameAgent("pty-1", "Bug Hunter");
+
+    await store.sendToAgent("pty-1", "first");
+    await store.sendToAgent("pty-1", "second");
+
+    const calls = injectCalls();
+    expect(calls.length).toBe(2);
+    // First gets the protocol re-emit; second is slim (no protocol block).
+    expect(calls[0]).toContain("Agent Task Protocol");
+    expect(calls[1]).not.toContain("Agent Task Protocol");
+  });
+
+  it("failed inject preserves renamePendingByAgent for retry", async () => {
+    const store = useCollaboratorStore.getState();
+    store.renameAgent("pty-1", "Bug Hunter");
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+
+    // Persistent mock that throws ONLY for inject_into_pty (other calls like
+    // read_memory_file in prependContextHeader continue to resolve to null).
+    // mockImplementationOnce was incorrect here — the first invoke call is
+    // for read_memory_file inside the header builder, so a once-mock would
+    // be consumed before the inject ever runs.
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "inject_into_pty") throw new Error("pty died");
+      return null;
+    });
+    await store.sendToAgent("pty-1", "hello");
+
+    // The catch-branch rollback inside sendToAgent's first-send path clears
+    // contextSentByAgent[sessionId] so the next sender re-enters the full
+    // branch. renamePendingByAgent stays populated — the rename's intent
+    // survives the failure path.
+    expect(useCollaboratorStore.getState().contextSentByAgent["pty-1"]).toBeUndefined();
+    expect(_isRenamePendingForTests("pty-1")).toBe(true);
+  });
+});
+
+describe("resolveAgent — nickname-aware resolution (codex1/2/3 round-7)", () => {
+  // After v5 §4 release exited slugs, the resolver MUST prefer live agents
+  // for slug-based lookups; handles remain unfiltered (immutable + unique).
+  const buildAgents = (): SpawnedAgent[] => [
+    {
+      sessionId: "pty-A",
+      tool: "claude_code",
+      status: "running",
+      collabSessionId: "s",
+      ordinal: 1,
+      handle: "claude1",
+      nickname: "Bug Hunter",
+      nicknameSlug: "bug-hunter",
+      nameHistory: [
+        { nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" },
+        { nickname: "Bug Hunter", setAt: "2024-01-02T00:00:00.000Z", setBy: "user" },
+      ],
+    },
+    {
+      sessionId: "pty-B",
+      tool: "codex_cli",
+      status: "running",
+      collabSessionId: "s",
+      ordinal: 1,
+      handle: "codex1",
+      nickname: "Codex CLI #1",
+      nicknameSlug: "codex-cli-1",
+      nameHistory: [{ nickname: "Codex CLI #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
+    },
+  ];
+
+  it("resolves exact handle (immutable) for live agents", () => {
+    const agents = buildAgents();
+    expect(resolveAgent("claude1", agents)?.sessionId).toBe("pty-A");
+    expect(resolveAgent("codex1", agents)?.sessionId).toBe("pty-B");
+  });
+
+  it("resolves nickname slug for live agents (the codex1/2/3 round-7 fix)", () => {
+    const agents = buildAgents();
+    // direct "@bug-hunter" typing now routes to claude1 (renamed agent)
+    expect(resolveAgent("bug-hunter", agents)?.sessionId).toBe("pty-A");
+    // case- and punctuation-insensitive via slugify
+    expect(resolveAgent("Bug Hunter", agents)?.sessionId).toBe("pty-A");
+    expect(resolveAgent("Bug.Hunter", agents)?.sessionId).toBe("pty-A");
+  });
+
+  it("prefers live agents over exited siblings sharing a slug (v5 §4)", () => {
+    const agents = buildAgents();
+    // Mark A exited; B takes the slug.
+    agents[0].status = "exited";
+    agents[1].nickname = "Bug Hunter";
+    agents[1].nicknameSlug = "bug-hunter";
+    // Resolver should now route @bug-hunter to live B, not exited A.
+    expect(resolveAgent("bug-hunter", agents)?.sessionId).toBe("pty-B");
+  });
+
+  it("handle prefix still matches (allows exited)", () => {
+    const agents = buildAgents();
+    expect(resolveAgent("clau", agents)?.sessionId).toBe("pty-A");
+  });
+
+  it("nickname slug PREFIX match — live-only", () => {
+    const agents = buildAgents();
+    // "bug" prefix-matches A's nicknameSlug "bug-hunter"
+    expect(resolveAgent("bug", agents)?.sessionId).toBe("pty-A");
+    // Mark A exited; prefix slug match should now skip A.
+    agents[0].status = "exited";
+    expect(resolveAgent("bug", agents)).toBeNull();
+  });
+
+  it("returns null for unknown token", () => {
+    expect(resolveAgent("nonexistent", buildAgents())).toBeNull();
+  });
+
+  it("history-slug match resolves an OLD nickname to the renamed agent (claude2 G6)", () => {
+    const agents = buildAgents();
+    // A had birth name "Claude Code #1" and was renamed to "Bug Hunter".
+    // Typing the OLD slug should still route to A while A is live.
+    expect(resolveAgent("claude-code-1", agents)?.sessionId).toBe("pty-A");
+  });
+
+  it("history-slug match is LIVE-ONLY (skips exited agents)", () => {
+    const agents = buildAgents();
+    agents[0].status = "exited";
+    expect(resolveAgent("claude-code-1", agents)).toBeNull();
+  });
+});
+
+describe("parseInput — /rename slash command (codex1+codex2 round-7)", () => {
+  it("parses /rename @<agent> <nickname> with single-word nickname", () => {
+    const cmd = parseInput("/rename @claude1 BugHunter");
+    expect(cmd.type).toBe("rename");
+    expect(cmd.target).toBe("claude1");
+    expect(cmd.message).toBe("BugHunter");
+  });
+
+  it("parses /rename with multi-word freeform nickname", () => {
+    const cmd = parseInput("/rename @claude1 Bug Hunter");
+    expect(cmd.type).toBe("rename");
+    expect(cmd.target).toBe("claude1");
+    expect(cmd.message).toBe("Bug Hunter");
+  });
+
+  it("parses /rename with CJK nickname", () => {
+    const cmd = parseInput("/rename @claude1 버그 헌터");
+    expect(cmd.type).toBe("rename");
+    expect(cmd.target).toBe("claude1");
+    expect(cmd.message).toBe("버그 헌터");
+  });
+
+  it("returns rename type with no target/message on /rename alone (executor shows usage)", () => {
+    const cmd = parseInput("/rename");
+    expect(cmd.type).toBe("rename");
+    expect(cmd.target).toBeUndefined();
+    expect(cmd.message).toBeUndefined();
+  });
+
+  it("returns rename type with no target/message when only target given (no nickname)", () => {
+    const cmd = parseInput("/rename @claude1");
+    expect(cmd.type).toBe("rename");
+    expect(cmd.target).toBeUndefined();
+    expect(cmd.message).toBeUndefined();
+  });
+});
+
+describe("executeCommand — /rename and /task add canonicalization (claude3 I9-1, I9-2)", () => {
+  // Integration tests through the actual executor. Verify the routing AND
+  // the persisted result, not just the parser output.
+  const SESSION = "collab-execute-tests";
+
+  beforeEach(() => {
+    _resetWriteStateForTests();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(async () => null);
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Claude Code #1",
+          nicknameSlug: "claude-code-1",
+          nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
+        },
+      ],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [SESSION]: [] },
+      logEntriesBySession: { [SESSION]: [] },
+      statusMessages: {},
+    });
+  });
+
+  it("/rename @<handle> <nickname> updates the agent's nickname", async () => {
+    await executeCommand(parseInput("/rename @claude1 Bug Hunter"), SESSION);
+    const a = useCollaboratorStore.getState().agents[0];
+    expect(a.nickname).toBe("Bug Hunter");
+    expect(a.nicknameSlug).toBe("bug-hunter");
+    expect(a.handle).toBe("claude1"); // immutable
+  });
+
+  it("/rename surfaces RenameResult.message on validation failure", async () => {
+    await executeCommand(parseInput("/rename @claude1 all"), SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[SESSION];
+    expect(status).toContain("reserved");
+    // Agent unchanged.
+    expect(useCollaboratorStore.getState().agents[0].nickname).toBe("Claude Code #1");
+  });
+
+  it("/rename @<unknown> errors with 'not found'", async () => {
+    await executeCommand(parseInput("/rename @ghost NewName"), SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[SESSION];
+    expect(status).toContain("not found");
+    expect(useCollaboratorStore.getState().agents[0].nickname).toBe("Claude Code #1");
+  });
+
+  it("/rename strips a leading @ from the new nickname value", async () => {
+    await executeCommand(parseInput("/rename @claude1 @newname"), SESSION);
+    const a = useCollaboratorStore.getState().agents[0];
+    expect(a.nickname).toBe("newname"); // not "@newname"
+  });
+
+  it("/task add ... @<handle> writes canonical @handle (codex3 round-8)", async () => {
+    await executeCommand(parseInput("/task add Find leak | check logs @claude1"), SESSION);
+    const tasks = useCollaboratorStore.getState().getTasks(SESSION);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].assignee).toBe("@claude1");
+  });
+
+  it("/task add ... @<nickname> canonicalizes through resolveAgent (codex3 round-8)", async () => {
+    // First rename so claude1's nickname slug is "bug-hunter".
+    useCollaboratorStore.getState().renameAgent("pty-1", "Bug Hunter");
+    await executeCommand(parseInput("/task add Find leak | check logs @bug-hunter"), SESSION);
+    const tasks = useCollaboratorStore.getState().getTasks(SESSION);
+    expect(tasks).toHaveLength(1);
+    // Critically: assignee is the canonical IMMUTABLE handle, not the typed
+    // nickname slug. This is the load-bearing invariant — downstream lookups
+    // (findFreshestActiveTaskForMention, recentOutcomesBySession) all key on
+    // @<handle>, so a bad write here would orphan every routing path.
+    expect(tasks[0].assignee).toBe("@claude1");
+  });
+
+  it("/task add ... @<unknown> errors and does NOT create the task", async () => {
+    await executeCommand(parseInput("/task add Find leak | check logs @ghost"), SESSION);
+    const tasks = useCollaboratorStore.getState().getTasks(SESSION);
+    expect(tasks).toHaveLength(0); // task NOT created
+    const status = useCollaboratorStore.getState().statusMessages[SESSION];
+    expect(status).toContain("not found");
   });
 });
 

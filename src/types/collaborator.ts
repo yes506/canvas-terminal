@@ -22,15 +22,48 @@ export interface SpawnedAgentInit {
   collabSessionId: string;
 }
 
+/** One entry per name change. Append-only; index 0 is the system-set birth name. */
+export interface AgentNameRecord {
+  /** The nickname value at this point in history. */
+  nickname: string;
+  /** ISO timestamp this nickname became active. */
+  setAt: string;
+  /** Who renamed it: "system" (auto-generated at spawn), "user" (UI/slash command), or "@<handle>" (programmatic). */
+  setBy: "system" | "user" | `@${string}`;
+}
+
 /** Fully materialized agent with stored identity. */
 export interface SpawnedAgent extends SpawnedAgentInit {
   /** Monotonic per-tool ordinal within this collab session (1, 2, 3...). Always >= 1. */
   ordinal: number;
-  /** Canonical @-mention handle. Always indexed: "claude1", "codex1", "gemini2", etc. */
+  /** IMMUTABLE protocol handle. Always indexed: "claude1", "codex1", "gemini2". The
+   *  only string referenced by tasks (`assignee`), recent-outcome maps, conversation
+   *  log tags, and `*.done.json` author fields. Never mutates. */
   handle: string;
-  /** Human-readable display name. Always indexed: "Claude Code #1", "Codex CLI #2", etc. */
-  displayName: string;
+  /** MUTABLE human-readable display label. Initial value is the system-generated
+   *  "Claude Code #1"-style string. The user can rename via the inline header UI or
+   *  the `/rename` slash command. Validated to 1-32 chars, must contain at least one
+   *  letter or digit, must not collide with another live agent's nickname/handle/slug
+   *  in the same `collabSessionId`. */
+  nickname: string;
+  /** MUTABLE cached `slugify(nickname)` for O(1) collision and dropdown filtering.
+   *  Recomputed on `addAgent` and `renameAgent`; never read without the matching
+   *  `nickname` write. */
+  nicknameSlug: string;
+  /** Append-only rename audit. `nameHistory[0]` is the birth name (`setBy: "system"`);
+   *  the last entry is always the current nickname. */
+  nameHistory: AgentNameRecord[];
 }
+
+/** Result type returned by `renameAgent`. The store owns the human-readable message
+ *  so all rename surfaces (inline UI, `/rename` slash command) share one wording. */
+export type RenameResult =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: "invalid" | "reserved" | "duplicate" | "not-found";
+      message: string;
+    };
 
 // ---------------------------------------------------------------------------
 // Structured Task

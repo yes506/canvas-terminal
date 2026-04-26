@@ -3,6 +3,7 @@ import {
   useCollaboratorStore,
   agentDisplayName,
   toolLabel,
+  slugify,
 } from "../../stores/collaboratorStore";
 import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps";
 import type { SpawnedAgent, TaskStatus } from "../../types/collaborator";
@@ -20,6 +21,7 @@ export interface ParsedCommand {
     | "context"
     | "memory"
     | "task"
+    | "rename"
     | "unknown";
   target?: string;
   message?: string;
@@ -66,6 +68,23 @@ export function parseInput(input: string): ParsedCommand {
     return { type: "task", message: rest || undefined, raw: trimmed };
   }
 
+  // /rename @<agent> <new-nickname>
+  // Captures the new nickname as the rest of the line (allows spaces).
+  const renameMatch = trimmed.match(/^\/rename\s+@(\S+)\s+(.+)$/);
+  if (renameMatch) {
+    return {
+      type: "rename",
+      target: renameMatch[1],
+      message: renameMatch[2].trim(),
+      raw: trimmed,
+    };
+  }
+  if (trimmed === "/rename" || trimmed.startsWith("/rename ")) {
+    // Malformed — pass through with no target/message so the executor can
+    // surface a usage hint.
+    return { type: "rename", raw: trimmed };
+  }
+
   // @agent message
   const atMatch = trimmed.match(/^@(\S+)\s+(.+)$/s);
   if (atMatch) {
@@ -90,14 +109,50 @@ export function resolveAgent(
   agents: SpawnedAgent[],
 ): SpawnedAgent | null {
   const lower = target.toLowerCase();
+  const slug = slugify(target);
 
-  // Exact handle match (primary resolution path)
-  const exactMatch = agents.find((a) => a.handle === lower);
-  if (exactMatch) return exactMatch;
+  // Exact handle match (primary resolution path; allows exited agents — handles
+  // are immutable + unique forever within a collabSessionId).
+  const exactHandleMatch = agents.find((a) => a.handle === lower);
+  if (exactHandleMatch) return exactHandleMatch;
 
-  // Prefix match: "@claude" → first agent whose handle starts with "claude"
-  const prefixMatch = agents.find((a) => a.handle.startsWith(lower));
-  if (prefixMatch) return prefixMatch;
+  // Exact nickname-slug match — LIVE AGENTS ONLY. Per v5 §4 "live agents own
+  // the namespace": after a rename releases an exited agent's slug, the resolver
+  // must prefer the live agent. Otherwise `@bug-hunter` could route to dead A.
+  if (slug.length > 0) {
+    const exactSlugMatch = agents.find(
+      (a) => a.status !== "exited" && a.nicknameSlug === slug,
+    );
+    if (exactSlugMatch) return exactSlugMatch;
+  }
+
+  // Handle prefix match: "@claude" → first agent whose handle starts with
+  // "claude". Allows exited agents — prefix routing is best-effort and
+  // first-match by iteration order; a user typing a partial handle is
+  // intentionally targeting that named agent regardless of liveness.
+  const prefixHandleMatch = agents.find((a) => a.handle.startsWith(lower));
+  if (prefixHandleMatch) return prefixHandleMatch;
+
+  // Nickname-slug prefix — LIVE AGENTS ONLY. Same rationale as exact-slug.
+  if (slug.length > 0) {
+    const prefixSlugMatch = agents.find(
+      (a) => a.status !== "exited" && a.nicknameSlug.startsWith(slug),
+    );
+    if (prefixSlugMatch) return prefixSlugMatch;
+  }
+
+  // History-slug match — LIVE AGENTS ONLY. Lets users address an agent by any
+  // PAST nickname; a renamed agent stays reachable even if the user remembers
+  // the old label (e.g., scrolling back through the conversation log and
+  // typing the name they see there). v6 §2 step 5. (claude2 G6 round-8.)
+  if (slug.length > 0) {
+    const historyMatch = agents.find(
+      (a) =>
+        a.status !== "exited" &&
+        a.nameHistory.some((r) => slugify(r.nickname) === slug),
+    );
+    if (historyMatch) return historyMatch;
+  }
 
   // Fallback: sessionId match
   return agents.find((a) => a.sessionId === target) ?? null;
@@ -119,7 +174,8 @@ export function getHelpText(): string {
     "       /task <id> assign @<agent>  /task <id> done [notes]",
     "Canvas: /canvas-export [msg]  /canvas-export @agent [msg]  /canvas-import @agent",
     "Memory: /context <text>  /memory list|read|delete|clear",
-    "Agents: @claude @codex @gemini  Indexed: @claude1 @claude2",
+    "Agents: @claude @codex @gemini  Indexed: @claude1 @claude2  Or by nickname: @bug-hunter",
+    "Rename: /rename @<agent> <new nickname>",
   ].join("\n");
 }
 
@@ -330,26 +386,50 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           let objective: string;
           let assignee: string | null = null;
 
+          // Canonicalize the trailing @-token through resolveAgent BEFORE
+          // writing the assignee. Symmetric with the /task <id> assign path
+          // (see comment there). Without this, `/task add ... @bug-hunter`
+          // would persist the mutable nickname token into t.assignee, and
+          // every handle-keyed downstream lookup (findFreshestActiveTaskForMention,
+          // recentOutcomesBySession) would fail to match. (codex3 round-8.)
+          const canonicalizeAssignee = (rawToken: string): string | null => {
+            const resolved = resolveAgent(rawToken, scopedAgents);
+            return resolved ? `@${resolved.handle}` : null;
+          };
+          let unresolvedToken: string | null = null;
           if (pipeIdx >= 0) {
             title = body.slice(0, pipeIdx).trim();
             let rest = body.slice(pipeIdx + 1).trim();
-            // Extract @agent from the end
             const atMatch = rest.match(/\s+@(\S+)$/);
             if (atMatch) {
-              assignee = `@${atMatch[1]}`;
+              const canonical = canonicalizeAssignee(atMatch[1]);
+              if (canonical) {
+                assignee = canonical;
+              } else {
+                unresolvedToken = atMatch[1];
+              }
               rest = rest.slice(0, -atMatch[0].length).trim();
             }
             objective = rest;
           } else {
-            // No pipe — title only, extract @agent
             let rest = body;
             const atMatch = rest.match(/\s+@(\S+)$/);
             if (atMatch) {
-              assignee = `@${atMatch[1]}`;
+              const canonical = canonicalizeAssignee(atMatch[1]);
+              if (canonical) {
+                assignee = canonical;
+              } else {
+                unresolvedToken = atMatch[1];
+              }
               rest = rest.slice(0, -atMatch[0].length).trim();
             }
             title = rest;
             objective = rest;
+          }
+
+          if (unresolvedToken) {
+            status(`Agent "${unresolvedToken}" not found.`);
+            break;
           }
 
           const task = store.addTask({ title, objective, assignee }, collabSessionId);
@@ -393,8 +473,20 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             status(`Task not found: ${taskId}`);
             break;
           }
-          store.updateTask(task.id, { assignee: `@${agent}` }, collabSessionId);
-          status(`Task ${task.id} assigned to @${agent}`);
+          // Canonicalize the typed token through resolveAgent BEFORE writing to
+          // the task ledger. Otherwise a user typing /task X assign @bug-hunter
+          // (a nickname) would land assignee: "@bug-hunter" — which never
+          // matches handle-keyed lookups in findFreshestActiveTaskForMention or
+          // recentOutcomesBySession after a future rename. The on-disk audit
+          // also stays canonical: the markdown writer at formatTasksMarkdown
+          // (`Assignee` line) sees @<handle>, not the typed nickname.
+          const resolved = resolveAgent(agent, scopedAgents);
+          if (!resolved) {
+            status(`Agent "${agent}" not found.`);
+            break;
+          }
+          store.updateTask(task.id, { assignee: `@${resolved.handle}` }, collabSessionId);
+          status(`Task ${task.id} assigned to @${resolved.handle}`);
           break;
         }
 
@@ -460,6 +552,31 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
         }
       } catch (err) {
         status(`Memory error: ${err}`);
+      }
+      break;
+    }
+
+    case "rename": {
+      if (!cmd.target || !cmd.message) {
+        status('Usage: /rename @<agent> <new nickname>');
+        break;
+      }
+      const targetAgent = resolveAgent(cmd.target, scopedAgents);
+      if (!targetAgent) {
+        status(`Agent "${cmd.target}" not found.`);
+        break;
+      }
+      // Strip a leading "@" if the user typed it as part of the nickname value.
+      // The rename action validates and returns RenameResult — we surface
+      // result.message verbatim on failure (store owns the strings).
+      const newNickname = cmd.message.replace(/^@/, "");
+      const result = store.renameAgent(targetAgent.sessionId, newNickname);
+      if (result.ok) {
+        status(
+          `Agent @${targetAgent.handle} renamed to "${newNickname.trim()}"`,
+        );
+      } else {
+        status(result.message);
       }
       break;
     }
