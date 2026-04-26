@@ -325,6 +325,17 @@ const taskWriteChainsBySession = new Map<string, Promise<unknown>>();
 // write paths, not just tasks.
 const abortedSessions = new Set<string>();
 
+// Per-agent in-flight first-send promise. Enforces ORDERING during the
+// first-send window: while a first-send is running for a sessionId, any
+// concurrent send to the same agent waits for it to settle before deciding
+// header shape. Without this, a slim send could overtake the first full
+// send at the PTY and the agent would receive a slim message before ever
+// learning the protocol — breaking the slim-header design's correctness
+// argument. The `contextSentByAgent` flag in store state remains the
+// source of truth for what the next sender SHOULD do; this map enforces
+// the wait-and-then-re-check loop. Cleared on resolve/reject in `finally`.
+const firstSendInflight = new Map<string, Promise<void>>();
+
 /**
  * Test-only reset hook for module-level write state. Vitest test isolation
  * via `resetStores()` doesn't reach into module-scoped maps/sets, so a
@@ -332,12 +343,15 @@ const abortedSessions = new Set<string>();
  * test using the same SESSION ID. Tests should call this in `beforeEach`.
  *
  * Renamed from `_resetTaskWriteStateForTests` in round-11 since it now
- * resets BOTH write-chain maps plus the abort set (claude3 D4).
+ * resets BOTH write-chain maps plus the abort set (claude3 D4). Now also
+ * clears `firstSendInflight` so a test that exercises the gating doesn't
+ * leave a stale promise behind for the next SESSION ID.
  */
 export function _resetWriteStateForTests(): void {
   taskWriteChainsBySession.clear();
   conversationWriteChainsBySession.clear();
   abortedSessions.clear();
+  firstSendInflight.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +587,21 @@ interface CollaboratorState {
    * frame. Entries are auto-cleared after RECENT_OUTCOME_TTL_MS.
    */
   recentOutcomesBySession: Record<string, Record<string, AgentRecentOutcome>>;
+  /**
+   * Per-agent flag tracking whether the full context header (paths +
+   * identity + TASK_PROTOCOL + active-task summary) has been successfully
+   * injected at least once.
+   *   absent     → next send is the first; uses full header
+   *   "inflight" → first full-header send is mid-flight; concurrent sends
+   *                MUST await `firstSendInflight.get(sessionId)` first so
+   *                the first PTY-arrival is always the full-header message
+   *   true       → first send confirmed; subsequent sends use slim header
+   * Cleared in removeAgent / endSession / killAllAgents. The slim header
+   * stays implementable because the agent's CLI tool retains the protocol
+   * from message #1 (with a 1-line breadcrumb fallback for very long
+   * conversations whose context summarized away the original).
+   */
+  contextSentByAgent: Record<string, true | "inflight">;
 
   // Session lifecycle
   startSession: (id: string) => void;
@@ -776,6 +805,48 @@ async function prependContextHeader(
   return parts.join("\n");
 }
 
+/**
+ * Slim context header used for every send AFTER the first. Drops the static
+ * `TASK_PROTOCOL` block (the agent learned it from message #1) and the
+ * inline `[Shared context]` lookup. Keeps:
+ *   - shared memory dir (paths agents may need to write artifacts)
+ *   - tasks file path + active-task summary (so the agent sees newly
+ *     assigned tasks WITHOUT a separate Read tool call per turn)
+ *   - conversation log path (for context recovery)
+ *   - agent identity
+ *   - 1-line protocol-reminder breadcrumb (in case the agent's own CLI
+ *     context summarized away message #1, the breadcrumb gives just enough
+ *     for the agent to write a valid done.json from memory)
+ *
+ * Net footprint: ~5-15 lines vs. ~40-80 for `prependContextHeader`. This is
+ * the S1 fix from the bug report — without it, the user sees the full
+ * protocol echoed in the agent's TUI input area on every turn.
+ */
+async function buildSlimHeader(
+  text: string,
+  collabSessionId: string | null,
+  tasks: CollabTask[],
+  agentIdentity?: string | null,
+): Promise<string> {
+  const dir = await getMemoryDir();
+  const parts: string[] = [`[Collaborator shared memory: ${dir}]`];
+  if (collabSessionId) {
+    parts.push(`[Tasks file: ${dir}/${taskFileRelativePath(collabSessionId)}]`);
+    parts.push(`[Conversation log: ${dir}/conversation-${collabSessionId}.md]`);
+  }
+  if (agentIdentity) {
+    parts.push(`[You are @${agentIdentity}]`);
+  }
+  parts.push(
+    `[Protocol reminder: signal completion via ${dir}/{TASK_ID}.done.json — ` +
+    `full protocol was sent in this session's first message]`,
+  );
+  const summary = formatTaskSummaryForPrompt(tasks);
+  if (summary) parts.push(summary);
+  parts.push(text);
+  return parts.join("\n");
+}
+
 export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   agents: [],
   statusMessages: {},
@@ -787,6 +858,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   pendingInputs: {},
   pendingMessagesByAgent: {},
   recentOutcomesBySession: {},
+  contextSentByAgent: {},
 
   // -- Session lifecycle --------------------------------------------------
 
@@ -827,6 +899,16 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     taskWriteChainsBySession.delete(forSession);
     conversationWriteChainsBySession.delete(forSession);
     set((s) => {
+      // Compute sessionIds to drop while we still have the unfiltered agents
+      // list — used both to filter contextSentByAgent and to drop
+      // firstSendInflight entries (belt & suspenders cleanup).
+      const sessionIdsToDrop = new Set(
+        s.agents.filter((a) => a.collabSessionId === forSession).map((a) => a.sessionId),
+      );
+      for (const sid of sessionIdsToDrop) firstSendInflight.delete(sid);
+      const contextSentByAgent = Object.fromEntries(
+        Object.entries(s.contextSentByAgent).filter(([sid]) => !sessionIdsToDrop.has(sid)),
+      );
       const { [forSession]: _status, ...statusMessages } = s.statusMessages;
       const { [forSession]: _logs, ...logEntriesBySession } = s.logEntriesBySession;
       const { [forSession]: _tasks, ...tasksBySession } = s.tasksBySession;
@@ -844,6 +926,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         historyIndexBySession,
         draftInputBySession,
         recentOutcomesBySession,
+        contextSentByAgent,
         agents: s.agents.filter((a) => a.collabSessionId !== forSession),
       };
     });
@@ -864,11 +947,17 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   },
 
   removeAgent: (sessionId) => {
+    // Belt & suspenders: clear any in-flight first-send promise for this
+    // sessionId (the `finally` in sendToAgent normally handles this, but if
+    // the component is yanked mid-flight we don't want a dangling promise).
+    firstSendInflight.delete(sessionId);
     set((s) => {
-      const { [sessionId]: _, ...pendingMessagesByAgent } = s.pendingMessagesByAgent;
+      const { [sessionId]: _pm, ...pendingMessagesByAgent } = s.pendingMessagesByAgent;
+      const { [sessionId]: _ctx, ...contextSentByAgent } = s.contextSentByAgent;
       return {
         agents: s.agents.filter((a) => a.sessionId !== sessionId),
         pendingMessagesByAgent,
+        contextSentByAgent,
       };
     });
   },
@@ -908,15 +997,26 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         // Already dead
       }
     }
+    // TODO(future): taskCounter is module-global; resetting it here when
+    // scoped to one session can cause task-id collisions in another live
+    // session. Pre-existing — tracked separately. (@claude2 task-16 Note 3)
     taskCounter = 0;
+    // Belt & suspenders: clear firstSendInflight for the killed sessions
+    // (the per-call `finally` normally handles this, but if a kill races
+    // an in-flight inject we don't want a dangling promise).
+    const killedIds = new Set(toKill.map((a) => a.sessionId));
+    for (const id of killedIds) firstSendInflight.delete(id);
     if (sid) {
       resetOrdinalCounters(sid);
       set((s) => ({
         agents: s.agents.filter((a) => a.collabSessionId !== sid),
+        contextSentByAgent: Object.fromEntries(
+          Object.entries(s.contextSentByAgent).filter(([id]) => !killedIds.has(id)),
+        ),
       }));
     } else {
       toolOrdinalCounters.clear();
-      set({ agents: [] });
+      set({ agents: [], contextSentByAgent: {} });
     }
     if (sid) {
       // Mark the session aborted BEFORE deleting the file so any chain-
@@ -1009,10 +1109,62 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         }
       }
       const sessionTasks = agentCollabId ? (get().tasksBySession[agentCollabId] ?? []) : [];
-      const text = await prependContextHeader(content, agentCollabId, sessionTasks, mention);
-      // Mute the output capture to suppress the echoed prompt from being logged
-      muteCapture(sessionId, 1500);
-      await invoke("inject_into_pty", { sessionId, text, tool });
+
+      // ── Order-safe + race-safe first-send gating ──────────────────
+      // S1 fix: only the FIRST send to an agent carries the full
+      // ~40-line TASK_PROTOCOL. Subsequent sends carry a slim ~5-15-line
+      // header (paths + identity + active-task summary + breadcrumb).
+      //
+      // The while-loop is load-bearing: it ensures we only proceed when
+      // no first-send is in-flight for this agent. A simple "if inflight
+      // await" wouldn't catch the case where a previous first-send fails
+      // and the next sender becomes the new first sender between our
+      // await and our flag read — re-checking the map closes that gap.
+      while (firstSendInflight.has(sessionId)) {
+        await firstSendInflight.get(sessionId)!.catch(() => {});
+      }
+      const flagState = get().contextSentByAgent[sessionId];
+      const useFullHeader = flagState === undefined;
+
+      if (useFullHeader) {
+        // Become the first sender. Mark inflight in BOTH state (for the
+        // next sender's sync flagState read) AND firstSendInflight (for
+        // the next sender's await before deciding header shape).
+        set((s) => ({
+          contextSentByAgent: { ...s.contextSentByAgent, [sessionId]: "inflight" },
+        }));
+        const work = (async () => {
+          try {
+            const text = await prependContextHeader(content, agentCollabId, sessionTasks, mention);
+            muteCapture(sessionId, 1500);
+            await invoke("inject_into_pty", { sessionId, text, tool });
+            set((s) => ({
+              contextSentByAgent: { ...s.contextSentByAgent, [sessionId]: true },
+            }));
+          } catch (err) {
+            // Roll back so the next sender retries with a full header.
+            set((s) => {
+              const { [sessionId]: _, ...rest } = s.contextSentByAgent;
+              return { contextSentByAgent: rest };
+            });
+            throw err;
+          }
+        })();
+        firstSendInflight.set(sessionId, work);
+        try {
+          await work;
+        } finally {
+          firstSendInflight.delete(sessionId);
+        }
+      } else {
+        // flagState === true (we waited above; "inflight" cannot occur here
+        // because the `while` loop drained it).
+        const text = await buildSlimHeader(content, agentCollabId, sessionTasks, mention);
+        muteCapture(sessionId, 1500);
+        await invoke("inject_into_pty", { sessionId, text, tool });
+      }
+      // ── End first-send gating ─────────────────────────────────────
+
       const label = agent ? toolLabel(agent.tool) : sessionId;
       if (agentCollabId) {
         get().setStatus(`Sent to ${label}`, agentCollabId);
@@ -1073,16 +1225,51 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         continue;
       }
       try {
-        // Each agent gets its own identity injected into the context header
+        // Each agent gets its own identity injected into the context header.
         const identity = agent.handle;
-        const text = await prependContextHeader(content, sid, sessionTasks, identity);
-        // Mute the output capture to suppress the echoed prompt from being logged
-        muteCapture(agent.sessionId, 1500);
-        await invoke("inject_into_pty", {
-          sessionId: agent.sessionId,
-          text,
-          tool: agent.tool,
-        });
+        const aSid = agent.sessionId;
+
+        // ── Per-agent first-send gating (mirrors sendToAgent) ───────
+        // Each agent's gating is independent — broadcasting to N agents
+        // can have N first-sends running in parallel, but for any one
+        // agent the ordering and dedup guarantees still hold.
+        while (firstSendInflight.has(aSid)) {
+          await firstSendInflight.get(aSid)!.catch(() => {});
+        }
+        const flagState = get().contextSentByAgent[aSid];
+        const useFullHeader = flagState === undefined;
+
+        if (useFullHeader) {
+          set((s) => ({
+            contextSentByAgent: { ...s.contextSentByAgent, [aSid]: "inflight" },
+          }));
+          const work = (async () => {
+            try {
+              const text = await prependContextHeader(content, sid, sessionTasks, identity);
+              muteCapture(aSid, 1500);
+              await invoke("inject_into_pty", { sessionId: aSid, text, tool: agent.tool });
+              set((s) => ({
+                contextSentByAgent: { ...s.contextSentByAgent, [aSid]: true },
+              }));
+            } catch (err) {
+              set((s) => {
+                const { [aSid]: _, ...rest } = s.contextSentByAgent;
+                return { contextSentByAgent: rest };
+              });
+              throw err;
+            }
+          })();
+          firstSendInflight.set(aSid, work);
+          try {
+            await work;
+          } finally {
+            firstSendInflight.delete(aSid);
+          }
+        } else {
+          const text = await buildSlimHeader(content, sid, sessionTasks, identity);
+          muteCapture(aSid, 1500);
+          await invoke("inject_into_pty", { sessionId: aSid, text, tool: agent.tool });
+        }
         sent++;
       } catch {
         // Skip failed
