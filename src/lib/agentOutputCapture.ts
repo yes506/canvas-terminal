@@ -92,16 +92,32 @@ const RESPONSE_DONE_PATTERNS = [
  * is logged to the conversation file.
  */
 const INJECTED_HEADER_PATTERNS = [
+  // Full-header shapes (prependContextHeader)
   /\[Collaborator shared memory:.*?\]/g,
   /\[Conversation log:.*?\]/g,
   /\[Task definitions:.*?\]/g,
   /\[Shared context:.*?\]/g,
   /\[To share notes with other agents.*?\]/g,
   /\[Your identity:.*?\]/g,
-  /## Agent Task Protocol[\s\S]*?(?=\n## Active Tasks|\n## [^\n]*$)/g,
+  /## Agent Task Protocol[\s\S]*?(?=\n## Active Tasks|\n## Your active tasks|\n## Other agents|\n## [^\n]*$)/g,
   /## Active Tasks[\s\S]*?(?=\n[^\s-]|\n*$)/g,
+  // Slim-header shapes (buildSlimHeader). Mute capture should suppress
+  // most of these, but a partial echo can still leak a single bracketed
+  // line; without these patterns the cleanup fallback misses them and
+  // they pollute the conversation log. (codex1 task-8.)
+  /\[Tasks file:.*?\]/g,
+  /\[You are @[^\]]+\]/g,
+  /\[Protocol reminder:[\s\S]*?\]/g,
+  /\[Read-discipline:[\s\S]*?\]/g,
+  /## Your active tasks[\s\S]*?(?=\n## Other agents|\n[^\s-]|\n*$)/g,
+  /## Other agents' active tasks[\s\S]*?(?=\n[^\s-]|\n*$)/g,
+  // Pasted-text marker (CLI-side noise)
   /\[Pasted\s*text\s*#\d+\+\d+\s*lines\]/gi,
 ];
+
+export function _filterInjectedContentForTests(text: string): string {
+  return filterInjectedContent(text);
+}
 
 function filterInjectedContent(text: string): string {
   let result = text;

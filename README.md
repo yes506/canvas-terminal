@@ -9,9 +9,66 @@ Sketch a diagram, click Upload, and the AI CLI tool running in your terminal see
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Built with](https://img.shields.io/badge/built%20with-Tauri%20v2-blue.svg)
+[![Release](https://img.shields.io/github/v/release/yes506/canvas-terminal?label=download)](https://github.com/yes506/canvas-terminal/releases/latest)
 
 <!-- TODO: Replace with an actual screenshot or GIF of the app -->
 <!-- ![Canvas Terminal Screenshot](docs/screenshot.png) -->
+
+---
+
+## Get Started
+
+### Download Latest Release
+
+Download the latest macOS build from [GitHub Releases](https://github.com/yes506/canvas-terminal/releases/latest), open the `.dmg`, and drag **Canvas Terminal** into Applications.
+
+### Build from Source
+
+#### Prerequisites
+
+| Tool | Version | Install |
+|------|---------|---------|
+| **Rust** | 1.70+ | [rustup.rs](https://rustup.rs/) |
+| **Node.js** | 18+ | [nodejs.org](https://nodejs.org/) |
+
+> The Tauri CLI is included as an npm devDependency — no separate `cargo install` needed.
+
+#### Build & Install
+
+```bash
+# 1. Install Rust (skip if already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# 2. Clone and enter the project
+git clone https://github.com/yes506/canvas-terminal.git
+cd canvas-terminal
+
+# 3. Install all dependencies (frontend + Tauri CLI)
+npm install
+
+# 4. Build the production app
+npm run tauri:build
+
+# 5. Open the generated DMG and drag to Applications
+open src-tauri/target/release/bundle/dmg/Canvas\ Terminal_*.dmg
+```
+
+#### Development Mode
+
+```bash
+npm install
+npm run tauri dev    # Hot reload — frontend changes apply instantly
+```
+
+| Script | Description |
+|--------|-------------|
+| `npm run dev` | Vite dev server (frontend only) |
+| `npm run tauri dev` | Full app with hot reload |
+| `npm run tauri:build` | Production build (.dmg) |
+| `npm run build` | Frontend only (TypeScript + Vite) |
+| `npm run preview` | Preview the built frontend |
+| `npm run clean` | Remove dist and release bundles |
 
 ---
 
@@ -49,121 +106,6 @@ This creates a **visual feedback loop** between you, the canvas, and the AI. Wor
 - **Agent command prompt** with `@mentions`, broadcasts, task tracking, and memory file management
 - **Canvas routing for agents** so `/canvas-export` and `/canvas-import` work directly with spawned collaborators
 - **Automatic agent output capture** that flushes readable terminal output into the shared collaboration log
-
----
-
-## Collaborator Workflow
-
-The collaborator is a dedicated split pane for multi-agent sessions.
-
-### Open It
-
-- Click the **zap** button in the tab bar
-- Press `Cmd+E`
-- Or type `collaborator` directly in a terminal and press Enter
-
-### Launch Agents
-
-The collaborator toolbar can spawn:
-
-- **Claude Code**
-- **Codex CLI**
-- **Gemini CLI**
-
-Each agent runs in its own PTY-backed mini terminal and inherits the active terminal's working directory when possible.
-
-When multiple sessions of the same tool are running, the target selector disambiguates them with labels like `Claude Code #1`, `Claude Code #2`, plus matching handles such as `@claude1` and `@claude2`.
-
-### Send Commands
-
-Use the input prompt at the bottom of the collaborator pane:
-
-| Input | Action |
-|------|--------|
-| `@claude fix this bug` | Send a message to one agent |
-| `plain message` | If one agent is running, send directly. If multiple agents are running, open a target selector before sending |
-| `@all investigate startup latency` | Explicitly broadcast to all running agents |
-| `/status` | Show active agents |
-| `/help` | Show command help |
-| `/canvas-export [msg]` | Export canvas and show target selector (or send to sole agent) |
-| `/canvas-export @agent [msg]` | Export canvas to a specific agent with optional prompt |
-| `/canvas-import @agent` | Ask a specific agent to write a response file and import it back |
-| `/context <text>` | Append shared context |
-| `/memory list` | List files in shared memory |
-| `/memory read <path>` | Read a shared-memory file |
-| `/memory delete <path>` | Delete a shared-memory file |
-| `/memory clear` | Clear the shared memory directory |
-| `/task list` | List collaboration tasks |
-| `/task add <title> | <objective> [@agent]` | Create a task |
-| `/task <id> status <pending|in-progress|completed|blocked>` | Update task state |
-| `/task <id> assign @<agent>` | Reassign a task |
-| `/task <id> done [notes]` | Mark a task complete |
-
-### Shared Memory Files
-
-Canvas Terminal creates a collaboration workspace under:
-
-```text
-~/.cache/canvas-terminal/collab-memory
-```
-
-Typical files:
-
-- `conversation-<session>.md` — append-only conversation and task reports
-- `tasks.md` — generated task definitions for active collaboration
-- `context.md` — optional shared context for all agents
-
-These files are designed for agent-to-agent handoff and are protected by path validation, size limits, and symlink checks in the Tauri backend.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-| Tool | Version | Install |
-|------|---------|---------|
-| **Rust** | 1.70+ | [rustup.rs](https://rustup.rs/) |
-| **Node.js** | 18+ | [nodejs.org](https://nodejs.org/) |
-
-> The Tauri CLI is included as an npm devDependency — no separate `cargo install` needed.
-
-### Build & Install
-
-```bash
-# 1. Install Rust (skip if already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# 2. Clone and enter the project
-git clone https://github.com/yes506/canvas-terminal.git
-cd canvas-terminal
-
-# 3. Install all dependencies (frontend + Tauri CLI)
-npm install
-
-# 4. Build the production app
-npm run tauri:build
-
-# 5. Open the generated DMG and drag to Applications
-open src-tauri/target/release/bundle/dmg/Canvas\ Terminal_*.dmg
-```
-
-### Development Mode
-
-```bash
-npm install
-npm run tauri dev    # Hot reload — frontend changes apply instantly
-```
-
-| Script | Description |
-|--------|-------------|
-| `npm run dev` | Vite dev server (frontend only) |
-| `npm run tauri dev` | Full app with hot reload |
-| `npm run tauri:build` | Production build (.dmg) |
-| `npm run build` | Frontend only (TypeScript + Vite) |
-| `npm run preview` | Preview the built frontend |
-| `npm run clean` | Remove dist and release bundles |
 
 ---
 
@@ -252,6 +194,71 @@ A Fabric.js-powered drawing board designed for quick sketching, not pixel-perfec
 - **Pan & Zoom** — trackpad or toolbar, 25% to 500%
 - **Snapshots** — capture canvas only (camera icon) or full app window (monitor icon) as on-canvas images
 - **Save/Load** — Cmd+S / Cmd+O for `.canvas.json` files (fabric.js JSON, version-controllable)
+
+---
+
+## Collaborator Workflow
+
+The collaborator is a dedicated split pane for multi-agent sessions.
+
+### Open It
+
+- Click the **zap** button in the tab bar
+- Press `Cmd+E`
+- Or type `collaborator` directly in a terminal and press Enter
+
+### Launch Agents
+
+The collaborator toolbar can spawn:
+
+- **Claude Code**
+- **Codex CLI**
+- **Gemini CLI**
+
+Each agent runs in its own PTY-backed mini terminal and inherits the active terminal's working directory when possible.
+
+When multiple sessions of the same tool are running, the target selector disambiguates them with labels like `Claude Code #1`, `Claude Code #2`, plus matching handles such as `@claude1` and `@claude2`.
+
+### Send Commands
+
+Use the input prompt at the bottom of the collaborator pane:
+
+| Input | Action |
+|------|--------|
+| `@claude fix this bug` | Send a message to one agent |
+| `plain message` | If one agent is running, send directly. If multiple agents are running, open a target selector before sending |
+| `@all investigate startup latency` | Explicitly broadcast to all running agents |
+| `/status` | Show active agents |
+| `/help` | Show command help |
+| `/canvas-export [msg]` | Export canvas and show target selector (or send to sole agent) |
+| `/canvas-export @agent [msg]` | Export canvas to a specific agent with optional prompt |
+| `/canvas-import @agent` | Ask a specific agent to write a response file and import it back |
+| `/context <text>` | Append shared context |
+| `/memory list` | List files in shared memory |
+| `/memory read <path>` | Read a shared-memory file |
+| `/memory delete <path>` | Delete a shared-memory file |
+| `/memory clear` | Clear the shared memory directory |
+| `/task list` | List collaboration tasks |
+| `/task add <title> | <objective> [@agent]` | Create a task |
+| `/task <id> status <pending|in-progress|completed|blocked>` | Update task state |
+| `/task <id> assign @<agent>` | Reassign a task |
+| `/task <id> done [notes]` | Mark a task complete |
+
+### Shared Memory Files
+
+Canvas Terminal creates a collaboration workspace under:
+
+```text
+~/.cache/canvas-terminal/collab-memory
+```
+
+Typical files:
+
+- `conversation-<session>.md` — append-only conversation and task reports
+- `tasks.md` — generated task definitions for active collaboration
+- `context.md` — optional shared context for all agents
+
+These files are designed for agent-to-agent handoff and are protected by path validation, size limits, and symlink checks in the Tauri backend.
 
 ---
 

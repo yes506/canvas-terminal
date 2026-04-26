@@ -9,9 +9,66 @@
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Built with](https://img.shields.io/badge/built%20with-Tauri%20v2-blue.svg)
+[![Release](https://img.shields.io/github/v/release/yes506/canvas-terminal?label=download)](https://github.com/yes506/canvas-terminal/releases/latest)
 
 <!-- TODO: 실제 앱 스크린샷 또는 GIF로 교체 -->
 <!-- ![Canvas Terminal 스크린샷](docs/screenshot.png) -->
+
+---
+
+## 시작하기
+
+### 최신 릴리스 다운로드
+
+[GitHub Releases](https://github.com/yes506/canvas-terminal/releases/latest)에서 최신 macOS 빌드를 내려받고, `.dmg`를 연 뒤 **Canvas Terminal**을 Applications로 드래그하면 됩니다.
+
+### 소스에서 빌드하기
+
+#### 사전 요구 사항
+
+| 도구 | 버전 | 설치 |
+|------|------|------|
+| **Rust** | 1.70+ | [rustup.rs](https://rustup.rs/) |
+| **Node.js** | 18+ | [nodejs.org](https://nodejs.org/) |
+
+> Tauri CLI는 npm devDependency에 포함되어 있어 별도의 `cargo install`이 필요 없습니다.
+
+#### 빌드 & 설치
+
+```bash
+# 1. Rust 설치 (이미 설치된 경우 건너뛰기)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# 2. 프로젝트 클론 및 진입
+git clone https://github.com/yes506/canvas-terminal.git
+cd canvas-terminal
+
+# 3. 모든 의존성 설치 (프론트엔드 + Tauri CLI)
+npm install
+
+# 4. 프로덕션 앱 빌드
+npm run tauri:build
+
+# 5. 생성된 DMG를 열고 Applications로 드래그
+open src-tauri/target/release/bundle/dmg/Canvas\ Terminal_*.dmg
+```
+
+#### 개발 모드
+
+```bash
+npm install
+npm run tauri dev    # 핫 리로드 — 프론트엔드 변경 즉시 반영
+```
+
+| 스크립트 | 설명 |
+|----------|------|
+| `npm run dev` | Vite 개발 서버 (프론트엔드만) |
+| `npm run tauri dev` | 핫 리로드로 전체 앱 시작 |
+| `npm run tauri:build` | 프로덕션 빌드 (.dmg) |
+| `npm run build` | 프론트엔드만 빌드 (TypeScript + Vite) |
+| `npm run preview` | 빌드된 프론트엔드 미리보기 |
+| `npm run clean` | dist 및 릴리스 번들 삭제 |
 
 ---
 
@@ -49,121 +106,6 @@
 - `@mention`, 브로드캐스트, 태스크 추적, 메모리 파일 관리를 지원하는 **에이전트 명령 프롬프트**
 - `/canvas-export`, `/canvas-import`가 스폰된 협업 에이전트와 직접 연결되는 **캔버스 라우팅**
 - 사람이 읽을 수 있는 텍스트만 협업 로그로 기록하는 **자동 에이전트 출력 캡처**
-
----
-
-## Collaborator 워크플로우
-
-Collaborator는 멀티 에이전트 세션을 위한 전용 분할 패널입니다.
-
-### 여는 방법
-
-- 탭 바의 **zap** 버튼 클릭
-- `Cmd+E` 입력
-- 또는 터미널에 `collaborator`를 입력하고 Enter
-
-### 에이전트 실행
-
-Collaborator 도구막대에서 다음 도구를 실행할 수 있습니다.
-
-- **Claude Code**
-- **Codex CLI**
-- **Gemini CLI**
-
-각 에이전트는 자체 PTY 기반 미니 터미널에서 실행되며, 가능하면 현재 활성 터미널의 작업 디렉토리를 그대로 이어받습니다.
-
-같은 도구의 여러 세션이 동시에 실행 중이면, 타깃 선택기는 `Claude Code #1`, `Claude Code #2`처럼 구분해서 보여주고, 이에 대응하는 `@claude1`, `@claude2` 같은 핸들도 함께 표시합니다.
-
-### 명령 보내기
-
-Collaborator 패널 하단 입력창에서 다음과 같이 사용할 수 있습니다.
-
-| 입력 | 동작 |
-|------|------|
-| `@claude fix this bug` | 특정 에이전트 하나에 메시지 전송 |
-| `plain message` | 에이전트가 1개면 바로 전송하고, 여러 개면 전송 전에 타깃 선택기를 엽니다 |
-| `@all investigate startup latency` | 실행 중인 모든 에이전트에 명시적으로 브로드캐스트 |
-| `/status` | 활성 에이전트 목록 표시 |
-| `/help` | 명령 도움말 표시 |
-| `/canvas-export [메시지]` | 캔버스를 내보내고 대상 선택기 표시 (에이전트 1개면 자동 전송) |
-| `/canvas-export @agent [메시지]` | 특정 에이전트에 캔버스를 내보내기 (프롬프트 첨부 가능) |
-| `/canvas-import @agent` | 특정 에이전트가 응답 파일을 쓰게 하고 다시 캔버스로 가져오기 |
-| `/context <text>` | 공유 컨텍스트 추가 |
-| `/memory list` | 공유 메모리 파일 목록 표시 |
-| `/memory read <path>` | 공유 메모리 파일 읽기 |
-| `/memory delete <path>` | 공유 메모리 파일 삭제 |
-| `/memory clear` | 공유 메모리 디렉토리 비우기 |
-| `/task list` | 협업 태스크 목록 표시 |
-| `/task add <title> | <objective> [@agent]` | 새 태스크 생성 |
-| `/task <id> status <pending|in-progress|completed|blocked>` | 태스크 상태 변경 |
-| `/task <id> assign @<agent>` | 태스크 담당 에이전트 변경 |
-| `/task <id> done [notes]` | 태스크 완료 처리 |
-
-### 공유 메모리 파일
-
-Canvas Terminal은 다음 경로 아래에 협업용 워크스페이스를 만듭니다.
-
-```text
-~/.cache/canvas-terminal/collab-memory
-```
-
-대표적인 파일은 다음과 같습니다.
-
-- `conversation-<session>.md` — append-only 대화 및 태스크 보고 로그
-- `tasks.md` — 활성 협업 세션의 태스크 정의 파일
-- `context.md` — 모든 에이전트가 공유하는 선택적 컨텍스트 파일
-
-이 파일들은 에이전트 간 인수인계를 위한 용도로 설계되었고, Tauri 백엔드에서 경로 검증, 크기 제한, 심볼릭 링크 차단으로 보호됩니다.
-
----
-
-## 빠른 시작
-
-### 사전 요구 사항
-
-| 도구 | 버전 | 설치 |
-|------|------|------|
-| **Rust** | 1.70+ | [rustup.rs](https://rustup.rs/) |
-| **Node.js** | 18+ | [nodejs.org](https://nodejs.org/) |
-
-> Tauri CLI는 npm devDependency에 포함되어 있어 별도의 `cargo install`이 필요 없습니다.
-
-### 빌드 & 설치
-
-```bash
-# 1. Rust 설치 (이미 설치된 경우 건너뛰기)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# 2. 프로젝트 클론 및 진입
-git clone https://github.com/yes506/canvas-terminal.git
-cd canvas-terminal
-
-# 3. 모든 의존성 설치 (프론트엔드 + Tauri CLI)
-npm install
-
-# 4. 프로덕션 앱 빌드
-npm run tauri:build
-
-# 5. 생성된 DMG를 열고 Applications로 드래그
-open src-tauri/target/release/bundle/dmg/Canvas\ Terminal_*.dmg
-```
-
-### 개발 모드
-
-```bash
-npm install
-npm run tauri dev    # 핫 리로드 — 프론트엔드 변경 즉시 반영
-```
-
-| 스크립트 | 설명 |
-|----------|------|
-| `npm run dev` | Vite 개발 서버 (프론트엔드만) |
-| `npm run tauri dev` | 핫 리로드로 전체 앱 시작 |
-| `npm run tauri:build` | 프로덕션 빌드 (.dmg) |
-| `npm run build` | 프론트엔드만 빌드 (TypeScript + Vite) |
-| `npm run preview` | 빌드된 프론트엔드 미리보기 |
-| `npm run clean` | dist 및 릴리스 번들 삭제 |
 
 ---
 
@@ -252,6 +194,71 @@ Collaborator는 터미널 레이아웃 안에 포함된 PTY 기반 멀티 에이
 - **팬 & 줌** — 트랙패드 또는 도구바, 25% ~ 500%
 - **스냅샷** — 캔버스만 캡처(카메라 아이콘) 또는 전체 앱 창 캡처(모니터 아이콘)
 - **저장/불러오기** — Cmd+S / Cmd+O로 `.canvas.json` 파일 관리 (fabric.js JSON, 버전 관리 가능)
+
+---
+
+## Collaborator 워크플로우
+
+Collaborator는 멀티 에이전트 세션을 위한 전용 분할 패널입니다.
+
+### 여는 방법
+
+- 탭 바의 **zap** 버튼 클릭
+- `Cmd+E` 입력
+- 또는 터미널에 `collaborator`를 입력하고 Enter
+
+### 에이전트 실행
+
+Collaborator 도구막대에서 다음 도구를 실행할 수 있습니다.
+
+- **Claude Code**
+- **Codex CLI**
+- **Gemini CLI**
+
+각 에이전트는 자체 PTY 기반 미니 터미널에서 실행되며, 가능하면 현재 활성 터미널의 작업 디렉토리를 그대로 이어받습니다.
+
+같은 도구의 여러 세션이 동시에 실행 중이면, 타깃 선택기는 `Claude Code #1`, `Claude Code #2`처럼 구분해서 보여주고, 이에 대응하는 `@claude1`, `@claude2` 같은 핸들도 함께 표시합니다.
+
+### 명령 보내기
+
+Collaborator 패널 하단 입력창에서 다음과 같이 사용할 수 있습니다.
+
+| 입력 | 동작 |
+|------|------|
+| `@claude fix this bug` | 특정 에이전트 하나에 메시지 전송 |
+| `plain message` | 에이전트가 1개면 바로 전송하고, 여러 개면 전송 전에 타깃 선택기를 엽니다 |
+| `@all investigate startup latency` | 실행 중인 모든 에이전트에 명시적으로 브로드캐스트 |
+| `/status` | 활성 에이전트 목록 표시 |
+| `/help` | 명령 도움말 표시 |
+| `/canvas-export [메시지]` | 캔버스를 내보내고 대상 선택기 표시 (에이전트 1개면 자동 전송) |
+| `/canvas-export @agent [메시지]` | 특정 에이전트에 캔버스를 내보내기 (프롬프트 첨부 가능) |
+| `/canvas-import @agent` | 특정 에이전트가 응답 파일을 쓰게 하고 다시 캔버스로 가져오기 |
+| `/context <text>` | 공유 컨텍스트 추가 |
+| `/memory list` | 공유 메모리 파일 목록 표시 |
+| `/memory read <path>` | 공유 메모리 파일 읽기 |
+| `/memory delete <path>` | 공유 메모리 파일 삭제 |
+| `/memory clear` | 공유 메모리 디렉토리 비우기 |
+| `/task list` | 협업 태스크 목록 표시 |
+| `/task add <title> | <objective> [@agent]` | 새 태스크 생성 |
+| `/task <id> status <pending|in-progress|completed|blocked>` | 태스크 상태 변경 |
+| `/task <id> assign @<agent>` | 태스크 담당 에이전트 변경 |
+| `/task <id> done [notes]` | 태스크 완료 처리 |
+
+### 공유 메모리 파일
+
+Canvas Terminal은 다음 경로 아래에 협업용 워크스페이스를 만듭니다.
+
+```text
+~/.cache/canvas-terminal/collab-memory
+```
+
+대표적인 파일은 다음과 같습니다.
+
+- `conversation-<session>.md` — append-only 대화 및 태스크 보고 로그
+- `tasks.md` — 활성 협업 세션의 태스크 정의 파일
+- `context.md` — 모든 에이전트가 공유하는 선택적 컨텍스트 파일
+
+이 파일들은 에이전트 간 인수인계를 위한 용도로 설계되었고, Tauri 백엔드에서 경로 검증, 크기 제한, 심볼릭 링크 차단으로 보호됩니다.
 
 ---
 
