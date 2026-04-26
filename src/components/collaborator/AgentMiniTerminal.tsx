@@ -100,6 +100,24 @@ export function AgentMiniTerminal({
       terminalRef.current = terminal;
       fitAddonRef.current = fitAddon;
 
+      // S2 fix: auto-follow PTY output when user is at-bottom OR actively
+      // focused on this terminal. Preserves manual scrollback (user can
+      // scroll up to read past output without being yanked back) but
+      // ensures the live prompt is always visible in the steady state.
+      // The 2-row dead zone tolerates cosmetic TUI redraw jitter without
+      // weakening genuine scroll-up intent. Defined here (not later) so
+      // it's in scope for the early write sites at L142, L162, L205.
+      const writeWithFollowBottom = (payload: string) => {
+        const buf = terminal.buffer.active;
+        const shouldFollow =
+          buf.baseY - buf.viewportY <= 2 ||
+          document.activeElement === terminal.textarea;
+        terminal.write(payload, () => {
+          if (disposed.current) return;
+          if (shouldFollow) terminal.scrollToBottom();
+        });
+      };
+
       if (disposed.current) {
         terminal.dispose();
         return;
@@ -139,7 +157,7 @@ export function AgentMiniTerminal({
         `pty-data-${sessionId}`,
         (event) => {
           if (!disposed.current) {
-            terminal.write(event.payload);
+            writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
           }
         },
@@ -159,7 +177,7 @@ export function AgentMiniTerminal({
           if (!disposed.current) {
             // Flush any remaining buffered output before marking exit
             captureRef.current?.flush();
-            terminal.write("\r\n\x1b[33m[Process exited]\x1b[0m\r\n");
+            writeWithFollowBottom("\r\n\x1b[33m[Process exited]\x1b[0m\r\n");
             useCollaboratorStore
               .getState()
               .setAgentStatus(sessionId, "exited");
@@ -202,7 +220,7 @@ export function AgentMiniTerminal({
           });
         } catch (shellErr) {
           if (!disposed.current) {
-            terminal.write(
+            writeWithFollowBottom(
               `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
             );
           }
@@ -492,10 +510,26 @@ export function AgentMiniTerminal({
       terminal.onData((data) => {
         if (disposed.current) return;
         invoke("write_to_pty", { sessionId, data }).catch(() => {});
+        // S2 fix: user typing is explicit "I want to see the prompt" intent.
+        // Always snap to bottom on input — prevents the case where the user
+        // started typing while scrolled up and didn't realize their input
+        // was happening at the live prompt below the visible viewport.
+        terminal.scrollToBottom();
       });
 
-      // Track focus state for visual indicator
-      terminal.textarea?.addEventListener("focus", () => setFocused(true));
+      // Track focus state for visual indicator. Focus also snaps to bottom
+      // (compensating for the preventScroll: true override at L471 above
+      // which suppresses the browser's natural scroll-caret-into-view).
+      // Do it on the next animation frame so xterm has settled, and guard
+      // disposal so a refocus that races a unmount doesn't throw.
+      terminal.textarea?.addEventListener("focus", () => {
+        setFocused(true);
+        requestAnimationFrame(() => {
+          if (!disposed.current && document.activeElement === terminal.textarea) {
+            terminal.scrollToBottom();
+          }
+        });
+      });
       terminal.textarea?.addEventListener("blur", () => setFocused(false));
 
       // If we fell back to shell spawn, type the CLI tool command into the shell
@@ -565,7 +599,7 @@ export function AgentMiniTerminal({
         `pty-data-${sessionId}`,
         (event) => {
           if (!disposed.current) {
-            terminal.write(event.payload);
+            writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
             checkReady(event.payload);
           }
