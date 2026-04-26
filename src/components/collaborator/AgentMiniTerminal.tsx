@@ -6,7 +6,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { terminalThemes } from "../terminal/themes";
 import { useTerminalStore } from "../../stores/terminalStore";
-import { useCollaboratorStore, agentDisplayName, scanForTaskCompletions } from "../../stores/collaboratorStore";
+import {
+  useCollaboratorStore,
+  agentDisplayName,
+  getAgentTaskState,
+  getIndicatorPresentation,
+  scanForTaskCompletions,
+  type AgentLifecycle,
+} from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture, stripAnsi, registerCapture, unregisterCapture } from "../../lib/agentOutputCapture";
 import { isEnvBootstrapped } from "../../lib/terminalManager";
@@ -673,20 +680,74 @@ export function AgentMiniTerminal({
   const displayName = agent ? agentDisplayName(agent) : tool.label;
   const isExited = agent?.status === "exited";
   const isSpawning = agent?.status === "spawning";
+  // Pre-registration window: the component mounts and starts spawning the
+  // PTY before `addAgent({ status: "spawning" })` runs. Treat the missing
+  // agent record as "starting…" so the header doesn't briefly read "idle".
+  const isPreRegistration = !agent;
+
+  // Subscribe to the slices that drive the in-frame state indicator, scoped
+  // to this collab session so an outcome change in *another* session does
+  // not re-render this component.
+  const tasksForSession = useCollaboratorStore((s) =>
+    collabSessionId ? s.tasksBySession[collabSessionId] ?? null : null,
+  );
+  const sessionOutcomes = useCollaboratorStore((s) =>
+    collabSessionId ? s.recentOutcomesBySession[collabSessionId] ?? null : null,
+  );
+  // Wrap in a single-key map so we can keep using getAgentTaskState's
+  // existing signature without contorting it.
+  const outcomesProxy = collabSessionId && sessionOutcomes
+    ? { [collabSessionId]: sessionOutcomes }
+    : {};
+  const taskState =
+    agent && collabSessionId
+      ? getAgentTaskState(collabSessionId, agent.handle, tasksForSession ?? [], outcomesProxy)
+      : { kind: "idle" as const };
+
+  // Resolve indicator visuals + ARIA attributes via the pure helper. The
+  // mapping (lifecycle × task state → color/label/aria) is unit-tested in
+  // collaboratorStore.test.ts so changes go through a typed isolated function
+  // instead of an inline IIFE that's only verifiable by rendering the full
+  // xterm-bound component.
+  // Use the imported `AgentLifecycle` type so adding a 5th lifecycle to
+  // the canonical type errors out here instead of silently coercing to
+  // "running" via the ternary fallthrough.
+  const lifecycle: AgentLifecycle =
+    isExited ? "exited"
+    : isSpawning ? "spawning"
+    : isPreRegistration ? "pre-registration"
+    : "running";
+  const indicator = getIndicatorPresentation(lifecycle, taskState);
 
   return (
     <div className={`flex flex-col h-full min-h-0 border rounded-md overflow-hidden ${focused ? "border-accent" : "border-surface-lighter"}`}>
       {/* Agent header */}
       <div className="flex items-center gap-2 px-2 py-1 bg-surface-light border-b border-surface-lighter text-xs shrink-0">
-        <span
-          className={`w-1.5 h-1.5 rounded-full shrink-0 ${isExited ? "bg-gray-500" : isSpawning ? "bg-yellow-400 animate-pulse" : "bg-green-400"}`}
-        />
-        <span className={`font-bold ${tool.colorClass} truncate`}>
+        {/* Status light — `ping` halo flags a fresh outcome (completed/blocked).
+            Static `ring` keeps the highlight visible even when reduced-motion
+            disables the halo animation. */}
+        <span className="relative inline-flex w-2 h-2 shrink-0" aria-hidden="true" title={indicator.label}>
+          {indicator.ping && (
+            <span className={`absolute inline-flex w-full h-full rounded-full opacity-70 motion-safe:animate-ping ${indicator.color}`} />
+          )}
+          <span
+            className={`relative inline-flex w-2 h-2 rounded-full ${indicator.color} ring-2 ${indicator.ringColor} ${indicator.pulse ? "motion-safe:animate-pulse" : ""}`}
+          />
+        </span>
+        <span className={`font-bold ${tool.colorClass} truncate shrink-0`}>
           {displayName}
         </span>
-        <div className="flex-1" />
+        <span
+          role={indicator.liveRole}
+          aria-live={indicator.liveLevel}
+          aria-atomic="true"
+          className={`flex-1 min-w-0 truncate text-[11px] ${indicator.tone}`}
+          title={indicator.label}
+        >
+          {indicator.label}
+        </span>
         <button
-          className="text-text-dim hover:text-red-400 transition-colors p-0.5"
+          className="text-text-dim hover:text-red-400 transition-colors p-0.5 shrink-0"
           onClick={() => onClose(sessionId)}
           title="Close agent"
         >

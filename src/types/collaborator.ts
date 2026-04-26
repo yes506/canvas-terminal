@@ -67,4 +67,12 @@ export interface CollabTask {
   createdAt: string;
   /** ISO timestamp of last update */
   updatedAt: string;
+  /**
+   * ISO timestamp of the last assignment event. Initially equal to
+   * `createdAt`; refreshed when `updateTask` changes `assignee`. Used by
+   * the in-frame indicator's freshness gate so re-assignments (e.g. via
+   * `/task <id> assign @<agent>`) correctly preempt a lingering completion
+   * highlight even when the task was originally created long before.
+   */
+  assignedAt: string;
 }
