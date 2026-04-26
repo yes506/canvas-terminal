@@ -422,16 +422,97 @@ function formatTasksMarkdown(tasks: CollabTask[]): string {
   return lines.join("\n");
 }
 
-/** Build a concise task summary for context header injection. */
-function formatTaskSummaryForPrompt(tasks: CollabTask[]): string {
-  if (tasks.length === 0) return "";
-  const lines = ["\n## Active Tasks"];
-  for (const t of tasks) {
-    const assignee = t.assignee ?? "unassigned";
-    lines.push(`- [${t.status}] ${t.id}: ${t.title} (${assignee})`);
-    if (t.objective) lines.push(`  Objective: ${t.objective}`);
-    if (t.deliverables.length > 0) lines.push(`  Deliverables: ${t.deliverables.join("; ")}`);
-    if (t.dependencies.length > 0) lines.push(`  Depends on: ${t.dependencies.join(", ")}`);
+/** Maximum length of an objective string before truncation in summary. */
+const OBJECTIVE_TRUNCATE_AT = 120;
+
+/** Slim-header cap on "others" task entries. Beyond this, render an
+ *  `... and N more` line. Prevents O(N) growth of the slim payload as the
+ *  collaboration scales (codex2 task-10 finding). */
+const SLIM_OTHERS_CAP = 5;
+
+/**
+ * Build a recipient-aware, status-filtered task summary for context-header
+ * injection. Replaces the older `formatTaskSummaryForPrompt` (v0.1.6) which
+ * iterated ALL tasks regardless of status — that grew the slim header
+ * unboundedly as completed tasks accumulated.
+ *
+ * What this version does (vs. the predecessor):
+ *   - Filter to active tasks only (`pending` | `in-progress`). Completed
+ *     and blocked tasks become history; if an agent needs them, the tasks
+ *     file path is in the header.
+ *   - Split into "yours" + "others" when `recipient` is provided. Each
+ *     agent only needs full detail for tasks assigned to it (or
+ *     unassigned, which anyone could pick up). Other agents' tasks
+ *     appear as one-line entries so the recipient still has coordination
+ *     context without paying for everyone else's full objectives.
+ *   - Truncate long objectives to OBJECTIVE_TRUNCATE_AT chars (full text
+ *     remains in the tasks file).
+ *   - Strip the 13-char `Date.now()` suffix from rendered task IDs
+ *     (storage keeps the long form for uniqueness; the rendered prompt
+ *     doesn't need it).
+ *
+ * `recipient` is the bare handle (e.g. "claude1", no "@" prefix) — same
+ * value already threaded through as `mention` / `identity`.
+ */
+export function formatTaskSummaryForAgent(
+  tasks: CollabTask[],
+  recipient: string | null,
+  options: { othersCap?: number } = {},
+): string {
+  const active = tasks.filter(
+    (t) => t.status === "pending" || t.status === "in-progress",
+  );
+  if (active.length === 0) return "";
+
+  const mention = recipient ? `@${recipient}` : null;
+  // Unassigned tasks count as "yours" — anyone could pick them up, and
+  // tucking them under "others" would hide them from every agent.
+  const mine = mention
+    ? active.filter((t) => t.assignee === mention || t.assignee === null)
+    : active;
+  const others = mention
+    ? active.filter((t) => t.assignee && t.assignee !== mention)
+    : [];
+
+  const renderId = (id: string) => id.replace(/-\d{13}$/, "");
+  const truncateObj = (s: string) =>
+    s.length > OBJECTIVE_TRUNCATE_AT
+      ? s.slice(0, OBJECTIVE_TRUNCATE_AT - 3) + "..."
+      : s;
+
+  const lines: string[] = [];
+  if (mine.length > 0) {
+    // When recipient is known, label the bucket as "yours". When recipient
+    // is null (broadcast / unscoped context), the bucket is the entire
+    // active list, so the neutral label is more accurate (claude2 task-28
+    // cosmetic observation).
+    lines.push(mention ? "\n## Your active tasks" : "\n## Active tasks");
+    for (const t of mine) {
+      lines.push(`- [${t.status}] ${renderId(t.id)}: ${t.title}`);
+      // Only emit Objective if it adds info beyond the title; the chat
+      // history already has the user's prompt that originated the task.
+      if (t.objective && t.objective !== t.title) {
+        lines.push(`  Objective: ${truncateObj(t.objective)}`);
+      }
+      if (t.deliverables.length > 0) {
+        lines.push(`  Deliverables: ${t.deliverables.join("; ")}`);
+      }
+      if (t.dependencies.length > 0) {
+        lines.push(`  Depends on: ${t.dependencies.join(", ")}`);
+      }
+    }
+  }
+  if (others.length > 0) {
+    const cap = options.othersCap;
+    const visible = cap != null && others.length > cap ? others.slice(0, cap) : others;
+    const hidden = others.length - visible.length;
+    lines.push(`\n## Other agents' active tasks (${others.length})`);
+    for (const t of visible) {
+      lines.push(`- ${renderId(t.id)} (${t.assignee}): ${t.title}`);
+    }
+    if (hidden > 0) {
+      lines.push(`- ... and ${hidden} more`);
+    }
   }
   return lines.join("\n");
 }
@@ -798,7 +879,7 @@ async function prependContextHeader(
 
   // Inject task protocol and active task summary
   parts.push(TASK_PROTOCOL);
-  const taskSummary = formatTaskSummaryForPrompt(tasks);
+  const taskSummary = formatTaskSummaryForAgent(tasks, agentIdentity ?? null);
   if (taskSummary) parts.push(taskSummary);
 
   parts.push(text);
@@ -807,16 +888,20 @@ async function prependContextHeader(
 
 /**
  * Slim context header used for every send AFTER the first. Drops the static
- * `TASK_PROTOCOL` block (the agent learned it from message #1) and the
- * inline `[Shared context]` lookup. Keeps:
+ * `TASK_PROTOCOL` block (the agent learned it from message #1) but still
+ * probes for a current `[Shared context]` so a `/context` set after the
+ * first send remains visible. Keeps:
  *   - shared memory dir (paths agents may need to write artifacts)
  *   - tasks file path + active-task summary (so the agent sees newly
  *     assigned tasks WITHOUT a separate Read tool call per turn)
  *   - conversation log path (for context recovery)
+ *   - shared-context breadcrumb (only when context.md exists)
  *   - agent identity
  *   - 1-line protocol-reminder breadcrumb (in case the agent's own CLI
  *     context summarized away message #1, the breadcrumb gives just enough
  *     for the agent to write a valid done.json from memory)
+ *   - read-discipline hint, placed after the active-task summary so the
+ *     "task list above" wording is literally accurate
  *
  * Net footprint: ~5-15 lines vs. ~40-80 for `prependContextHeader`. This is
  * the S1 fix from the bug report — without it, the user sees the full
@@ -834,6 +919,20 @@ async function buildSlimHeader(
     parts.push(`[Tasks file: ${dir}/${taskFileRelativePath(collabSessionId)}]`);
     parts.push(`[Conversation log: ${dir}/conversation-${collabSessionId}.md]`);
   }
+  // Re-surface the [Shared context] breadcrumb when context.md exists.
+  // The full header probes for this in `prependContextHeader`; the slim
+  // path used to skip it, so a `/context` set AFTER message #1 was
+  // invisible to all subsequent slim sends. (codex2 task-4, codex3 task-6.)
+  try {
+    const content = await invoke<string | null>("read_memory_file", {
+      relativePath: "context.md",
+    });
+    if (content) {
+      parts.push(`[Shared context: ${dir}/context.md]`);
+    }
+  } catch {
+    // No context file
+  }
   if (agentIdentity) {
     parts.push(`[You are @${agentIdentity}]`);
   }
@@ -841,8 +940,24 @@ async function buildSlimHeader(
     `[Protocol reminder: signal completion via ${dir}/{TASK_ID}.done.json — ` +
     `full protocol was sent in this session's first message]`,
   );
-  const summary = formatTaskSummaryForPrompt(tasks);
-  if (summary) parts.push(summary);
+  // Active-task summary first, then the read-discipline hint that refers
+  // to it as "above". Earlier ordering pushed the hint before the summary,
+  // making the wording literally wrong (codex3 task-6). The hint is also
+  // skipped when the summary is empty (no active tasks) so it doesn't
+  // refer to a non-existent list (4-way concurrent finding from
+  // claude2/claude3/codex3/claude1 in task-15..20 verification round).
+  // The slim path also caps the "others" bucket — full path remains uncapped
+  // so the message-1 send still has the complete picture (codex2 task-10).
+  const summary = formatTaskSummaryForAgent(tasks, agentIdentity ?? null, {
+    othersCap: SLIM_OTHERS_CAP,
+  });
+  if (summary) {
+    parts.push(summary);
+    parts.push(
+      `[Read-discipline: trust the task list above — prefer targeted Grep ` +
+      `over full Read of shared tasks/conversation files]`,
+    );
+  }
   parts.push(text);
   return parts.join("\n");
 }

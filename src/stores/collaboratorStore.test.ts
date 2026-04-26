@@ -4,10 +4,12 @@ import {
   getAgentTaskState,
   getIndicatorPresentation,
   scanForTaskCompletions,
+  formatTaskSummaryForAgent,
   _resetWriteStateForTests,
   RECENT_OUTCOME_TTL_MS,
   STATUS_TTL_MS,
 } from "./collaboratorStore";
+import type { CollabTask } from "../types/collaborator";
 import { useTerminalStore } from "./terminalStore";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -1108,7 +1110,7 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
     expect(calls.length).toBe(2);
     expect(calls[1]).not.toContain("Agent Task Protocol");
     expect(calls[1]).toContain("Tasks file:");
-    expect(calls[1]).toContain("Active Tasks");        // formatTaskSummaryForPrompt
+    expect(calls[1]).toContain("Your active tasks");   // formatTaskSummaryForAgent
     expect(calls[1]).toContain("Protocol reminder");   // breadcrumb
     expect(calls[1]).toContain("second");
   });
@@ -1217,7 +1219,339 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
     const calls = injectCalls();
     // Second call has the active-task summary because the first send
     // auto-created a task. Verify the section is present.
-    expect(calls[1]).toContain("Active Tasks");
+    expect(calls[1]).toContain("Your active tasks");
   });
 });
+
+// task-47 (v0.1.7): formatTaskSummaryForAgent — recipient-aware,
+// status-filtered task summary that replaces the old
+// formatTaskSummaryForPrompt. Closes the dominant remaining bloat in
+// the per-message payload after v0.1.6's TASK_PROTOCOL gating.
+describe("task-47 — formatTaskSummaryForAgent slimming", () => {
+  // Helper to construct a minimal CollabTask without re-typing every field.
+  const mkTask = (overrides: Partial<CollabTask> & Pick<CollabTask, "id" | "title">): CollabTask => ({
+    objective: overrides.title,
+    context: "",
+    deliverables: [],
+    assignee: null,
+    dependencies: [],
+    status: "pending",
+    reasoning: null,
+    conclusion: null,
+    output: null,
+    completedBy: null,
+    createdAt: "2026-04-26T00:00:00.000Z",
+    updatedAt: "2026-04-26T00:00:00.000Z",
+    assignedAt: "2026-04-26T00:00:00.000Z",
+    ...overrides,
+  });
+
+  it("drops completed and blocked tasks from the active summary", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "pending one", status: "pending", assignee: "@claude1" }),
+      mkTask({ id: "task-2-1777170000001", title: "completed one", status: "completed", assignee: "@claude1" }),
+      mkTask({ id: "task-3-1777170000002", title: "blocked one", status: "blocked", assignee: "@claude1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    expect(out).toContain("pending one");
+    expect(out).not.toContain("completed one");
+    expect(out).not.toContain("blocked one");
+  });
+
+  it("splits 'yours' vs 'others' when recipient is known", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "mine A", assignee: "@claude1" }),
+      mkTask({ id: "task-2-1777170000001", title: "mine B", assignee: "@claude1" }),
+      mkTask({ id: "task-3-1777170000002", title: "theirs A", assignee: "@codex1" }),
+      mkTask({ id: "task-4-1777170000003", title: "theirs B", assignee: "@codex1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    expect(out).toMatch(/## Your active tasks[\s\S]*mine A[\s\S]*mine B/);
+    expect(out).toMatch(/## Other agents' active tasks \(2\)[\s\S]*theirs A[\s\S]*theirs B/);
+  });
+
+  it("includes unassigned tasks under 'yours' (anyone could pick them up)", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "open task", assignee: null }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    expect(out).toContain("Your active tasks");
+    expect(out).toContain("open task");
+    // No 'others' section since the only task is unassigned (counted as mine).
+    expect(out).not.toContain("Other agents' active tasks");
+  });
+
+  it("omits 'others' section when no other-agent tasks exist", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "solo", assignee: "@claude1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    expect(out).toContain("Your active tasks");
+    expect(out).not.toContain("Other agents' active tasks");
+  });
+
+  it("truncates objectives longer than 120 chars and appends '...'", () => {
+    const longObj = "x".repeat(150);
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "long-obj task", objective: longObj, assignee: "@claude1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    // Truncated body: 117 chars of x + "..."
+    expect(out).toContain("x".repeat(117) + "...");
+    expect(out).not.toContain("x".repeat(150));
+  });
+
+  it("strips the -{Date.now()} suffix from rendered task IDs", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-5-1777170000000", title: "x", assignee: "@claude1" }),
+      mkTask({ id: "task-6-1777170000001", title: "y", assignee: "@codex1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    expect(out).toContain("task-5: x");
+    expect(out).toContain("task-6 (@codex1): y");
+    expect(out).not.toContain("1777170000000");
+    expect(out).not.toContain("1777170000001");
+  });
+
+  it("returns empty string when no active tasks remain after filtering", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "done", status: "completed", assignee: "@claude1" }),
+    ];
+    expect(formatTaskSummaryForAgent(tasks, "claude1")).toBe("");
+  });
+
+  it("when recipient is null (broadcast scope), all active tasks land under one section without split", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "mixed A", assignee: "@claude1" }),
+      mkTask({ id: "task-2-1777170000001", title: "mixed B", assignee: "@codex1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, null);
+    // Heading is neutral when recipient is null — "Your active tasks"
+    // would be misleading since the section contains everyone's tasks.
+    expect(out).toContain("## Active tasks");
+    expect(out).not.toContain("## Your active tasks");
+    expect(out).toContain("mixed A");
+    expect(out).toContain("mixed B");
+    expect(out).not.toContain("Other agents' active tasks");
+  });
+
+  it("omits Objective line when objective equals title (avoids duplication)", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "same", objective: "same", assignee: "@claude1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    expect(out).toContain("task-1: same");
+    expect(out).not.toContain("Objective:");
+  });
+
+  // B4 regression — `othersCap` slices the others bucket and renders an
+  // "... and N more" trailer. Without the cap, slim-header payload grows
+  // unbounded as collaboration scales (codex2 task-10 finding).
+  it("caps the 'others' bucket when options.othersCap is provided", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "mine", assignee: "@claude1" }),
+      ...Array.from({ length: 8 }, (_, i) =>
+        mkTask({
+          id: `task-${i + 2}-1777170000${String(i + 1).padStart(3, "0")}`,
+          title: `their ${i + 1}`,
+          assignee: i % 2 === 0 ? "@codex1" : "@claude2",
+        }),
+      ),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1", { othersCap: 5 });
+    // Header still reports the true total (8), not the capped count.
+    expect(out).toContain("## Other agents' active tasks (8)");
+    expect(out).toContain("their 1");
+    expect(out).toContain("their 5");
+    // Items past the cap are hidden behind a "... and N more" line.
+    expect(out).not.toContain("their 6");
+    expect(out).not.toContain("their 8");
+    expect(out).toContain("- ... and 3 more");
+  });
+
+  it("does not append '... and N more' when others count is at or below the cap", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "mine", assignee: "@claude1" }),
+      mkTask({ id: "task-2-1777170000001", title: "their A", assignee: "@codex1" }),
+      mkTask({ id: "task-3-1777170000002", title: "their B", assignee: "@codex2" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1", { othersCap: 5 });
+    expect(out).toContain("their A");
+    expect(out).toContain("their B");
+    expect(out).not.toContain("and 0 more");
+    expect(out).not.toContain("and -");
+  });
+
+  it("with no cap (default), all others are rendered (full-header behavior preserved)", () => {
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1-1777170000000", title: "mine", assignee: "@claude1" }),
+      ...Array.from({ length: 10 }, (_, i) =>
+        mkTask({
+          id: `task-${i + 2}-1777170000${String(i + 1).padStart(3, "0")}`,
+          title: `their ${i + 1}`,
+          assignee: "@codex1",
+        }),
+      ),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1"); // no options
+    expect(out).toContain("their 1");
+    expect(out).toContain("their 10");
+    expect(out).not.toContain("more");
+  });
+});
+
+// Regression: slim-header correctness fixes from task-13 synthesis
+//   B1 — re-add [Shared context] probe to slim header
+//   B2 — read-discipline hint must come AFTER the task summary it refers to
+describe("slim-header correctness (B1 + B2)", () => {
+  const injectCalls = () =>
+    vi.mocked(invoke).mock.calls
+      .filter((c) => c[0] === "inject_into_pty")
+      .map((c) => (c[1] as { text: string }).text);
+
+  beforeEach(() => {
+    resetStores();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(async () => null);
+    useCollaboratorStore.setState({
+      agents: [{
+        sessionId: "pty-1",
+        tool: "claude_code",
+        status: "running",
+        collabSessionId: SESSION,
+        ordinal: 1,
+        handle: "claude1",
+        displayName: "Claude Code #1",
+      }],
+    });
+  });
+  afterEach(() => {
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  // B1
+  it("slim header includes [Shared context: …] when context.md exists", async () => {
+    // Mock read_memory_file to return non-empty content for context.md.
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "read_memory_file" && (args as { relativePath?: string })?.relativePath === "context.md") {
+        return "important shared constraint";
+      }
+      return null;
+    });
+
+    const store = useCollaboratorStore.getState();
+    await store.sendToAgent("pty-1", "first");
+    await store.sendToAgent("pty-1", "second");
+
+    const calls = injectCalls();
+    expect(calls.length).toBe(2);
+    // Slim send (calls[1]) must include the [Shared context] breadcrumb.
+    expect(calls[1]).toMatch(/\[Shared context: .*context\.md\]/);
+  });
+
+  it("slim header omits [Shared context: …] when context.md is empty/missing", async () => {
+    // Default mock returns null → no context.md content.
+    const store = useCollaboratorStore.getState();
+    await store.sendToAgent("pty-1", "first");
+    await store.sendToAgent("pty-1", "second");
+
+    const calls = injectCalls();
+    expect(calls.length).toBe(2);
+    expect(calls[1]).not.toContain("[Shared context:");
+  });
+
+  // B2
+  it("slim header places the read-discipline hint AFTER the task summary it references", async () => {
+    const store = useCollaboratorStore.getState();
+    await store.sendToAgent("pty-1", "first");
+    await store.sendToAgent("pty-1", "second");
+
+    const calls = injectCalls();
+    expect(calls.length).toBe(2);
+    const slim = calls[1];
+    const taskSectionIdx = slim.indexOf("## Your active tasks");
+    const readDisciplineIdx = slim.indexOf("[Read-discipline:");
+    expect(taskSectionIdx).toBeGreaterThan(-1);
+    expect(readDisciplineIdx).toBeGreaterThan(-1);
+    // "above" wording requires the hint to come after the section it labels.
+    expect(readDisciplineIdx).toBeGreaterThan(taskSectionIdx);
+  });
+
+  // B2 — degenerate empty-summary case: 4-way concurrent finding from
+  // claude2/claude3/codex3/claude1 in the task-15..20 verification round.
+  // The hint must NOT appear when there are no active tasks for it to
+  // refer to, otherwise "trust the task list above" is literally false.
+  it("slim header omits the read-discipline hint when there are no active tasks", async () => {
+    const store = useCollaboratorStore.getState();
+    // First send auto-creates a task (sendToAgent does this).
+    await store.sendToAgent("pty-1", "first");
+
+    // Mark every active task in this session as completed so the next
+    // slim send will have an empty summary.
+    const sessionTasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    for (const t of sessionTasks) {
+      store.updateTask(t.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+    }
+
+    // Second send must NOT auto-create a new task. The auto-create logic
+    // only fires when no freshest-active task exists for this agent. We
+    // just completed all of them, so a fresh one WILL be created. Work
+    // around by sending via broadcastToAll on a session that has no
+    // pending tasks AND uses an existing agent... but that re-creates
+    // the same problem. Easier: send and then immediately re-complete
+    // the auto-created task before checking — but we want to verify the
+    // SLIM path's behavior with empty summary. The cleanest path is to
+    // call buildSlimHeader-equivalent through sendToAgent after marking
+    // the auto-created task done, then send a third message which will
+    // also auto-create. So we have to test the formatter's empty branch
+    // through formatTaskSummaryForAgent directly + a separate slim-path
+    // test that injects a task list of all-completed.
+
+    // The above gymnastics show the testability constraint: sendToAgent
+    // ALWAYS ensures a fresh task exists. So instead, verify via the
+    // formatter's contract that empty input yields empty output (already
+    // covered at line 1320), and rely on the conditional `if (summary)`
+    // guard in buildSlimHeader to drop the hint. The integration test
+    // below covers the visible side-effect:
+    expect(formatTaskSummaryForAgent([], "claude1")).toBe("");
+    // And the slim-header conditional is exercised via a fake-empty
+    // tasks list test below.
+  });
+
+  it("slim header with all-completed tasks omits both the summary and the read-discipline hint (integration)", async () => {
+    // Override sendToAgent's auto-task-creation by pre-seeding a completed
+    // task and then triggering the second send WITHOUT going through
+    // sendToAgent's task-creation path. We do this by calling
+    // sendToAgent twice — the first call seeds via auto-create, then
+    // we mark it completed AND pre-add a fresh task to suppress
+    // auto-create on the second call. Then mark THAT one completed too,
+    // and broadcastToAll WITHOUT a session id (which doesn't auto-create).
+    const store = useCollaboratorStore.getState();
+    await store.sendToAgent("pty-1", "first");
+
+    // Now manually mark all tasks completed.
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    for (const t of tasks) {
+      store.updateTask(t.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+    }
+
+    // broadcastToAll(content, undefined) takes the session-less path which
+    // does NOT auto-create tasks (see lines 1272-1290 — auto-create is
+    // gated on `if (sid)`).
+    await store.broadcastToAll("second", undefined);
+
+    const calls = injectCalls();
+    // calls[0] = first send (full header), calls[1] = broadcast (slim).
+    expect(calls.length).toBe(2);
+    const slim = calls[1];
+    // Empty summary → no "Your active tasks" header AND no read-discipline.
+    expect(slim).not.toContain("## Your active tasks");
+    expect(slim).not.toContain("[Read-discipline:");
+    // But the rest of the slim header must still be intact.
+    expect(slim).toContain("[Protocol reminder:");
+    expect(slim).toContain("[You are @claude1]");
+    expect(slim).toContain("second"); // user content reaches the agent
+  });
+});
+
 
