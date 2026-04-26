@@ -2,9 +2,9 @@
 
 🌐 **English** | [한국어](README.ko.md)
 
-**A terminal where your drawings become AI prompts, and multiple AI CLIs can collaborate side by side.**
+**A canvas-first terminal where drawings, documents, and multiple AI CLIs connect in one workspace.**
 
-Sketch a diagram, click Upload, and the AI CLI tool running in your terminal sees it. Ask it to respond, and the result renders back on the canvas. Open the Collaborator pane, launch multiple agent terminals, and coordinate them with shared task and memory files. Canvas Terminal turns a visual idea into an AI conversation — no copy-paste, no file juggling.
+Sketch a diagram, click Upload, and the AI CLI tool running in your terminal sees it. Ask it to respond, and the result renders back on the canvas as an image, Markdown, HTML, SVG, or plain text. Open the Collaborator pane, launch multiple agent terminals, and coordinate them with shared task and memory files. Canvas Terminal turns a visual idea into a multi-agent AI workspace — no copy-paste, no file juggling.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
@@ -93,15 +93,16 @@ npm run tauri dev    # Hot reload — frontend changes apply instantly
 1. **Draw** something on the canvas — an architecture diagram, a UI wireframe, a flowchart.
 2. **Upload** — the canvas becomes a PNG. Its file path is pasted into the active terminal.
 3. **AI processes** — Claude Code, Gemini CLI, Codex, or any CLI tool reads the image.
-4. **Download** — the AI's response (Markdown, SVG, HTML, image, or plain text) is rendered back onto the canvas.
+4. **Download** — the AI's response (Markdown, SVG, HTML, image, or plain text) is rendered back onto the canvas, so the canvas works with document-like outputs as well as images.
 
-This creates a **visual feedback loop** between you, the canvas, and the AI. Works with any CLI tool that accepts image paths.
+This creates a **visual feedback loop** between you, the canvas, and the AI. Works with any CLI tool that accepts image paths, and brings both visual and document-style outputs back onto the canvas.
 
 ---
 
 ## What's New
 
 - **Collaborator pane** for running Claude Code, Codex CLI, and Gemini CLI in parallel
+- **Multi-agent collaboration workflow** with shared task routing, shared memory files, and agent-specific canvas import/export
 - **Shared memory workspace** at `~/.cache/canvas-terminal/collab-memory` for conversation logs, task files, and context
 - **Agent command prompt** with `@mentions`, broadcasts, task tracking, and memory file management
 - **Canvas routing for agents** so `/canvas-export` and `/canvas-import` work directly with spawned collaborators
@@ -111,7 +112,7 @@ This creates a **visual feedback loop** between you, the canvas, and the AI. Wor
 
 ## Canvas-to-Terminal Integration
 
-The core feature that makes Canvas Terminal different from every other terminal emulator.
+The core feature that makes Canvas Terminal different from every other terminal emulator: the canvas can send drawings to AI tools and render not just images, but document-style outputs back into the workspace.
 
 ### Export (Canvas → Terminal)
 
@@ -172,6 +173,9 @@ The collaborator is a PTY-backed multi-agent workspace embedded inside the termi
 ### Canvas
 
 A Fabric.js-powered drawing board designed for quick sketching, not pixel-perfect illustration.
+
+- **Document-aware canvas output** — AI responses can come back as Markdown, HTML, SVG, plain text, or standard images, then render directly onto the canvas
+- **Collaborator-aware canvas routing** — send one canvas export to one or many agents and import each response back independently
 
 **Drawing tools:**
 
