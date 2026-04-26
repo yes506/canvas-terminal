@@ -1,0 +1,1055 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  useCollaboratorStore,
+  getAgentTaskState,
+  getIndicatorPresentation,
+  scanForTaskCompletions,
+  _resetWriteStateForTests,
+  RECENT_OUTCOME_TTL_MS,
+  STATUS_TTL_MS,
+} from "./collaboratorStore";
+import { useTerminalStore } from "./terminalStore";
+import { invoke } from "@tauri-apps/api/core";
+
+// Mock the Tauri invoke to avoid native calls during tests
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn().mockResolvedValue(null),
+}));
+
+const SESSION = "test-session-1";
+
+function resetStores() {
+  useTerminalStore.setState({
+    unreadByCollabSession: {},
+    tabs: [],
+    activeTabId: null,
+  });
+  useCollaboratorStore.setState({
+    tasksBySession: {},
+    statusMessages: {},
+    logEntriesBySession: {},
+    recentOutcomesBySession: {},
+  });
+  // Module-level write state (taskWriteChainsBySession + abortedTaskWriteSessions)
+  // isn't part of the zustand store, so setState above doesn't touch it.
+  // A teardown-race test can leave an abort marker that would short-circuit
+  // a subsequent test using the same SESSION ID — clear it here for isolation.
+  _resetWriteStateForTests();
+}
+
+// (PR-A footer-status tests removed in task-16: the 4 s setStatus-on-terminal
+// block was deleted because it duplicated the new in-frame indicator.)
+
+describe("task-16 — 3-state agent task machine + 5 s completed TTL", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does NOT set a footer status message on terminal-state transition (PR-A removed)", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "test", title: "x", assignee: "@claude1" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBeUndefined();
+  });
+
+  it("getAgentTaskState reports `in_progress` when a pending task is assigned", () => {
+    const store = useCollaboratorStore.getState();
+    store.addTask({ objective: "do it", title: "build", assignee: "@claude1" }, SESSION);
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskTitle).toBe("build");
+  });
+
+  it("an active task outranks a recent completion (highlight ends early when next task is freshly assigned)", () => {
+    const store = useCollaboratorStore.getState();
+    const t1 = store.addTask({ objective: "first", title: "first", assignee: "@claude1" }, SESSION);
+    store.updateTask(t1.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+    // Sanity check: with no active task, state is `completed`.
+    let tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    let state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("completed");
+    expect(state.outcomeKind).toBe("completed");
+
+    // Now a fresh task arrives mid-highlight — it must outrank the completed
+    // state so the user sees the new work, not a stale ✓.
+    store.addTask({ objective: "second", title: "second", assignee: "@claude1" }, SESSION);
+    tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskTitle).toBe("second");
+  });
+
+  it("`completed` state turns into `idle` 5 s after the terminal transition (no fresh task)", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "test", title: "x", assignee: "@claude1" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    // Within the window — state is `completed`.
+    let tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    let state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("completed");
+
+    // Past 5 s — state is `idle`, regardless of whether the cleanup
+    // setTimeout has fired (self-correcting TTL guard).
+    vi.advanceTimersByTime(5000);
+    tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("idle");
+  });
+
+  it("blocked outcomes still surface as `completed` state with `outcomeKind: 'blocked'`", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "stuck", title: "y", assignee: "@codex1" }, SESSION);
+    store.updateTask(task.id, { status: "blocked", completedBy: "@codex1" }, SESSION);
+
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(SESSION, "codex1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("completed");
+    expect(state.outcomeKind).toBe("blocked");
+  });
+
+  it("idle by default when no task is assigned and no recent outcome exists", () => {
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("idle");
+  });
+});
+
+// task-23 reflection: cross-validated freshness defect (codex1/codex2/codex3).
+// `getAgentTaskState` previously used `tasks.find(...)` which (a) picks the
+// first array match (the OLDEST active task, since addTask appends) and
+// (b) lets ANY active task preempt the highlight, even pre-existing backlog
+// assigned BEFORE completion. Both behaviors contradict the user's
+// "freshly-assigned" wording. The fix introduces a freshness check against
+// the recent outcome's `at` timestamp and picks the most-recent active task.
+describe("task-23 — freshness semantics for `in_progress` precedence", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a pre-existing backlog task does NOT preempt the completed highlight", () => {
+    const store = useCollaboratorStore.getState();
+
+    // Simulate a backlog task assigned BEFORE the completion event.
+    // (Use addTask directly to bypass the auto-create/hasActiveTask guard.)
+    const backlog = store.addTask({ objective: "later", title: "backlog", assignee: "@claude1" }, SESSION);
+    expect(backlog.status).toBe("pending");
+
+    // Time passes — the agent finishes a separate task (task A).
+    vi.advanceTimersByTime(2000);
+    const taskA = store.addTask({ objective: "now", title: "task A", assignee: "@claude1" }, SESSION);
+    // Move A to completed in one step. updateTask records the recent outcome.
+    store.updateTask(taskA.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    // Backlog task is still pending and was assigned BEFORE the outcome.
+    // It should NOT preempt the 5 s completed highlight.
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("completed");
+    expect(state.taskTitle).toBe("task A");
+  });
+
+  it("a freshly-assigned task DOES preempt the completed highlight", () => {
+    const store = useCollaboratorStore.getState();
+
+    const taskA = store.addTask({ objective: "first", title: "task A", assignee: "@claude1" }, SESSION);
+    store.updateTask(taskA.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    // Now the user sends a fresh message → a new task is assigned.
+    vi.advanceTimersByTime(1000);
+    const fresh = store.addTask({ objective: "second", title: "task B", assignee: "@claude1" }, SESSION);
+    expect(fresh.status).toBe("pending");
+
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskTitle).toBe("task B");
+  });
+
+  it("when multiple active tasks coexist, the freshest one is shown", () => {
+    const store = useCollaboratorStore.getState();
+    store.addTask({ objective: "old", title: "old task", assignee: "@claude1" }, SESSION);
+    vi.advanceTimersByTime(50);
+    store.addTask({ objective: "newer", title: "newer task", assignee: "@claude1" }, SESSION);
+    vi.advanceTimersByTime(50);
+    store.addTask({ objective: "newest", title: "newest task", assignee: "@claude1" }, SESSION);
+
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskTitle).toBe("newest task");
+  });
+
+  it("after the 5 s TTL expires, a stale backlog task transitions to in_progress", () => {
+    const store = useCollaboratorStore.getState();
+
+    // Backlog assigned first.
+    const backlog = store.addTask({ objective: "later", title: "backlog", assignee: "@claude1" }, SESSION);
+    vi.advanceTimersByTime(1000);
+    const taskA = store.addTask({ objective: "now", title: "task A", assignee: "@claude1" }, SESSION);
+    store.updateTask(taskA.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    // Within window: completed wins (backlog doesn't preempt).
+    let tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    let state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("completed");
+
+    // After TTL: backlog finally surfaces as in_progress.
+    vi.advanceTimersByTime(5000);
+    tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskTitle).toBe("backlog");
+    // (avoid unused-var warning)
+    expect(backlog.id).toBeTruthy();
+  });
+});
+
+describe("task-23 — robustness fixes (empty completedBy, footer auto-clear)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("falls through to assignee when completedBy is an empty string", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@codex1" }, SESSION);
+    // Agent-protocol JSON could legally deliver an empty `author` field.
+    store.updateTask(task.id, { status: "completed", completedBy: "" }, SESSION);
+
+    const outcomes = useCollaboratorStore.getState().recentOutcomesBySession[SESSION] ?? {};
+    expect(outcomes["codex1"]).toBeDefined();
+    expect(outcomes[""]).toBeUndefined(); // no orphan entry under empty key
+  });
+
+  it("Task Report `**Agent**:` line also falls through to assignee when completedBy is empty (codex3 round-6)", () => {
+    // Previously this used `task.completedBy ?? task.assignee ?? "unassigned"`,
+    // and `??` does NOT treat `""` as absent — so an agent-protocol JSON
+    // with `"author": ""` produced an empty `**Agent**:` line in the
+    // conversation log even though the outcome-routing path was already
+    // patched. The fix mirrors the outcome path: trim() + ||.
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@codex1" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "" }, SESSION);
+
+    const logEntries = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    const reportEntry = logEntries.find((e) => e.content.startsWith("Task Report\n"));
+    expect(reportEntry).toBeDefined();
+    expect(reportEntry?.content).toContain("**Agent**: @codex1");
+    // Negative: the bug would have produced "**Agent**: " (empty after the colon).
+    expect(reportEntry?.content).not.toMatch(/\*\*Agent\*\*:\s*\n/);
+  });
+
+  it("setStatus auto-clears after STATUS_TTL_MS (so footer messages don't go stale)", () => {
+    const store = useCollaboratorStore.getState();
+    store.setStatus("Sent to Claude Code", SESSION);
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBe("Sent to Claude Code");
+
+    vi.advanceTimersByTime(STATUS_TTL_MS);
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBeUndefined();
+  });
+
+  it("setStatus auto-clear does NOT stomp a fresher message (equality guard)", () => {
+    const store = useCollaboratorStore.getState();
+    store.setStatus("first", SESSION);
+    vi.advanceTimersByTime(2000);
+    store.setStatus("second", SESSION);
+    // First timer fires at t=4000 — slot now holds "second", so guard skips.
+    vi.advanceTimersByTime(2000);
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBe("second");
+    // Second timer fires at t=6000.
+    vi.advanceTimersByTime(2000);
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBeUndefined();
+  });
+});
+
+// task-30 reflection: cross-validated by codex1, codex3, claude3 — the
+// freshness gate previously keyed off `task.createdAt`, which missed the
+// reassignment-via-updateTask flow (e.g. `/task <id> assign @<agent>`).
+// Tasks now carry `assignedAt`, set in addTask and refreshed in
+// updateTask only when `assignee` actually changes.
+describe("task-30 — assignment freshness via `assignedAt`", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("addTask sets assignedAt equal to createdAt initially", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    expect(task.assignedAt).toBe(task.createdAt);
+  });
+
+  it("updateTask refreshes assignedAt when assignee changes", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    const before = task.assignedAt;
+
+    vi.advanceTimersByTime(1000);
+    store.updateTask(task.id, { assignee: "@codex1" }, SESSION);
+
+    const updated = useCollaboratorStore.getState().tasksBySession[SESSION]?.find((t) => t.id === task.id);
+    expect(updated?.assignedAt).not.toBe(before);
+    expect(new Date(updated!.assignedAt).getTime()).toBeGreaterThan(new Date(before).getTime());
+  });
+
+  it("updateTask does NOT refresh assignedAt when assignee is the same", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    const before = task.assignedAt;
+
+    vi.advanceTimersByTime(1000);
+    // Same assignee — should be a no-op for assignedAt to avoid spurious
+    // "fresh" classification on unrelated metadata updates.
+    store.updateTask(task.id, { assignee: "@claude1", reasoning: "meh" }, SESSION);
+
+    const updated = useCollaboratorStore.getState().tasksBySession[SESSION]?.find((t) => t.id === task.id);
+    expect(updated?.assignedAt).toBe(before);
+  });
+
+  it("reassigning an old backlog task during a completed highlight DOES preempt", () => {
+    const store = useCollaboratorStore.getState();
+
+    // An old backlog task assigned to nobody (or different agent).
+    const orphan = store.addTask({ objective: "later", title: "orphan", assignee: null }, SESSION);
+
+    vi.advanceTimersByTime(2000);
+    // claude1 completes a different task.
+    const taskA = store.addTask({ objective: "now", title: "task A", assignee: "@claude1" }, SESSION);
+    store.updateTask(taskA.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    // Within window — completed wins (no fresh task for claude1 yet).
+    let tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    let state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("completed");
+
+    // Now the user reassigns the orphan task to claude1 mid-highlight.
+    // Even though `orphan.createdAt` is older than the completion outcome,
+    // the reassignment refreshes `assignedAt` to "now", which IS after the
+    // outcome — so the freshness gate must promote orphan to in_progress.
+    vi.advanceTimersByTime(500);
+    store.updateTask(orphan.id, { assignee: "@claude1" }, SESSION);
+
+    tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskTitle).toBe("orphan");
+  });
+
+  it("RECENT_OUTCOME_TTL_MS is exported and used by tests", () => {
+    // Smoke test that the constant is reachable and the helper honours it.
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    let tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    let state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("completed");
+
+    vi.advanceTimersByTime(RECENT_OUTCOME_TTL_MS);
+    tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("idle");
+  });
+});
+
+// task-37 reflection: tighten the {assignee: undefined} guard (claude1 D3 +
+// claude3 D2 cross-validated), persist assignedAt to markdown (claude1 D1 +
+// claude2 D1 + claude3 D1 cross-validated by 3 agents), and indicator
+// presentation tests (5-rounds-running coverage gap).
+describe("task-37 — robustness + indicator presentation coverage", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("updateTask({assignee: undefined}) does NOT spuriously bump assignedAt OR overwrite the existing assignee", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    const beforeAssignedAt = task.assignedAt;
+    const beforeAssignee = task.assignee;
+
+    vi.advanceTimersByTime(1000);
+    store.updateTask(task.id, { assignee: undefined as unknown as string | null }, SESSION);
+
+    const updated = useCollaboratorStore.getState().tasksBySession[SESSION]?.find((t) => t.id === task.id);
+    // assignedAt unchanged (existing guard).
+    expect(updated?.assignedAt).toBe(beforeAssignedAt);
+    // codex1 + claude2 round-5 finding: the spread used to overwrite
+    // task.assignee with `undefined` even when the assignedAt guard fired.
+    // The Object.fromEntries(filter !== undefined) pre-spread now strips
+    // the offending key so the original assignee is preserved.
+    expect(updated?.assignee).toBe(beforeAssignee);
+    expect(updated?.assignee).toBe("@claude1");
+  });
+});
+
+// task-37: pure indicator-presentation helper tests. Replaces the
+// rendered-component test gap that was flagged 5 rounds running by every
+// reviewer — extracting the IIFE to a pure function lets us pin the full
+// (lifecycle × task state × outcomeKind) decision matrix without
+// stand-up cost for an xterm/PTY-spawning component.
+describe("task-37 — getIndicatorPresentation precedence matrix", () => {
+  it("`exited` lifecycle wins over any task state", () => {
+    const r = getIndicatorPresentation("exited", { kind: "in_progress", taskTitle: "x" });
+    expect(r.label).toBe("exited");
+    expect(r.color).toBe("bg-gray-500");
+    expect(r.pulse).toBe(false);
+    expect(r.ping).toBe(false);
+  });
+
+  it("`spawning` lifecycle wins over any task state", () => {
+    const r = getIndicatorPresentation("spawning", { kind: "completed", taskTitle: "y", outcomeKind: "completed" });
+    expect(r.label).toBe("starting…");
+    expect(r.color).toBe("bg-yellow-400");
+    expect(r.pulse).toBe(true);
+  });
+
+  it("`pre-registration` lifecycle reads as starting (no idle flash)", () => {
+    const r = getIndicatorPresentation("pre-registration", { kind: "idle" });
+    expect(r.label).toBe("starting…");
+  });
+
+  it("running + in_progress → sky pulse with task title in label", () => {
+    const r = getIndicatorPresentation("running", { kind: "in_progress", taskTitle: "build foo" });
+    expect(r.color).toBe("bg-sky-400");
+    expect(r.pulse).toBe(true);
+    expect(r.ping).toBe(false);
+    expect(r.label).toBe("in progress: build foo");
+    expect(r.liveRole).toBe("status");
+    expect(r.liveLevel).toBe("polite");
+  });
+
+  it("running + in_progress with empty title → bare 'in progress' label", () => {
+    const r = getIndicatorPresentation("running", { kind: "in_progress", taskTitle: "" });
+    expect(r.label).toBe("in progress");
+  });
+
+  it("running + completed (outcomeKind: completed) → emerald + ping + ✓ label + polite role", () => {
+    const r = getIndicatorPresentation("running", { kind: "completed", taskTitle: "ship it", outcomeKind: "completed" });
+    expect(r.color).toBe("bg-emerald-400");
+    expect(r.ping).toBe(true);
+    expect(r.label).toBe("✓ ship it");
+    expect(r.liveRole).toBe("status");
+    expect(r.liveLevel).toBe("polite");
+  });
+
+  it("running + completed (outcomeKind: blocked) → amber + pulse + ping + ⚠ label + alert role", () => {
+    const r = getIndicatorPresentation("running", { kind: "completed", taskTitle: "stuck", outcomeKind: "blocked" });
+    expect(r.color).toBe("bg-amber-500");
+    expect(r.pulse).toBe(true);
+    expect(r.ping).toBe(true);
+    expect(r.label).toBe("⚠ stuck");
+    expect(r.liveRole).toBe("alert");
+    expect(r.liveLevel).toBe("assertive");
+  });
+
+  it("running + idle → dim green, no animation", () => {
+    const r = getIndicatorPresentation("running", { kind: "idle" });
+    expect(r.color).toBe("bg-green-400/60");
+    expect(r.pulse).toBe(false);
+    expect(r.ping).toBe(false);
+    expect(r.label).toBe("idle");
+  });
+});
+
+// task-38 reflection: address two deferred items now that the user asked
+// for the best path.
+//   (1) sendToAgent / broadcastToAll on an existing active task now bump
+//       `assignedAt` so the freshness gate sees the send as a fresh act
+//       of assignment (cross-validated 3 rounds: claude2 D2, claude3 D7,
+//       codex3 finding 3 rounds running).
+//   (2) `setStatus(msg, session, "persistent")` opt-out for the auto-clear
+//       — used for errors so the user has time to read them after the
+//       PR-A-removal-induced 4 s TTL was applied to error messages too.
+describe("task-38 — sendToAgent/broadcast bump `assignedAt` on existing active task", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a fresh send re-promotes the indicator from `completed` to `in_progress`", async () => {
+    const store = useCollaboratorStore.getState();
+    // Seed: an agent with a backlog task assigned BEFORE a recent
+    // completion of a different task.
+    useCollaboratorStore.setState({
+      agents: [{
+        sessionId: "pty-1",
+        tool: "claude_code",
+        status: "running",
+        collabSessionId: SESSION,
+        ordinal: 1,
+        handle: "claude1",
+        displayName: "Claude Code #1",
+      }],
+    });
+    const backlog = store.addTask({ objective: "later", title: "backlog", assignee: "@claude1" }, SESSION);
+
+    vi.advanceTimersByTime(2000);
+    const taskA = store.addTask({ objective: "now", title: "task A", assignee: "@claude1" }, SESSION);
+    store.updateTask(taskA.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    // Sanity: indicator currently `completed` because backlog is older
+    // than recent.at, so the freshness gate keeps the highlight.
+    let tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    let state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("completed");
+
+    // The user now sends a fresh message. sendToAgent finds backlog as
+    // the existing active task and should bump its assignedAt — even
+    // though no new task is created. Note: the spawn / inject side-effects
+    // are mocked to no-ops via the global tauri invoke mock at top of file.
+    vi.advanceTimersByTime(500);
+    await store.sendToAgent("pty-1", "follow-up message");
+
+    tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskTitle).toBe("backlog");
+    // `backlog.assignedAt` should now be strictly newer than its initial
+    // value AND newer than recent.at.
+    const updatedBacklog = tasks.find((t) => t.id === backlog.id);
+    expect(new Date(updatedBacklog!.assignedAt).getTime()).toBeGreaterThan(new Date(backlog.assignedAt).getTime());
+  });
+});
+
+describe("task-38 — setStatus persistence opt-in", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("persistent messages do NOT auto-clear after STATUS_TTL_MS", () => {
+    const store = useCollaboratorStore.getState();
+    store.setStatus("Error: connection refused", SESSION, "persistent");
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBe("Error: connection refused");
+
+    vi.advanceTimersByTime(STATUS_TTL_MS * 3);
+    // Still there — persistent messages stay until manually overwritten.
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBe("Error: connection refused");
+  });
+
+  it("transient messages still auto-clear (default kind)", () => {
+    const store = useCollaboratorStore.getState();
+    store.setStatus("Sent to Claude Code", SESSION); // no kind = transient
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBeDefined();
+
+    vi.advanceTimersByTime(STATUS_TTL_MS);
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBeUndefined();
+  });
+
+  it("a transient message can overwrite a persistent one (and then auto-clear)", () => {
+    const store = useCollaboratorStore.getState();
+    store.setStatus("Error: x", SESSION, "persistent");
+    vi.advanceTimersByTime(2000);
+    store.setStatus("Sent to Claude Code", SESSION);
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBe("Sent to Claude Code");
+    vi.advanceTimersByTime(STATUS_TTL_MS);
+    expect(useCollaboratorStore.getState().statusMessages[SESSION]).toBeUndefined();
+  });
+});
+
+// task-45 reflection (closes claude2 D2 + claude3 D5): a real integration
+// test for scanForTaskCompletions's in-loop re-read. The previous test
+// exercised updateTask's statusChanged guard rather than the function under
+// test. Now we mock invoke per-call to simulate two concurrent scans
+// reading the same .done.json, then assert exactly one terminal-state
+// transition (one Task Report block) results.
+describe("task-45 — scanForTaskCompletions in-loop re-read (real integration)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+    // Don't reset the global mock — the module-level
+    // `conversationWriteChain` may still resolve async work from prior
+    // tests, and resetting would leave it observing `undefined` returns.
+    // Instead just override the implementation; the override automatically
+    // takes priority over the default `mockResolvedValue(null)`.
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    // Restore the default for subsequent describe blocks. We use
+    // mockImplementation here (not mockReset) to preserve any pending
+    // microtask chain that may still inspect the result.
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  it("calling scanForTaskCompletions twice over the same .done.json fires only ONE terminal transition", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+
+    const doneJson = JSON.stringify({
+      task_id: task.id,
+      status: "completed",
+      author: "@claude1",
+      reasoning: "r",
+      conclusion: "c",
+      output: "o",
+    });
+
+    // The mock returns the same done-file across both invocations. After
+    // the first scan calls delete_memory_file, list_memory_files would in
+    // reality return []; we simulate that by tracking deletion state in
+    // the mock.
+    let deleted = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, _args?: unknown) => {
+      if (cmd === "list_memory_files") return deleted ? [] : [`${task.id}.done.json`];
+      if (cmd === "read_memory_file") return deleted ? null : doneJson;
+      if (cmd === "delete_memory_file") {
+        deleted = true;
+        return null;
+      }
+      return null;
+    });
+
+    // Run two scans back-to-back. Even if a hypothetical second pass saw
+    // the file before deletion (e.g. concurrent invocation), the in-loop
+    // re-read of store.getTasks inside scanForTaskCompletions would catch
+    // the now-terminal task and skip the second updateTask call.
+    await scanForTaskCompletions(SESSION);
+    await scanForTaskCompletions(SESSION);
+
+    // Exactly one Task Report block in the conversation log — not two.
+    const logEntries = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    const reportCount = logEntries.filter((e) => e.content.startsWith("Task Report\n")).length;
+    expect(reportCount).toBe(1);
+
+    // The task is terminal in the store.
+    const updated = useCollaboratorStore.getState().tasksBySession[SESSION]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("completed");
+  });
+
+  it("when the file is replayed AFTER deletion, the loser scan bails on already-terminal status", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+
+    // First scan terminalizes the task and (would) delete the file.
+    store.updateTask(task.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    // Now run a scan against a "stale" view of the file system that still
+    // shows the .done.json. The in-loop re-read should detect the task is
+    // already terminal and bail (best-effort delete + continue), not
+    // double-fire updateTask.
+    const doneJson = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "list_memory_files") return [`${task.id}.done.json`];
+      if (cmd === "read_memory_file") return doneJson;
+      if (cmd === "delete_memory_file") return null;
+      return null;
+    });
+
+    const logsBefore = useCollaboratorStore.getState().logEntriesBySession[SESSION]?.length ?? 0;
+    await scanForTaskCompletions(SESSION);
+    const logsAfter = useCollaboratorStore.getState().logEntriesBySession[SESSION]?.length ?? 0;
+
+    // No new log entries — the loser scan saw terminal status and bailed
+    // without calling updateTask.
+    expect(logsAfter).toBe(logsBefore);
+  });
+});
+
+// task-45: regression for codex3 D1 — bumpAssignedAt picks freshest active
+// task, not the first array match. Ensures fresh sends bump the same task
+// the indicator surfaces as in_progress.
+describe("task-45 — sendToAgent bumps the freshest active task, not the oldest", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+    // Inherit the global default mockResolvedValue(null); no reset needed.
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  it("when an agent has multiple active tasks, send bumps the freshest one (matches indicator label)", async () => {
+    useCollaboratorStore.setState({
+      agents: [{
+        sessionId: "pty-1",
+        tool: "claude_code",
+        status: "running",
+        collabSessionId: SESSION,
+        ordinal: 1,
+        handle: "claude1",
+        displayName: "Claude Code #1",
+      }],
+    });
+    const store = useCollaboratorStore.getState();
+
+    const oldBacklog = store.addTask({ objective: "old", title: "old backlog", assignee: "@claude1" }, SESSION);
+    vi.advanceTimersByTime(1000);
+    const currentWork = store.addTask({ objective: "now", title: "current work", assignee: "@claude1" }, SESSION);
+
+    // Fresh send — should bump CURRENT WORK (the freshest), not OLD BACKLOG.
+    vi.advanceTimersByTime(500);
+    await store.sendToAgent("pty-1", "follow-up message");
+
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const updatedOld = tasks.find((t) => t.id === oldBacklog.id);
+    const updatedCurrent = tasks.find((t) => t.id === currentWork.id);
+
+    // Old backlog's assignedAt should be unchanged (still the original).
+    expect(updatedOld?.assignedAt).toBe(oldBacklog.assignedAt);
+    // Current work's assignedAt should be strictly newer.
+    expect(new Date(updatedCurrent!.assignedAt).getTime()).toBeGreaterThan(new Date(currentWork.assignedAt).getTime());
+  });
+
+  it("a queued persistTasks write is short-circuited after killAllAgents/endSession (codex1+claude3 round-7+8 teardown)", async () => {
+    // After teardown, any subsequent persistTasks call must NOT invoke
+    // write_memory_file for the tasks file: the abort flag short-circuits
+    // the chain step. (For the in-flight write race — claude3 round-8 D1
+    // — killAllAgents now awaits the pending chain BEFORE issuing the
+    // delete IPC, so the in-flight write settles first. That ordering
+    // is implicit in `await store.killAllAgents(...)`.)
+    const store = useCollaboratorStore.getState();
+    vi.mocked(invoke).mockImplementation(async () => null);
+
+    // Pre-abort: add a task — its persistTasks call should fire normally.
+    store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    await store.killAllAgents(SESSION);
+
+    // Snapshot tasks-file write count after teardown finishes.
+    const tasksWritesBefore = vi.mocked(invoke).mock.calls.filter(
+      (c) =>
+        c[0] === "write_memory_file" &&
+        (c[1] as { relativePath?: string })?.relativePath?.startsWith("tasks-"),
+    ).length;
+
+    // Post-abort: a new addTask schedules persistTasks. The chain step
+    // checks the abort flag and skips invoke("write_memory_file", ...).
+    store.addTask({ objective: "z", title: "w", assignee: "@claude1" }, SESSION);
+    await Promise.resolve();
+    await Promise.resolve();
+    const tasksWritesAfter = vi.mocked(invoke).mock.calls.filter(
+      (c) =>
+        c[0] === "write_memory_file" &&
+        (c[1] as { relativePath?: string })?.relativePath?.startsWith("tasks-"),
+    ).length;
+
+    expect(tasksWritesAfter).toBe(tasksWritesBefore);
+  });
+
+  it("killAllAgents awaits in-flight writes BEFORE issuing delete IPCs (claude3 D5 + claude1 self-D2 ordering pin)", async () => {
+    // The abort flag short-circuits QUEUED writes, but a write already
+    // past the abort check must complete BEFORE the delete fires (Tauri
+    // doesn't guarantee ordering between independent commands). Verify
+    // by recording the order of write_memory_file vs delete_memory_file
+    // mock invocations: write must precede delete for the same file.
+    const store = useCollaboratorStore.getState();
+    const order: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      const path = (args as { relativePath?: string })?.relativePath ?? "";
+      if (cmd === "write_memory_file") {
+        if (path.startsWith("tasks-")) order.push("write_tasks");
+        else if (path.startsWith("conversation-")) order.push("write_conversation");
+      } else if (cmd === "delete_memory_file") {
+        if (path.startsWith("tasks-")) order.push("delete_tasks");
+        else if (path.startsWith("conversation-")) order.push("delete_conversation");
+      }
+      return null;
+    });
+
+    store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    // Drain microtasks so the chain steps fire write_memory_file BEFORE
+    // killAllAgents sets the abort flag — this gives us an "in-flight"
+    // write that the explicit await must serialize against the delete.
+    // (Without these drains, the abort-flag check would short-circuit
+    // both writes synchronously, giving us no in-flight ordering to test.)
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    await store.killAllAgents(SESSION);
+
+    // Both write/delete pairs must appear in write-then-delete order.
+    // Use `lastIndexOf` for writes so the assertion holds even if MULTIPLE
+    // writes happened before the delete — a future test extension that
+    // adds more in-flight writes shouldn't silently weaken the contract
+    // (claude3 round-10 D6).
+    const wTasksLast = order.lastIndexOf("write_tasks");
+    const dTasks = order.indexOf("delete_tasks");
+    expect(wTasksLast).toBeGreaterThanOrEqual(0);
+    expect(dTasks).toBeGreaterThan(wTasksLast);
+
+    const wConvLast = order.lastIndexOf("write_conversation");
+    const dConv = order.indexOf("delete_conversation");
+    expect(wConvLast).toBeGreaterThanOrEqual(0);
+    expect(dConv).toBeGreaterThan(wConvLast);
+  });
+
+  it("a queued conversation-log write is also short-circuited after teardown (claude1 round-8 D3)", async () => {
+    // Same shape as the task-write teardown guard, applied to the
+    // conversation-log chain. Without this, appendLog steps queued
+    // before the abort could fire after killAllAgents deletes
+    // conversation-{sid}.md and recreate it with stale content.
+    const store = useCollaboratorStore.getState();
+    vi.mocked(invoke).mockImplementation(async () => null);
+
+    // Pre-abort: an appendLog (via addTask) schedules a conversation
+    // write through conversationWriteChain.
+    store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    await store.killAllAgents(SESSION);
+
+    const convWritesBefore = vi.mocked(invoke).mock.calls.filter(
+      (c) =>
+        c[0] === "write_memory_file" &&
+        (c[1] as { relativePath?: string })?.relativePath?.startsWith("conversation-"),
+    ).length;
+
+    // Post-abort: another appendLog (e.g. via setStatus → no, via
+    // direct test invocation). We use the store's appendLog through
+    // `addTask` again; the conversation chain step should now skip.
+    store.addTask({ objective: "z", title: "w", assignee: "@claude1" }, SESSION);
+    // Drain microtasks for the conversation chain to advance.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    const convWritesAfter = vi.mocked(invoke).mock.calls.filter(
+      (c) =>
+        c[0] === "write_memory_file" &&
+        (c[1] as { relativePath?: string })?.relativePath?.startsWith("conversation-"),
+    ).length;
+
+    // No new conversation-log write should have fired post-abort.
+    expect(convWritesAfter).toBe(convWritesBefore);
+  });
+
+  it("rapid persistTasks calls serialize in order (no last-snapshot-wins races)", async () => {
+    // codex1 round-6 race: bumpAssignedAt fires persistTasks fire-and-forget.
+    // During a multi-agent broadcast, multiple writes could race and an
+    // earlier write could land *after* a later one, leaving stale state.
+    // The fix introduces a per-session task-write chain, mirroring
+    // conversationWriteChain. We verify by spying on write_memory_file
+    // calls and asserting the LAST persistTasks call's content is the one
+    // that wins (i.e., writes happen in invocation order).
+    const store = useCollaboratorStore.getState();
+    const taskCalls: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "write_memory_file") {
+        const a = args as { content?: string; relativePath?: string };
+        // Filter to tasks-file writes only — addTask also fires
+        // conversation-log writes via appendLog, and now that the
+        // conversation chain is per-session those writes are also
+        // serialized but uninteresting for THIS test's assertion.
+        if (a.relativePath?.startsWith("tasks-")) {
+          taskCalls.push(a.content ?? "");
+        }
+      }
+      return null;
+    });
+
+    // Trigger three rapid writes in succession.
+    store.addTask({ objective: "a", title: "task A", assignee: "@claude1" }, SESSION);
+    store.addTask({ objective: "b", title: "task B", assignee: "@claude1" }, SESSION);
+    store.addTask({ objective: "c", title: "task C", assignee: "@claude1" }, SESSION);
+
+    // Drain the chain by awaiting persistTasks once more.
+    await store.persistTasks(SESSION);
+
+    // Each addTask call schedules a persist, plus our explicit drain.
+    // Calls must be in order: each subsequent write contains a superset
+    // of the previous (same task list grows monotonically).
+    expect(taskCalls.length).toBeGreaterThanOrEqual(3);
+    // The final write reflects all three tasks.
+    const final = taskCalls[taskCalls.length - 1];
+    expect(final).toContain("task A");
+    expect(final).toContain("task B");
+    expect(final).toContain("task C");
+    // Earlier writes should NOT contain later tasks (proves order).
+    expect(taskCalls[0]).toContain("task A");
+    expect(taskCalls[0]).not.toContain("task C");
+  });
+
+  it("bumpAssignedAt does NOT change updatedAt (semantic clarity)", async () => {
+    useCollaboratorStore.setState({
+      agents: [{
+        sessionId: "pty-1",
+        tool: "claude_code",
+        status: "running",
+        collabSessionId: SESSION,
+        ordinal: 1,
+        handle: "claude1",
+        displayName: "Claude Code #1",
+      }],
+    });
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    const initialUpdatedAt = task.updatedAt;
+
+    vi.advanceTimersByTime(1000);
+    await store.sendToAgent("pty-1", "follow-up");
+
+    const updated = useCollaboratorStore.getState().tasksBySession[SESSION]?.find((t) => t.id === task.id);
+    // updatedAt should NOT have moved — bumpAssignedAt is not a "field
+    // change", only a freshness-signal refresh.
+    expect(updated?.updatedAt).toBe(initialUpdatedAt);
+    // assignedAt SHOULD have moved.
+    expect(new Date(updated!.assignedAt).getTime()).toBeGreaterThan(new Date(task.assignedAt).getTime());
+  });
+});
+
+describe("PR-C in-frame outcome — replaces global toast", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("records a recent outcome on terminal-state transition", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "test", title: "task body" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    const outcome = useCollaboratorStore.getState().recentOutcomesBySession[SESSION]?.["claude1"];
+    expect(outcome).toBeDefined();
+    expect(outcome?.kind).toBe("completed");
+    expect(outcome?.taskId).toBe(task.id);
+  });
+
+  it("records blocked outcomes with the blocked kind", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "test", title: "stuck" }, SESSION);
+    store.updateTask(task.id, { status: "blocked", completedBy: "@codex1" }, SESSION);
+
+    const outcome = useCollaboratorStore.getState().recentOutcomesBySession[SESSION]?.["codex1"];
+    expect(outcome?.kind).toBe("blocked");
+  });
+
+  it("auto-clears the recent outcome after 5s", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "test", title: "x" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+
+    expect(useCollaboratorStore.getState().recentOutcomesBySession[SESSION]?.["claude1"]).toBeDefined();
+    vi.advanceTimersByTime(5000);
+    expect(useCollaboratorStore.getState().recentOutcomesBySession[SESSION]?.["claude1"]).toBeUndefined();
+  });
+
+  it("falls back to assignee when completedBy is absent", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "test", title: "y", assignee: "@gemini1" }, SESSION);
+    store.updateTask(task.id, { status: "completed" }, SESSION);
+
+    const outcome = useCollaboratorStore.getState().recentOutcomesBySession[SESSION]?.["gemini1"];
+    expect(outcome?.kind).toBe("completed");
+  });
+
+  it("increments the per-collab-session unread counter", () => {
+    const store = useCollaboratorStore.getState();
+    const t1 = store.addTask({ objective: "test", title: "a" }, SESSION);
+    const t2 = store.addTask({ objective: "test", title: "b" }, SESSION);
+    store.updateTask(t1.id, { status: "completed", completedBy: "@x" }, SESSION);
+    vi.advanceTimersByTime(2000);
+    store.updateTask(t2.id, { status: "completed", completedBy: "@y" }, SESSION);
+
+    expect(useTerminalStore.getState().unreadByCollabSession[SESSION]).toBe(2);
+  });
+
+  it("suppresses unread increment when the active tab already contains the matching collab session", () => {
+    // Set up an active tab that contains the SESSION's collaborator leaf.
+    useTerminalStore.setState({
+      tabs: [
+        {
+          id: "tab-1",
+          title: "T1",
+          paneTree: { type: "leaf", kind: "collaborator", sessionId: SESSION },
+          activePaneSessionId: SESSION,
+          maximizedPaneSessionId: null,
+        },
+      ],
+      activeTabId: "tab-1",
+    });
+
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@a" }, SESSION);
+
+    // Badge must NOT increment — user is already viewing this session.
+    expect(useTerminalStore.getState().unreadByCollabSession[SESSION] ?? 0).toBe(0);
+  });
+
+  it("STILL increments unread when the collab pane is hidden by a maximize on another pane", () => {
+    // Tab is active and contains the collab session — but a *different*
+    // pane (the terminal) is maximized, so the collab pane is hidden.
+    // Without the visibility-aware suppression, completions vanish:
+    // no toast (removed), no in-frame light (hidden), no badge (suppressed).
+    useTerminalStore.setState({
+      tabs: [
+        {
+          id: "tab-1",
+          title: "T1",
+          paneTree: {
+            type: "split",
+            direction: "horizontal",
+            children: [
+              { type: "leaf", kind: "terminal", sessionId: "term-1" },
+              { type: "leaf", kind: "collaborator", sessionId: SESSION },
+            ],
+          },
+          activePaneSessionId: "term-1",
+          maximizedPaneSessionId: "term-1", // collab pane is HIDDEN
+        },
+      ],
+      activeTabId: "tab-1",
+    });
+
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@a" }, SESSION);
+
+    // Badge MUST increment — collab pane is not visible, so this is the
+    // only signal the user has.
+    expect(useTerminalStore.getState().unreadByCollabSession[SESSION]).toBe(1);
+  });
+
+  it("suppresses unread when the collab pane IS the maximized pane", () => {
+    useTerminalStore.setState({
+      tabs: [
+        {
+          id: "tab-1",
+          title: "T1",
+          paneTree: {
+            type: "split",
+            direction: "horizontal",
+            children: [
+              { type: "leaf", kind: "terminal", sessionId: "term-1" },
+              { type: "leaf", kind: "collaborator", sessionId: SESSION },
+            ],
+          },
+          activePaneSessionId: SESSION,
+          maximizedPaneSessionId: SESSION, // collab pane IS the maximized pane
+        },
+      ],
+      activeTabId: "tab-1",
+    });
+
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y" }, SESSION);
+    store.updateTask(task.id, { status: "completed", completedBy: "@a" }, SESSION);
+
+    // Collab pane is fully visible → suppression is correct.
+    expect(useTerminalStore.getState().unreadByCollabSession[SESSION] ?? 0).toBe(0);
+  });
+});

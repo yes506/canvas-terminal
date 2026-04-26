@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { useTerminalStore } from "../../stores/terminalStore";
+import { useTerminalStore, findCollaboratorLeaf } from "../../stores/terminalStore";
+import type { Tab } from "../../types/terminal";
 import { useCanvasStore } from "../../stores/canvasStore";
 import { PaneTree } from "./PaneTree";
 import { TerminalSearch } from "./TerminalSearch";
@@ -276,6 +277,7 @@ export function TerminalTabs() {
                     <Zap size={10} className="text-accent flex-shrink-0" />
                   )}
                   {tab.title}
+                  <UnreadBadge tab={tab} />
                 </span>
               )}
               <button
@@ -406,5 +408,28 @@ function CollaboratorButton() {
     >
       <Zap size={14} />
     </button>
+  );
+}
+
+/**
+ * Renders an unread-completion pill on a tab whose pane tree contains a collaborator leaf.
+ * Predicate uses the literal `?.sessionId === collabSessionId` form (not `Boolean(...)`)
+ * so that a future invariant change to "multiple collaborator leaves per tab" doesn't
+ * silently widen the match. See plan §5 cross-cutting decisions.
+ */
+function UnreadBadge({ tab }: { tab: Tab }) {
+  const collabLeaf = findCollaboratorLeaf(tab.paneTree);
+  const collabSessionId = collabLeaf?.sessionId;
+  const count = useTerminalStore((s) =>
+    collabSessionId ? (s.unreadByCollabSession[collabSessionId] ?? 0) : 0,
+  );
+  if (!collabSessionId || count === 0) return null;
+  return (
+    <span
+      className="ml-1 px-1.5 min-w-[16px] h-4 inline-flex items-center justify-center text-[10px] leading-none rounded-full bg-accent text-surface font-medium"
+      aria-label={`${count} unread completion${count === 1 ? "" : "s"}`}
+    >
+      {count > 99 ? "99+" : count}
+    </span>
   );
 }

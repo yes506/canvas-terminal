@@ -101,6 +101,24 @@ export function findCollaboratorLeaf(node: PaneNode): PaneLeaf | null {
   );
 }
 
+/**
+ * Whether the collaborator pane for `collabSessionId` is *actually visible*
+ * in `tab` — i.e. present in the tree AND not hidden by a maximize on a
+ * different pane. PaneTree only renders the maximized leaf when one is set,
+ * so a tree-membership check alone misclassifies a pane as visible while a
+ * sibling pane is maximized. Used to gate unread-badge suppression/clearing
+ * so collab task completions can't slip past while their pane is hidden.
+ */
+export function isCollabPaneVisibleInTab(tab: Tab | undefined, collabSessionId: string): boolean {
+  if (!tab) return false;
+  const collab = findCollaboratorLeaf(tab.paneTree);
+  if (!collab || collab.sessionId !== collabSessionId) return false;
+  if (tab.maximizedPaneSessionId !== null) {
+    return tab.maximizedPaneSessionId === collabSessionId;
+  }
+  return true;
+}
+
 const UNDO_CLOSE_TIMEOUT = 5000;
 
 interface TerminalState {
@@ -111,6 +129,11 @@ interface TerminalState {
   themeName: string;
   closedTabs: ClosedTab[];
 
+  // Per-collab-session unread completion counter (PR-B Phase 2.2)
+  // Keyed by collabSessionId so badges can survive future "clear-on-pane-focus" tightening
+  // without redesign. Render via findCollaboratorLeaf — see TerminalTabs.
+  unreadByCollabSession: Record<string, number>;
+
   // Tab management
   addTab: (cwd?: string) => void;
   openCollaboratorSplit: () => void;
@@ -120,6 +143,8 @@ interface TerminalState {
   renameTab: (id: string, title: string) => void;
   reorderTab: (fromIndex: number, toIndex: number) => void;
   undoCloseTab: () => void;
+  incrementUnread: (collabSessionId: string) => void;
+  clearUnread: (collabSessionId: string) => void;
 
   // Pane management
   splitPane: (direction: "horizontal" | "vertical") => void;
@@ -148,6 +173,36 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   searchVisible: false,
   themeName: "monochrome",
   closedTabs: [],
+  unreadByCollabSession: {},
+
+  incrementUnread: (collabSessionId) => {
+    // Suppress badge increment only if the collaborator pane is *actually
+    // visible* — i.e. present in the active tab's tree AND not hidden by a
+    // maximize on another pane. Tree-membership alone is not enough: the
+    // user may have maximized a terminal pane, hiding the collab pane while
+    // it's still in the tree. Without this guard, completions would fire
+    // no toast (removed), no in-frame light (hidden pane), and no badge
+    // (suppressed) — silently lost.
+    const s = get();
+    const activeTab = s.tabs.find((t) => t.id === s.activeTabId);
+    if (isCollabPaneVisibleInTab(activeTab, collabSessionId)) {
+      return;
+    }
+    set((s) => ({
+      unreadByCollabSession: {
+        ...s.unreadByCollabSession,
+        [collabSessionId]: (s.unreadByCollabSession[collabSessionId] ?? 0) + 1,
+      },
+    }));
+  },
+
+  clearUnread: (collabSessionId) => {
+    set((s) => {
+      if (!(collabSessionId in s.unreadByCollabSession)) return s;
+      const { [collabSessionId]: _, ...rest } = s.unreadByCollabSession;
+      return { unreadByCollabSession: rest };
+    });
+  },
 
   addTab: (cwd?: string) => {
     const sessionId = generateSessionId();
@@ -290,7 +345,20 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     });
   },
 
-  setActiveTab: (id) => set({ activeTabId: id }),
+  setActiveTab: (id) => {
+    set({ activeTabId: id });
+    // Clear unread only when the collaborator pane is *actually visible* in
+    // the activated tab. If a different pane is maximized, the collab pane
+    // is still hidden, so the badge must persist until the user un-maximizes
+    // (handled in toggleMaximizePane).
+    const tab = get().tabs.find((t) => t.id === id);
+    if (tab) {
+      const collab = findCollaboratorLeaf(tab.paneTree);
+      if (collab && isCollabPaneVisibleInTab(tab, collab.sessionId)) {
+        get().clearUnread(collab.sessionId);
+      }
+    }
+  },
 
   renameTab: (id, title) =>
     set((state) => ({
@@ -456,6 +524,18 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
           : t
       ),
     });
+    // Un-maximizing may reveal a previously hidden collab pane. If so,
+    // clear its unread badge — completions accumulated while hidden have
+    // now become visible (in-frame indicator) again.
+    if (isMaximized) {
+      const collab = findCollaboratorLeaf(tab.paneTree);
+      if (collab) {
+        const updatedTab = get().tabs.find((t) => t.id === tab.id);
+        if (updatedTab && isCollabPaneVisibleInTab(updatedTab, collab.sessionId)) {
+          get().clearUnread(collab.sessionId);
+        }
+      }
+    }
   },
 
   increaseFontSize: () =>
