@@ -1,6 +1,13 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import type { SpawnedAgent, SpawnedAgentInit, ToolId, CollabTask } from "../types/collaborator";
+import type {
+  SpawnedAgent,
+  SpawnedAgentInit,
+  ToolId,
+  CollabTask,
+  AgentNameRecord,
+  RenameResult,
+} from "../types/collaborator";
 import { TOOL_CONFIGS } from "../types/collaborator";
 import { muteCapture } from "../lib/agentOutputCapture";
 import { useTerminalStore } from "./terminalStore";
@@ -73,9 +80,11 @@ export function toolShortName(tool: ToolId): string {
   return cfg?.command ?? tool;
 }
 
-/** Return the stored display name for an agent. */
+/** Return the current display label for an agent. Always reads `nickname`,
+ *  which is mutable; `nameHistory[0].nickname` carries the original system-set
+ *  birth name for callers that need to show "Spawned as: …". */
 export function agentDisplayName(agent: SpawnedAgent): string {
-  return agent.displayName;
+  return agent.nickname;
 }
 
 /**
@@ -337,6 +346,35 @@ const abortedSessions = new Set<string>();
 const firstSendInflight = new Map<string, Promise<void>>();
 
 /**
+ * Per-rename one-shot flag. Forces the next send (sendToAgent OR broadcastToAll)
+ * for `sessionId` to use the FULL header so the agent re-learns its identity
+ * after a rename. Drained on the success branch of the inject, paired with the
+ * existing `contextSentByAgent[sessionId] := true` write — both writes invalidate
+ * the "rename-since-last-emit" claim and must move together if either is moved.
+ *
+ * Orthogonal to `firstSendInflight`: that map tracks per-send PROMISES used to
+ * await concurrent first-sends. This set tracks whether the agent has been
+ * RENAMED since its last full-header emission. Different lifetimes, different
+ * consumers, different cleanup sites. Cleared in removeAgent / killAllAgents /
+ * endSession / _resetWriteStateForTests, parallel to `firstSendInflight`.
+ */
+const renamePendingByAgent = new Set<string>();
+
+/**
+ * NFKC-normalize, lowercase, replace any run of whitespace/punctuation/symbols
+ * with `-`, trim leading/trailing `-`. Used for nickname collision checks and
+ * dropdown filtering. Returns "" for inputs that contain no letters/digits;
+ * `renameAgent` rejects those at validation time.
+ */
+export function slugify(s: string): string {
+  return s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{C}\p{S}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
  * Test-only reset hook for module-level write state. Vitest test isolation
  * via `resetStores()` doesn't reach into module-scoped maps/sets, so a
  * teardown-race test can leave an abort marker that stomps on the next
@@ -352,6 +390,18 @@ export function _resetWriteStateForTests(): void {
   conversationWriteChainsBySession.clear();
   abortedSessions.clear();
   firstSendInflight.clear();
+  renamePendingByAgent.clear();
+}
+
+/**
+ * Test-only inspector for the module-level `renamePendingByAgent` set. The
+ * production code never reads this externally — but tests need to assert state
+ * directly to catch silent regressions: e.g., a future refactor that moves
+ * the `.add()` above the no-op short-circuit, or drops one of the four cleanup
+ * sites, would not be caught by observable-behavior tests alone (claude3 V6-3).
+ */
+export function _isRenamePendingForTests(sessionId: string): boolean {
+  return renamePendingByAgent.has(sessionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -392,15 +442,24 @@ Replace \`SHARED_MEMORY_DIR\` with the path shown above, \`TASK_ID\` with your a
 - Shared memory directory — Write files here to share artifacts with other agents.
 `.trim();
 
-/** Format tasks array into a markdown document for shared memory. */
-function formatTasksMarkdown(tasks: CollabTask[]): string {
+/**
+ * Format tasks array into a markdown document for shared memory.
+ *
+ * The optional `agents` argument lets the writer decorate `@<handle>`
+ * references in `**Assignee**:` and `**Completed By**:` with the agent's
+ * current nickname (e.g. `@claude2 (reviewer-2)`). When omitted — or when
+ * the assigned handle no longer maps to a live agent — the bare canonical
+ * `@<handle>` is rendered, preserving the existing on-disk audit format.
+ */
+function formatTasksMarkdown(tasks: CollabTask[], agents?: SpawnedAgent[]): string {
   if (tasks.length === 0) return "# Collaboration Tasks\n\nNo tasks defined yet.\n";
 
+  const nickByHandle = buildNicknameIndex(agents);
   const lines = ["# Collaboration Tasks\n"];
   for (const t of tasks) {
     lines.push(`## ${t.id} — ${t.status}`);
     lines.push(`**Title**: ${t.title}`);
-    lines.push(`**Assignee**: ${t.assignee ?? "unassigned"}`);
+    lines.push(`**Assignee**: ${formatAgentRef(t.assignee, t.assignee ? nickByHandle.get(t.assignee.trim()) : null)}`);
     lines.push(`**Objective**: ${t.objective}`);
     if (t.context) lines.push(`**Context**: ${t.context}`);
     if (t.deliverables.length > 0) {
@@ -410,7 +469,7 @@ function formatTasksMarkdown(tasks: CollabTask[]): string {
     if (t.dependencies.length > 0) {
       lines.push(`**Dependencies**: ${t.dependencies.join(", ")}`);
     }
-    if (t.completedBy) lines.push(`**Completed By**: ${t.completedBy}`);
+    if (t.completedBy) lines.push(`**Completed By**: ${formatAgentRef(t.completedBy, nickByHandle.get(t.completedBy.trim()))}`);
     if (t.reasoning) lines.push(`**Reasoning**: ${t.reasoning}`);
     if (t.conclusion) lines.push(`**Conclusion**: ${t.conclusion}`);
     if (t.output) lines.push(`**Output**: ${t.output}`);
@@ -578,6 +637,60 @@ function resolveTaskAuthor(task: CollabTask): string | null {
   return task.completedBy?.trim() || task.assignee?.trim() || null;
 }
 
+/**
+ * Render an agent reference with both its canonical handle (the immutable
+ * `@<handle>` identity used for handle-keyed lookups and protocol strings)
+ * AND, when known, its current human-readable nickname in parentheses.
+ *
+ * The handle is preserved verbatim so downstream readers (regex filters,
+ * task-mention parsers) keep matching; the nickname is appended only as a
+ * trailing `(label)` decoration. When the nickname is unknown — e.g. an
+ * agent that has been removed from the session, or a task created before
+ * the matching agent spawned — the function returns the bare handle.
+ *
+ * Used by:
+ *  - `formatTasksMarkdown` (Assignee / Completed By lines on disk)
+ *  - the conversation-log Task Report `**Agent**:` header
+ *  - the conversation-log `Task created:` line
+ *  - the `[Your identity: …]` and `[You are …]` context-header lines
+ *    injected into every agent prompt
+ *
+ * Format: `@claude2 (reviewer-2)` — paren style. Mirrors the rename log's
+ * pre-existing convention of writing nicknames inside double quotes/parens.
+ */
+function formatAgentRef(
+  mention: string | null | undefined,
+  nickname: string | null | undefined,
+): string {
+  if (!mention) return "unassigned";
+  const trimmedMention = mention.trim();
+  if (!trimmedMention) return "unassigned";
+  const handle = trimmedMention.startsWith("@") ? trimmedMention : `@${trimmedMention}`;
+  const nick = nickname?.trim();
+  return nick ? `${handle} (${nick})` : handle;
+}
+
+/**
+ * Build a handle→nickname index from a list of currently-spawned agents.
+ *
+ * Skips `status === "exited"` agents so dead agents don't keep contributing
+ * presentational decorations to persisted task/report formatting after the
+ * PTY closes. (codex1 task-7 + codex2 task-9 cross-validated finding —
+ * `setAgentStatus(sessionId, "exited")` leaves the agent in `store.agents`
+ * until `removeAgent` runs, so without this filter the documented
+ * "fall back to bare @handle when the agent has exited" invariant
+ * was not actually enforced.)
+ */
+function buildNicknameIndex(agents: SpawnedAgent[] | undefined): Map<string, string> {
+  const idx = new Map<string, string>();
+  if (!agents) return idx;
+  for (const a of agents) {
+    if (a.status === "exited") continue;
+    if (a.nickname) idx.set(`@${a.handle}`, a.nickname);
+  }
+  return idx;
+}
+
 function bumpAssignedAt(
   taskId: string,
   forSession: string,
@@ -700,6 +813,28 @@ interface CollaboratorState {
 
   // Agent lifecycle
   addAgent: (agent: SpawnedAgentInit) => void;
+  /**
+   * Rename an agent's nickname. Returns `RenameResult`; the store owns the
+   * human-readable failure messages so all rename surfaces (inline UI, /rename
+   * slash command) share one wording. The handle is IMMUTABLE — only `nickname`,
+   * `nicknameSlug`, and `nameHistory` mutate. On success, sets a one-shot flag
+   * (`renamePendingByAgent`) that forces the next send (per-agent or broadcast)
+   * to use the FULL header so the agent re-learns its identity.
+   *
+   * Validation rules (in order):
+   *   - trim → length must be 1..32 chars
+   *   - lowercase must not equal "all" or "all agents" (reserved for broadcast)
+   *   - `slugify(nickname)` must be non-empty (rejects pure-emoji / pure-punct)
+   *   - must not equal another LIVE agent's `nickname`/`handle`/`nicknameSlug`
+   *     (case-insensitive) within the same `collabSessionId`. Exited agents
+   *     do not reserve names — see v5 §4 "Live agents own the namespace".
+   *   - exited agents themselves CAN be renamed (audit clarity post-mortem).
+   *
+   * No-op short-circuit: if `target.nickname === trimmed`, returns `{ ok: true }`
+   * WITHOUT adding to `renamePendingByAgent`, since the next send doesn't need
+   * a redundant full-header re-emit.
+   */
+  renameAgent: (sessionId: string, rawNickname: string) => RenameResult;
   removeAgent: (sessionId: string) => void;
   setAgentStatus: (
     sessionId: string,
@@ -842,6 +977,7 @@ async function prependContextHeader(
   collabSessionId: string | null,
   tasks: CollabTask[],
   agentIdentity?: string | null,
+  agentNickname?: string | null,
 ): Promise<string> {
   const dir = await getMemoryDir();
   const parts: string[] = [];
@@ -872,9 +1008,18 @@ async function prependContextHeader(
     "[To share notes with other agents, write files to the shared memory directory above.]",
   );
 
-  // Inject agent identity so each agent knows who it is
+  // Inject agent identity so each agent knows who it is. We surface BOTH
+  // the canonical immutable handle (`@claudeN`/`@codexN`) AND the current
+  // human-readable nickname when known, then explicitly tell the agent to
+  // use the @-handle in protocol artifacts (.done.json author, mentions,
+  // log lines). The handle remains the single string referenced by
+  // handle-keyed lookups (findFreshestActiveTaskForMention,
+  // recentOutcomesBySession), so writing the nickname in the prompt only
+  // is presentational — it never lands on disk under a non-canonical key.
   if (agentIdentity) {
-    parts.push(`[Your identity: You are @${agentIdentity}. Use this name when authoring files or referencing yourself in logs.]`);
+    const nick = agentNickname?.trim();
+    const idLabel = nick ? `@${agentIdentity} (${nick})` : `@${agentIdentity}`;
+    parts.push(`[Your identity: You are ${idLabel}. Use the @${agentIdentity} handle when authoring files or referencing yourself in logs.]`);
   }
 
   // Inject task protocol and active task summary
@@ -912,6 +1057,7 @@ async function buildSlimHeader(
   collabSessionId: string | null,
   tasks: CollabTask[],
   agentIdentity?: string | null,
+  agentNickname?: string | null,
 ): Promise<string> {
   const dir = await getMemoryDir();
   const parts: string[] = [`[Collaborator shared memory: ${dir}]`];
@@ -934,7 +1080,11 @@ async function buildSlimHeader(
     // No context file
   }
   if (agentIdentity) {
-    parts.push(`[You are @${agentIdentity}]`);
+    // Slim variant of the full header's identity line — same handle-first,
+    // nickname-in-parens convention, no usage hint (the agent learned the
+    // "use @handle in protocol writes" rule from message #1's full header).
+    const nick = agentNickname?.trim();
+    parts.push(nick ? `[You are @${agentIdentity} (${nick})]` : `[You are @${agentIdentity}]`);
   }
   parts.push(
     `[Protocol reminder: signal completion via ${dir}/{TASK_ID}.done.json — ` +
@@ -1020,7 +1170,10 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       const sessionIdsToDrop = new Set(
         s.agents.filter((a) => a.collabSessionId === forSession).map((a) => a.sessionId),
       );
-      for (const sid of sessionIdsToDrop) firstSendInflight.delete(sid);
+      for (const sid of sessionIdsToDrop) {
+        firstSendInflight.delete(sid);
+        renamePendingByAgent.delete(sid);
+      }
       const contextSentByAgent = Object.fromEntries(
         Object.entries(s.contextSentByAgent).filter(([sid]) => !sessionIdsToDrop.has(sid)),
       );
@@ -1052,13 +1205,114 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   addAgent: (raw) => {
     const ordinal = nextOrdinal(raw.collabSessionId, raw.tool);
     const short = toolShortName(raw.tool);
+    const initialNickname = `${toolLabel(raw.tool)} #${ordinal}`;
+    const setAt = new Date().toISOString();
     const agent: SpawnedAgent = {
       ...raw,
       ordinal,
       handle: `${short}${ordinal}`,
-      displayName: `${toolLabel(raw.tool)} #${ordinal}`,
+      nickname: initialNickname,
+      nicknameSlug: slugify(initialNickname),
+      nameHistory: [{ nickname: initialNickname, setAt, setBy: "system" }],
     };
     set((s) => ({ agents: [...s.agents, agent] }));
+  },
+
+  renameAgent: (sessionId, rawNickname) => {
+    const trimmed = rawNickname.trim();
+    if (trimmed.length === 0 || trimmed.length > 32) {
+      return {
+        ok: false,
+        reason: "invalid",
+        message: "Nickname must be 1–32 characters.",
+      };
+    }
+    const lower = trimmed.toLowerCase();
+    if (lower === "all" || lower === "all agents") {
+      return {
+        ok: false,
+        reason: "reserved",
+        message: '"all" and "all agents" are reserved for broadcast.',
+      };
+    }
+    const newSlug = slugify(trimmed);
+    if (newSlug.length === 0) {
+      return {
+        ok: false,
+        reason: "invalid",
+        message: "Nickname must contain at least one letter or number.",
+      };
+    }
+    const state = get();
+    const target = state.agents.find((a) => a.sessionId === sessionId);
+    if (!target) {
+      return { ok: false, reason: "not-found", message: "Agent not found." };
+    }
+    // No-op short-circuit. The check is BEFORE the dupe scan so that a rename
+    // back to the current value never even risks tripping a "duplicate" against
+    // self (the dupe scan filters self by sessionId, but this is clearer intent).
+    // Critically: returning here SKIPS the renamePendingByAgent.add() below, so
+    // a no-op rename does not trigger a wasteful full-header re-emit.
+    if (target.nickname === trimmed) return { ok: true };
+
+    // Liveness filter on collision check: live agents own the namespace.
+    // Exited agents' nicknames are historical labels, not active reservations.
+    // (codex1 C2-2 from synthesis v5 §4.)
+    const dupe = state.agents.some(
+      (a) =>
+        a.sessionId !== sessionId &&
+        a.collabSessionId === target.collabSessionId &&
+        a.status !== "exited" &&
+        (a.nickname.toLowerCase() === lower ||
+          a.handle.toLowerCase() === lower ||
+          a.nicknameSlug === newSlug),
+    );
+    if (dupe) {
+      return {
+        ok: false,
+        reason: "duplicate",
+        message: "Name already in use by another agent.",
+      };
+    }
+
+    const setAt = new Date().toISOString();
+    const oldNickname = target.nickname;
+    const record: AgentNameRecord = {
+      nickname: trimmed,
+      setAt,
+      setBy: "user",
+    };
+    set((s) => {
+      // Clear contextSentByAgent[sessionId] via destructure-omit so the next
+      // send for this agent treats it as "never seen full header." Matches the
+      // removeAgent destructure pattern. (claude2 P1 + codex1 C2-1.)
+      const { [sessionId]: _omit, ...contextSentByAgent } = s.contextSentByAgent;
+      return {
+        agents: s.agents.map((a) =>
+          a.sessionId === sessionId
+            ? {
+                ...a,
+                nickname: trimmed,
+                nicknameSlug: newSlug,
+                nameHistory: [...a.nameHistory, record],
+              }
+            : a,
+        ),
+        contextSentByAgent,
+      };
+    });
+    // Belt-and-suspenders against the in-flight first-send race: if a send
+    // is mid-flight when the rename fires, the post-resolve `[sessionId]: true`
+    // write at the success branch would otherwise stomp the rename's clear.
+    // The set survives that write because it lives outside store state.
+    // (claude2 P2 from synthesis v5 §3.)
+    renamePendingByAgent.add(sessionId);
+    get().appendLog(
+      "system",
+      `Agent @${target.handle} renamed: "${oldNickname}" → "${trimmed}"`,
+      target.collabSessionId,
+    );
+    return { ok: true };
   },
 
   removeAgent: (sessionId) => {
@@ -1066,6 +1320,11 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     // sessionId (the `finally` in sendToAgent normally handles this, but if
     // the component is yanked mid-flight we don't want a dangling promise).
     firstSendInflight.delete(sessionId);
+    // Same belt-and-suspenders for the rename-pending flag — if the agent
+    // is removed mid-rename window, drain so the slot doesn't outlive the
+    // sessionId (matters if a future agent recycles this id, though current
+    // generateSessionId() avoids reuse).
+    renamePendingByAgent.delete(sessionId);
     set((s) => {
       const { [sessionId]: _pm, ...pendingMessagesByAgent } = s.pendingMessagesByAgent;
       const { [sessionId]: _ctx, ...contextSentByAgent } = s.contextSentByAgent;
@@ -1120,7 +1379,10 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     // (the per-call `finally` normally handles this, but if a kill races
     // an in-flight inject we don't want a dangling promise).
     const killedIds = new Set(toKill.map((a) => a.sessionId));
-    for (const id of killedIds) firstSendInflight.delete(id);
+    for (const id of killedIds) {
+      firstSendInflight.delete(id);
+      renamePendingByAgent.delete(id);
+    }
     if (sid) {
       resetOrdinalCounters(sid);
       set((s) => ({
@@ -1183,6 +1445,11 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       const tool = agent?.tool ?? null;
       const agentCollabId = agent?.collabSessionId ?? null;
       const mention = agent ? agent.handle : "?";
+      // The current display nickname, if any. Threaded into header builders
+      // so the `[Your identity: …]` / `[You are @<handle> (<nickname>)]`
+      // line carries the agent's mutable label alongside the canonical
+      // handle. Mirrors `broadcastToAll`'s identity threading.
+      const nickname = agent?.nickname ?? null;
 
       // Queue message if agent is still starting up
       if (agent?.status === "spawning") {
@@ -1238,8 +1505,22 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       while (firstSendInflight.has(sessionId)) {
         await firstSendInflight.get(sessionId)!.catch(() => {});
       }
+      // OR-in `renamePendingByAgent.has` so a rename that landed during an
+      // in-flight first-send still forces the next send into the full header.
+      // The bare `flagState === undefined` check would miss it because the
+      // post-resolve `[sessionId]: true` write at the success branch (below)
+      // overwrites the rename's `delete` of contextSentByAgent. The set itself
+      // is module-level so the zustand `set((s) => ...)` write to
+      // contextSentByAgent doesn't reach it; the set IS drained explicitly on
+      // success — see the PAIRED INVARIANT block below. The OR-in here protects
+      // the rename intent across the await window before the success branch
+      // fires (i.e., during the firstSendInflight wait loop above, where a
+      // rename can arrive and add to the set).
+      // Read-only here; the consume happens on inject SUCCESS so a failed
+      // send preserves the rename intent for the next attempt.
       const flagState = get().contextSentByAgent[sessionId];
-      const useFullHeader = flagState === undefined;
+      const renamePending = renamePendingByAgent.has(sessionId);
+      const useFullHeader = renamePending || flagState === undefined;
 
       if (useFullHeader) {
         // Become the first sender. Mark inflight in BOTH state (for the
@@ -1250,12 +1531,19 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         }));
         const work = (async () => {
           try {
-            const text = await prependContextHeader(content, agentCollabId, sessionTasks, mention);
+            const text = await prependContextHeader(content, agentCollabId, sessionTasks, mention, nickname);
             muteCapture(sessionId, 1500);
             await invoke("inject_into_pty", { sessionId, text, tool });
+            // PAIRED INVARIANT: contextSentByAgent[sessionId] := true AND
+            // renamePendingByAgent.delete(sessionId) must happen together.
+            // Both writes invalidate the "rename-since-last-emit" claim. If you
+            // move one, move the other — splitting them silently regresses the
+            // slim-header design (the leak forces every subsequent send into
+            // the full header for no reason).
             set((s) => ({
               contextSentByAgent: { ...s.contextSentByAgent, [sessionId]: true },
             }));
+            renamePendingByAgent.delete(sessionId);
           } catch (err) {
             // Roll back so the next sender retries with a full header.
             set((s) => {
@@ -1274,7 +1562,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       } else {
         // flagState === true (we waited above; "inflight" cannot occur here
         // because the `while` loop drained it).
-        const text = await buildSlimHeader(content, agentCollabId, sessionTasks, mention);
+        const text = await buildSlimHeader(content, agentCollabId, sessionTasks, mention, nickname);
         muteCapture(sessionId, 1500);
         await invoke("inject_into_pty", { sessionId, text, tool });
       }
@@ -1342,6 +1630,10 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       try {
         // Each agent gets its own identity injected into the context header.
         const identity = agent.handle;
+        // …along with its current nickname so the slim/full header renders
+        // `@claude2 (reviewer-2)` instead of just `@claude2`. See
+        // `sendToAgent` for the matching threading.
+        const identityNickname = agent.nickname ?? null;
         const aSid = agent.sessionId;
 
         // ── Per-agent first-send gating (mirrors sendToAgent) ───────
@@ -1351,8 +1643,13 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         while (firstSendInflight.has(aSid)) {
           await firstSendInflight.get(aSid)!.catch(() => {});
         }
+        // Symmetric with sendToAgent: OR-in renamePendingByAgent so a rename
+        // followed by a broadcast still re-emits the full header. Without this,
+        // rename + broadcast would silently lose the rename's full-header
+        // intent if the per-agent flagState had already been written to true.
         const flagState = get().contextSentByAgent[aSid];
-        const useFullHeader = flagState === undefined;
+        const renamePending = renamePendingByAgent.has(aSid);
+        const useFullHeader = renamePending || flagState === undefined;
 
         if (useFullHeader) {
           set((s) => ({
@@ -1360,12 +1657,16 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
           }));
           const work = (async () => {
             try {
-              const text = await prependContextHeader(content, sid, sessionTasks, identity);
+              const text = await prependContextHeader(content, sid, sessionTasks, identity, identityNickname);
               muteCapture(aSid, 1500);
               await invoke("inject_into_pty", { sessionId: aSid, text, tool: agent.tool });
+              // PAIRED INVARIANT: see sendToAgent's matching comment. Both
+              // writes invalidate the "rename-since-last-emit" claim and must
+              // move together if either is moved.
               set((s) => ({
                 contextSentByAgent: { ...s.contextSentByAgent, [aSid]: true },
               }));
+              renamePendingByAgent.delete(aSid);
             } catch (err) {
               set((s) => {
                 const { [aSid]: _, ...rest } = s.contextSentByAgent;
@@ -1381,7 +1682,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
             firstSendInflight.delete(aSid);
           }
         } else {
-          const text = await buildSlimHeader(content, sid, sessionTasks, identity);
+          const text = await buildSlimHeader(content, sid, sessionTasks, identity, identityNickname);
           muteCapture(aSid, 1500);
           await invoke("inject_into_pty", { sessionId: aSid, text, tool: agent.tool });
         }
@@ -1504,7 +1805,17 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         [forSession]: [...(s.tasksBySession[forSession] ?? []), task],
       },
     }));
-    get().appendLog("system", `Task created: ${task.id} — ${task.title}`, forSession);
+    // Append assignee with nickname-decorated handle so the conversation
+    // log surfaces both the canonical mention and the human-readable name
+    // at task-creation time. Lookup uses the live session roster — same
+    // index `formatTasksMarkdown` builds — so the two writers stay in sync.
+    let assigneeSuffix = "";
+    if (task.assignee) {
+      const sessionAgents = get().agents.filter((a) => a.collabSessionId === forSession);
+      const nick = buildNicknameIndex(sessionAgents).get(task.assignee.trim());
+      assigneeSuffix = ` → ${formatAgentRef(task.assignee, nick)}`;
+    }
+    get().appendLog("system", `Task created: ${task.id} — ${task.title}${assigneeSuffix}`, forSession);
     get().persistTasks(forSession);
     return task;
   },
@@ -1565,13 +1876,22 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       const isTerminal = task.status === "completed" || task.status === "blocked";
       const statusChanged = task.status !== prevStatus;
       if (isTerminal && statusChanged) {
+        // Decorate the resolved author handle with its current nickname,
+        // when the agent is still in the session roster. Falls back to the
+        // bare handle (existing behavior) for assignees whose agent has
+        // since exited or was never in this session — this preserves the
+        // codex3 round-6 invariant that an empty `completedBy` falls
+        // through to `assignee` and never produces an empty Agent line.
+        const author = resolveTaskAuthor(task);
+        const sessionAgents = get().agents.filter((a) => a.collabSessionId === forSession);
+        const authorNick = author ? buildNicknameIndex(sessionAgents).get(author.trim()) : null;
         const report = [
           `# ${task.id} — ${task.status}`,
           // Use the shared resolveTaskAuthor helper so this header and
           // the outcome-routing fallback below can't drift (claude3
           // round-7 D6 — both sites previously open-coded the same
           // trim()+|| pattern).
-          `**Agent**: ${resolveTaskAuthor(task) ?? "unassigned"}`,
+          `**Agent**: ${formatAgentRef(author, authorNick)}`,
           `**Subject**: ${task.title}`,
           task.reasoning ? `**Reasoning**: ${task.reasoning}` : null,
           task.conclusion ? `**Conclusion**: ${task.conclusion}` : null,
@@ -1644,7 +1964,13 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     // concurrent invoke("write_memory_file", ...) calls could land
     // out-of-order and leave an older snapshot on disk.
     const tasks = get().tasksBySession[forSession] ?? [];
-    const content = formatTasksMarkdown(tasks);
+    // Thread the live agent roster so `**Assignee**:` / `**Completed By**:`
+    // lines render with the canonical handle AND current nickname, e.g.
+    // `@claude2 (reviewer-2)`. Filtered to this collab session — handles are
+    // unique within a session and we don't want a same-handle agent from a
+    // sibling pane to leak its nickname into the wrong tasks file.
+    const sessionAgents = get().agents.filter((a) => a.collabSessionId === forSession);
+    const content = formatTasksMarkdown(tasks, sessionAgents);
     const prev = taskWriteChainsBySession.get(forSession) ?? Promise.resolve();
     const next = prev
       .catch(() => {}) // a previous failure must not block the next write

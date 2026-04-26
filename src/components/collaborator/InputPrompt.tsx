@@ -34,6 +34,7 @@ export function InputPrompt() {
   const [fileEntryCount, setFileEntryCount] = useState(0);
   const [pending, setPending] = useState<PendingMessage | null>(null);
   const [selectorIndex, setSelectorIndex] = useState(0);
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileSelectRef = useRef<((confirmDir?: boolean) => void) | null>(null);
   const pushHistory = useCollaboratorStore((s) => s.pushHistory);
@@ -104,9 +105,12 @@ export function InputPrompt() {
     setFileEntryCount(count);
   }, []);
 
-  // Reset selector index when pending changes
+  // Reset selector index AND checked set when pending changes (selector opens
+  // or closes). Checked-set reset is critical: a previous canceled selection
+  // must not survive into the next time the selector opens.
   useEffect(() => {
     setSelectorIndex(0);
+    setCheckedIds(new Set());
   }, [pending]);
 
   // Auto-focus on mount
@@ -198,12 +202,69 @@ export function InputPrompt() {
     [mention, value, cursorPos],
   );
 
+  /** Toggle a row's checked state in the selector's multi-select set. */
+  const toggleChecked = useCallback((id: string) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  /** Execute with the entire checked set. Routes to broadcastToAll only when
+   *  the synthetic "all" sentinel row is checked. Selecting every individual
+   *  agent fans out N sendToAgent calls — equivalent in result, but each agent
+   *  receives its own first-send-gating window rather than one shared one. */
+  const executeWithChecked = useCallback(async () => {
+    if (!pending) return;
+    const { message: msg, commandPrefix } = pending;
+    const ids = Array.from(checkedIds);
+    if (ids.length === 0) return;
+    setPending(null);
+    setCheckedIds(new Set());
+
+    const store = useCollaboratorStore.getState();
+    const allSelected = ids.includes("all");
+
+    if (commandPrefix) {
+      // Canvas command paths: fan out per checked agent. The "all" sentinel
+      // takes precedence — running canvas-export once with @all is cheaper
+      // than N individual exports.
+      const spaceIdx = commandPrefix.indexOf(" ", 1);
+      const baseCmd = spaceIdx > 0 ? commandPrefix.slice(0, spaceIdx) : commandPrefix;
+      const trailing = spaceIdx > 0 ? commandPrefix.slice(spaceIdx) : "";
+      if (allSelected) {
+        await executeCommand(parseInput(`${baseCmd} @all${trailing}`), collabSessionId);
+      } else {
+        for (const id of ids) {
+          const agent = agents.find((a) => a.sessionId === id);
+          if (!agent) continue;
+          await executeCommand(
+            parseInput(`${baseCmd} @${agent.handle}${trailing}`),
+            collabSessionId,
+          );
+        }
+      }
+    } else {
+      if (allSelected) {
+        await store.broadcastToAll(msg, collabSessionId);
+      } else {
+        for (const id of ids) {
+          await store.sendToAgent(id, msg);
+        }
+      }
+    }
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, [pending, checkedIds, agents, collabSessionId]);
+
   /** Execute with a selected target from the selector. */
   const executeWithTarget = useCallback(
     async (option: { label: string; detail?: string; agent: SpawnedAgent | null }) => {
       if (!pending) return;
       const { message: msg, commandPrefix } = pending;
       setPending(null);
+      setCheckedIds(new Set());
 
       if (commandPrefix) {
         // Canvas command with target — insert @handle or @all right after the slash command
@@ -235,6 +296,7 @@ export function InputPrompt() {
     if (pending) {
       setValue(pending.message);
       setPending(null);
+      setCheckedIds(new Set());
       requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [pending]);
@@ -319,10 +381,24 @@ export function InputPrompt() {
           setSelectorIndex((i) => (i < selectorOptions.length - 1 ? i + 1 : 0));
           return;
         }
+        // Space toggles the cursor row's checkbox.
+        if (e.key === " ") {
+          e.preventDefault();
+          const opt = selectorOptions[selectorIndex];
+          if (opt) toggleChecked(opt.agent?.sessionId ?? "all");
+          return;
+        }
         if (e.key === "Enter" || e.key === "Tab") {
           e.preventDefault();
-          const selected = selectorOptions[selectorIndex];
-          if (selected) executeWithTarget(selected);
+          // If the user has explicitly checked rows, send to those.
+          // Otherwise fall back to the cursor row (single-target fast path
+          // preserves muscle memory for "open selector, press Enter").
+          if (checkedIds.size > 0) {
+            executeWithChecked();
+          } else {
+            const selected = selectorOptions[selectorIndex];
+            if (selected) executeWithTarget(selected);
+          }
           return;
         }
         if (e.key === "Escape") {
@@ -330,11 +406,18 @@ export function InputPrompt() {
           dismissSelector();
           return;
         }
-        // Number keys 1-9 for quick selection
+        // Digit keys 1-9 toggle the corresponding row's checkbox (NOT one-shot
+        // send). This keeps the selection model uniform: Space, click, and
+        // digits all toggle; Enter submits. Previous behavior (one-shot send
+        // on digit) silently discarded user-toggled checkboxes — see v6 §7.
         const num = parseInt(e.key);
         if (num >= 1 && num <= selectorOptions.length) {
           e.preventDefault();
-          executeWithTarget(selectorOptions[num - 1]);
+          const opt = selectorOptions[num - 1];
+          if (opt) {
+            toggleChecked(opt.agent?.sessionId ?? "all");
+            setSelectorIndex(num - 1);
+          }
           return;
         }
         return;
@@ -434,6 +517,9 @@ export function InputPrompt() {
       showSelector,
       selectorOptions,
       selectorIndex,
+      checkedIds,
+      toggleChecked,
+      executeWithChecked,
       executeWithTarget,
       dismissSelector,
       showFile,
@@ -457,29 +543,50 @@ export function InputPrompt() {
       {/* Target selector dropdown */}
       {showSelector && (
         <div className="absolute bottom-full left-0 right-0 mx-2 mb-1 bg-surface-light border border-surface-lighter rounded-md shadow-lg overflow-hidden z-50">
-          <div className="px-3 py-1.5 text-xs text-text-dim border-b border-surface-lighter font-mono">
-            Send to: <span className="text-cyan-400">↑↓</span> navigate{" "}
-            <span className="text-cyan-400">Enter</span> select{" "}
-            <span className="text-cyan-400">Esc</span> cancel
+          <div className="px-3 py-1.5 text-xs text-text-dim border-b border-surface-lighter font-mono flex items-center justify-between">
+            <span>
+              Send to: <span className="text-cyan-400">↑↓</span> navigate{" "}
+              <span className="text-cyan-400">Space/1-9</span> toggle{" "}
+              <span className="text-cyan-400">Enter</span> send{" "}
+              <span className="text-cyan-400">Esc</span> cancel
+            </span>
+            {checkedIds.size > 0 && (
+              <span className="text-accent font-bold">{checkedIds.size} selected</span>
+            )}
           </div>
-          {selectorOptions.map((opt, i) => (
-            <button
-              key={opt.agent?.sessionId ?? "all"}
-              className={`w-full text-left px-3 py-1.5 text-sm font-mono transition-colors ${
-                i === selectorIndex
-                  ? "bg-accent/20 text-accent"
-                  : "text-text hover:bg-surface-lighter"
-              }`}
-              onMouseEnter={() => setSelectorIndex(i)}
-              onClick={() => executeWithTarget(opt)}
-            >
-              <span className="text-text-dim mr-2">{i + 1}.</span>
-              <span>{opt.label}</span>
-              {opt.detail && (
-                <span className="text-text-dim ml-2">{opt.detail}</span>
-              )}
-            </button>
-          ))}
+          {selectorOptions.map((opt, i) => {
+            const id = opt.agent?.sessionId ?? "all";
+            const isChecked = checkedIds.has(id);
+            return (
+              <button
+                key={id}
+                className={`w-full text-left px-3 py-1.5 text-sm font-mono transition-colors flex items-center gap-2 ${
+                  i === selectorIndex
+                    ? "bg-accent/20 text-accent"
+                    : "text-text hover:bg-surface-lighter"
+                }`}
+                onMouseEnter={() => setSelectorIndex(i)}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => toggleChecked(id)}
+              >
+                <span className="text-text-dim w-4 shrink-0">{i + 1}.</span>
+                <span
+                  className={`inline-block w-3.5 h-3.5 border rounded-sm shrink-0 flex items-center justify-center text-[10px] leading-none ${
+                    isChecked
+                      ? "bg-accent border-accent text-surface"
+                      : "border-surface-lighter bg-surface"
+                  }`}
+                  aria-hidden="true"
+                >
+                  {isChecked ? "✓" : ""}
+                </span>
+                <span className="truncate">{opt.label}</span>
+                {opt.detail && (
+                  <span className="text-text-dim ml-2 truncate">{opt.detail}</span>
+                )}
+              </button>
+            );
+          })}
         </div>
       )}
 

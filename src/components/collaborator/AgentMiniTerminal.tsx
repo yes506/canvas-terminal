@@ -56,6 +56,13 @@ export function AgentMiniTerminal({
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disposed = useRef(false);
   const [focused, setFocused] = useState(false);
+  // Inline-rename state for the header label. `editing === false` shows the
+  // <span>; `editing === true` shows an <input value={draft}>. The store action
+  // owns validation and human messages — we only thread RenameResult.message
+  // back to setStatus on failure. (codex1+codex2 round-3-onwards.)
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     disposed.current = false;
@@ -768,9 +775,65 @@ export function AgentMiniTerminal({
             className={`relative inline-flex w-2 h-2 rounded-full ${indicator.color} ring-2 ${indicator.ringColor} ${indicator.pulse ? "motion-safe:animate-pulse" : ""}`}
           />
         </span>
-        <span className={`font-bold ${tool.colorClass} truncate shrink-0`}>
-          {displayName}
-        </span>
+        {editing ? (
+          <input
+            ref={renameInputRef}
+            type="text"
+            value={draft}
+            maxLength={32}
+            autoFocus
+            spellCheck={false}
+            className={`font-bold ${tool.colorClass} bg-surface border border-accent/40 rounded px-1 py-0 text-xs outline-none focus:border-accent w-32 sm:w-44 shrink-0`}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                if (!collabSessionId) return;
+                const result = useCollaboratorStore.getState().renameAgent(sessionId, draft);
+                if (result.ok) {
+                  setEditing(false);
+                } else {
+                  // Enter on invalid: KEEP the input open so the user can
+                  // correct without losing their typed value. Surface the
+                  // store's human message via the footer status slot.
+                  // (Phase 5 spec: Enter is a deliberate commit gesture.)
+                  useCollaboratorStore.getState().setStatus(result.message, collabSessionId, "persistent");
+                }
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                setEditing(false);
+              }
+            }}
+            onBlur={() => {
+              if (!collabSessionId) {
+                setEditing(false);
+                return;
+              }
+              const result = useCollaboratorStore.getState().renameAgent(sessionId, draft);
+              if (!result.ok) {
+                // Blur on invalid: REVERT silently so an accidental focus
+                // shift doesn't leave the input in a bad state. Surface the
+                // reason so the user knows why their pending edit didn't
+                // commit. (Phase 5 spec: blur is often accidental.)
+                useCollaboratorStore.getState().setStatus(result.message, collabSessionId, "persistent");
+              }
+              setEditing(false);
+            }}
+          />
+        ) : (
+          <span
+            className={`font-bold ${tool.colorClass} truncate shrink-0 cursor-text select-none`}
+            title="Double-click to rename"
+            onDoubleClick={(e) => {
+              e.preventDefault();
+              setDraft(displayName);
+              setEditing(true);
+              requestAnimationFrame(() => renameInputRef.current?.select());
+            }}
+          >
+            {displayName}
+          </span>
+        )}
         <span
           role={indicator.liveRole}
           aria-live={indicator.liveLevel}
