@@ -15,6 +15,24 @@ const IMPORT_PROMPT = [
 ].join("\n");
 
 /**
+ * Concatenate the original Markdown source of every imported `.md` image on the canvas.
+ * Returns null when no object carries a `markdownSource` — caller should toast and abort.
+ *
+ * Duplicate sources concatenate (acceptable v1 behavior — user can delete the redundant image).
+ */
+export function exportImportedMarkdown(canvas: fabric.Canvas): string | null {
+  const sources = canvas
+    .getObjects()
+    .map(
+      (o) =>
+        (o as fabric.FabricObject & { markdownSource?: string }).markdownSource,
+    )
+    .filter((s): s is string => typeof s === "string" && s.length > 0);
+  if (sources.length === 0) return null;
+  return sources.join("\n\n---\n\n");
+}
+
+/**
  * Export the current canvas as a PNG snapshot and return the saved file path.
  * Returns null if the canvas is empty or unavailable.
  */

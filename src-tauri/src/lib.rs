@@ -100,6 +100,7 @@ pub fn run() {
             commands::memory::delete_memory_file,
             commands::memory::clear_memory_dir,
             commands::memory::list_memory_files,
+            commands::memory::get_memory_file_mtime,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

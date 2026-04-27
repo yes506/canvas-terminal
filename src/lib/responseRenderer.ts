@@ -1,7 +1,25 @@
 import { marked } from "marked";
 import html2canvas from "html2canvas";
+import DOMPurify from "dompurify";
 
-type ResponseFormat = "svg" | "html" | "markdown" | "text";
+export type ResponseFormat = "svg" | "html" | "markdown" | "text";
+
+export interface RenderOptions {
+  /**
+   * When true, DOMPurify scrubs the rendered HTML before it is attached to the DOM.
+   * Default false preserves existing behavior for AI-trusted responses; user-imported
+   * `.md` files (Slack, email, web) must pass `sanitize: true`.
+   */
+  sanitize?: boolean;
+  /**
+   * Force a specific format instead of running `detectFormat` against the content.
+   * `.md` imports pass `format: "markdown"` so plain-text `.md` files (no headings,
+   * lists, etc.) are still parsed by `marked.parse` rather than escaped to <pre>,
+   * and so raw `<svg>...` inside `.md` doesn't take the SVG fast-path that bypasses
+   * sanitization.
+   */
+  format?: ResponseFormat;
+}
 
 function detectFormat(content: string): ResponseFormat {
   const trimmed = content.trim();
@@ -79,21 +97,60 @@ export const RENDER_STYLES = `
 `;
 
 /**
+ * Pure helper: converts content to HTML and (optionally) sanitizes it.
+ * Exported so unit tests can assert on the HTML string directly — `renderResponseToDataUrl`
+ * returns a PNG data URL and is not directly testable for sanitization rules.
+ */
+export function toSanitizedHtml(content: string, opts?: RenderOptions): string {
+  // Caller-provided format wins over heuristic detection. `.md` imports pass
+  // `format: "markdown"` so plain-text `.md` files render as parsed markdown,
+  // not as `<pre>...</pre>`.
+  const format = opts?.format ?? detectFormat(content);
+  let html = toHtml(content, format);
+  if (opts?.sanitize) {
+    html = DOMPurify.sanitize(html, {
+      // Strict HTML allowlist — excludes SVG/MathML, matching the existing SVG-import
+      // exclusion at Toolbar.tsx and src-tauri/src/commands/canvas.rs (read_image_as_data_url).
+      USE_PROFILES: { html: true },
+      // Block media tags so html2canvas (useCORS:true) cannot fetch arbitrary URLs
+      // encoded in user-imported markdown.
+      FORBID_TAGS: ["img", "video", "audio", "source", "picture", "track"],
+      // NOTE: iframe/embed/object/form are NOT in USE_PROFILES.html and are stripped
+      // automatically. Do NOT use FORBID_ATTR with a regex — DOMPurify expects string[]
+      // and silently ignores regex; defaults already strip on* handlers and javascript: URLs.
+    });
+  }
+  return html;
+}
+
+/**
  * Renders an AI text response (markdown, SVG, HTML, plain text) into a PNG data URL.
  * Uses an offscreen DOM container + html2canvas for rasterization.
+ *
+ * Pass `{ sanitize: true }` for any content of unknown provenance (e.g. user-imported
+ * `.md` files). The default `sanitize: false` preserves existing behavior for AI
+ * responses produced by a CLI agent the user explicitly invoked.
  */
-export async function renderResponseToDataUrl(content: string): Promise<string> {
-  const format = detectFormat(content);
-  const htmlContent = toHtml(content, format);
+export async function renderResponseToDataUrl(
+  content: string,
+  opts?: RenderOptions,
+): Promise<string> {
+  const format = opts?.format ?? detectFormat(content);
 
-  // For SVG, try direct canvas rasterization first (higher fidelity than html2canvas)
-  if (format === "svg" && content.trim()) {
+  // SVG fast-path uses <img src=svg> + canvas which never executes scripts but DOES
+  // trigger network fetches for any embedded <image href="...">. We only take this
+  // path for AI-trusted callers (sanitize !== true). Sanitize-true callers always
+  // route through DOMPurify, which strips the inert-script and remote-fetch attack
+  // surfaces consistently for any input format.
+  if (format === "svg" && content.trim() && !opts?.sanitize) {
     try {
       return await rasterizeSvg(content);
     } catch {
       // Fall through to html2canvas approach
     }
   }
+
+  const htmlContent = toSanitizedHtml(content, opts);
 
   const container = document.createElement("div");
   container.style.cssText =

@@ -28,6 +28,49 @@ interface AgentMiniTerminalProps {
 }
 
 /**
+ * PTY-exit handler logic, extracted as a pure function for testability.
+ *
+ * Statement order is load-bearing:
+ *   1. flush capture buffer
+ *   2. write `[Process exited]` to the terminal — visible IMMEDIATELY,
+ *      before any IPC, so a slow scan can't delay the visible notice
+ *   3. await scanForTaskCompletions — terminalizes the task and records
+ *      the recentOutcome BEFORE the lifecycle flips; without this, an
+ *      agent that writes .done.json then exits before the next poll
+ *      tick leaves tasks-{sid}.md stuck on `in-progress` and the
+ *      conversation log without a Task Report (data integrity)
+ *   4. flip lifecycle to `"exited"` — runs unconditionally even if the
+ *      scan throws, so a future scan exception cannot strand the
+ *      indicator on `"running"`
+ */
+export async function handlePtyExit(opts: {
+  disposed: boolean;
+  capture: { flush(): void } | null;
+  writeProcessExitedLine: () => void;
+  collabSessionId: string | null;
+  sessionId: string;
+}): Promise<void> {
+  if (opts.disposed) return;
+  opts.capture?.flush();
+  opts.writeProcessExitedLine();
+  if (opts.collabSessionId) {
+    try {
+      await scanForTaskCompletions(opts.collabSessionId);
+    } catch (err) {
+      // Non-fatal: scanForTaskCompletions internally swallows IPC
+      // errors today, but a future refactor could surface an exception.
+      // Logging makes a regression discoverable without blocking the
+      // lifecycle flip below.
+      console.warn(
+        "scanForTaskCompletions failed in pty-exit handler:",
+        err,
+      );
+    }
+  }
+  useCollaboratorStore.getState().setAgentStatus(opts.sessionId, "exited");
+}
+
+/**
  * Spawns a PTY session, runs an AI CLI tool in it, and renders an interactive
  * xterm.js terminal. Users can type directly into the AI CLI tool.
  */
@@ -177,18 +220,21 @@ export function AgentMiniTerminal({
         return;
       }
 
-      // Listen for PTY exit
+      // Listen for PTY exit. Logic is delegated to `handlePtyExit` (above)
+      // so it can be unit-tested without xterm/PTY plumbing. Tauri's
+      // listen() accepts async callbacks and does not block event dispatch
+      // on the returned promise — no back-pressure.
       unlistenExitRef.current = await listen(
         `pty-exit-${sessionId}`,
         () => {
-          if (!disposed.current) {
-            // Flush any remaining buffered output before marking exit
-            captureRef.current?.flush();
-            writeWithFollowBottom("\r\n\x1b[33m[Process exited]\x1b[0m\r\n");
-            useCollaboratorStore
-              .getState()
-              .setAgentStatus(sessionId, "exited");
-          }
+          void handlePtyExit({
+            disposed: disposed.current,
+            capture: captureRef.current,
+            writeProcessExitedLine: () =>
+              writeWithFollowBottom("\r\n\x1b[33m[Process exited]\x1b[0m\r\n"),
+            collabSessionId,
+            sessionId,
+          });
         },
       );
 

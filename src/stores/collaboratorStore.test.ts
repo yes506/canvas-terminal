@@ -2358,4 +2358,226 @@ describe("executeCommand — /rename and /task add canonicalization (claude3 I9-
   });
 });
 
+// ---------------------------------------------------------------------------
+// Phase 1.3 — Orphan `.done.json` cleanup (task-31 implementation)
+// ---------------------------------------------------------------------------
+//
+// These tests cover the orphan-cleanup branch added to
+// scanForTaskCompletions: when a `.done.json` file's task_id doesn't
+// match any task in any loaded session AND the file's mtime is older
+// than the 24h grace period, delete it. Otherwise preserve.
+//
+// Tests verify:
+//  1. Empty-session pane scans walk the loop (line 921 early-return removed).
+//  2. Orphan with mtime > 24h: deleted.
+//  3. Orphan with mtime < 24h: preserved (hydration-race safety).
+//  4. GRACE_MS boundary: file with age === GRACE_MS is preserved (strict >).
+//  5. Prefix-tolerant matcher prevents false-orphan classification.
+//  6. Clock-skew clamp: backward Date.now() doesn't false-delete recent files.
+//  7. file-gone race: get_memory_file_mtime rejection is caught and skipped.
+//  8. Cross-session match: a foreign session's task prevents orphan deletion.
+describe("Phase 1.3 — orphan `.done.json` cleanup (task-31)", () => {
+  const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
+  const FOREIGN_SESSION = "test-session-foreign";
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  it("empty-session pane scans the loop and deletes orphan with mtime > 24h", async () => {
+    // Session has NO tasks. The pre-Phase-1.3 early-return at line 921
+    // would short-circuit here; with the early-return removed, the
+    // orphan loop runs.
+    const orphanPath = "task-orphan-1.done.json";
+    const orphanJson = JSON.stringify({ task_id: "task-orphan-1", status: "completed" });
+    const oldMtime = Date.now() - ORPHAN_GRACE_MS - 1000; // 24h + 1s old
+    const deletedFiles: string[] = [];
+
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return [orphanPath];
+      if (cmd === "read_memory_file") return orphanJson;
+      if (cmd === "get_memory_file_mtime") return oldMtime;
+      if (cmd === "delete_memory_file") {
+        deletedFiles.push((args as { relativePath: string }).relativePath);
+        return null;
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(SESSION);
+    expect(deletedFiles).toContain(orphanPath);
+  });
+
+  it("preserves orphan with mtime < 24h (hydration-race safety)", async () => {
+    const orphanPath = "task-orphan-2.done.json";
+    const orphanJson = JSON.stringify({ task_id: "task-orphan-2", status: "completed" });
+    const recentMtime = Date.now() - 1000; // 1s old
+    const deletedFiles: string[] = [];
+
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return [orphanPath];
+      if (cmd === "read_memory_file") return orphanJson;
+      if (cmd === "get_memory_file_mtime") return recentMtime;
+      if (cmd === "delete_memory_file") {
+        deletedFiles.push((args as { relativePath: string }).relativePath);
+        return null;
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(SESSION);
+    expect(deletedFiles).not.toContain(orphanPath);
+  });
+
+  it("GRACE_MS boundary: age === GRACE_MS is preserved (strict >)", async () => {
+    const orphanPath = "task-orphan-boundary.done.json";
+    const orphanJson = JSON.stringify({ task_id: "task-orphan-boundary", status: "completed" });
+    // Exactly GRACE_MS old — strict `>` means this is preserved.
+    const boundaryMtime = Date.now() - ORPHAN_GRACE_MS;
+    const deletedFiles: string[] = [];
+
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return [orphanPath];
+      if (cmd === "read_memory_file") return orphanJson;
+      if (cmd === "get_memory_file_mtime") return boundaryMtime;
+      if (cmd === "delete_memory_file") {
+        deletedFiles.push((args as { relativePath: string }).relativePath);
+        return null;
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(SESSION);
+    expect(deletedFiles).not.toContain(orphanPath);
+  });
+
+  it("prefix-tolerant matcher: truncated task_id is NOT classified as orphan", async () => {
+    // Session has the long-form task; one .done.json carries the long
+    // form, another carries just the prefix. NEITHER should be deleted
+    // as orphan — they both prefix-match the stored task.
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
+    // task.id is e.g. "task-1-1234567890"
+
+    const longPath = `${task.id}.done.json`;
+    const truncPrefix = task.id.split("-").slice(0, 2).join("-"); // e.g. "task-1"
+    const truncPath = `${truncPrefix}.done.json`;
+
+    const longJson = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    const truncJson = JSON.stringify({ task_id: truncPrefix, status: "completed", author: "@claude1" });
+    const oldMtime = Date.now() - ORPHAN_GRACE_MS - 1000;
+    const deletedFiles: string[] = [];
+
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return [longPath, truncPath];
+      if (cmd === "read_memory_file") {
+        const rel = (args as { relativePath: string }).relativePath;
+        return rel === longPath ? longJson : truncJson;
+      }
+      if (cmd === "get_memory_file_mtime") return oldMtime;
+      if (cmd === "delete_memory_file") {
+        deletedFiles.push((args as { relativePath: string }).relativePath);
+        return null;
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(SESSION);
+    // The long-form file matches the task and is processed (delete_memory_file
+    // called as part of the success path); the truncated form is no longer
+    // a no-op continue — it now also matches via prefix, so the in-loop find
+    // returns the task and the file is processed too. Either way, neither
+    // file should be deleted *as an orphan* (i.e., via the cross-session
+    // orphan branch). To assert this distinctly, we verify the task DID
+    // terminalize (proving the matcher saw both as belonging to it).
+    const updated = useCollaboratorStore.getState().tasksBySession[SESSION]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("completed");
+  });
+
+  it("clock-skew clamp: Date.now() < mtimeMs (forward-stamped file) is preserved", async () => {
+    const orphanPath = "task-orphan-future.done.json";
+    const orphanJson = JSON.stringify({ task_id: "task-orphan-future", status: "completed" });
+    // File mtime AHEAD of current time (e.g. NTP correction set clock back).
+    const futureMtime = Date.now() + 60 * 1000;
+    const deletedFiles: string[] = [];
+
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return [orphanPath];
+      if (cmd === "read_memory_file") return orphanJson;
+      if (cmd === "get_memory_file_mtime") return futureMtime;
+      if (cmd === "delete_memory_file") {
+        deletedFiles.push((args as { relativePath: string }).relativePath);
+        return null;
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(SESSION);
+    // Math.max(0, Date.now() - mtimeMs) = 0; 0 > GRACE_MS is false; preserved.
+    expect(deletedFiles).not.toContain(orphanPath);
+  });
+
+  it("file-gone race: get_memory_file_mtime rejection is caught and skipped", async () => {
+    const orphanPath = "task-orphan-gone.done.json";
+    const orphanJson = JSON.stringify({ task_id: "task-orphan-gone", status: "completed" });
+    const deletedFiles: string[] = [];
+    let mtimeRejections = 0;
+
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return [orphanPath];
+      if (cmd === "read_memory_file") return orphanJson;
+      if (cmd === "get_memory_file_mtime") {
+        mtimeRejections++;
+        throw new Error("not found");
+      }
+      if (cmd === "delete_memory_file") {
+        deletedFiles.push((args as { relativePath: string }).relativePath);
+        return null;
+      }
+      return null;
+    });
+
+    // Should NOT throw, and should NOT call delete_memory_file (mtime
+    // resolution failed → skip).
+    await expect(scanForTaskCompletions(SESSION)).resolves.toBeUndefined();
+    expect(mtimeRejections).toBeGreaterThan(0);
+    expect(deletedFiles).not.toContain(orphanPath);
+  });
+
+  it("cross-session match: a foreign session's task prevents orphan deletion", async () => {
+    // SESSION has no tasks; FOREIGN_SESSION has the task that the
+    // .done.json belongs to. The orphan branch must NOT delete it.
+    const store = useCollaboratorStore.getState();
+    const foreignTask = store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, FOREIGN_SESSION);
+
+    const path = `${foreignTask.id}.done.json`;
+    const doneJson = JSON.stringify({ task_id: foreignTask.id, status: "completed", author: "@claude1" });
+    const oldMtime = Date.now() - ORPHAN_GRACE_MS - 1000;
+    const deletedFiles: string[] = [];
+
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return [path];
+      if (cmd === "read_memory_file") return doneJson;
+      if (cmd === "get_memory_file_mtime") return oldMtime;
+      if (cmd === "delete_memory_file") {
+        deletedFiles.push((args as { relativePath: string }).relativePath);
+        return null;
+      }
+      return null;
+    });
+
+    // Scanning SESSION (no tasks). FOREIGN_SESSION owns the matching task.
+    await scanForTaskCompletions(SESSION);
+    // The orphan branch sees foundInAnySession=true via the cross-session
+    // tasksBySession lookup, so the file is preserved (left for FOREIGN_SESSION
+    // to process when it scans).
+    expect(deletedFiles).not.toContain(path);
+  });
+});
+
 

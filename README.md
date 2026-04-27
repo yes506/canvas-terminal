@@ -4,7 +4,7 @@
 
 **A canvas-first terminal where drawings, documents, and multiple AI CLIs connect in one workspace.**
 
-Sketch a diagram, click Upload, and the AI CLI tool running in your terminal sees it. Ask it to respond, and the result renders back on the canvas as an image, Markdown, HTML, SVG, or plain text. Open the Collaborator pane, launch multiple agent terminals, and coordinate them with shared task and memory files. Canvas Terminal turns a visual idea into a multi-agent AI workspace — no copy-paste, no file juggling.
+Sketch a diagram, click Upload, and the AI CLI tool running in your terminal sees it. Ask it to respond, and the result is rendered back on the canvas as an image — supported response formats are PNG/JPEG, SVG, HTML, Markdown, and plain text. Drop an image or `.md` file directly onto the canvas to insert it the same way; PDF, DOCX, XLSX, CSV, and HWP files are inserted via the toolbar's Insert File button. Open the Collaborator pane, launch multiple agent terminals, and coordinate them with shared task and memory files. Canvas Terminal turns a visual idea into a multi-agent AI workspace — no copy-paste, no file juggling.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
@@ -93,7 +93,7 @@ npm run tauri dev    # Hot reload — frontend changes apply instantly
 1. **Draw** something on the canvas — an architecture diagram, a UI wireframe, a flowchart.
 2. **Upload** — the canvas becomes a PNG. Its file path is pasted into the active terminal.
 3. **AI processes** — Claude Code, Gemini CLI, Codex, or any CLI tool reads the image.
-4. **Download** — the AI's response (Markdown, SVG, HTML, image, or plain text) is rendered back onto the canvas, so the canvas works with document-like outputs as well as images.
+4. **Download** — the AI's response (Markdown, SVG, HTML, image, or plain text) is rendered back onto the canvas as an image, so the canvas works with document-like outputs as well as images. Markdown source from imported `.md` files can be exported back out via **Cmd+Shift+S**.
 
 This creates a **visual feedback loop** between you, the canvas, and the AI. Works with any CLI tool that accepts image paths, and brings both visual and document-style outputs back onto the canvas.
 
@@ -175,6 +175,8 @@ The collaborator is a PTY-backed multi-agent workspace embedded inside the termi
 A Fabric.js-powered drawing board designed for quick sketching, not pixel-perfect illustration.
 
 - **Document-aware canvas output** — AI responses can come back as Markdown, HTML, SVG, plain text, or standard images, then render directly onto the canvas
+- **Markdown file round-trip** — drop `.md` files onto the canvas to render them as styled images; **Cmd+Shift+S** exports the original Markdown source back to disk
+- **Importable file formats** (toolbar Insert File) — PDF, DOCX, XLSX, XLS, CSV, TSV, HWP, HWPX, and **MD**. Drag-and-drop currently accepts images and `.md` only.
 - **Collaborator-aware canvas routing** — send one canvas export to one or many agents and import each response back independently
 
 **Drawing tools:**
@@ -326,7 +328,7 @@ These files are designed for agent-to-agent handoff and are protected by path va
 | Build tool | [Vite](https://vitejs.dev/) |
 | Styling | [Tailwind CSS](https://tailwindcss.com/) |
 | Icons | [Lucide](https://lucide.dev/) |
-| Markdown rendering | [Marked](https://marked.js.org/) |
+| Markdown rendering | [Marked](https://marked.js.org/) + [DOMPurify](https://github.com/cure53/DOMPurify) (sanitizes user-imported `.md` files) |
 | Screen capture | [html2canvas](https://html2canvas.hertzen.com/) |
 
 ---

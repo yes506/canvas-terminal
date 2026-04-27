@@ -12,6 +12,13 @@ import {
 } from "../../stores/canvasStore";
 import { MIN_ZOOM, MAX_ZOOM } from "../../constants/canvas";
 import type { ShapeTool } from "../../types/canvas";
+import { renderResponseToDataUrl } from "../../lib/responseRenderer";
+import { useToastStore } from "../../stores/toastStore";
+
+// Mirror of MAX_IMAGE_READ_SIZE in src-tauri/src/commands/canvas.rs (20 MB).
+// Drag-drop bypasses the Tauri backend, so we enforce the same ceiling here to keep
+// behavior symmetric with the Toolbar file-picker path.
+const MAX_DROP_TEXT_BYTES = 20 * 1024 * 1024;
 
 const CANVAS_BG = "#2f2f2f";
 
@@ -421,38 +428,91 @@ export function useCanvas() {
     });
     canvas.on("object:removed", () => pushCanvasState(canvas));
 
-    // --- Handle image drop ---
-    const handleDrop = (e: DragEvent) => {
+    // --- Handle image / markdown drop ---
+    const handleDrop = async (e: DragEvent) => {
       e.preventDefault();
       if (!e.dataTransfer?.files.length) return;
 
       const file = e.dataTransfer.files[0];
-      if (!file.type.startsWith("image/")) return;
+      const isMarkdown =
+        file.type === "text/markdown" || /\.md$/i.test(file.name);
 
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = reader.result as string;
+      if (file.type.startsWith("image/")) {
+        // Existing image flow — unchanged.
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const imgEl = new Image();
+          imgEl.onload = () => {
+            const img = new fabric.Image(imgEl, {
+              left: e.offsetX ?? 100,
+              top: e.offsetY ?? 100,
+            });
+            const maxW = 300;
+            if (img.width && img.width > maxW) {
+              img.scaleToWidth(maxW);
+            }
+            const fullPath = (file as File & { path?: string }).path || file.name;
+            (img as fabric.FabricObject & { filePath?: string }).filePath = fullPath;
+            canvas.add(img);
+            canvas.setActiveObject(img);
+            canvas.renderAll();
+            pushCanvasState(canvas);
+          };
+          imgEl.src = dataUrl;
+        };
+        reader.readAsDataURL(file);
+        return;
+      }
+
+      if (!isMarkdown) return;
+
+      if (file.size > MAX_DROP_TEXT_BYTES) {
+        useToastStore
+          .getState()
+          .showToast("Markdown file too large (max 20 MB).");
+        return;
+      }
+
+      try {
+        const text = await file.text();
+        // Force format: "markdown" — extension (.md / text/markdown) already
+        // disambiguates intent, so detectFormat()'s heuristics don't apply.
+        const dataUrl = await renderResponseToDataUrl(text, {
+          sanitize: true,
+          format: "markdown",
+        });
         const imgEl = new Image();
         imgEl.onload = () => {
           const img = new fabric.Image(imgEl, {
             left: e.offsetX ?? 100,
             top: e.offsetY ?? 100,
           });
-          const maxW = 300;
-          if (img.width && img.width > maxW) {
-            img.scaleToWidth(maxW);
-          }
-          const fullPath = (file as File & { path?: string }).path || file.name;
-          (img as fabric.FabricObject & { filePath?: string }).filePath =
-            fullPath;
+          const maxW = 600;
+          if (img.width && img.width > maxW) img.scaleToWidth(maxW);
+          // Concrete metadata-attach — required for Cmd+Shift+S export to round-trip.
+          (
+            img as fabric.FabricObject & {
+              markdownSource?: string;
+              filePath?: string;
+            }
+          ).markdownSource = text;
+          (
+            img as fabric.FabricObject & {
+              markdownSource?: string;
+              filePath?: string;
+            }
+          ).filePath = file.name;
           canvas.add(img);
           canvas.setActiveObject(img);
           canvas.renderAll();
           pushCanvasState(canvas);
         };
         imgEl.src = dataUrl;
-      };
-      reader.readAsDataURL(file);
+      } catch (err) {
+        console.error("Markdown drop failed:", err);
+        useToastStore.getState().showToast("Failed to import Markdown file.");
+      }
     };
 
     const handleDragOver = (e: DragEvent) => {

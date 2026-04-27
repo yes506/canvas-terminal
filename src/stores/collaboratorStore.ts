@@ -897,6 +897,19 @@ interface CollaboratorState {
 }
 
 /**
+ * Orphan `.done.json` cleanup grace period.
+ *
+ * On app cold boot, `tasksBySession` is empty until each `CollaboratorPane`
+ * mounts and `startSession` populates it. If a scan fires before all
+ * sessions hydrate, the cross-session check sees "no task in any loaded
+ * session" for files that legitimately belong to those still-loading
+ * sessions. The 24-hour grace makes recent files untouchable by orphan
+ * cleanup — completions younger than 24h are always preserved, which is
+ * far longer than any plausible cold-boot hydration latency.
+ */
+const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Scan shared memory for task completion signal files (*.done.json).
  * Agents write these files to signal task completion with structured data.
  *
@@ -910,6 +923,13 @@ interface CollaboratorState {
  *   "output": "..."
  * }
  * ```
+ *
+ * Files whose `task_id` doesn't match any task in any loaded session are
+ * treated as orphans and deleted after `ORPHAN_GRACE_MS`. The matching
+ * predicate is prefix-tolerant — agents sometimes write a truncated
+ * `task_id` like `"task-1"` when the stored id is `"task-1-1234"` — so
+ * the orphan check uses the SAME predicate as the in-loop `find` to
+ * avoid silently classifying prefix-matching files as orphans.
  */
 export async function scanForTaskCompletions(forSession: string): Promise<void> {
   try {
@@ -918,7 +938,10 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
     if (doneFiles.length === 0) return;
 
     const store = useCollaboratorStore.getState();
-    if (store.getTasks(forSession).length === 0) return;
+    // NOTE: the previous `if (store.getTasks(forSession).length === 0) return;`
+    // early-return blocked empty-session panes from running orphan cleanup.
+    // Removed so the loop below can walk `doneFiles` even when this session
+    // has no tasks — orphans by definition aren't in any session's list.
 
     for (const relPath of doneFiles) {
       try {
@@ -935,6 +958,14 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
         };
         if (!data.task_id) continue;
 
+        // Prefix-tolerant matcher — agents sometimes drop the
+        // `-${Date.now()}` suffix from `task_id` in their `.done.json`
+        // payloads (e.g. `"task-1"` vs stored `"task-1-1234"`). The
+        // orphan check below MUST use this same predicate so prefix
+        // matches aren't classified as orphan.
+        const matches = (t: CollabTask) =>
+          t.id === data.task_id || t.id.startsWith(data.task_id!);
+
         // Re-read the current task list inside the loop (codex2's recurring
         // race finding). Using a snapshot taken before the loop lets two
         // concurrent scans both see a non-terminal task and double-fire
@@ -942,8 +973,37 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
         // iteration, the second scan sees the already-terminal task and
         // bails instead of producing duplicate "Task updated:" log lines.
         const tasksNow = store.getTasks(forSession);
-        const task = tasksNow.find((t) => t.id === data.task_id || t.id.startsWith(data.task_id!));
-        if (!task) continue;
+        const task = tasksNow.find(matches);
+
+        if (!task) {
+          // Cross-session orphan check — per-iteration re-read of
+          // `tasksBySession` mirrors the in-loop pattern above so a
+          // mid-scan `addTask` (e.g. from `sendToAgent` auto-creating a
+          // task) is seen by later iterations.
+          const allBySession = useCollaboratorStore.getState().tasksBySession;
+          const foundInAnySession = Object.values(allBySession).some((ts) =>
+            ts.some(matches),
+          );
+          if (!foundInAnySession) {
+            let mtimeMs: number | null;
+            try {
+              mtimeMs = await invoke<number>("get_memory_file_mtime", { relativePath: relPath });
+            } catch {
+              // File gone or stat failed (e.g. mtime-unsupported FS).
+              // Skip — preserves pre-cleanup behavior on such filesystems.
+              mtimeMs = null;
+            }
+            // `Math.max(0, …)` clamps backward clock skew (NTP correction,
+            // VM resume, manual clock change) so a recent file isn't
+            // false-deleted. Forward jumps >24h would still false-delete,
+            // but that's a rare scenario and the 24h grace bounds the risk.
+            if (mtimeMs !== null && Math.max(0, Date.now() - mtimeMs) > ORPHAN_GRACE_MS) {
+              await invoke("delete_memory_file", { relativePath: relPath }).catch(() => {});
+            }
+          }
+          continue;
+        }
+
         if (task.status === "completed" || task.status === "blocked") {
           // The race winner already terminalized this task. Best-effort
           // delete so the file doesn't accumulate; ignore if it's gone.

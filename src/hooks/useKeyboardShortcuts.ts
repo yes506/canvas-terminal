@@ -5,6 +5,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCanvasStore } from "../stores/canvasStore";
+import { useToastStore } from "../stores/toastStore";
+import { exportImportedMarkdown } from "../lib/canvasOps";
 import {
   useTerminalStore,
   getTerminalInstance,
@@ -250,17 +252,50 @@ export function useKeyboardShortcuts() {
           break;
         }
 
-        // --- Canvas save/load ---
-        case "s": {
+        // --- Canvas save / Markdown export ---
+        // `case "S"` catches the shifted variant — `e.key` flips case under shift,
+        // but the existing switch was lowercase-only and would have missed it.
+        case "s":
+        case "S": {
           e.preventDefault();
           const canvas = useCanvasStore.getState().fabricCanvas;
           if (!canvas) break;
+
+          if (e.shiftKey) {
+            // Cmd+Shift+S — export imported Markdown source(s) as `.md`.
+            const md = exportImportedMarkdown(canvas);
+            if (!md) {
+              useToastStore
+                .getState()
+                .showToast("No imported Markdown on canvas to export.");
+              break;
+            }
+            const mdPath = await save({
+              filters: [{ name: "Markdown", extensions: ["md"] }],
+              defaultPath: "canvas.md",
+            });
+            if (mdPath) {
+              await invoke("save_canvas", { path: mdPath, data: md });
+            }
+            break;
+          }
+
+          // Cmd+S — existing canvas.json save. propertiesToInclude must
+          // mirror src/stores/canvasStore.ts so save/undo/redo preserve the
+          // same custom properties.
           const filePath = await save({
             filters: [{ name: "Canvas", extensions: ["canvas.json"] }],
             defaultPath: "untitled.canvas.json",
           });
           if (filePath) {
-            const json = JSON.stringify(canvas.toJSON(), null, 2);
+            const json = JSON.stringify(
+              (canvas.toJSON as (props?: string[]) => unknown)([
+                "filePath",
+                "markdownSource",
+              ]),
+              null,
+              2,
+            );
             await invoke("save_canvas", { path: filePath, data: json });
           }
           break;

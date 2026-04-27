@@ -30,7 +30,7 @@ export function unlockHistory() {
 
 export function pushCanvasState(canvas: Canvas) {
   if (historyLocked) return;
-  undoStack.push(JSON.stringify(canvas.toJSON()));
+  undoStack.push(JSON.stringify((canvas.toJSON as (props?: string[]) => unknown)(["filePath", "markdownSource"])));
   redoStack.length = 0;
   if (undoStack.length > 50) undoStack.shift();
   useCanvasStore.setState({
@@ -41,7 +41,7 @@ export function pushCanvasState(canvas: Canvas) {
 
 export function undoCanvas(canvas: Canvas) {
   if (undoStack.length === 0) return;
-  redoStack.push(JSON.stringify(canvas.toJSON()));
+  redoStack.push(JSON.stringify((canvas.toJSON as (props?: string[]) => unknown)(["filePath", "markdownSource"])));
   const prev = undoStack.pop()!;
   historyLocked = true;
   canvas.loadFromJSON(prev).then(() => {
@@ -56,7 +56,7 @@ export function undoCanvas(canvas: Canvas) {
 
 export function redoCanvas(canvas: Canvas) {
   if (redoStack.length === 0) return;
-  undoStack.push(JSON.stringify(canvas.toJSON()));
+  undoStack.push(JSON.stringify((canvas.toJSON as (props?: string[]) => unknown)(["filePath", "markdownSource"])));
   const next = redoStack.pop()!;
   historyLocked = true;
   canvas.loadFromJSON(next).then(() => {

@@ -19,6 +19,7 @@ import {
   unlockHistory,
   pushCanvasState,
 } from "../../stores/canvasStore";
+import { useToastStore } from "../../stores/toastStore";
 import { MIN_ZOOM, MAX_ZOOM } from "../../constants/canvas";
 
 interface LayerContextMenu {
@@ -324,6 +325,9 @@ export function DrawingBoard() {
         </div>
       )}
 
+      {/* Global toast (markdown import/export status, future shortcuts) */}
+      <GlobalToast />
+
       {/* Layer order context menu */}
       {layerMenu && (
         <div
@@ -373,6 +377,16 @@ export function DrawingBoard() {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function GlobalToast() {
+  const message = useToastStore((s) => s.message);
+  if (!message) return null;
+  return (
+    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-surface-light/95 backdrop-blur border border-surface-lighter rounded-lg px-3 py-2 shadow z-10 text-xs text-text max-w-[90%]">
+      {message}
     </div>
   );
 }
