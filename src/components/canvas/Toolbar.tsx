@@ -121,6 +121,13 @@ export function Toolbar({ onExportToTerminal, onImportIntoCanvas, isWaitingForIm
             });
             if (img.width && img.width > 400) img.scaleToWidth(400);
             (img as fabric.FabricObject & { filePath?: string }).filePath = fullPath;
+            // Markdown imports carry their original UTF-8 source so Cmd+Shift+S
+            // can round-trip the file losslessly.
+            if (ext === "md" && renderResult.markdownSource) {
+              (
+                img as fabric.FabricObject & { markdownSource?: string }
+              ).markdownSource = renderResult.markdownSource;
+            }
             fabricCanvas.add(img);
             if (page.pageNumber === 1) fabricCanvas.setActiveObject(img);
             fabricCanvas.renderAll();
@@ -174,7 +181,7 @@ export function Toolbar({ onExportToTerminal, onImportIntoCanvas, isWaitingForIm
 
       {/* Insert image or document */}
       <button
-        title="Insert File (Image, PDF, DOCX, XLSX, HWP...)"
+        title="Insert File (Image, PDF, DOCX, XLSX, HWP, MD...)"
         className="w-8 h-8 flex items-center justify-center rounded text-text-muted hover:bg-surface-lighter hover:text-text transition-colors"
         onClick={handleFileInsert}
       >

@@ -300,7 +300,7 @@ pub fn read_document_as_base64(path: String) -> Result<String, String> {
         .unwrap_or("")
         .to_lowercase();
     let allowed = [
-        "pdf", "docx", "xlsx", "xls", "csv", "tsv", "hwp", "hwpx",
+        "pdf", "docx", "xlsx", "xls", "csv", "tsv", "hwp", "hwpx", "md",
     ];
     if !allowed.contains(&ext.as_str()) {
         return Err(format!("Document type not permitted: {}", ext));

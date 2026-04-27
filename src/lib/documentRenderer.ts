@@ -9,7 +9,8 @@ export type DocumentFormat =
   | "csv"
   | "tsv"
   | "hwp"
-  | "hwpx";
+  | "hwpx"
+  | "md";
 
 export interface DocumentPage {
   dataUrl: string;
@@ -21,6 +22,8 @@ export interface DocumentRenderResult {
   format: DocumentFormat;
   pageCount: number;
   renderMode?: "styled" | "preview" | "text-only";
+  /** Original UTF-8 source for `md` imports — preserved so export can round-trip. */
+  markdownSource?: string;
 }
 
 interface HtmlRenderOptions {
@@ -32,7 +35,7 @@ interface HtmlRenderOptions {
 }
 
 const SUPPORTED_EXTENSIONS: DocumentFormat[] = [
-  "pdf", "docx", "xlsx", "xls", "csv", "tsv", "hwp", "hwpx",
+  "pdf", "docx", "xlsx", "xls", "csv", "tsv", "hwp", "hwpx", "md",
 ];
 
 export function getDocumentExtensions(): string[] {
@@ -863,6 +866,27 @@ export async function renderDocument(
       pages = result.pages;
       renderMode = result.renderMode;
       break;
+    }
+    case "md": {
+      // base64 -> ArrayBuffer -> UTF-8 string. Do NOT use atob() — it returns a binary
+      // string and corrupts Korean / emoji.
+      const text = new TextDecoder("utf-8").decode(new Uint8Array(data));
+      // Force format: "markdown" — the file's extension already disambiguates intent,
+      // so we shouldn't fall back to detectFormat()'s heuristics (which would render
+      // plain-text .md files as <pre>, or take the SVG fast-path for raw <svg> inside .md).
+      const dataUrl = await renderResponseToDataUrl(text, {
+        sanitize: true,
+        format: "markdown",
+      });
+      // Early return — needs `markdownSource` which the unified outer return doesn't carry.
+      // Future "normalize the switch" refactors must preserve this branch.
+      return {
+        pages: [{ dataUrl, pageNumber: 1 }],
+        format: "md",
+        pageCount: 1,
+        renderMode: "styled",
+        markdownSource: text,
+      };
     }
     default:
       throw new Error(`Unsupported document format: ${format}`);

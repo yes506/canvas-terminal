@@ -216,6 +216,41 @@ pub fn clear_stale_sessions() -> Result<(), String> {
 
     Ok(())
 }
+/// Get a memory file's last-modified time as Unix epoch milliseconds.
+///
+/// Returns `Err` for missing files (the JS caller treats absence and
+/// stat-error identically — distinct from `read_memory_file`'s
+/// `Ok(None)` shape, which returns `Option` because its caller needs to
+/// distinguish "missing" from "stat-error" while this caller does not).
+///
+/// Used by `scanForTaskCompletions` to gate orphan `.done.json` deletion
+/// behind a 24-hour grace period so cold-boot session-load races can't
+/// mis-classify recently-written completions.
+///
+/// Filesystems that don't support `mtime` (some overlay/tmpfs mounts in
+/// container environments) propagate an `Err`; the JS caller skips those
+/// files, leaving them in place. Matches pre-orphan-cleanup behavior on
+/// such filesystems.
+#[tauri::command]
+pub fn get_memory_file_mtime(relative_path: String) -> Result<u64, String> {
+    validate_relative_path(&relative_path)?;
+    let dir = get_memory_dir()?;
+    let full_path = dir.join(&relative_path);
+    // `metadata` follows symlinks intentionally — consistent with
+    // `read_memory_file`, which also follows. `write_memory_file` and
+    // `delete_memory_file` reject symlinks at write/delete time, and
+    // `validate_relative_path` blocks `..`/absolute traversal at input,
+    // so a symlink can't be planted via this code path.
+    let metadata = std::fs::metadata(&full_path)
+        .map_err(|e| format!("stat {}: {}", relative_path, e))?;
+    let modified = metadata.modified().map_err(|e| e.to_string())?;
+    let ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as u64;
+    Ok(ms)
+}
+
 /// List all files in the shared memory directory (recursive).
 /// Returns relative paths.
 #[tauri::command]

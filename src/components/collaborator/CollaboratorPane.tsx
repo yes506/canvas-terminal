@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useShallow } from "zustand/react/shallow";
-import { useCollaboratorStore } from "../../stores/collaboratorStore";
+import { useCollaboratorStore, scanForTaskCompletions } from "../../stores/collaboratorStore";
 import { useTerminalStore, getActiveSessionId } from "../../stores/terminalStore";
 import { generateSessionId } from "../../lib/sessionId";
 import { CollabSessionContext } from "./CollabSessionContext";
@@ -50,6 +50,47 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
       // Kill only this session's agents and clear memory on unmount
       killAllAgents(collabId);
       endSession(collabId);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Per-session polling fallback for `.done.json` task-completion ingestion.
+  //
+  // The primary trigger for `scanForTaskCompletions` is the per-agent PTY
+  // capture's `onFlush` debounce in `AgentMiniTerminal`, which can miss
+  // when (a) the buffer filters to empty after an agent's quiet completion,
+  // (b) `muteCapture` reset() drops the pending flush, (c) continuous CLI
+  // animation keeps the debounce timer alive forever, or (d) a single agent
+  // finishes silently with no peer capture to pump the trigger.
+  //
+  // This poll bounds the resulting "stuck in progress" staleness to ≤ POLL_MS
+  // for any mounted pane. It also runs an immediate scan on mount (before
+  // the first interval) so a `.done.json` already on disk when the pane
+  // mounts (session restored, agent finished while pane was unmounted)
+  // is processed without waiting for the first POLL_MS interval.
+  useEffect(() => {
+    let cancelled = false;
+    // Immediate kickoff. Async chain (list_memory_files + per-file IPCs)
+    // resolves after mount, but does NOT wait for the first POLL_MS tick.
+    // scanForTaskCompletions internally swallows errors; the .catch here
+    // is belt-and-suspenders against a future refactor that surfaces one,
+    // and the warn-log mirrors AgentMiniTerminal's pty-exit-handler
+    // pattern so a regression is discoverable rather than silent.
+    void scanForTaskCompletions(collabId).catch((err) => {
+      console.warn("scanForTaskCompletions failed on pane mount:", err);
+    });
+
+    const POLL_MS = 2000;
+    const handle = window.setInterval(() => {
+      if (cancelled) return;
+      void scanForTaskCompletions(collabId).catch((err) => {
+        console.warn("scanForTaskCompletions failed in poll tick:", err);
+      });
+    }, POLL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(handle);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
