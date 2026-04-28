@@ -56,6 +56,7 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_NAME: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
@@ -111,6 +112,32 @@ jobs:
           # keychain arg. If this fails, fail at <1s rather than 3+ min into build.
           security find-identity -v -p codesigning
 
+          # Resolve the imported cert to the exact SHA-1 token that `codesign -s`
+          # accepts. This is more reliable than passing the CN string from secrets,
+          # which can fail on whitespace/formatting differences.
+          RESOLVED_IDENTITY_SHA=$(
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | awk -v name="$APPLE_SIGNING_IDENTITY_NAME" '
+                index($0, name) { print $2; found=1; exit }
+                END { if (!found) exit 1 }
+              '
+          ) || RESOLVED_IDENTITY_SHA=""
+
+          if [ -z "$RESOLVED_IDENTITY_SHA" ]; then
+            RESOLVED_IDENTITY_SHA=$(
+              security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+              | awk '/Developer ID Application:/ { print $2; exit }'
+            )
+          fi
+
+          if [ -z "$RESOLVED_IDENTITY_SHA" ]; then
+            echo "ERROR: Could not resolve a Developer ID Application identity from imported keychain"
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+
+          echo "APPLE_SIGNING_IDENTITY_SHA=$RESOLVED_IDENTITY_SHA" >> "$GITHUB_ENV"
+
           # Wipe the .p12 + intermediate file from disk (still in keychain)
           rm -f "$CERT_PATH" "$INTERMEDIATE_PATH"
 
@@ -128,22 +155,19 @@ jobs:
 
       - name: Build, sign, and notarize Tauri app
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_SIGNING_IDENTITY_NAME: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
-          # Defensive: strip trailing whitespace from APPLE_SIGNING_IDENTITY.
-          # GitHub's secret editor often appends a newline; codesign does an
-          # exact string match on the cert CN and silently fails with
-          # "no identity found" when the secret has trailing whitespace, even
-          # though `security find-identity` still lists the cert. Confirmed via
-          # the v0.3.3 diagnostic build (run 25037624877): codesign with the
-          # SHA1 hash worked, codesign with the secret name did not.
-          APPLE_SIGNING_IDENTITY=$(printf '%s' "$APPLE_SIGNING_IDENTITY" | sed 's/[[:space:]]*$//')
+          # Use the resolved SHA-1 identity from the imported keychain. Keep the
+          # original secret name only for diagnostics.
+          APPLE_SIGNING_IDENTITY=$(printf '%s' "${APPLE_SIGNING_IDENTITY_SHA:-}" | sed 's/[[:space:]]*$//')
           export APPLE_SIGNING_IDENTITY
+          echo "Using signing identity SHA: ${APPLE_SIGNING_IDENTITY:0:12}..."
+          echo "Requested signing identity name: $(printf '%s' "$APPLE_SIGNING_IDENTITY_NAME" | sed 's/[[:space:]]*$//')"
           # Defensive re-unlock: Rust compile takes minutes; keychain may have
           # auto-locked even with -t 21600 if the runner went idle.
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain-db"
