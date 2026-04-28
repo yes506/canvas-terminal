@@ -168,10 +168,85 @@ jobs:
           export APPLE_SIGNING_IDENTITY
           echo "Using signing identity SHA: ${APPLE_SIGNING_IDENTITY:0:12}..."
           echo "Requested signing identity name: $(printf '%s' "$APPLE_SIGNING_IDENTITY_NAME" | sed 's/[[:space:]]*$//')"
-          # Defensive re-unlock: Rust compile takes minutes; keychain may have
-          # auto-locked even with -t 21600 if the runner went idle.
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain-db"
-          npx tauri build --target ${{ matrix.target }}
+
+          # Retry the whole build+sign+notarize. Apple's notary service can
+          # take 10+ minutes; the runner's NSURLSession occasionally drops the
+          # status long-poll with NSURLError -1009 ("No network route"), which
+          # Tauri's bundler treats as fatal. Rust artifacts are cached by
+          # swatinem/rust-cache so retries link in seconds rather than minutes.
+          MAX_ATTEMPTS=3
+          attempt=1
+          while : ; do
+            echo "::group::tauri build attempt $attempt/$MAX_ATTEMPTS"
+            # Defensive re-unlock per attempt: keychain may have auto-locked
+            # between attempts if a prior wait dragged on.
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain-db"
+            if npx tauri build --target ${{ matrix.target }}; then
+              echo "::endgroup::"
+              echo "tauri build succeeded on attempt $attempt"
+              break
+            fi
+            rc=$?
+            echo "::endgroup::"
+            echo "tauri build failed on attempt $attempt (exit $rc)"
+            if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+              echo "exhausted $MAX_ATTEMPTS attempts — failing"
+              exit "$rc"
+            fi
+            attempt=$((attempt + 1))
+            sleep 15
+          done
+
+      - name: Capture notarization debug info on failure
+        if: failure()
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          set +e
+          mkdir -p notary-debug
+
+          if [ -z "${APPLE_API_KEY_PATH:-}" ] || [ ! -f "$APPLE_API_KEY_PATH" ]; then
+            echo "API key file unavailable — failure happened before key was staged"
+            exit 0
+          fi
+
+          echo "Fetching recent notarization history..."
+          xcrun notarytool history \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --output-format json \
+            > notary-debug/history.json 2> notary-debug/history.stderr.txt
+
+          LATEST_ID=$(jq -r '.history[0].id // empty' notary-debug/history.json 2>/dev/null)
+
+          if [ -n "$LATEST_ID" ]; then
+            echo "Most recent submission: $LATEST_ID"
+            echo "$LATEST_ID" > notary-debug/latest-submission-id.txt
+            xcrun notarytool log "$LATEST_ID" notary-debug/log.json \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              2> notary-debug/log.stderr.txt
+            xcrun notarytool info "$LATEST_ID" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" \
+              > notary-debug/info.txt 2>&1
+          else
+            echo "No submission found in history — failure may have happened before submit" \
+              > notary-debug/no-submission.txt
+          fi
+          exit 0
+
+      - name: Upload notarization debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: notary-debug-${{ matrix.arch_label }}
+          path: notary-debug/
+          if-no-files-found: ignore
 
       - name: Verify signature & notarization
         run: |
