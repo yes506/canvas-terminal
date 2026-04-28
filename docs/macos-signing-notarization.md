@@ -122,16 +122,30 @@ Using the `APPLE_SIGNING_IDENTITY` environment variable is usually safer because
 
 ## 7. CI/CD note
 
-The current [release workflow](../.github/workflows/release.yml) builds unsigned DMGs on GitHub-hosted macOS runners. Your local Keychain certificate is not available there, so public release builds from GitHub Actions will remain unsigned unless you also import the certificate and notarization secrets in CI.
+The [release workflow](../.github/workflows/release.yml) signs and notarizes DMGs on GitHub-hosted macOS runners for both `aarch64-apple-darwin` and `x86_64-apple-darwin`. Tags matching `v*` trigger the workflow; on success, the workflow attaches the notarized DMGs to a GitHub Release.
 
-If you want CI signing later, add these secrets and import the certificate in the workflow:
+Required repository secrets:
 
-- `APPLE_CERTIFICATE` as base64-encoded `.p12`
-- `APPLE_CERTIFICATE_PASSWORD`
-- `APPLE_SIGNING_IDENTITY`
-- Either `APPLE_API_ISSUER` / `APPLE_API_KEY` / `APPLE_API_KEY_PATH`, or `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID`
+- `APPLE_CERTIFICATE` — base64-encoded `Developer ID Application` `.p12`
+- `APPLE_CERTIFICATE_PASSWORD` — password for the `.p12`
+- `APPLE_SIGNING_IDENTITY` — the certificate Common Name, e.g. `Developer ID Application: Your Name (TEAMID)`. Used as a hint; the workflow resolves the SHA-1 token from the imported keychain at build time.
+- `KEYCHAIN_PASSWORD` — any random string; used only to lock/unlock the temporary build keychain
+- `APPLE_API_KEY` — base64-encoded `.p8` private key from App Store Connect
+- `APPLE_API_KEY_ID` — the key ID associated with the `.p8`
+- `APPLE_API_ISSUER` — the App Store Connect issuer UUID
+- `APPLE_TEAM_ID` — your Apple Developer Team ID
 
-For now, the simplest reliable path is:
+How the workflow handles signing and notarization:
+
+1. Imports the `.p12` into a fresh temporary keychain that is added to the user search list and made default.
+2. Imports Apple's Developer ID G2 intermediate CA explicitly — macOS runners do not always have it pre-trusted.
+3. Resolves the imported certificate to its SHA-1 identity (more robust than passing the CN string).
+4. Stages the `.p8` API key under `$RUNNER_TEMP/private_keys/AuthKey_<id>.p8` and exports `APPLE_API_KEY_PATH`.
+5. Runs `npx tauri build` inside a retry loop (up to 3 attempts). Tauri signs the `.app`, notarizes it, staples it, then signs and notarizes the DMG and staples that too. The retry exists because Apple's notary service can take 10+ minutes and the runner's NSURLSession occasionally drops the status long-poll with `NSURLError -1009`. Rust artifacts are cached, so retries link in seconds.
+6. On failure, the workflow fetches the latest notarization submission's status and `notarytool log` and uploads them as a `notary-debug-<arch>` artifact, so the difference between a transient network drop and an actual Apple rejection is recoverable from CI alone.
+7. Runs `codesign --verify`, `spctl`, and `xcrun stapler validate` against the resulting DMG before publishing.
+
+Local builds remain a valid fallback path:
 
 1. Build on your own Mac with the certificate installed in Keychain.
 2. Let Tauri sign and notarize during `npm run tauri:build`.
