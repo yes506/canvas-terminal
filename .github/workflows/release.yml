@@ -126,6 +126,75 @@ jobs:
           chmod 600 "$KEY_PATH"
           echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
+      - name: DEBUG — codesign identity & keychain visibility
+        # TEMPORARY: remove after diagnosing v0.3.2 'no identity found' failure.
+        # Tests three hypotheses: (1) APPLE_SIGNING_IDENTITY value mismatch
+        # (whitespace/newline in secret), (2) invalid 'codesign:' partition ID,
+        # (3) macOS-26 search-list scope change. No secret values are echoed —
+        # comparison via SHA-256 of name + length only.
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set +e
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+
+          echo "::group::Runner & keychain configuration"
+          echo "macOS version: $(sw_vers -productVersion)"
+          echo "Default keychain (user): $(security default-keychain -d user)"
+          echo "User search list:"; security list-keychains -d user
+          echo "Common search list:"; security list-keychains -d common
+          echo "::endgroup::"
+
+          echo "::group::Identity availability across scopes"
+          echo "→ find-identity (no keychain arg, default+search):"
+          security find-identity -v -p codesigning
+          echo ""
+          echo "→ find-identity (explicit temp keychain):"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          echo ""
+          echo "→ find-identity (login.keychain):"
+          security find-identity -v -p codesigning login.keychain-db
+          echo "::endgroup::"
+
+          echo "::group::Identity name verification (no leak — hash + length only)"
+          EXPECTED_NAME=$(security find-identity -v -p codesigning | head -1 | sed -n 's/.*"\(.*\)".*/\1/p')
+          EXPECTED_LEN=$(printf '%s' "$EXPECTED_NAME" | wc -c | tr -d ' ')
+          SECRET_LEN=${#APPLE_SIGNING_IDENTITY}
+          EXPECTED_HASH=$(printf '%s' "$EXPECTED_NAME" | shasum -a 256 | cut -d' ' -f1)
+          SECRET_HASH=$(printf '%s' "$APPLE_SIGNING_IDENTITY" | shasum -a 256 | cut -d' ' -f1)
+          SHA1_HASH=$(security find-identity -v -p codesigning | head -1 | awk '{print $2}')
+          echo "Keychain identity length: $EXPECTED_LEN bytes"
+          echo "Secret identity length:   $SECRET_LEN bytes"
+          echo "Keychain name SHA256 prefix: ${EXPECTED_HASH:0:16}"
+          echo "Secret name SHA256 prefix:   ${SECRET_HASH:0:16}"
+          if [ "$EXPECTED_HASH" = "$SECRET_HASH" ]; then
+            echo "RESULT: name match (hashes equal) — secret is byte-exact"
+          else
+            echo "RESULT: NAME MISMATCH — secret value differs from keychain identity"
+            echo "  → almost certainly trailing whitespace/newline in the GitHub secret"
+          fi
+          echo "Identity SHA1 (use as fallback signing target): $SHA1_HASH"
+          echo "SHA1_HASH=$SHA1_HASH" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+
+          echo "::group::codesign matrix — name vs SHA1 × default vs explicit keychain"
+          run_codesign() {
+            local desc="$1" identity="$2" extra="$3"
+            cp /bin/echo /tmp/cstest && chmod +w /tmp/cstest
+            echo "→ $desc"
+            codesign --force --options runtime --sign "$identity" $extra /tmp/cstest 2>&1
+            echo "  exit: $?"
+            echo ""
+          }
+          run_codesign "name + default keychain"          "$APPLE_SIGNING_IDENTITY" ""
+          run_codesign "SHA1 + default keychain"          "$SHA1_HASH"              ""
+          run_codesign "name + --keychain $KEYCHAIN_PATH" "$APPLE_SIGNING_IDENTITY" "--keychain $KEYCHAIN_PATH"
+          run_codesign "SHA1 + --keychain $KEYCHAIN_PATH" "$SHA1_HASH"              "--keychain $KEYCHAIN_PATH"
+          rm -f /tmp/cstest
+          echo "::endgroup::"
+
+          set -e
+
       - name: Build, sign, and notarize Tauri app
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
