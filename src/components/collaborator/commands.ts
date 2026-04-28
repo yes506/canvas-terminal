@@ -174,7 +174,7 @@ export function getHelpText(): string {
     "       /task <id> assign @<agent>  /task <id> done [notes]",
     "Canvas: /canvas-export [msg]  /canvas-export @agent [msg]  /canvas-import @agent",
     "Memory: /context <text>  /memory list|read|delete|clear",
-    "Agents: @claude @codex @gemini  Indexed: @claude1 @claude2  Or by nickname: @bug-hunter",
+    "Agents: @claude @codex @gemini @copilot  Indexed: @claude1 @claude2  Or by nickname: @bug-hunter",
     "Rename: /rename @<agent> <new nickname>",
   ].join("\n");
 }

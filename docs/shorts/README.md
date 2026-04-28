@@ -11,7 +11,7 @@ This folder contains a ready-to-record 9:16 short for Canvas Terminal.
 
 1. **Hero** — Canvas + Terminal split view with animated drawing and typing terminal lines
 2. **Visual Feedback Loop** — 4-step flow diagram (Draw → Upload → AI Processes → Download)
-3. **Multi-Agent Collaborator** — Three parallel agent terminals (@claude, @codex, @gemini) with @mention bar
+3. **Multi-Agent Collaborator** — Four parallel agent terminals (@claude, @codex, @gemini, @copilot) with @mention bar
 4. **Terminal Power** — Tabs, WebGL, themes, IME support + tech stack pills
 5. **CTA** — GitHub URL, tags (macOS / MIT / Tauri v2 / Open Source), star button
 

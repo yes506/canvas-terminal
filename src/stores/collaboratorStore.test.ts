@@ -12,7 +12,7 @@ import {
   slugify,
 } from "./collaboratorStore";
 import type { CollabTask, SpawnedAgent } from "../types/collaborator";
-import { parseInput, resolveAgent, executeCommand } from "../components/collaborator/commands";
+import { parseInput, resolveAgent, executeCommand, getHelpText } from "../components/collaborator/commands";
 import { useTerminalStore } from "./terminalStore";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -2577,6 +2577,65 @@ describe("Phase 1.3 — orphan `.done.json` cleanup (task-31)", () => {
     // tasksBySession lookup, so the file is preserved (left for FOREIGN_SESSION
     // to process when it scans).
     expect(deletedFiles).not.toContain(path);
+  });
+});
+
+describe("Copilot CLI roster registration", () => {
+  // Module-level ordinal counters in collaboratorStore are keyed by
+  // `${collabSessionId}:${tool}` and persist across tests. Each test in this
+  // suite uses a fresh unique session id so ordinals start at 1 deterministically.
+  beforeEach(() => {
+    useCollaboratorStore.setState({ agents: [] });
+  });
+
+  it("derives @copilot1 handle and 'Copilot CLI #1' nickname from the registry row", () => {
+    const session = `copilot-suite-${Date.now()}-1`;
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-copilot-1",
+      tool: "copilot_cli",
+      status: "running",
+      collabSessionId: session,
+    });
+
+    const agent = useCollaboratorStore
+      .getState()
+      .agents.find((a) => a.sessionId === "pty-copilot-1")!;
+
+    expect(agent.handle).toBe("copilot1");
+    expect(agent.ordinal).toBe(1);
+    expect(agent.nickname).toBe("Copilot CLI #1");
+    expect(agent.nicknameSlug).toBe("copilot-cli-1");
+    expect(agent.nameHistory[0]).toMatchObject({
+      nickname: "Copilot CLI #1",
+      setBy: "system",
+    });
+  });
+
+  it("isolates Copilot ordinals from other tools (claude1 + copilot1, not copilot2)", () => {
+    const session = `copilot-suite-${Date.now()}-2`;
+    const store = useCollaboratorStore.getState();
+    store.addAgent({
+      sessionId: "pty-claude-1",
+      tool: "claude_code",
+      status: "running",
+      collabSessionId: session,
+    });
+    store.addAgent({
+      sessionId: "pty-copilot-1",
+      tool: "copilot_cli",
+      status: "running",
+      collabSessionId: session,
+    });
+
+    const handles = useCollaboratorStore
+      .getState()
+      .agents.map((a) => a.handle)
+      .sort();
+    expect(handles).toEqual(["claude1", "copilot1"]);
+  });
+
+  it("includes @copilot in the /help agent roster string", () => {
+    expect(getHelpText()).toMatch(/@copilot\b/);
   });
 });
 

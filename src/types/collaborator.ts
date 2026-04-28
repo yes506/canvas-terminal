@@ -1,4 +1,4 @@
-export type ToolId = "claude_code" | "codex_cli" | "gemini_cli";
+export type ToolId = "claude_code" | "codex_cli" | "gemini_cli" | "copilot_cli";
 
 export interface ToolConfig {
   id: ToolId;
@@ -11,6 +11,7 @@ export const TOOL_CONFIGS: ToolConfig[] = [
   { id: "claude_code", label: "Claude Code", command: "claude", colorClass: "text-purple-400" },
   { id: "codex_cli", label: "Codex CLI", command: "codex", colorClass: "text-orange-400" },
   { id: "gemini_cli", label: "Gemini CLI", command: "gemini", colorClass: "text-blue-400" },
+  { id: "copilot_cli", label: "Copilot CLI", command: "copilot", colorClass: "text-emerald-400" },
 ];
 
 /** Raw spawn facts passed by AgentMiniTerminal to addAgent(). Identity fields are computed by the store. */
@@ -36,7 +37,7 @@ export interface AgentNameRecord {
 export interface SpawnedAgent extends SpawnedAgentInit {
   /** Monotonic per-tool ordinal within this collab session (1, 2, 3...). Always >= 1. */
   ordinal: number;
-  /** IMMUTABLE protocol handle. Always indexed: "claude1", "codex1", "gemini2". The
+  /** IMMUTABLE protocol handle. Always indexed: "claude1", "codex1", "gemini2", "copilot1". The
    *  only string referenced by tasks (`assignee`), recent-outcome maps, conversation
    *  log tags, and `*.done.json` author fields. Never mutates. */
   handle: string;

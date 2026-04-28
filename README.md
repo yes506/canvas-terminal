@@ -94,7 +94,7 @@ For public macOS distribution, see [docs/macos-signing-notarization.md](docs/mac
 
 1. **Draw** something on the canvas — an architecture diagram, a UI wireframe, a flowchart.
 2. **Upload** — the canvas becomes a PNG. Its file path is pasted into the active terminal.
-3. **AI processes** — Claude Code, Gemini CLI, Codex, or any CLI tool reads the image.
+3. **AI processes** — Claude Code, Gemini CLI, Codex, Copilot CLI, or any CLI tool reads the image.
 4. **Download** — the AI's response (Markdown, SVG, HTML, image, or plain text) is rendered back onto the canvas as an image, so the canvas works with document-like outputs as well as images. Markdown source from imported `.md` files can be exported back out via **Cmd+Shift+S**.
 
 This creates a **visual feedback loop** between you, the canvas, and the AI. Works with any CLI tool that accepts image paths, and brings both visual and document-style outputs back onto the canvas.
@@ -103,7 +103,7 @@ This creates a **visual feedback loop** between you, the canvas, and the AI. Wor
 
 ## What's New
 
-- **Collaborator pane** for running Claude Code, Codex CLI, and Gemini CLI in parallel
+- **Collaborator pane** for running Claude Code, Codex CLI, Gemini CLI, and Copilot CLI in parallel
 - **Multi-agent collaboration workflow** with shared task routing, shared memory files, and agent-specific canvas import/export
 - **Shared memory workspace** at `~/.cache/canvas-terminal/collab-memory` for conversation logs, task files, and context
 - **Agent command prompt** with `@mentions`, broadcasts, task tracking, and memory file management
@@ -164,7 +164,7 @@ The terminal is a full PTY shell — not a simplified emulator. It spawns a logi
 
 The collaborator is a PTY-backed multi-agent workspace embedded inside the terminal layout.
 
-- **Three launch targets** — Claude Code, Codex CLI, Gemini CLI
+- **Four launch targets** — Claude Code, Codex CLI, Gemini CLI, Copilot CLI
 - **Parallel agent terminals** — spawn multiple instances of the same tool, with indexed targeting like `@claude1` and `@claude2`
 - **Shared task protocol** — built-in task creation, assignment, status updates, and completion logging
 - **Shared memory backend** — task files, conversation logs, and optional context persisted under `~/.cache/canvas-terminal/collab-memory`
@@ -222,6 +222,7 @@ The collaborator toolbar can spawn:
 - **Claude Code**
 - **Codex CLI**
 - **Gemini CLI**
+- **Copilot CLI** — requires GitHub authentication on first launch (`gh auth login` or in-app device-code prompt).
 
 Each agent runs in its own PTY-backed mini terminal and inherits the active terminal's working directory when possible.
 
