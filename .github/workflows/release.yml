@@ -77,7 +77,12 @@ jobs:
             -k "$KEYCHAIN_PATH"
 
           # Add temp keychain to user's search list (preserve existing entries)
-          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+
+          # Make the temp keychain the default — required for codesign called by
+          # third-party tools (e.g. Tauri bundler) which doesn't pass --keychain
+          # explicitly and only checks the default keychain on some macOS versions.
+          security default-keychain -s "$KEYCHAIN_PATH"
 
           # Grant codesign / Apple tools silent access to the private key
           security set-key-partition-list \
@@ -101,8 +106,10 @@ jobs:
           fi
           rm -f "$IMPORT_LOG"
 
-          # Confirm we have a codesigning-eligible identity (this is the real check)
-          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          # Confirm a codesigning-eligible identity is reachable via the SAME code
+          # path codesign uses (search list + default keychain) — no explicit
+          # keychain arg. If this fails, fail at <1s rather than 3+ min into build.
+          security find-identity -v -p codesigning
 
           # Wipe the .p12 + intermediate file from disk (still in keychain)
           rm -f "$CERT_PATH" "$INTERMEDIATE_PATH"
@@ -125,7 +132,13 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npx tauri build --target ${{ matrix.target }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Defensive re-unlock: Rust compile takes minutes; keychain may have
+          # auto-locked even with -t 21600 if the runner went idle.
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain-db"
+          npx tauri build --target ${{ matrix.target }}
 
       - name: Verify signature & notarization
         run: |
