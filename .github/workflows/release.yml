@@ -87,10 +87,21 @@ jobs:
 
           # Install Apple's Developer ID G2 intermediate CA — required for chain
           # validation; macOS runners don't always have the G2 variant pre-installed.
+          # Many .p12 exports from Keychain Access include the chain, so the
+          # intermediate may already be present — treat "already exists" as success.
           curl -sSL -o "$INTERMEDIATE_PATH" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
-          security import "$INTERMEDIATE_PATH" -k "$KEYCHAIN_PATH"
+          IMPORT_LOG="$RUNNER_TEMP/intermediate-import.log"
+          if security import "$INTERMEDIATE_PATH" -k "$KEYCHAIN_PATH" >"$IMPORT_LOG" 2>&1; then
+            cat "$IMPORT_LOG"
+          elif grep -q "already exists" "$IMPORT_LOG"; then
+            echo "G2 intermediate already in keychain (bundled with .p12 chain) — ok"
+          else
+            cat "$IMPORT_LOG" >&2
+            exit 1
+          fi
+          rm -f "$IMPORT_LOG"
 
-          # Confirm we have a codesigning-eligible identity
+          # Confirm we have a codesigning-eligible identity (this is the real check)
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
           # Wipe the .p12 + intermediate file from disk (still in keychain)
