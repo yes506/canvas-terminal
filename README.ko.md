@@ -92,7 +92,7 @@ npm run tauri dev    # 핫 리로드 — 프론트엔드 변경 즉시 반영
 
 1. **그리기** — 캔버스에 아키텍처 다이어그램, UI 와이어프레임, 플로차트 등을 스케치합니다.
 2. **업로드** — 캔버스가 PNG로 변환되고, 파일 경로가 활성 터미널에 붙여넣기됩니다.
-3. **AI 처리** — Claude Code, Gemini CLI, Codex 등 CLI 도구가 이미지를 읽습니다.
+3. **AI 처리** — Claude Code, Gemini CLI, Codex, Copilot CLI 등 CLI 도구가 이미지를 읽습니다.
 4. **다운로드** — AI의 응답(Markdown, SVG, HTML, 이미지, 일반 텍스트)이 이미지로 캔버스에 렌더링되므로, 캔버스는 이미지뿐 아니라 문서형 출력도 바로 다룰 수 있습니다. 임포트한 `.md` 파일의 원본 마크다운 소스는 **Cmd+Shift+S**로 다시 디스크에 내보낼 수 있습니다.
 
 이를 통해 사용자, 캔버스, AI 간의 **시각적 피드백 루프**가 만들어집니다. 이미지 경로를 받는 모든 CLI 도구와 호환되며, 시각 결과물과 문서형 결과물을 모두 다시 캔버스로 가져올 수 있습니다.
@@ -101,7 +101,7 @@ npm run tauri dev    # 핫 리로드 — 프론트엔드 변경 즉시 반영
 
 ## 새로운 내용
 
-- **Collaborator 패널**로 Claude Code, Codex CLI, Gemini CLI를 병렬 실행
+- **Collaborator 패널**로 Claude Code, Codex CLI, Gemini CLI, Copilot CLI를 병렬 실행
 - **멀티 에이전트 협업 워크플로우**로 공유 태스크 라우팅, 공유 메모리 파일, 에이전트별 캔버스 import/export 지원
 - `~/.cache/canvas-terminal/collab-memory` 아래의 **공유 메모리 워크스페이스**로 대화 로그, 태스크 파일, 컨텍스트 관리
 - `@mention`, 브로드캐스트, 태스크 추적, 메모리 파일 관리를 지원하는 **에이전트 명령 프롬프트**
@@ -162,7 +162,7 @@ Collaborator 패널이 활성화된 상태에서는 캔버스 import/export도 C
 
 Collaborator는 터미널 레이아웃 안에 포함된 PTY 기반 멀티 에이전트 작업 공간입니다.
 
-- **3가지 실행 대상** — Claude Code, Codex CLI, Gemini CLI
+- **4가지 실행 대상** — Claude Code, Codex CLI, Gemini CLI, Copilot CLI
 - **병렬 에이전트 터미널** — 같은 도구도 여러 개 띄울 수 있으며 `@claude1`, `@claude2`처럼 인덱스로 지정 가능
 - **공유 태스크 프로토콜** — 태스크 생성, 할당, 상태 변경, 완료 로그를 기본 지원
 - **공유 메모리 백엔드** — 태스크 파일, 대화 로그, 선택적 컨텍스트가 `~/.cache/canvas-terminal/collab-memory` 아래에 저장
@@ -220,6 +220,7 @@ Collaborator 도구막대에서 다음 도구를 실행할 수 있습니다.
 - **Claude Code**
 - **Codex CLI**
 - **Gemini CLI**
+- **Copilot CLI** — 첫 실행 시 GitHub 인증 필요 (`gh auth login` 또는 앱 내 디바이스 코드 프롬프트).
 
 각 에이전트는 자체 PTY 기반 미니 터미널에서 실행되며, 가능하면 현재 활성 터미널의 작업 디렉토리를 그대로 이어받습니다.
 

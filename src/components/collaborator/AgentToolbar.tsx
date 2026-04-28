@@ -10,6 +10,7 @@ const TOOL_ICONS: Record<string, string> = {
   claude_code: "C",
   codex_cli: "X",
   gemini_cli: "G",
+  copilot_cli: "P",
 };
 
 export function AgentToolbar({ onSpawn, agents }: AgentToolbarProps) {
