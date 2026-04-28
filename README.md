@@ -70,6 +70,8 @@ npm run tauri dev    # Hot reload — frontend changes apply instantly
 | `npm run preview` | Preview the built frontend |
 | `npm run clean` | Remove dist and release bundles |
 
+For public macOS distribution, see [docs/macos-signing-notarization.md](docs/macos-signing-notarization.md) for Apple code signing and notarization of the generated DMG.
+
 ---
 
 ## How It Works
