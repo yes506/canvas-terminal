@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { invoke } from "@tauri-apps/api/core";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -274,5 +276,18 @@ describe("Phase 1.2 — handlePtyExit (task-31 implementation)", () => {
     await expect(handlerPromise).resolves.toBeUndefined();
     // Agents array remains empty (no zombie agent re-introduced).
     expect(useCollaboratorStore.getState().agents).toHaveLength(0);
+  });
+
+  it("keeps mini terminals on the default renderer to avoid idle WebGL blank panes", () => {
+    // Behavioral guard: the WebGL addon must not be imported in the mini-terminal
+    // path. Asserting only the import absence (not the rationale comment text)
+    // keeps this test resilient to harmless comment rewording.
+    const source = readFileSync(
+      resolve(process.cwd(), "src/components/collaborator/AgentMiniTerminal.tsx"),
+      "utf8",
+    );
+
+    expect(source).not.toContain("@xterm/addon-webgl");
+    expect(source).not.toContain("WebglAddon");
   });
 });
