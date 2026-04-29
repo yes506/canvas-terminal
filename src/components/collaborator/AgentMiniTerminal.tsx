@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { WebglAddon } from "@xterm/addon-webgl";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { terminalThemes } from "../terminal/themes";
@@ -131,15 +130,9 @@ export function AgentMiniTerminal({
       const fitAddon = new FitAddon();
       terminal.loadAddon(fitAddon);
       terminal.open(termRef.current);
-
-      // Load WebGL addon for GPU-accelerated, sharper text rendering
-      try {
-        const webglAddon = new WebglAddon(true);
-        webglAddon.onContextLoss(() => webglAddon.dispose());
-        terminal.loadAddon(webglAddon);
-      } catch {
-        // WebGL not available, fall back to canvas renderer
-      }
+      // Keep collaborator mini terminals on the default renderer.
+      // These panes are small and numerous, so avoiding WebGL prevents
+      // idle GPU-context loss from leaving a black, stale viewport.
 
       fitAddon.fit();
       requestAnimationFrame(() => {
