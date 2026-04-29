@@ -9,7 +9,9 @@ Sketch a diagram, click Upload, and the AI CLI tool running in your terminal see
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Built with](https://img.shields.io/badge/built%20with-Tauri%20v2-blue.svg)
+<!-- Release download badge temporarily disabled — current release artifacts cannot be installed due to an Apple notarization issue. Restore once notarization is fixed.
 [![Release](https://img.shields.io/github/v/release/yes506/canvas-terminal?label=download)](https://github.com/yes506/canvas-terminal/releases/latest)
+-->
 
 <!-- TODO: Replace with an actual screenshot or GIF of the app -->
 <!-- ![Canvas Terminal Screenshot](docs/screenshot.png) -->
@@ -20,7 +22,12 @@ Sketch a diagram, click Upload, and the AI CLI tool running in your terminal see
 
 ### Download Latest Release
 
+> ⚠️ **Prebuilt downloads are temporarily unavailable.**
+> The published `.dmg` cannot currently be installed due to an Apple notarization issue. Please use **Build from Source** below until this is resolved.
+
+<!-- Restore once notarization is fixed:
 Download the latest macOS build from [GitHub Releases](https://github.com/yes506/canvas-terminal/releases/latest), open the `.dmg`, and drag **Canvas Terminal** into Applications.
+-->
 
 ### Build from Source
 
