@@ -13,7 +13,7 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "Canvas Terminal v0.1.1",
+        "title": "Canvas Terminal",
         "width": 1400,
         "height": 900,
         "minWidth": 800,
