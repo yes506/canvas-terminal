@@ -9,9 +9,7 @@ Canvas Terminal is built around a single idea: **collective intelligence**. Sket
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Built with](https://img.shields.io/badge/built%20with-Tauri%20v2-blue.svg)
-<!-- Release download badge temporarily disabled — current release artifacts cannot be installed due to an Apple notarization issue. Restore once notarization is fixed.
 [![Release](https://img.shields.io/github/v/release/yes506/canvas-terminal?label=download)](https://github.com/yes506/canvas-terminal/releases/latest)
--->
 
 <!-- TODO: Replace with an actual screenshot or GIF of the app -->
 <!-- ![Canvas Terminal Screenshot](docs/screenshot.png) -->
@@ -22,12 +20,9 @@ Canvas Terminal is built around a single idea: **collective intelligence**. Sket
 
 ### Download Latest Release
 
-> ⚠️ **Prebuilt downloads are temporarily unavailable.**
-> The published `.dmg` cannot currently be installed due to an Apple notarization issue. Please use **Build from Source** below until this is resolved.
-
-<!-- Restore once notarization is fixed:
 Download the latest macOS build from [GitHub Releases](https://github.com/yes506/canvas-terminal/releases/latest), open the `.dmg`, and drag **Canvas Terminal** into Applications.
--->
+
+Releases are code-signed and Apple-notarized, and the app updates itself in place via Tauri 2 auto-update from signed GitHub Releases — no need to manually re-download for new versions.
 
 ### Build from Source
 
