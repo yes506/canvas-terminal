@@ -1,8 +1,8 @@
 import { useRef, useEffect } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { useCollaboratorStore, mentionableNames, toolLabel } from "../../stores/collaboratorStore";
+import { useCollaboratorStore } from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
-import { TOOL_CONFIGS } from "../../types/collaborator";
+import { TOOL_CONFIGS, type SpawnedAgent, type ToolId } from "../../types/collaborator";
 
 interface AtMentionProps {
   query: string;
@@ -10,12 +10,48 @@ interface AtMentionProps {
   onSelect: (name: string) => void;
 }
 
-/** Map a mentionable name to a color class. */
-function colorForName(name: string): string {
-  for (const cfg of TOOL_CONFIGS) {
-    if (name.startsWith(cfg.command)) return cfg.colorClass;
-  }
-  return "text-accent";
+/** One row in the mention dropdown. Discriminated so the synthetic broadcast
+ *  row (no `tool`) is type-safe without optional chaining at every call site. */
+export type MentionEntry =
+  | {
+      kind: "agent";
+      handle: string;
+      nickname: string;
+      nicknameSlug: string;
+      tool: ToolId;
+      ordinal: number;
+    }
+  | { kind: "all" };
+
+/** Pure helper used by both the dropdown render and the InputPrompt key handler.
+ *  Filters agents by handle prefix or nicknameSlug prefix (case-insensitive),
+ *  sorted by ordinal then tool, with the synthetic "all" row appended when its
+ *  prefix matches the query. One entry per agent — Array.filter over `agents`
+ *  guarantees uniqueness without a separate dedup pass. */
+export function filterMentionEntries(
+  query: string,
+  agents: SpawnedAgent[],
+): MentionEntry[] {
+  const q = query.toLowerCase();
+  const sorted = [...agents].sort(
+    (a, b) => a.ordinal - b.ordinal || a.tool.localeCompare(b.tool),
+  );
+  const entries: MentionEntry[] = sorted
+    .filter(
+      (a) =>
+        a.handle.toLowerCase().startsWith(q) ||
+        a.nicknameSlug.startsWith(q),
+    )
+    .map((a) => ({
+      kind: "agent",
+      handle: a.handle,
+      nickname: a.nickname,
+      nicknameSlug: a.nicknameSlug,
+      tool: a.tool,
+      ordinal: a.ordinal,
+    }));
+  if ("all".startsWith(q)) entries.push({ kind: "all" });
+  return entries;
 }
 
 export function AtMention({ query, selectedIndex, onSelect }: AtMentionProps) {
@@ -25,14 +61,7 @@ export function AtMention({ query, selectedIndex, onSelect }: AtMentionProps) {
   );
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Build options: filtered mentionable names + "all"
-  const names = mentionableNames(agents);
-  const lower = query.toLowerCase();
-  const filtered = names.filter((n) => n.toLowerCase().startsWith(lower));
-  // Always include "all" if it matches or query is empty
-  if ("all".startsWith(lower)) {
-    filtered.push("all");
-  }
+  const entries = filterMentionEntries(query, agents);
 
   // Scroll selected into view
   useEffect(() => {
@@ -40,25 +69,30 @@ export function AtMention({ query, selectedIndex, onSelect }: AtMentionProps) {
     el?.scrollIntoView({ block: "nearest" });
   }, [selectedIndex]);
 
-  if (filtered.length === 0) return null;
+  if (entries.length === 0) return null;
 
   return (
     <div
       ref={listRef}
       className="absolute bottom-full left-0 right-0 mb-1 mx-3 bg-surface-light border border-surface-lighter rounded-md shadow-lg max-h-40 overflow-y-auto z-20"
     >
-      {filtered.map((name, i) => {
-        const isAll = name === "all";
-        const color = isAll ? "text-accent" : colorForName(name);
-        const label = isAll
-          ? "Broadcast to all"
-          : toolLabel(
-              TOOL_CONFIGS.find((c) => name.startsWith(c.command))?.id ?? name,
-            );
+      {entries.map((entry, i) => {
+        const colorClass =
+          entry.kind === "all"
+            ? "text-accent"
+            : TOOL_CONFIGS.find((c) => c.id === entry.tool)?.colorClass ??
+              "text-text";
+
+        const key = entry.kind === "all" ? "__all__" : entry.handle;
+        const selectValue = entry.kind === "all" ? "all" : entry.handle;
+        const primary =
+          entry.kind === "all" ? "@all" : entry.nickname;
+        const secondary =
+          entry.kind === "all" ? "Broadcast to all" : `@${entry.handle}`;
 
         return (
           <button
-            key={name}
+            key={key}
             className={`flex items-center gap-2 w-full px-3 py-1.5 text-xs text-left transition-colors ${
               i === selectedIndex
                 ? "bg-accent/20 text-text"
@@ -66,11 +100,11 @@ export function AtMention({ query, selectedIndex, onSelect }: AtMentionProps) {
             }`}
             onMouseDown={(e) => {
               e.preventDefault(); // Prevent input blur
-              onSelect(name);
+              onSelect(selectValue);
             }}
           >
-            <span className={`font-bold ${color}`}>@{name}</span>
-            <span className="text-text-dim">{label}</span>
+            <span className={`font-bold ${colorClass} truncate min-w-0`}>{primary}</span>
+            <span className="text-text-dim flex-shrink-0">{secondary}</span>
           </button>
         );
       })}
