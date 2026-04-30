@@ -22,3 +22,20 @@ tauri-plugin-process = "2"
 base64 = "0.22"
 dirs = "6"
 serde_json = "1"
+
+# Dashboard server (v4+v5 plan).
+# tokio: net for TcpListener, sync for broadcast, time for interval timer.
+# rt-multi-thread/macros so the spawned async tasks compile against the same
+# tokio runtime tauri::async_runtime exposes.
+tokio = { version = "1", features = ["net", "sync", "time", "rt-multi-thread", "macros"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+futures = "0.3"
+rand = "0.8"
+hex = "0.4"
+
+[dev-dependencies]
+# `tower::ServiceExt::oneshot` is the cleanest way to drive an axum Router
+# in unit tests without binding a real TCP port. Test-only — the production
+# server uses axum::serve directly.
+tower = { version = "0.5", features = ["util"] }

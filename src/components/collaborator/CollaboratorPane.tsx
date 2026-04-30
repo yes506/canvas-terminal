@@ -8,7 +8,7 @@ import { CollabSessionContext } from "./CollabSessionContext";
 import { AgentToolbar } from "./AgentToolbar";
 import { AgentMiniTerminal } from "./AgentMiniTerminal";
 import { InputPrompt } from "./InputPrompt";
-import { Zap, Cpu, X } from "lucide-react";
+import { Zap, Cpu, X, Monitor } from "lucide-react";
 import type { ToolConfig } from "../../types/collaborator";
 
 interface CollaboratorPaneProps {
@@ -150,6 +150,19 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
             {agents.length} agent{agents.length !== 1 ? "s" : ""}
           </span>
           <div className="flex-1" />
+          <button
+            type="button"
+            className="p-0.5 rounded hover:bg-surface-lighter text-text-dim hover:text-text transition-colors"
+            onClick={() => {
+              invoke("open_dashboard").catch((err) => {
+                console.error("[dashboard] open_dashboard failed:", err);
+              });
+            }}
+            title="Open Dashboard (⌘⇧D)"
+            aria-label="Open Dashboard"
+          >
+            <Monitor size={14} />
+          </button>
           <button
             className="p-0.5 rounded hover:bg-surface-lighter text-text-dim hover:text-text transition-colors"
             onClick={() => useTerminalStore.getState().openCollaboratorSplit()}

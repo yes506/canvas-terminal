@@ -10,6 +10,7 @@ import { checkForUpdates } from "./lib/updater";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 
 export default function App() {
   const { exportToTerminal, importIntoCanvas, isWaitingForImport } = useCanvasIntegration();
@@ -35,6 +36,20 @@ export default function App() {
   useEffect(() => {
     const unlistenPromise = listen("menu-check-for-updates", () => {
       checkForUpdates({ manual: true });
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  // App menu "Open Dashboard" → lazy-start the localhost server and open
+  // the token URL in the default browser. The token URL never crosses
+  // the IPC boundary (see commands::dashboard::open_dashboard rationale).
+  useEffect(() => {
+    const unlistenPromise = listen("menu-open-dashboard", () => {
+      invoke("open_dashboard").catch((err) => {
+        console.error("[dashboard] open_dashboard failed:", err);
+      });
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());

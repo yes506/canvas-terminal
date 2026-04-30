@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist-dashboard",
+    "tsBuildInfoFile": "./dist-dashboard/.tsbuildinfo"
+  },
+  "include": ["src/dashboard", "src/shared"],
+  "exclude": [
+    "src/components",
+    "src/stores",
+    "src/lib",
+    "src/main.tsx",
+    "src/App.tsx",
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ]
+}
