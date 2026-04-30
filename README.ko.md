@@ -9,9 +9,7 @@ Canvas Terminal은 단 하나의 아이디어 위에 설계되었습니다 — *
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 ![Built with](https://img.shields.io/badge/built%20with-Tauri%20v2-blue.svg)
-<!-- 릴리스 다운로드 배지 임시 비활성화 — 현재 릴리스 산출물이 Apple 공증(notarization) 문제로 설치되지 않아 비활성화합니다. 공증 문제 해결 후 복원하세요.
 [![Release](https://img.shields.io/github/v/release/yes506/canvas-terminal?label=download)](https://github.com/yes506/canvas-terminal/releases/latest)
--->
 
 <!-- TODO: 실제 앱 스크린샷 또는 GIF로 교체 -->
 <!-- ![Canvas Terminal 스크린샷](docs/screenshot.png) -->
@@ -22,12 +20,9 @@ Canvas Terminal은 단 하나의 아이디어 위에 설계되었습니다 — *
 
 ### 최신 릴리스 다운로드
 
-> ⚠️ **사전 빌드된 다운로드를 일시적으로 제공하지 않습니다.**
-> 현재 배포된 `.dmg`는 Apple 공증(notarization) 문제로 설치할 수 없습니다. 문제가 해결될 때까지 아래 **소스에서 빌드하기**를 이용해 주세요.
-
-<!-- 공증 문제 해결 후 복원:
 [GitHub Releases](https://github.com/yes506/canvas-terminal/releases/latest)에서 최신 macOS 빌드를 내려받고, `.dmg`를 연 뒤 **Canvas Terminal**을 Applications로 드래그하면 됩니다.
--->
+
+릴리스는 코드 서명 및 Apple 공증(notarization)이 적용되어 있으며, 서명된 GitHub Releases를 통해 Tauri 2 자동 업데이트로 새 버전이 앱 안에서 직접 갱신됩니다 — 새 버전을 받을 때마다 다시 내려받을 필요가 없습니다.
 
 ### 소스에서 빌드하기
 
