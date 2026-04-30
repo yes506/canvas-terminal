@@ -28,6 +28,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Refuse to ship placeholder updater pubkey
+        # Defense against the human-error class of bug where a release tag
+        # is cut before `tauri signer generate` has been run and the
+        # placeholder pubkey replaced. See docs/operations.md for the
+        # keypair generation procedure.
+        run: |
+          set -euo pipefail
+          PUBKEY=$(jq -r '.plugins.updater.pubkey // ""' src-tauri/tauri.conf.json)
+          case "$PUBKEY" in
+            PLACEHOLDER_*|"")
+              echo "ERROR: tauri.conf.json plugins.updater.pubkey is still the placeholder ('$PUBKEY')." >&2
+              echo "       Generate the real keypair (see docs/operations.md) and replace it before tagging." >&2
+              exit 1
+              ;;
+          esac
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -217,6 +233,69 @@ jobs:
           ditto -c -k --keepParent "$APP" "$ZIP"
 
           bash scripts/notarize-and-staple.sh "$ZIP" "$APP"
+
+      - name: Ensure gnu-tar (xattr preservation) is available
+        # macOS BSD tar does NOT preserve xattrs by default — see the DMG
+        # re-bundle step below which explicitly chose `ditto` over `cp -R`
+        # because the staple ticket is xattr-dependent. We need GNU tar for
+        # the same reason.
+        run: |
+          if ! command -v gtar >/dev/null; then
+            echo "gtar not found, installing..."
+            brew install gnu-tar
+          fi
+          gtar --version | head -1
+
+      - name: Build & sign updater tarball (post-staple)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP=$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' -type d | head -1)
+          [ -z "$APP" ] && { echo "ERROR: stapled .app not found"; exit 1; }
+
+          VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          OUT_DIR="$RUNNER_TEMP/updater"
+          mkdir -p "$OUT_DIR"
+          TARBALL="$OUT_DIR/Canvas-Terminal_${VERSION}_${{ matrix.arch_label }}.app.tar.gz"
+
+          # gtar with explicit xattr preservation (--xattrs-include='*' picks up
+          # com.apple.* xattrs that the default xattr filter excludes).
+          gtar -C "$(dirname "$APP")" \
+               --xattrs --xattrs-include='*' \
+               -czf "$TARBALL" \
+               "$(basename "$APP")"
+
+          # Round-trip validation: extract → re-validate staple → diff xattrs.
+          # Implemented as a script (not inline YAML) because shell quoting
+          # around xattr manifests is fragile inside YAML.
+          bash scripts/verify-staple-roundtrip.sh "$APP" "$TARBALL"
+
+          # Sign with Tauri Ed25519 signer. Direct binary call (not `npm run
+          # tauri --`) for predictable env handling — npm scripts add a layer
+          # that has been observed to drop or transform env vars in non-obvious
+          # ways. The signer reads TAURI_SIGNING_PRIVATE_KEY / _PASSWORD from
+          # env directly; we deliberately do NOT pass them as -k/-p flags
+          # (which would expose them in `ps` argv).
+          #
+          # NOTE: this step calls only the local Ed25519 signer — never any
+          # Apple network. Safe-by-construction against the b80b898 CI-hang
+          # failure mode the unset block above was added to prevent.
+          node_modules/.bin/tauri signer sign "$TARBALL"
+          # Produces "$TARBALL.sig" alongside.
+
+          echo "UPDATER_TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          echo "UPDATER_SIGNATURE=$TARBALL.sig" >> "$GITHUB_ENV"
+
+      - name: Upload updater artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-${{ matrix.arch_label }}
+          path: |
+            ${{ env.UPDATER_TARBALL }}
+            ${{ env.UPDATER_SIGNATURE }}
 
       - name: Re-bundle DMG with stapled .app
         run: |
@@ -437,7 +516,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download all DMG artifacts
+      - name: Download all artifacts (DMG + updater)
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -446,10 +525,51 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Generate latest.json
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Strip leading 'v' for the manifest version field.
+          # Note: when the rc-tag workflow is used, the version files say "0.3.9"
+          # while the tag is "v0.3.9-rc.1" — so VER here is derived from the
+          # actual binary version baked into the .app, not the tag string.
+          # We read it from the artifact filename to stay consistent.
+          AARCH64_TARBALL=$(ls artifacts/Canvas-Terminal_*_apple-silicon.app.tar.gz | head -1)
+          [ -z "$AARCH64_TARBALL" ] && { echo "ERROR: aarch64 updater tarball not found"; exit 1; }
+          VER=$(basename "$AARCH64_TARBALL" | sed -E 's/Canvas-Terminal_(.+)_apple-silicon\.app\.tar\.gz/\1/')
+
+          SIG_SI=$(cat "artifacts/Canvas-Terminal_${VER}_apple-silicon.app.tar.gz.sig")
+          SIG_IN=$(cat "artifacts/Canvas-Terminal_${VER}_intel.app.tar.gz.sig")
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          cat > artifacts/latest.json <<EOF
+          {
+            "version": "${VER}",
+            "notes": "See https://github.com/${REPO}/releases/tag/${TAG}",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${SIG_SI}",
+                "url": "${BASE}/Canvas-Terminal_${VER}_apple-silicon.app.tar.gz"
+              },
+              "darwin-x86_64": {
+                "signature": "${SIG_IN}",
+                "url": "${BASE}/Canvas-Terminal_${VER}_intel.app.tar.gz"
+              }
+            }
+          }
+          EOF
+          cat artifacts/latest.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.dmg
+          files: |
+            artifacts/*.dmg
+            artifacts/*.app.tar.gz
+            artifacts/*.app.tar.gz.sig
+            artifacts/latest.json
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
