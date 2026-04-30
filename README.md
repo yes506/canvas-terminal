@@ -2,9 +2,9 @@
 
 🌐 **English** | [한국어](README.ko.md)
 
-**A canvas-first terminal where drawings, documents, and multiple AI CLIs connect in one workspace.**
+**A canvas-first terminal where you and multiple AI CLIs think together as one collective.**
 
-Sketch a diagram, click Upload, and the AI CLI tool running in your terminal sees it. Ask it to respond, and the result is rendered back on the canvas as an image — supported response formats are PNG/JPEG, SVG, HTML, Markdown, and plain text. Drop an image or `.md` file directly onto the canvas to insert it the same way; PDF, DOCX, XLSX, CSV, and HWP files are inserted via the toolbar's Insert File button. Open the Collaborator pane, launch multiple agent terminals, and coordinate them with shared task and memory files. Canvas Terminal turns a visual idea into a multi-agent AI workspace — no copy-paste, no file juggling.
+Canvas Terminal is built around a single idea: **collective intelligence**. Sketch a diagram once and route the same picture to one agent or every agent in the workspace. Spawn Claude Code, Codex CLI, Gemini CLI, and Copilot CLI side by side, route tasks between them, and let them share memory through a common workspace — so what would be four separate chat windows becomes one coordinated system. Drop an image or `.md` file directly to insert it; PDF, DOCX, XLSX, CSV, and HWP files come in via the toolbar's Insert File button. Open the Collaborator pane to launch multiple agent terminals and coordinate them with shared task and memory files — no copy-paste, no file juggling.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
@@ -108,20 +108,83 @@ This creates a **visual feedback loop** between you, the canvas, and the AI. Wor
 
 ---
 
+## Collective Intelligence — The Core Idea
+
+> One human, many minds, one canvas, one memory.
+
+Canvas Terminal is not a terminal that happens to run AI tools. It is a workbench for **collective intelligence** — the deliberate composition of multiple AI agents, a human, a shared visual surface, and a shared memory into a single thinking system.
+
+### The three pillars
+
+**1. Many minds — diversity over redundancy.**
+Claude Code, Codex CLI, Gemini CLI, and Copilot CLI run in parallel mini-terminals. They do not share the same training, the same biases, or the same blind spots. Disagreement between them is signal, not noise. Address one with `@claude1`, broadcast to the swarm with `@all`, and let conflict surface what a single model would have hidden.
+
+**2. Shared memory — cognition that outlives a context window.**
+Every agent reads from and writes to `~/.cache/canvas-terminal/collab-memory`: conversation logs, task files, and an optional `context.md`. When one agent finishes a task it writes a JSON marker, and the next agent can continue from the same shared files instead of starting from scratch. The swarm's memory is a file tree, not a single chat history — durable, inspectable, and version-controllable.
+
+**3. Visual common ground — a channel text cannot replace.**
+The canvas is the lingua franca. A diagram you sketch is exported as an image to one agent or all agents at once. Their answers — Markdown, SVG, HTML, plain text, PNG — render back on the same canvas. Shape, spatial layout, and annotation become things the swarm can point at together. No copy-paste, no "describe what you see" preamble.
+
+### The topology
+
+```
+                         ┌──────────────────────┐
+                         │    Shared Canvas     │
+                         │ visual common ground │
+                         └──────────┬───────────┘
+                                    │
+                            export ↕ import
+                                    │
+        ┌───────────┬───────────┬───┴───────┬───────────┬─────────┐
+        │           │           │           │           │         │
+   ┌────▼────┐ ┌────▼────┐ ┌────▼────┐ ┌────▼────┐ ┌────▼────┐ ┌──▼──┐
+   │ @human  │ │ @claude │ │ @codex  │ │ @gemini │ │@copilot │ │ ... │
+   └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘ └──┬──┘
+        │           │           │           │           │         │
+        └───────────┴───────────┴───┬───────┴───────────┴─────────┘
+                                    │
+                         ┌──────────▼───────────┐
+                         │    Shared Memory     │
+                         │  tasks · logs · ctx  │
+                         └──────────────────────┘
+```
+
+### Solo AI chat vs. Canvas Terminal collective
+
+| Solo AI chat | Canvas Terminal collective |
+|---|---|
+| One model, one context window | N models, N perspectives |
+| Text-only channel | Text + canvas + files |
+| Memory dies with the tab | Memory lives on disk, picked up by the next agent |
+| You orchestrate by copy-paste | You orchestrate with `@mentions`, `/task`, `/canvas-export` |
+| Disagreement is friction | Disagreement is a feature |
+
+The human stays the conductor. Canvas Terminal does not replace human judgment — it lowers the cost of distributing work, surfacing disagreement, and recombining results into a single decision. Every other section of this README — the canvas integration, the collaborator pane, the task protocol, the shared-memory layout — is an implementation detail of these three pillars. Read it that way.
+
+---
+
 ## What's New
 
+> These collaboration features are not isolated utilities — together they form the runtime of collective intelligence inside the terminal.
+
+**Many minds**
 - **Collaborator pane** for running Claude Code, Codex CLI, Gemini CLI, and Copilot CLI in parallel
-- **Multi-agent collaboration workflow** with shared task routing, shared memory files, and agent-specific canvas import/export
-- **Shared memory workspace** at `~/.cache/canvas-terminal/collab-memory` for conversation logs, task files, and context
-- **Agent command prompt** with `@mentions`, broadcasts, task tracking, and memory file management
-- **Canvas routing for agents** so `/canvas-export` and `/canvas-import` work directly with spawned collaborators
-- **Automatic agent output capture** that flushes readable terminal output into the shared collaboration log
+- **Indexed handles** like `@claude1` / `@claude2`, with `@all` broadcasts and a target selector for untargeted prompts
+
+**Shared memory**
+- **Shared workspace** at `~/.cache/canvas-terminal/collab-memory` for conversation logs, task files, and optional context
+- **Multi-agent task protocol** — assign, claim, complete with JSON markers
+- **Automatic agent output capture** that strips ANSI sequences and appends readable text to the shared log
+
+**Visual common ground**
+- **Canvas routing for agents** — `/canvas-export` and `/canvas-import` work directly with spawned collaborators
+- **Document round-trip** — Markdown, SVG, HTML, PNG/JPEG, and plain text render back onto the canvas
 
 ---
 
 ## Canvas-to-Terminal Integration
 
-The core feature that makes Canvas Terminal different from every other terminal emulator: the canvas can send drawings to AI tools and render not just images, but document-style outputs back into the workspace.
+The canvas is the visual common ground for the collective. It is how a sketch becomes shared perception across every agent in the workspace — and how their document-style responses come back home.
 
 ### Export (Canvas → Terminal)
 
@@ -169,7 +232,7 @@ The terminal is a full PTY shell — not a simplified emulator. It spawns a logi
 
 ### Collaborator
 
-The collaborator is a PTY-backed multi-agent workspace embedded inside the terminal layout.
+The collaborator is the runtime of Collective Intelligence — a PTY-backed multi-agent workspace where many minds and one shared memory live together inside the terminal layout.
 
 - **Four launch targets** — Claude Code, Codex CLI, Gemini CLI, Copilot CLI
 - **Parallel agent terminals** — spawn multiple instances of the same tool, with indexed targeting like `@claude1` and `@claude2`
@@ -255,14 +318,14 @@ Use the input prompt at the bottom of the collaborator pane:
 | `/memory delete <path>` | Delete a shared-memory file |
 | `/memory clear` | Clear the shared memory directory |
 | `/task list` | List collaboration tasks |
-| `/task add <title> | <objective> [@agent]` | Create a task |
+| `/task add <title> \| <objective> [@agent]` | Create a task |
 | `/task <id> status <pending|in-progress|completed|blocked>` | Update task state |
 | `/task <id> assign @<agent>` | Reassign a task |
 | `/task <id> done [notes]` | Mark a task complete |
 
 ### Shared Memory Files
 
-Canvas Terminal creates a collaboration workspace under:
+Shared memory is the externalized cognition of the swarm. Every agent reads from and writes to the same directory, so the collective's thinking outlives any single conversation. Canvas Terminal creates the workspace under:
 
 ```text
 ~/.cache/canvas-terminal/collab-memory
