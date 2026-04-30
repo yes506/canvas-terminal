@@ -9,12 +9,20 @@ use tauri::{Emitter, Manager};
 /// default "Close Window".  This prevents the native menu from closing the
 /// entire Tauri window when the user presses Cmd+W.
 fn build_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, tauri::Error> {
+    let check_for_updates = MenuItem::with_id(
+        app,
+        "check_for_updates",
+        "Check for Updates…",
+        true,
+        None::<&str>,
+    )?;
     let app_menu = Submenu::with_items(
         app,
         "Canvas Terminal",
         true,
         &[
             &PredefinedMenuItem::about(app, None, None)?,
+            &check_for_updates,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::hide(app, None)?,
             &PredefinedMenuItem::hide_others(app, None)?,
@@ -61,6 +69,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .setup(|app| {
             let menu = build_menu(app)?;
@@ -73,6 +83,9 @@ pub fn run() {
             if event.id() == "close_tab" {
                 // Forward to the frontend so it can close the active tab
                 let _ = app.emit("menu-close-tab", ());
+            } else if event.id() == "check_for_updates" {
+                // Frontend listens and runs a manual update check
+                let _ = app.emit("menu-check-for-updates", ());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -101,6 +114,9 @@ pub fn run() {
             commands::memory::clear_memory_dir,
             commands::memory::list_memory_files,
             commands::memory::get_memory_file_mtime,
+            commands::settings::get_settings,
+            commands::settings::set_settings,
+            commands::settings::open_external_url,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

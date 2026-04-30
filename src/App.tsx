@@ -2,11 +2,14 @@ import { useRef, useCallback, useEffect } from "react";
 import { DrawingBoard } from "./components/canvas/DrawingBoard";
 import { Toolbar } from "./components/canvas/Toolbar";
 import { TerminalTabs } from "./components/terminal/TerminalTabs";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { useCanvasIntegration } from "./components/canvas/CanvasIntegration";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useCanvasStore } from "./stores/canvasStore";
+import { checkForUpdates } from "./lib/updater";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 
 export default function App() {
   const { exportToTerminal, importIntoCanvas, isWaitingForImport } = useCanvasIntegration();
@@ -17,6 +20,25 @@ export default function App() {
     getVersion().then((version) => {
       getCurrentWindow().setTitle(`Canvas Terminal v${version}`);
     });
+  }, []);
+
+  // Auto-check for updates ~3s after mount so we don't compete with terminal
+  // boot. The settings layer (auto_check_updates flag) gates this internally.
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      checkForUpdates({ manual: false });
+    }, 3000);
+    return () => window.clearTimeout(handle);
+  }, []);
+
+  // App menu "Check for Updates…" → manual update check
+  useEffect(() => {
+    const unlistenPromise = listen("menu-check-for-updates", () => {
+      checkForUpdates({ manual: true });
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
   }, []);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -46,7 +68,9 @@ export default function App() {
   }, []);
 
   return (
-    <div ref={containerRef} className="flex h-screen w-screen overflow-hidden" style={{ background: "transparent" }}>
+    <div className="flex flex-col h-screen w-screen overflow-hidden" style={{ background: "transparent" }}>
+      <UpdateBanner />
+      <div ref={containerRef} className="flex flex-1 min-h-0 overflow-hidden" style={{ background: "transparent" }}>
       {/* Canvas panel — always mounted, width controlled by CSS */}
       <div
         ref={canvasPanelRef}
@@ -79,6 +103,7 @@ export default function App() {
       {/* Terminal — always mounted, never re-created */}
       <div className="flex-1 h-full min-w-0 bg-surface">
         <TerminalTabs />
+      </div>
       </div>
     </div>
   );

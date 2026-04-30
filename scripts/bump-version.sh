@@ -27,6 +27,22 @@ fi
 
 BUMP="$1"
 
+# Refuse to bump if the updater pubkey is still the placeholder. Bumping the
+# version is the typical first step before pushing a release tag, so catching
+# the missing-keypair case here protects against a release that ships a
+# dead-on-arrival auto-updater. See docs/operations.md for the keypair flow.
+# (The read-only "current version" path above runs before this guard so
+# `npm run version:check` works regardless of keypair state.)
+PUBKEY=$(jq -r '.plugins.updater.pubkey // ""' "$TAURI" 2>/dev/null || true)
+case "$PUBKEY" in
+  PLACEHOLDER_*)
+    echo "ERROR: src-tauri/tauri.conf.json plugins.updater.pubkey is still the placeholder." >&2
+    echo "       Run 'node_modules/.bin/tauri signer generate' and replace it before bumping." >&2
+    echo "       See docs/operations.md for the keypair generation procedure." >&2
+    exit 1
+    ;;
+esac
+
 # Parse current version
 IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
 

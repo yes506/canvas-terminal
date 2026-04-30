@@ -28,6 +28,14 @@
       "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'self'"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "PLACEHOLDER_RUN_TAURI_SIGNER_GENERATE_AND_REPLACE_BEFORE_FIRST_RELEASE",
+      "endpoints": [
+        "https://github.com/yes506/canvas-terminal/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": [

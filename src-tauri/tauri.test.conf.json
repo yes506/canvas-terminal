@@ -1,0 +1,9 @@
+{
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/yes506/canvas-terminal-updater-test/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
