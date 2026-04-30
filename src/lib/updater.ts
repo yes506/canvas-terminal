@@ -127,8 +127,3 @@ export async function skipVersion(version: string): Promise<void> {
   await setSettings({ ...settings, last_skipped_version: version });
   useUpdateStore.getState().setState("idle");
 }
-
-export async function setAutoCheckEnabled(enabled: boolean): Promise<void> {
-  const settings = await getSettings();
-  await setSettings({ ...settings, auto_check_updates: enabled });
-}

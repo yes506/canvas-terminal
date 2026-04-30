@@ -5,15 +5,18 @@ use std::path::PathBuf;
 /// Maximum memory file size (10 MB)
 const MAX_MEMORY_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-fn get_memory_root() -> Result<PathBuf, String> {
+pub(crate) fn get_memory_root() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let dir = home.join(".cache").join("canvas-terminal").join("collab-memory");
+    let dir = home
+        .join(".cache")
+        .join("canvas-terminal")
+        .join("collab-memory");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create memory directory: {}", e))?;
     Ok(dir)
 }
 
-fn get_memory_dir() -> Result<PathBuf, String> {
+pub(crate) fn get_memory_dir() -> Result<PathBuf, String> {
     let root = get_memory_root()?;
     let dir = root.join(format!("session-{}", std::process::id()));
     std::fs::create_dir_all(&dir)
@@ -37,7 +40,12 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 /// Validate that a relative path doesn't escape the memory directory.
-fn validate_relative_path(relative: &str) -> Result<(), String> {
+///
+/// `pub(crate)` so the dashboard module's raw-file endpoint can reuse the same
+/// invariants without re-deriving them. See `dashboard::server` for the HTTP
+/// caller; `validate_relative_path` is the single source of truth for path
+/// safety.
+pub(crate) fn validate_relative_path(relative: &str) -> Result<(), String> {
     if relative.is_empty() {
         return Err("Path cannot be empty".to_string());
     }
@@ -111,6 +119,153 @@ pub fn write_memory_file(relative_path: String, content: String) -> Result<Strin
     Ok(full_path.to_string_lossy().to_string())
 }
 
+/// Atomically write a file to the shared memory directory.
+///
+/// Visibility-atomic: the reader sees old content or new content, never a
+/// half-written or zero-byte file. Used for the dashboard's roster sidecar
+/// (`agents-{collabId}.json`), which the dashboard server polls via SSE
+/// during periods that overlap the truncate-then-write window of
+/// `write_memory_file`.
+///
+/// Crash-durability is best-effort: this fsyncs the temp file but not the
+/// parent directory, so a power loss between `rename` and the next fsync of
+/// the parent is not guaranteed survivable.
+///
+/// Implementation notes (v5 §3.1):
+///  - Tmp file lives in the SAME parent directory as the final path so the
+///    rename is atomic on one filesystem.
+///  - Tmp filename: `.{basename}.{pid}.{nanos}.tmp` — leading dot keeps it
+///    out of generic listings; pid+nanos defeats the same-process collision
+///    on `O_EXCL` and the self-perpetuating orphan-tmp leak that an earlier
+///    plan revision was vulnerable to.
+///  - Pre-clean of `tmp_path` is defense in depth; with the nanos suffix
+///    the collision rate is effectively zero, but the cleanup is free.
+///  - Final-path symlink is rejected both before write and immediately
+///    before rename (TOCTOU mitigation).
+///
+/// Known limitation: the per-component symlink walk runs once before
+/// `create_dir_all` and `open(tmp_path)`. A symlink introduced AFTER the
+/// walk but BEFORE the temp-file open could still redirect the temp path.
+/// Acceptable for the current local single-user threat model; a stronger
+/// defense would require directory-fd-based traversal (`openat`) or a
+/// post-create canonical-parent re-check. Tracked for Day 2 hardening
+/// alongside the atomic-write fixture tests.
+#[tauri::command]
+pub fn write_memory_file_atomic(relative_path: String, content: String) -> Result<String, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    validate_relative_path(&relative_path)?;
+    let dir = get_memory_dir()?;
+    let final_path = dir.join(&relative_path);
+
+    // Reject existing symlink or directory at final path.
+    if let Ok(meta) = std::fs::symlink_metadata(&final_path) {
+        if meta.is_symlink() {
+            return Err("Refusing to write through a symlink".to_string());
+        }
+        if meta.is_dir() {
+            return Err("Refusing to overwrite a directory".to_string());
+        }
+    }
+
+    // Walk the relative path components and reject any component that
+    // is an existing symlink. This matters when the helper is reused for
+    // nested paths — a planted symlink at a parent directory could redirect
+    // writes outside the memory tree even though the final-path symlink
+    // check passed. Cheap to do for every write.
+    let mut walk = dir.clone();
+    for component in std::path::Path::new(&relative_path).components() {
+        if let std::path::Component::Normal(seg) = component {
+            walk.push(seg);
+            if let Ok(meta) = std::fs::symlink_metadata(&walk) {
+                if meta.is_symlink() {
+                    return Err(format!(
+                        "Refusing to write through symlinked path component: {}",
+                        walk.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // Create parent directories so atomic writes work for nested paths.
+    if let Some(parent) = final_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| "Final path has no parent".to_string())?;
+    let basename = final_path
+        .file_name()
+        .ok_or_else(|| "Final path has no basename".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let tmp_name = format!(".{}.{}.{}.tmp", basename, std::process::id(), nanos);
+    let tmp_path = parent.join(&tmp_name);
+
+    // Pre-clean any orphan at this exact tmp path. Effectively never collides
+    // because of the nanos suffix, but free defense against future call-pattern
+    // changes that drop the suffix.
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let file_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp_path);
+
+    let file = match file_result {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Failed to create tmp file: {}", e));
+        }
+    };
+
+    let mut writer = std::io::BufWriter::new(file);
+    if let Err(e) = writer.write_all(content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("Failed to write tmp file: {}", e));
+    }
+    if let Err(e) = writer.flush() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("Failed to flush tmp file: {}", e));
+    }
+    let file = match writer.into_inner() {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Failed to unwrap writer: {}", e));
+        }
+    };
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("Failed to fsync tmp file: {}", e));
+    }
+
+    // TOCTOU re-check immediately before rename.
+    if let Ok(meta) = std::fs::symlink_metadata(&final_path) {
+        if meta.is_symlink() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err("Refusing to rename over a symlink".to_string());
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("Failed to rename tmp into place: {}", e));
+    }
+
+    Ok(final_path.to_string_lossy().to_string())
+}
+
 /// Read a file from the shared memory directory.
 /// Returns None if the file doesn't exist.
 #[tauri::command]
@@ -165,7 +320,10 @@ pub fn delete_memory_file(relative_path: String) -> Result<bool, String> {
         if p == dir {
             break;
         }
-        if std::fs::read_dir(p).map(|mut d| d.next().is_none()).unwrap_or(false) {
+        if std::fs::read_dir(p)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false)
+        {
             let _ = std::fs::remove_dir(p);
         } else {
             break;
@@ -241,8 +399,8 @@ pub fn get_memory_file_mtime(relative_path: String) -> Result<u64, String> {
     // `delete_memory_file` reject symlinks at write/delete time, and
     // `validate_relative_path` blocks `..`/absolute traversal at input,
     // so a symlink can't be planted via this code path.
-    let metadata = std::fs::metadata(&full_path)
-        .map_err(|e| format!("stat {}: {}", relative_path, e))?;
+    let metadata =
+        std::fs::metadata(&full_path).map_err(|e| format!("stat {}: {}", relative_path, e))?;
     let modified = metadata.modified().map_err(|e| e.to_string())?;
     let ms = modified
         .duration_since(std::time::UNIX_EPOCH)

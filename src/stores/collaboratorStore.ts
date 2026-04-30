@@ -87,19 +87,6 @@ export function agentDisplayName(agent: SpawnedAgent): string {
   return agent.nickname;
 }
 
-/**
- * Build the list of @-mentionable names from the current agent set.
- * Derives directly from stored handles: ["claude1", "codex1", "claude2"].
- */
-export function mentionableNames(agents: SpawnedAgent[]): string[] {
-  return agents.map((a) => a.handle);
-}
-
-/** Return the stored @-mention handle for an agent. */
-export function agentMentionName(agent: SpawnedAgent): string {
-  return agent.handle;
-}
-
 // ---------------------------------------------------------------------------
 // Indicator presentation — pure mapping from (lifecycle × task state) to the
 // visual + a11y attributes the AgentMiniTerminal header renders. Extracted

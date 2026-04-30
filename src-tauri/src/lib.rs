@@ -1,6 +1,10 @@
 mod commands;
+mod dashboard;
 mod state;
 
+use std::sync::atomic::Ordering;
+
+use dashboard::DashboardInfo;
 use state::AppState;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{Emitter, Manager};
@@ -51,6 +55,13 @@ fn build_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, tauri::Error> {
         ],
     )?;
 
+    let open_dashboard = MenuItem::with_id(
+        app,
+        "open_dashboard",
+        "Open Dashboard",
+        true,
+        Some("CmdOrCtrl+Shift+D"),
+    )?;
     let window_menu = Submenu::with_items(
         app,
         "Window",
@@ -58,6 +69,8 @@ fn build_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, tauri::Error> {
         &[
             &PredefinedMenuItem::minimize(app, None)?,
             &PredefinedMenuItem::maximize(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &open_dashboard,
         ],
     )?;
 
@@ -72,6 +85,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
+        .manage(DashboardInfo::new())
         .setup(|app| {
             let menu = build_menu(app)?;
             app.set_menu(menu)?;
@@ -86,6 +100,9 @@ pub fn run() {
             } else if event.id() == "check_for_updates" {
                 // Frontend listens and runs a manual update check
                 let _ = app.emit("menu-check-for-updates", ());
+            } else if event.id() == "open_dashboard" {
+                // Frontend listens and calls invoke('open_dashboard')
+                let _ = app.emit("menu-open-dashboard", ());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -109,6 +126,7 @@ pub fn run() {
             commands::canvas::cleanup_import_file,
             commands::memory::init_memory_dir,
             commands::memory::write_memory_file,
+            commands::memory::write_memory_file_atomic,
             commands::memory::read_memory_file,
             commands::memory::delete_memory_file,
             commands::memory::clear_memory_dir,
@@ -117,9 +135,37 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::set_settings,
             commands::settings::open_external_url,
+            commands::dashboard::open_dashboard,
+            commands::dashboard::get_dashboard_info,
+            commands::dashboard::copy_dashboard_url_with_token,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                // SESSION_ALIVE = false is the FIRST statement of the destroy
+                // arm (v4 §3.4 / v5 §3.6) — it MUST run before any cleanup so
+                // the dashboard server's in-flight handlers see "session
+                // ended" instead of racing partial filesystem deletion.
+                if let Some(info) = window.try_state::<DashboardInfo>() {
+                    info.session_alive.store(false, Ordering::SeqCst);
+                    // Trigger graceful shutdown of the axum server if it is
+                    // running. We use try_lock instead of lock to avoid
+                    // blocking the destroy closure on a contended mutex —
+                    // if a Tauri command (open_dashboard etc.) is currently
+                    // mid-await holding the Mutex, try_lock returns Err and
+                    // the notify_waiters() call is silently skipped. In that
+                    // case the axum server is killed by process exit
+                    // (graceful shutdown becomes ungraceful but still
+                    // happens). Acceptable for MVP because process exit
+                    // follows main-window destroy on macOS; revisit if the
+                    // app ever supports multi-window where window-destroy
+                    // ≠ process-exit.
+                    if let Ok(guard) = info.running.try_lock() {
+                        if let Some(running) = guard.as_ref() {
+                            running.shutdown.notify_waiters();
+                        }
+                    }
+                }
+
                 // Main window destroyed — full cleanup
                 if let Some(state) = window.try_state::<AppState>() {
                     if let Ok(mut sessions) = state.sessions.lock() {
