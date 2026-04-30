@@ -2,12 +2,11 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
   useCollaboratorStore,
-  mentionableNames,
   agentDisplayName,
 } from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
 import { parseInput, executeCommand } from "./commands";
-import { AtMention, extractMentionQuery } from "./AtMention";
+import { AtMention, extractMentionQuery, filterMentionEntries } from "./AtMention";
 import { FileCompletion, escapeShellPath, extractFileQuery } from "./FileCompletion";
 import type { SpawnedAgent } from "../../types/collaborator";
 
@@ -80,15 +79,12 @@ export function InputPrompt() {
   }
   const showSelector = pending !== null && selectorOptions.length > 0;
 
-  // Compute filtered count for bounds checking
-  const filteredCount = (() => {
-    if (!mention) return 0;
-    const names = mentionableNames(agents);
-    const lower = mention.query.toLowerCase();
-    let count = names.filter((n) => n.toLowerCase().startsWith(lower)).length;
-    if ("all".startsWith(lower)) count++;
-    return count;
-  })();
+  // Compute filtered count for bounds checking. Single source of truth shared
+  // with AtMention's render so the keyboard-selected row and the visually-
+  // highlighted row cannot drift even if the predicate evolves.
+  const filteredCount = mention
+    ? filterMentionEntries(mention.query, agents).length
+    : 0;
 
   // Reset mention index when query changes
   useEffect(() => {
@@ -469,15 +465,11 @@ export function InputPrompt() {
         }
         if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
           e.preventDefault();
-          // Get the name at mentionIndex from the filtered list
-          const names = mentionableNames(agents);
-          const lower = (mention?.query ?? "").toLowerCase();
-          const filtered = names.filter((n) =>
-            n.toLowerCase().startsWith(lower),
-          );
-          if ("all".startsWith(lower)) filtered.push("all");
-          const selected = filtered[mentionIndex];
-          if (selected) insertMention(selected);
+          const entries = filterMentionEntries(mention?.query ?? "", agents);
+          const entry = entries[mentionIndex];
+          if (entry) {
+            insertMention(entry.kind === "all" ? "all" : entry.handle);
+          }
           return;
         }
         if (e.key === "Escape") {

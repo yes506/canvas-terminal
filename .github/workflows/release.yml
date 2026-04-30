@@ -153,49 +153,159 @@ jobs:
           chmod 600 "$KEY_PATH"
           echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
-      - name: Build, sign, and notarize Tauri app
+      # Decoupled build & notarization (replaces the previous single-step
+      # `Build, sign, and notarize Tauri app` and its retry-the-whole-build
+      # loop). Two bugs were stacked in the old flow:
+      #   A) Tauri v2 only notarizes the .app, never the DMG container, so
+      #      the published DMG was signed-but-unnotarized → users hit
+      #      "source=Unnotarized Developer ID" at install time.
+      #   B) Tauri's auto-notarization runs *inside* `tauri build`. When
+      #      Apple's long-poll dropped on macos-latest's NSURLSession,
+      #      the build returned nonzero and the outer retry loop spawned
+      #      a fresh `tauri build` (and therefore a fresh Apple submission)
+      #      instead of re-polling the in-flight one. Result: ~6h job
+      #      timeouts on v0.3.5 and v0.3.6.
+      # Fix: build with signing only (Tauri sees no APPLE_API_*, skips
+      # notarization), then submit/staple .app and DMG explicitly with
+      # poll-level retry via scripts/notarize-and-staple.sh.
+
+      - name: Build & sign Tauri app (no auto-notarization)
         env:
           APPLE_SIGNING_IDENTITY_NAME: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
-          # Use the resolved SHA-1 identity from the imported keychain. Keep the
-          # original secret name only for diagnostics.
           APPLE_SIGNING_IDENTITY=$(printf '%s' "${APPLE_SIGNING_IDENTITY_SHA:-}" | sed 's/[[:space:]]*$//')
           export APPLE_SIGNING_IDENTITY
           echo "Using signing identity SHA: ${APPLE_SIGNING_IDENTITY:0:12}..."
           echo "Requested signing identity name: $(printf '%s' "$APPLE_SIGNING_IDENTITY_NAME" | sed 's/[[:space:]]*$//')"
 
-          # Retry the whole build+sign+notarize. Apple's notary service can
-          # take 10+ minutes; the runner's NSURLSession occasionally drops the
-          # status long-poll with NSURLError -1009 ("No network route"), which
-          # Tauri's bundler treats as fatal. Rust artifacts are cached by
-          # swatinem/rust-cache so retries link in seconds rather than minutes.
-          MAX_ATTEMPTS=3
-          attempt=1
-          while : ; do
-            echo "::group::tauri build attempt $attempt/$MAX_ATTEMPTS"
-            # Defensive re-unlock per attempt: keychain may have auto-locked
-            # between attempts if a prior wait dragged on.
-            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain-db"
-            if npx tauri build --target ${{ matrix.target }}; then
-              echo "::endgroup::"
-              echo "tauri build succeeded on attempt $attempt"
-              break
-            fi
-            rc=$?
-            echo "::endgroup::"
-            echo "tauri build failed on attempt $attempt (exit $rc)"
-            if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
-              echo "exhausted $MAX_ATTEMPTS attempts — failing"
-              exit "$rc"
-            fi
-            attempt=$((attempt + 1))
-            sleep 15
-          done
+          # Defense in depth: explicitly unset every credential combo Tauri's
+          # bundler recognizes (see tauri-bundler src/bundle/macos/sign.rs's
+          # notarize_auth fn). This keeps the skip path robust against future
+          # refactors that might add APPLE_API_* to $GITHUB_ENV — without
+          # this, Tauri's auto-notarization could silently re-engage and
+          # bring the 6h CI-hang failure mode back.
+          # NOTE: if you add another `tauri build` step later (e.g. for a
+          # different bundle target), mirror this unset block there too.
+          unset APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH \
+                APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain-db"
+
+          # No APPLE_API_* in env → Tauri signs but skips notarization.
+          # No outer retry loop — the build itself does not call Apple's
+          # network and so does not exhibit the poll-drop hang.
+          npx tauri build --target ${{ matrix.target }}
+
+      - name: Notarize and staple .app
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP=$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' -type d | head -1)
+          if [ -z "$APP" ]; then
+            echo "ERROR: .app bundle not found under $BUNDLE_DIR/macos"
+            exit 1
+          fi
+          echo "Notarizing: $APP"
+
+          # notarytool needs a flat container — submit a zip, staple the .app.
+          ZIP="$RUNNER_TEMP/canvas-terminal-app.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+
+          bash scripts/notarize-and-staple.sh "$ZIP" "$APP"
+
+      - name: Re-bundle DMG with stapled .app
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          APP=$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' -type d | head -1)
+          DMG=$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' -type f | head -1)
+          if [ -z "$APP" ] || [ -z "$DMG" ]; then
+            echo "ERROR: APP or DMG not found (APP=$APP DMG=$DMG)"
+            exit 1
+          fi
+
+          # Tauri's DMG already has its custom layout (window size, icon
+          # positions, /Applications symlink). We swap the inner .app for
+          # the now-stapled one in-place, preserving the layout, instead of
+          # rebuilding the DMG from scratch.
+          DMG_RW="$RUNNER_TEMP/work.dmg"
+          MNT="$RUNNER_TEMP/dmg-mount"
+          mkdir -p "$MNT"
+
+          # Belt-and-suspenders: ensure the volume gets detached even if a
+          # later command in this step fails. GitHub-hosted runners are
+          # single-use so a leaked mount wouldn't poison subsequent runs,
+          # but a clean detach makes failure logs easier to read and is
+          # required for self-hosted runners.
+          trap 'hdiutil detach "$MNT" -force >/dev/null 2>&1 || true' EXIT
+
+          hdiutil convert "$DMG" -format UDRW -ov -o "$DMG_RW"
+          hdiutil attach "$DMG_RW" -readwrite -nobrowse -mountpoint "$MNT"
+
+          INNER_APP=$(find "$MNT" -maxdepth 2 -name '*.app' -type d | head -1)
+          if [ -z "$INNER_APP" ]; then
+            echo "ERROR: no .app found inside DMG after mount"
+            exit 1
+          fi
+          INNER_PARENT=$(dirname "$INNER_APP")
+          rm -rf "$INNER_APP"
+          # `ditto` is the macOS-canonical bundle copy: explicitly preserves
+          # ACLs, resource forks, and extended attributes (the staple ticket
+          # is stored as both a ticket file and xattrs). `cp -R` works in
+          # practice on modern macOS but `ditto` is what Apple's own tools
+          # use for app-bundle copies.
+          ditto "$APP" "$INNER_PARENT/$(basename "$APP")"
+          # Some macOS versions cache attribute state; sync before detach.
+          sync || true
+          hdiutil detach "$MNT"
+          trap - EXIT
+
+          # Recompress to UDZO (the format Tauri originally produced) and
+          # replace the original artifact.
+          DMG_FINAL="$RUNNER_TEMP/final.dmg"
+          hdiutil convert "$DMG_RW" -format UDZO -imagekey zlib-level=9 -ov -o "$DMG_FINAL"
+          mv -f "$DMG_FINAL" "$DMG"
+          rm -f "$DMG_RW"
+          echo "Re-bundled DMG: $DMG"
+
+      - name: Sign re-bundled DMG
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          DMG=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -type f | head -1)
+          [ -z "$DMG" ] && { echo "ERROR: DMG not found"; exit 1; }
+
+          APPLE_SIGNING_IDENTITY=$(printf '%s' "${APPLE_SIGNING_IDENTITY_SHA:-}" | sed 's/[[:space:]]*$//')
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/build.keychain-db"
+
+          # --force to overwrite Tauri's original DMG signature (the bytes
+          # changed when we swapped the .app, so the old signature is invalid).
+          # --keychain explicit: defense against future refactors of the
+          # default-keychain plumbing in the import step. Hardened runtime is
+          # not applicable to a DMG container (it gates executable code, not
+          # disk images) so we don't pass --options runtime here.
+          codesign --sign "$APPLE_SIGNING_IDENTITY" \
+            --keychain "$RUNNER_TEMP/build.keychain-db" \
+            --timestamp \
+            --force \
+            "$DMG"
+          codesign --verify --verbose=2 "$DMG"
+
+      - name: Notarize and staple DMG
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          set -euo pipefail
+          DMG=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -type f | head -1)
+          [ -z "$DMG" ] && { echo "ERROR: DMG not found"; exit 1; }
+          bash scripts/notarize-and-staple.sh "$DMG"
 
       - name: Capture notarization debug info on failure
         if: failure()
@@ -260,20 +370,40 @@ jobs:
             exit 1
           fi
 
-          echo "::group::codesign --verify"
+          echo "::group::codesign --verify (.app)"
           codesign --verify --deep --strict --verbose=2 "$APP"
           echo "::endgroup::"
 
-          echo "::group::codesign authority chain"
-          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|flags|Signature"
+          echo "::group::codesign authority chain (.app)"
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|flags|Signature|Timestamp|Runtime"
           echo "::endgroup::"
 
-          echo "::group::Gatekeeper assessment"
-          spctl -a -vvv -t install "$DMG"
+          echo "::group::stapler validate (.app)"
+          xcrun stapler validate "$APP"
           echo "::endgroup::"
 
-          echo "::group::Notarization staple validation"
+          echo "::group::stapler validate (.dmg)"
           xcrun stapler validate "$DMG"
+          echo "::endgroup::"
+
+          # The unambiguous green-light token is `source=Notarized Developer ID`
+          # in spctl output. Plain `source=Developer ID` (no "Notarized") means
+          # signed but not notarized → end users get blocked at install/launch.
+          # `|| true` keeps the captured output flowing through to echo + grep
+          # even when spctl exits nonzero (rejected case) — without it,
+          # `set -e` aborts at the assignment and the diagnostic gets eaten.
+          echo "::group::Gatekeeper assessment (.app — execute)"
+          APP_ASSESS=$(spctl --assess --type execute --verbose=4 "$APP" 2>&1 || true)
+          echo "$APP_ASSESS"
+          echo "$APP_ASSESS" | grep -q "source=Notarized Developer ID" \
+            || { echo "ERROR: .app is not notarized — got: $APP_ASSESS"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::Gatekeeper assessment (.dmg — install)"
+          DMG_ASSESS=$(spctl --assess --type install --verbose=4 "$DMG" 2>&1 || true)
+          echo "$DMG_ASSESS"
+          echo "$DMG_ASSESS" | grep -q "source=Notarized Developer ID" \
+            || { echo "ERROR: .dmg is not notarized — got: $DMG_ASSESS"; exit 1; }
           echo "::endgroup::"
 
       - name: Rename DMG with architecture label
