@@ -30,7 +30,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "PLACEHOLDER_RUN_TAURI_SIGNER_GENERATE_AND_REPLACE_BEFORE_FIRST_RELEASE",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg2MjA5QUFCQUVGQjJBRTgKUldUb0t2dXVxNW9naHVHbjZ6NmIvWDJIeWFjNjEwMFI2YzAxRjdSZTlLWEZ5a0hBS3BOY055Uk8K",
       "endpoints": [
         "https://github.com/yes506/canvas-terminal/releases/latest/download/latest.json"
       ]
