@@ -2847,8 +2847,12 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
     expect(gitDiffCalled).toBe(false);
   });
 
-  it("falls through to terminalization when kill_pty fails", async () => {
-    // PTY may already have exited; scan must not strand the task.
+  it("kill_pty failure does NOT bypass the gate (round-7 codex1+codex2 H1)", async () => {
+    // A dead PTY is already frozen. kill_pty failure must not block the
+    // diff snapshot — we still try git_diff_summary and route based on
+    // its result. If diff shows source delta, flip to awaiting-approval
+    // even though kill_pty failed. PTY-already-exited is the most common
+    // legitimate cause; we shouldn't strand the task OR bypass the gate.
     setupAgentWithWorktree();
     const store = useCollaboratorStore.getState();
     const task = store.addTask(
@@ -2871,6 +2875,16 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
         return null;
       }
       if (cmd === "kill_pty") throw new Error("PTY already exited");
+      if (cmd === "git_diff_summary") {
+        // PTY was already gone, but diff still works — and shows changes.
+        return {
+          hasChanges: true,
+          committed: ["src/foo.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       return null;
     });
 
@@ -2879,13 +2893,124 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
     const updated = useCollaboratorStore
       .getState()
       .tasksBySession[lb1Session]?.find((t) => t.id === task.id);
-    // Task is still terminalized (not stuck in-progress).
-    expect(updated?.status).toBe("completed");
+    // The gate engaged successfully despite kill_pty failing.
+    expect(updated?.status).toBe("awaiting-approval");
+    expect(updated?.pendingMerge).not.toBeNull();
+    expect(updated?.pendingMerge?.diffSummary.committed).toEqual(["src/foo.ts"]);
+    // Warn was logged for the kill_pty failure but didn't bypass the gate.
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("LB1 gate failed"),
+      expect.stringContaining("kill_pty failed"),
       expect.any(Error),
     );
     warnSpy.mockRestore();
+  });
+
+  it("git_diff_summary failure FAILS CLOSED → blocked (round-7 codex1+codex2 H1)", async () => {
+    // If the diff snapshot fails, we cannot determine whether source
+    // changed. Terminalizing as `completed` would silently bypass the
+    // approval gate — exactly the bypass codex1+codex2 flagged. Must
+    // fail closed: status → blocked, worktree preserved, error in
+    // conclusion so the user can act on it.
+    setupAgentWithWorktree();
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      lb1Session,
+    );
+    const doneJson = JSON.stringify({
+      task_id: task.id,
+      status: "completed",
+      author: "@claude1",
+    });
+    let deleted = false;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "list_memory_files")
+        return deleted ? [] : [`${task.id}.done.json`];
+      if (cmd === "read_memory_file") return deleted ? null : doneJson;
+      if (cmd === "delete_memory_file") {
+        deleted = true;
+        return null;
+      }
+      if (cmd === "kill_pty") return null; // succeeds
+      if (cmd === "git_diff_summary")
+        throw new Error("worktree path not found");
+      return null;
+    });
+
+    await scanForTaskCompletions(lb1Session);
+
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[lb1Session]?.find((t) => t.id === task.id);
+    // FAIL CLOSED: blocked, NOT completed.
+    expect(updated?.status).toBe("blocked");
+    // Diagnostic info preserved so the user can investigate.
+    expect(updated?.conclusion).toContain("git_diff_summary failed");
+    expect(updated?.conclusion).toContain("worktree path not found");
+    // pendingMerge cleared (terminal transition central cleanup ran).
+    expect(updated?.pendingMerge).toBeNull();
+    // Warning logged for diagnostic visibility.
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("LB1 fail-closed"),
+      expect.any(Error),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("gates by task.assignee, not data.author (round-7 codex2 H2 spoofing)", async () => {
+    // .done.json's `author` field is unauthenticated and a malicious
+    // agent could spoof it (e.g., to a handle without a worktree) to
+    // bypass the gate. The gate must route via task.assignee — the
+    // orchestrator-controlled field — and find the assignee's worktree
+    // regardless of what `author` claims.
+    setupAgentWithWorktree(); // assignee @claude1 has the worktree
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      lb1Session,
+    );
+    // Spoof: agent claims to be @some-other-agent (no worktree).
+    const doneJson = JSON.stringify({
+      task_id: task.id,
+      status: "completed",
+      author: "@some-other-agent",
+    });
+    let deleted = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "list_memory_files")
+        return deleted ? [] : [`${task.id}.done.json`];
+      if (cmd === "read_memory_file") return deleted ? null : doneJson;
+      if (cmd === "delete_memory_file") {
+        deleted = true;
+        return null;
+      }
+      if (cmd === "kill_pty") return null;
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["src/foo.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(lb1Session);
+
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[lb1Session]?.find((t) => t.id === task.id);
+    // Spoof did NOT bypass the gate — assignee has a worktree, so the
+    // gate engages and flips to awaiting-approval.
+    expect(updated?.status).toBe("awaiting-approval");
+    expect(updated?.pendingMerge).not.toBeNull();
+    // pendingMerge.agentHandle reflects the assignee, NOT the spoofed
+    // author. completedBy stays as audit metadata of who self-claimed.
+    expect(updated?.pendingMerge?.agentHandle).toBe("@claude1");
+    expect(updated?.completedBy).toBe("@some-other-agent");
   });
 });
 

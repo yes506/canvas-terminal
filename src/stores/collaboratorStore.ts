@@ -1028,47 +1028,89 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
         // ---------------------------------------------------------------
         // LB1: P2 awaiting-approval gate.
         //
-        // If the task's assignee/author has a worktree-backed agent record
-        // AND the worktree shows a source delta against baseSha (D2
-        // broadened scope), flip to `awaiting-approval` instead of
-        // terminalizing directly. The sequence (claude3 task-46 R2):
+        // Routing rules (round-7 fixes from codex1 task-69 H1, codex2
+        // task-71 H1+H2, claude3 task-72):
         //
-        //   1. Detect .done.json (above)
-        //   2. Find the worktree-backed agent
-        //   3. Kill the PTY SYNCHRONOUSLY — freezes worktree state BEFORE
-        //      the snapshot so the agent can't race new commits in
-        //   4. Snapshot diff summary from the frozen worktree
-        //   5. updateTask({ status: "awaiting-approval", pendingMerge })
+        // 1. Gate by `task.assignee` FIRST, not `data.author`. The
+        //    .done.json `author` field is unauthenticated and a malicious
+        //    or buggy agent could spoof it (e.g., "@some-other-agent")
+        //    to bypass the gate. `task.assignee` is set by the orchestrator
+        //    (slash command / UI) and the worktree was provisioned for
+        //    THAT agent. completedBy stays as audit metadata only.
         //
-        // If steps 2-4 don't apply (no agent, no worktree, or no delta),
-        // fall through to the existing terminalization below. Worktree
-        // metadata is captured BEFORE killing the PTY because removeAgent
-        // (which fires on PTY exit) will discard the SpawnedAgent record;
-        // we'd otherwise lose access to repoRoot/baseRef/etc.
+        // 2. Fail CLOSED on diff failure. If we know there's a worktree-
+        //    backed assignee but `git_diff_summary` fails, the system
+        //    cannot prove whether source changed — terminalizing as
+        //    `completed` would silently bypass the approval gate. Instead
+        //    transition to `blocked` with diagnostic info; the worktree
+        //    is preserved for manual inspection.
+        //
+        // 3. kill_pty failure is NOT terminal: a dead PTY is already
+        //    frozen, so we still attempt the diff snapshot. Only diff
+        //    failure (which means we cannot determine source delta)
+        //    triggers fail-closed.
+        //
+        // 4. The kill-BEFORE-snapshot ordering invariant (claude3
+        //    task-46 R2) holds: try kill_pty first; whether it succeeds
+        //    or fails, the diff happens after.
+        //
+        // KNOWN LIMITATION (claude3 task-72 O1) — defer to follow-up:
+        //   If the user closes the agent's pane within the 2s polling
+        //   window after .done.json is written but before the gate
+        //   engages, AgentMiniTerminal cleanup-on-unmount removes the
+        //   SpawnedAgent record. Subsequent scan tick can't find the
+        //   agent's worktree → falls through. Mitigation requires
+        //   integrating LB1 inline into AgentMiniTerminal cleanup OR
+        //   persisting worktree metadata to a sidecar file.
         // ---------------------------------------------------------------
-        const authorHandle = (completedBy ?? task.assignee ?? "").replace(/^@/, "");
-        const agent = authorHandle
+        const assigneeHandle = (task.assignee ?? "").replace(/^@/, "");
+        const agent = assigneeHandle
           ? store.agents.find(
               (a) =>
-                a.collabSessionId === forSession && a.handle === authorHandle,
+                a.collabSessionId === forSession &&
+                a.handle === assigneeHandle,
             )
           : undefined;
 
-        let routedToApproval = false;
+        let gateOutcome:
+          | { kind: "no-gate" }
+          | { kind: "approved"; pendingMerge: PendingMerge }
+          | { kind: "no-delta" }
+          | { kind: "fail-closed"; reason: string } = { kind: "no-gate" };
+
         if (
           requestedStatus === "completed" &&
           agent?.worktree &&
           agent.sessionId
         ) {
-          // Snapshot worktree metadata FIRST — kill_pty triggers
-          // removeAgent which discards the SpawnedAgent record.
+          // Snapshot worktree metadata FIRST — even though removeAgent
+          // doesn't fire on PTY exit (only on UI tile dismissal per
+          // AgentMiniTerminal's cleanup), capture defensively in case
+          // the SpawnedAgent record changes between PTY exit and snapshot
+          // (claude2 task-70 Concern 3 doc correction).
           const wt = agent.worktree;
           const ptySid = agent.sessionId;
+
+          // Try kill_pty. Failure is non-fatal: a dead PTY is already
+          // frozen, so we proceed to the diff anyway. Successful kill
+          // freezes the worktree explicitly.
+          let killError: unknown = null;
           try {
-            // Step 3: kill PTY synchronously (kill BEFORE snapshot —
-            // claude3 task-46 R2 ordering invariant).
             await invoke("kill_pty", { sessionId: ptySid });
-            // Step 4: snapshot from the frozen worktree.
+          } catch (err) {
+            killError = err;
+            // eslint-disable-next-line no-console
+            console.warn(
+              "[collab/scan] kill_pty failed; PTY may already be exited. Continuing with diff snapshot.",
+              err,
+            );
+          }
+
+          // Step: snapshot from the (now-frozen) worktree. Failure HERE
+          // is fail-CLOSED — without the diff we can't determine source
+          // delta and terminalizing as `completed` would silently
+          // bypass the gate.
+          try {
             const diff = await invoke<{
               hasChanges: boolean;
               committed: string[];
@@ -1079,54 +1121,80 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
               worktreePath: wt.path,
               baseSha: wt.baseSha,
             });
+
             if (diff.hasChanges) {
-              // Step 5: flip to awaiting-approval with the frozen snapshot.
-              const pendingMerge: PendingMerge = {
-                branch: wt.branch,
-                worktreePath: wt.path,
-                repoRoot: wt.repoRoot,
-                baseRef: wt.baseRef,
-                baseSha: wt.baseSha,
-                baseFresh: wt.baseFresh,
-                diffSummary: {
-                  committed: diff.committed,
-                  staged: diff.staged,
-                  unstaged: diff.unstaged,
-                  untracked: diff.untracked,
+              gateOutcome = {
+                kind: "approved",
+                pendingMerge: {
+                  branch: wt.branch,
+                  worktreePath: wt.path,
+                  repoRoot: wt.repoRoot,
+                  baseRef: wt.baseRef,
+                  baseSha: wt.baseSha,
+                  baseFresh: wt.baseFresh,
+                  diffSummary: {
+                    committed: diff.committed,
+                    staged: diff.staged,
+                    unstaged: diff.unstaged,
+                    untracked: diff.untracked,
+                  },
+                  agentHandle: `@${assigneeHandle}`,
                 },
-                agentHandle: `@${authorHandle}`,
               };
-              store.updateTask(
-                task.id,
-                {
-                  status: "awaiting-approval",
-                  reasoning: data.reasoning ?? null,
-                  conclusion: data.conclusion ?? null,
-                  output: data.output ?? null,
-                  completedBy,
-                  pendingMerge,
-                },
-                forSession,
-              );
-              routedToApproval = true;
+            } else {
+              // Worktree-backed agent but no source delta (e.g., read-
+              // only investigation). Safe to auto-complete.
+              gateOutcome = { kind: "no-delta" };
             }
-            // diff.hasChanges === false: agent worked in a worktree but
-            // produced no source delta (e.g., read-only investigation).
-            // Fall through to terminalize as `completed`.
-          } catch (err) {
-            // kill_pty or git_diff_summary failed. The PTY may already
-            // have exited; the worktree may already be gone. Don't strand
-            // the task — fall through to the existing terminalization
-            // path so the user isn't left with a stuck `in-progress`.
+          } catch (diffErr) {
+            // FAIL-CLOSED: cannot prove there's no source delta. Don't
+            // terminalize as completed — that would bypass the gate.
+            const reason = `git_diff_summary failed: ${String(diffErr)}${
+              killError ? ` (after kill_pty also failed: ${String(killError)})` : ""
+            }`;
             // eslint-disable-next-line no-console
             console.warn(
-              "[collab/scan] LB1 gate failed; falling through to direct terminalization:",
-              err,
+              "[collab/scan] LB1 fail-closed: cannot determine source delta for worktree-backed task; routing to blocked.",
+              diffErr,
             );
+            gateOutcome = { kind: "fail-closed", reason };
           }
         }
 
-        if (!routedToApproval) {
+        if (gateOutcome.kind === "approved") {
+          store.updateTask(
+            task.id,
+            {
+              status: "awaiting-approval",
+              reasoning: data.reasoning ?? null,
+              conclusion: data.conclusion ?? null,
+              output: data.output ?? null,
+              completedBy,
+              pendingMerge: gateOutcome.pendingMerge,
+            },
+            forSession,
+          );
+        } else if (gateOutcome.kind === "fail-closed") {
+          // Worktree-backed task whose diff snapshot failed. Preserve
+          // the worktree (no removal) so the user can inspect manually.
+          // Mark as blocked with the underlying error in conclusion so
+          // the failure is user-visible (not silently dropped).
+          store.updateTask(
+            task.id,
+            {
+              status: "blocked",
+              reasoning:
+                "LB1 gate could not determine source delta; preserving worktree for manual inspection.",
+              conclusion: gateOutcome.reason,
+              output: data.output ?? null,
+              completedBy,
+            },
+            forSession,
+          );
+        } else {
+          // no-gate (no agent / no worktree / non-completed status)
+          // OR no-delta (worktree-backed but read-only). Direct
+          // terminalization is correct in both cases.
           store.updateTask(
             task.id,
             {
