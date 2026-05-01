@@ -872,7 +872,18 @@ interface CollaboratorState {
   }, forSession: string) => CollabTask;
   updateTask: (
     taskId: string,
-    updates: Partial<Pick<CollabTask, "status" | "assignee" | "reasoning" | "conclusion" | "output" | "completedBy">>,
+    updates: Partial<
+      Pick<
+        CollabTask,
+        | "status"
+        | "assignee"
+        | "reasoning"
+        | "conclusion"
+        | "output"
+        | "completedBy"
+        | "pendingMerge"
+      >
+    >,
     forSession: string,
   ) => void;
   getTasks: (forSession: string) => CollabTask[];
@@ -1845,6 +1856,10 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // updateTask({ assignee }) refreshes this so the in-frame freshness
       // gate sees the re-assignment as fresh work.
       assignedAt: now,
+      // P2 awaiting-approval snapshot — populated when scanForTaskCompletions
+      // flips a worktree-touching task to `awaiting-approval` (LB1, next
+      // commit). Default null at creation.
+      pendingMerge: null,
     };
     set((s) => ({
       tasksBySession: {

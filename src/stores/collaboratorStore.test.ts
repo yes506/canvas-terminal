@@ -1396,6 +1396,7 @@ describe("task-47 — formatTaskSummaryForAgent slimming", () => {
     createdAt: "2026-04-26T00:00:00.000Z",
     updatedAt: "2026-04-26T00:00:00.000Z",
     assignedAt: "2026-04-26T00:00:00.000Z",
+    pendingMerge: null,
     ...overrides,
   });
 
