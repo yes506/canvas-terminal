@@ -135,6 +135,8 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::set_settings,
             commands::settings::open_external_url,
+            commands::settings::read_app_config_file,
+            commands::settings::write_app_config_file,
             commands::dashboard::open_dashboard,
             commands::dashboard::get_dashboard_info,
             commands::dashboard::copy_dashboard_url_with_token,

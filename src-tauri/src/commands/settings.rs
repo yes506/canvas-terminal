@@ -86,3 +86,106 @@ pub fn set_settings(app: tauri::AppHandle, settings: Settings) -> Result<(), Str
         .map_err(|e| format!("Cannot write settings: {}", e))?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Cross-restart persistence (claude2 task-103 critical fix)
+// ---------------------------------------------------------------------------
+//
+// The existing `commands::memory` module writes to a per-PID session dir
+// (`~/.cache/canvas-terminal/collab-memory/session-<PID>/`) and runs
+// `clear_stale_sessions()` at app startup which deletes all dirs whose
+// owning PID is no longer alive. That makes it unsuitable for state
+// that needs to survive restarts (LB3 ack persistence, future global
+// policy state).
+//
+// These commands target `app_config_dir()` instead, matching the
+// existing `settings.json` pattern. On macOS this resolves to
+// `~/Library/Application Support/canvas-terminal/`, on Linux to
+// `~/.config/canvas-terminal/`, and on Windows to
+// `%APPDATA%\canvas-terminal\`. None of those are touched by the
+// session-cleanup pass.
+
+/// Validate a relative path used by app-config persistence. Same shape
+/// as the memory module's validator: must be relative, no traversal,
+/// no leading slash, no `..`, no NUL.
+fn validate_app_config_relative_path(p: &str) -> Result<(), String> {
+    if p.is_empty() {
+        return Err("relative path is empty".to_string());
+    }
+    if p.starts_with('/') {
+        return Err("relative path must not start with '/'".to_string());
+    }
+    if p.contains("..") {
+        return Err("relative path must not contain '..'".to_string());
+    }
+    if p.contains('\0') {
+        return Err("relative path must not contain NUL".to_string());
+    }
+    Ok(())
+}
+
+fn app_config_file_path(app: &tauri::AppHandle, relative_path: &str) -> Result<PathBuf, String> {
+    validate_app_config_relative_path(relative_path)?;
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("Cannot resolve app_config_dir: {}", e))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Cannot create config dir: {}", e))?;
+    Ok(dir.join(relative_path))
+}
+
+/// Read a file from the app config dir. Returns `None` when the file
+/// doesn't exist (matches `read_memory_file`'s shape so callers can
+/// share the same null-handling). Reads up to 4 MiB; errors out for
+/// pathologically large files (defense in depth — the only intended
+/// caller is the LB3 acks file, which should be a few KB at most).
+#[tauri::command]
+pub fn read_app_config_file(
+    app: tauri::AppHandle,
+    relative_path: String,
+) -> Result<Option<String>, String> {
+    let path = app_config_file_path(&app, &relative_path)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    if metadata.len() > 4 * 1024 * 1024 {
+        return Err(format!(
+            "App config file too large: {} bytes",
+            metadata.len()
+        ));
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Write content to a file in the app config dir. Atomic-ish: writes
+/// to a `<name>.tmp` sibling then renames over the target so a crash
+/// mid-write doesn't truncate the existing file. O_NOFOLLOW protects
+/// against symlink redirection at the final target.
+#[tauri::command]
+pub fn write_app_config_file(
+    app: tauri::AppHandle,
+    relative_path: String,
+    content: String,
+) -> Result<(), String> {
+    let path = app_config_file_path(&app, &relative_path)?;
+    let tmp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|s| s.to_str()).unwrap_or("dat")
+    ));
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)
+            .map_err(|e| format!("Cannot open temp file: {}", e))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| format!("Cannot write temp file: {}", e))?;
+    }
+    fs::rename(&tmp_path, &path).map_err(|e| format!("Cannot rename temp file: {}", e))?;
+    Ok(())
+}

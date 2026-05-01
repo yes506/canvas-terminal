@@ -756,10 +756,19 @@ function bumpAssignedAt(
 /**
  * Round-15 polish: file-backed persistence for LB3 ack state. Restarts
  * shouldn't re-prompt the user for a repo they already explicitly acked.
- * Storage shape: a single JSON file `branch-protection-acks.json` in the
- * shared memory dir, mapping `repoRoot → {acceptedAt, note?}`. Best-
- * effort: read failures default to empty map (the user re-acks once,
- * which is acceptable degradation), write failures only log.
+ *
+ * Storage shape: a single JSON file `branch-protection-acks.json`
+ * mapping `repoRoot → {acceptedAt, note?}`.
+ *
+ * Round-16 (claude2 task-103 critical): the storage location is
+ * `app_config_dir()` via the new `read_app_config_file` / `write_app_
+ * config_file` Tauri commands — NOT the per-PID memory dir, which
+ * gets cleared on every app start by `clear_stale_sessions()`. The
+ * memory dir is per-PID-scoped and ephemeral; LB3 acks must be
+ * cross-restart durable.
+ *
+ * Best-effort: read failures default to empty map (the user re-acks
+ * once, acceptable degradation); write failures only log.
  */
 const BRANCH_PROTECTION_ACKS_PATH = "branch-protection-acks.json";
 
@@ -767,7 +776,9 @@ async function readBranchProtectionAcks(): Promise<
   Record<string, { acceptedAt: string; note?: string }>
 > {
   try {
-    const content = await invoke<string | null>("read_memory_file", {
+    // Round-16 claude2 task-103: target app_config_dir, NOT the per-
+    // PID memory dir which gets cleared on every restart.
+    const content = await invoke<string | null>("read_app_config_file", {
       relativePath: BRANCH_PROTECTION_ACKS_PATH,
     });
     if (!content) return {};
@@ -780,31 +791,63 @@ async function readBranchProtectionAcks(): Promise<
   }
 }
 
-async function writeBranchProtectionAcks(
-  acks: Record<string, { acceptedAt: string; note?: string }>,
-): Promise<void> {
-  try {
-    await invoke("write_memory_file", {
-      relativePath: BRANCH_PROTECTION_ACKS_PATH,
-      content: JSON.stringify(acks, null, 2),
+/**
+ * Round-16 codex2 task-104 M1: serialize concurrent writes via a
+ * promise chain so out-of-order completion can't resurrect a cleared
+ * ack. Each call appends to the chain; the latest in-memory snapshot
+ * is captured at write-time, so the final on-disk state always
+ * reflects the most recent mutation.
+ *
+ * Without this, two fire-and-forget writes (e.g., accept then quick
+ * clear) could complete in reverse order, leaving stale data on disk.
+ */
+let branchProtectionAcksWriteChain: Promise<void> = Promise.resolve();
+
+function persistBranchProtectionAcks(): void {
+  branchProtectionAcksWriteChain = branchProtectionAcksWriteChain
+    .catch(() => {})
+    .then(async () => {
+      // Snapshot the CURRENT in-memory state at write time, not at
+      // call time. This way the persisted state is always the latest
+      // mutation, regardless of how many writes are queued.
+      const snapshot = useCollaboratorStore.getState().branchProtectionAcks;
+      try {
+        await invoke("write_app_config_file", {
+          relativePath: BRANCH_PROTECTION_ACKS_PATH,
+          content: JSON.stringify(snapshot, null, 2),
+        });
+      } catch (err) {
+        // Best-effort; don't block UI.
+        console.warn(
+          "[collab/store] failed to persist branch-protection-acks:",
+          err,
+        );
+      }
     });
-  } catch (err) {
-    // Best-effort; don't block UI on persistence failure.
-    console.warn("[collab/store] failed to persist branch-protection-acks:", err);
-  }
 }
 
 /**
- * Hydrate `branchProtectionAcks` from disk on store startup. Idempotent:
- * if already populated (e.g., the in-memory state was written before
- * hydration completed), the on-disk state takes precedence — that's
- * the source of truth across restarts. Test code that wants in-memory-
- * only behavior can skip this by calling `setState({ branchProtectionAcks: {} })`
- * after construction.
+ * Hydrate `branchProtectionAcks` from disk on store startup.
+ *
+ * Round-16 (codex2 task-104 M2 + claude3 task-105 O1): MERGE rather
+ * than overwrite the in-memory state. If the user accepts a limited
+ * guarantee BEFORE hydration resolves (rare but possible during the
+ * App.tsx mount window), the in-memory ack must NOT be lost. Disk
+ * is the prior-restart source of truth; in-memory accumulates new
+ * acks since boot. Final state = union; conflict resolution prefers
+ * the in-memory entry (the user's most recent action wins).
  */
 export async function hydrateBranchProtectionAcks(): Promise<void> {
-  const acks = await readBranchProtectionAcks();
-  useCollaboratorStore.setState({ branchProtectionAcks: acks });
+  const onDisk = await readBranchProtectionAcks();
+  useCollaboratorStore.setState((s) => ({
+    branchProtectionAcks: {
+      ...onDisk,
+      // In-memory entries (made between mount and hydration resolution)
+      // override disk entries. The user explicitly chose them this
+      // session and they haven't been clobbered yet.
+      ...s.branchProtectionAcks,
+    },
+  }));
 }
 
 function ensureSessionMemoryFiles(collabSessionId: string): void {
@@ -1786,7 +1829,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     // Round-15: persist to disk on actual mutation. Fire-and-forget;
     // best-effort write — failure surfaces as a console.warn only.
     if (didMutate) {
-      void writeBranchProtectionAcks(get().branchProtectionAcks);
+      persistBranchProtectionAcks();
     }
   },
 
@@ -1799,7 +1842,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       return { branchProtectionAcks: rest };
     });
     if (didMutate) {
-      void writeBranchProtectionAcks(get().branchProtectionAcks);
+      persistBranchProtectionAcks();
     }
   },
 

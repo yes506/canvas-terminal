@@ -4691,43 +4691,53 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(state).toBe("verified-unprotected");
   });
 
-  it("acceptBranchProtectionLimited: persists the ack map to disk via write_memory_file (round-15)", async () => {
+  it("acceptBranchProtectionLimited: persists via write_app_config_file (round-16 claude2 task-103 critical fix)", async () => {
+    // Round-16 (claude2 task-103 critical): persistence MUST target
+    // app_config_dir, not the per-PID memory dir. The memory dir is
+    // wiped on every app start by clear_stale_sessions(), so writes
+    // there don't survive restarts.
     setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
-    const writeCalls: Array<{ relativePath: string; content: string }> = [];
+    const writeCalls: Array<{ cmd: string; relativePath: string; content: string }> = [];
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === "write_memory_file") {
-        writeCalls.push(args as { relativePath: string; content: string });
+      if (cmd === "write_app_config_file" || cmd === "write_memory_file") {
+        const a = args as { relativePath: string; content: string };
+        writeCalls.push({ cmd, relativePath: a.relativePath, content: a.content });
       }
       return null;
     });
     useCollaboratorStore.getState().acceptBranchProtectionLimited("/r", "test note");
-    // Allow microtask queue to drain (the persistence is fire-and-forget).
-    await new Promise((r) => setTimeout(r, 5));
+    // Allow promise chain to drain.
+    await new Promise((r) => setTimeout(r, 10));
     const persistCall = writeCalls.find(
       (c) => c.relativePath === "branch-protection-acks.json",
     );
     expect(persistCall).toBeDefined();
+    // CRITICAL: must be the app_config variant (cross-restart durable),
+    // NOT the memory variant (wiped by clear_stale_sessions on start).
+    expect(persistCall!.cmd).toBe("write_app_config_file");
     const persisted = JSON.parse(persistCall!.content);
     expect(persisted["/r"]).toBeDefined();
     expect(persisted["/r"].note).toBe("test note");
   });
 
-  it("clearBranchProtectionAck: removes ack and persists empty map", async () => {
+  it("clearBranchProtectionAck: removes ack and persists empty map via write_app_config_file", async () => {
     setupAwaitingApprovalTask({ hasResidue: false, ackProtection: true }); // pre-acked at /r
-    const writeCalls: Array<{ relativePath: string; content: string }> = [];
+    const writeCalls: Array<{ cmd: string; relativePath: string; content: string }> = [];
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === "write_memory_file") {
-        writeCalls.push(args as { relativePath: string; content: string });
+      if (cmd === "write_app_config_file" || cmd === "write_memory_file") {
+        const a = args as { relativePath: string; content: string };
+        writeCalls.push({ cmd, relativePath: a.relativePath, content: a.content });
       }
       return null;
     });
     useCollaboratorStore.getState().clearBranchProtectionAck("/r");
-    await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 10));
     expect(useCollaboratorStore.getState().branchProtectionAcks["/r"]).toBeUndefined();
     const persistCall = writeCalls.find(
       (c) => c.relativePath === "branch-protection-acks.json",
     );
     expect(persistCall).toBeDefined();
+    expect(persistCall!.cmd).toBe("write_app_config_file");
     const persisted = JSON.parse(persistCall!.content);
     expect(persisted["/r"]).toBeUndefined();
   });
@@ -4739,7 +4749,7 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       // Filter to ack-persistence writes only — task-list and conversation
       // log writes are unrelated.
       if (
-        cmd === "write_memory_file" &&
+        cmd === "write_app_config_file" &&
         (args as { relativePath?: string } | undefined)?.relativePath ===
           "branch-protection-acks.json"
       ) {
@@ -4748,9 +4758,48 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       return null;
     });
     useCollaboratorStore.getState().clearBranchProtectionAck("/r");
-    await new Promise((r) => setTimeout(r, 5));
+    await new Promise((r) => setTimeout(r, 10));
     // No-op: no ack-file persist write should have fired.
     expect(ackPersistCalls).toHaveLength(0);
+  });
+
+  it("persistBranchProtectionAcks: serialized writes — final on-disk state matches latest in-memory mutation (round-16 codex2 M1)", async () => {
+    // Round-16 codex2 task-104 M1 (load-bearing): without write
+    // serialization, a fast accept-then-clear sequence could leave
+    // disk holding the accept payload (write A finishes after write
+    // B) — resurrecting the cleared ack on next restart, defeating
+    // the point of clear-ack.
+    //
+    // The fix: a promise chain serializes writes AND each write
+    // snapshots the in-memory state at execution time (not call time).
+    // Result: the LAST write to land always reflects the latest
+    // mutation, regardless of how many calls are queued.
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    const writeOrder: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (
+        cmd === "write_app_config_file" &&
+        (args as { relativePath?: string } | undefined)?.relativePath ===
+          "branch-protection-acks.json"
+      ) {
+        writeOrder.push((args as { content: string }).content);
+      }
+      return null;
+    });
+    // accept then clear in quick succession.
+    useCollaboratorStore.getState().acceptBranchProtectionLimited("/r", "first");
+    useCollaboratorStore.getState().clearBranchProtectionAck("/r");
+    await new Promise((r) => setTimeout(r, 20));
+    // Both writes must have fired (no swallowed writes).
+    expect(writeOrder.length).toBeGreaterThanOrEqual(1);
+    // CRITICAL invariant: the FINAL disk state must reflect the latest
+    // mutation (cleared). Even if write A landed after write B due to
+    // out-of-order completion, the chain serializes them so the final
+    // write always reflects the latest snapshot.
+    const finalDiskState = JSON.parse(writeOrder[writeOrder.length - 1]);
+    expect(finalDiskState).toEqual({});
+    // And the in-memory state is also cleared.
+    expect(useCollaboratorStore.getState().branchProtectionAcks["/r"]).toBeUndefined();
   });
 
   it("/branch-protection clear-ack: removes ack for active session's repo", async () => {
@@ -4784,10 +4833,10 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(status).toContain("No limited-guarantee ack to clear");
   });
 
-  it("hydrateBranchProtectionAcks: loads persisted map from disk on startup", async () => {
+  it("hydrateBranchProtectionAcks: loads persisted map from app_config_dir (round-16 claude2)", async () => {
     useCollaboratorStore.setState({ branchProtectionAcks: {} });
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === "read_memory_file") {
+      if (cmd === "read_app_config_file") {
         if (
           (args as { relativePath?: string } | undefined)?.relativePath ===
           "branch-protection-acks.json"
@@ -4805,17 +4854,69 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(acks["/persisted-repo"].note).toBe("persisted");
   });
 
-  it("hydrateBranchProtectionAcks: degrades to empty when file missing or unparseable", async () => {
+  it("hydrateBranchProtectionAcks: in-memory acks made before hydration resolves WIN (round-16 codex2 M2 + claude3 O1)", async () => {
+    // Round-16: hydration MUST merge rather than overwrite. If the
+    // user accepts a limited guarantee BEFORE hydration's setState
+    // resolves (rare race during App.tsx mount), the in-memory ack
+    // must NOT be lost. Final state = union with in-memory winning
+    // on conflict (the user's most recent action).
     useCollaboratorStore.setState({
-      branchProtectionAcks: { "/lingering-old": { acceptedAt: "x" } },
+      branchProtectionAcks: {
+        "/in-memory-repo": { acceptedAt: "in-memory-ts", note: "from-current-session" },
+      },
     });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === "read_memory_file") return null; // file missing
+      if (cmd === "read_app_config_file") {
+        return JSON.stringify({
+          "/disk-repo": { acceptedAt: "old-ts", note: "from-prior-restart" },
+        });
+      }
       return null;
     });
     await hydrateBranchProtectionAcks();
-    // Empty disk replaces in-memory state — disk is the source of truth.
-    expect(useCollaboratorStore.getState().branchProtectionAcks).toEqual({});
+    const acks = useCollaboratorStore.getState().branchProtectionAcks;
+    // Both entries present after merge.
+    expect(acks["/in-memory-repo"]?.note).toBe("from-current-session");
+    expect(acks["/disk-repo"]?.note).toBe("from-prior-restart");
+  });
+
+  it("hydrateBranchProtectionAcks: empty disk preserves in-memory acks (no clobber)", async () => {
+    useCollaboratorStore.setState({
+      branchProtectionAcks: { "/from-current-session": { acceptedAt: "x" } },
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "read_app_config_file") return null; // file missing
+      return null;
+    });
+    await hydrateBranchProtectionAcks();
+    // Round-16 fix: empty disk MUST NOT clobber in-memory acks.
+    // The previous round-15 behavior (overwrite) lost user acks
+    // accepted between mount and hydration resolution.
+    expect(
+      useCollaboratorStore.getState().branchProtectionAcks["/from-current-session"],
+    ).toBeDefined();
+  });
+
+  it("hydrateBranchProtectionAcks: in-memory takes precedence on disk-vs-memory conflict", async () => {
+    // Same repoRoot in both — the in-memory entry (the user's most
+    // recent action this session) should override the disk entry.
+    useCollaboratorStore.setState({
+      branchProtectionAcks: {
+        "/r": { acceptedAt: "new-ts", note: "fresh-action" },
+      },
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "read_app_config_file") {
+        return JSON.stringify({
+          "/r": { acceptedAt: "old-ts", note: "stale-disk-state" },
+        });
+      }
+      return null;
+    });
+    await hydrateBranchProtectionAcks();
+    const acks = useCollaboratorStore.getState().branchProtectionAcks;
+    expect(acks["/r"]?.note).toBe("fresh-action");
+    expect(acks["/r"]?.acceptedAt).toBe("new-ts");
   });
 
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
