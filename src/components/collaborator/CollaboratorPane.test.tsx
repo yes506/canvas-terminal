@@ -21,6 +21,7 @@ vi.mock("./InputPrompt", () => ({
 }));
 
 import { CollaboratorPane } from "./CollaboratorPane";
+import * as Pane from "./CollaboratorPane";
 import * as Store from "../../stores/collaboratorStore";
 import { useCollaboratorStore } from "../../stores/collaboratorStore";
 import { useTerminalStore } from "../../stores/terminalStore";
@@ -256,5 +257,164 @@ describe("CollaboratorPane header — collab session id", () => {
     expect(getByText(PANE_SESSION)).toBeInTheDocument();
     // The title attribute carries the full id for tooltip on hover even when truncated.
     expect(getByTitle(PANE_SESSION)).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 frontend — provisionWorktreeForSpawn
+//
+// Locks in the spawn-time worktree provisioning logic. The closure inside
+// CollaboratorPane.handleSpawn delegates to this exported helper, so unit
+// testing it directly with a stubbed invoke is sufficient regression
+// protection without re-implementing the React event chain.
+// ---------------------------------------------------------------------------
+
+describe("provisionWorktreeForSpawn (P1 frontend worktree integration)", () => {
+  it("returns a no-isolation result when cwd is null (no active terminal)", async () => {
+    const inv = vi.fn();
+    const result = await Pane.provisionWorktreeForSpawn({
+      resolvedCwd: null,
+      collabId: "collab-1",
+      sessionId: "session-1",
+      toolId: "claude_code",
+      invokeShim: inv as unknown as typeof invoke,
+    });
+    expect(result.cwd).toBeNull();
+    expect(result.worktree).toBeNull();
+    expect(result.errorStatus).toBeNull();
+    // No git_* invokes should fire when there's no cwd to probe.
+    expect(inv).not.toHaveBeenCalled();
+  });
+
+  it("falls through (worktree=null) when cwd is not a git repo", async () => {
+    const inv = vi.fn(async (cmd: string) => {
+      if (cmd === "git_detect_repo") return null;
+      return null;
+    });
+    const result = await Pane.provisionWorktreeForSpawn({
+      resolvedCwd: "/Users/me/non-git-dir",
+      collabId: "collab-2",
+      sessionId: "session-2",
+      toolId: "claude_code",
+      invokeShim: inv as unknown as typeof invoke,
+    });
+    expect(result.cwd).toBe("/Users/me/non-git-dir");
+    expect(result.worktree).toBeNull();
+    expect(result.errorStatus).toBeNull();
+    // Only git_detect_repo should have been called — no compute/create.
+    expect(inv).toHaveBeenCalledTimes(1);
+    expect(inv).toHaveBeenCalledWith("git_detect_repo", {
+      cwd: "/Users/me/non-git-dir",
+    });
+  });
+
+  it("provisions a worktree when cwd is a git repo and threads the metadata", async () => {
+    const repoInfo = {
+      root: "/Users/me/repo",
+      currentBranch: "dev",
+      hasOriginDev: true,
+      hasLocalDev: true,
+    };
+    const worktreeMeta = {
+      repoRoot: "/Users/me/repo",
+      path: "/Users/me/.cache/canvas-terminal/worktrees/collab-3/claude_code-session-3",
+      branch: "agent/claude_code-session-3",
+      baseRef: "origin/dev",
+      baseSha: "abc123",
+      baseFresh: true,
+      createdAtMs: 1_700_000_000_000,
+    };
+    const inv = vi.fn(async (cmd: string, args: unknown) => {
+      if (cmd === "git_detect_repo") return repoInfo;
+      if (cmd === "compute_worktree_path") {
+        const a = args as { collabId: string; sessionId: string; toolId: string };
+        return `/Users/me/.cache/canvas-terminal/worktrees/${a.collabId}/${a.toolId}-${a.sessionId}`;
+      }
+      if (cmd === "git_worktree_create") return worktreeMeta;
+      return null;
+    });
+    const result = await Pane.provisionWorktreeForSpawn({
+      resolvedCwd: "/Users/me/repo",
+      collabId: "collab-3",
+      sessionId: "session-3",
+      toolId: "claude_code",
+      invokeShim: inv as unknown as typeof invoke,
+    });
+    expect(result.worktree).toEqual(worktreeMeta);
+    expect(result.cwd).toBe(worktreeMeta.path); // PTY runs INSIDE the worktree
+    expect(result.errorStatus).toBeNull();
+    expect(result.provisioningMessage).toBeNull();
+    // Verify the create call uses origin/dev (D7 fail-fast invariant).
+    expect(inv).toHaveBeenCalledWith(
+      "git_worktree_create",
+      expect.objectContaining({ baseRef: "origin/dev" }),
+    );
+  });
+
+  it("surfaces the missing-dev error and falls through to non-isolated spawn", async () => {
+    // The most common failure mode — repo lacks origin/dev. The backend
+    // raises a precise error string; the frontend must catch it, set the
+    // status line, and fall through (rather than blocking the spawn).
+    const inv = vi.fn(async (cmd: string) => {
+      if (cmd === "git_detect_repo")
+        return {
+          root: "/Users/me/fresh-repo",
+          currentBranch: "main",
+          hasOriginDev: false,
+          hasLocalDev: false,
+        };
+      if (cmd === "compute_worktree_path") return "/some/path";
+      if (cmd === "git_worktree_create")
+        throw new Error(
+          "base ref 'origin/dev' could not be resolved. Configure a different non-main base via the missing-dev modal.",
+        );
+      return null;
+    });
+    const result = await Pane.provisionWorktreeForSpawn({
+      resolvedCwd: "/Users/me/fresh-repo",
+      collabId: "collab-4",
+      sessionId: "session-4",
+      toolId: "claude_code",
+      invokeShim: inv as unknown as typeof invoke,
+    });
+    expect(result.worktree).toBeNull();
+    expect(result.cwd).toBe("/Users/me/fresh-repo"); // PTY proceeds in repo cwd
+    expect(result.errorStatus).toBeTruthy();
+    expect(result.errorStatus).toContain("missing-dev");
+    expect(result.provisioningMessage).toContain("worktree provisioning failed");
+  });
+
+  it("flags base_fresh=false (offline fallback) in the provisioning message", async () => {
+    const repoInfo = {
+      root: "/r",
+      currentBranch: "dev",
+      hasOriginDev: true,
+      hasLocalDev: true,
+    };
+    const worktreeMeta = {
+      repoRoot: "/r",
+      path: "/wt",
+      branch: "agent/x",
+      baseRef: "origin/dev",
+      baseSha: "abc",
+      baseFresh: false, // ← key: offline fallback
+      createdAtMs: 1,
+    };
+    const inv = vi.fn(async (cmd: string) => {
+      if (cmd === "git_detect_repo") return repoInfo;
+      if (cmd === "compute_worktree_path") return "/wt";
+      if (cmd === "git_worktree_create") return worktreeMeta;
+      return null;
+    });
+    const result = await Pane.provisionWorktreeForSpawn({
+      resolvedCwd: "/r",
+      collabId: "c",
+      sessionId: "s",
+      toolId: "claude_code",
+      invokeShim: inv as unknown as typeof invoke,
+    });
+    expect(result.worktree).toEqual(worktreeMeta);
+    expect(result.provisioningMessage).toContain("stale local origin/dev");
+    expect(result.errorStatus).toBeNull();
   });
 });

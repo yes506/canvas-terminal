@@ -14,6 +14,34 @@ export const TOOL_CONFIGS: ToolConfig[] = [
   { id: "copilot_cli", label: "Copilot CLI", command: "copilot", colorClass: "text-emerald-400" },
 ];
 
+// ---------------------------------------------------------------------------
+// Worktree-isolation policy types (P1 backend mirrors).
+// Match `commands::git::*` Rust outputs (serde camelCase). The frontend
+// treats these as opaque metadata; the backend owns the validation.
+// ---------------------------------------------------------------------------
+
+/** Output of `git_detect_repo` — local-refs-only repo snapshot. */
+export interface RepoInfo {
+  root: string;
+  currentBranch: string | null;
+  hasOriginDev: boolean;
+  hasLocalDev: boolean;
+}
+
+/** Output of `git_worktree_create`. Stored on `SpawnedAgent` so approval
+ *  works even after the agent is killed (kill-PTY-at-flip in P2). */
+export interface WorktreeMetadata {
+  repoRoot: string;
+  path: string;
+  branch: string;
+  baseRef: string;
+  baseSha: string;
+  /** false signals offline fallback; the approval UI surfaces this as
+   *  a "stale base" warning (codex2 #2). */
+  baseFresh: boolean;
+  createdAtMs: number;
+}
+
 /** Raw spawn facts passed by AgentMiniTerminal to addAgent(). Identity fields are computed by the store. */
 export interface SpawnedAgentInit {
   sessionId: string;
@@ -21,6 +49,11 @@ export interface SpawnedAgentInit {
   status: "spawning" | "running" | "exited";
   /** Which collaborator pane owns this agent. */
   collabSessionId: string;
+  /** Worktree metadata if the agent was spawned in a git repo (P1).
+   *  null means either the spawn cwd was not a git repo, or worktree
+   *  provisioning failed. P2's awaiting-approval gate is keyed on this
+   *  field being non-null. */
+  worktree?: WorktreeMetadata | null;
 }
 
 /** One entry per name change. Append-only; index 0 is the system-set birth name. */

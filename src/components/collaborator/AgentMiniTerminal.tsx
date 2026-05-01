@@ -16,13 +16,17 @@ import {
 import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture, stripAnsi, registerCapture, unregisterCapture } from "../../lib/agentOutputCapture";
 import { isEnvBootstrapped } from "../../lib/terminalManager";
-import type { ToolConfig } from "../../types/collaborator";
+import type { ToolConfig, WorktreeMetadata } from "../../types/collaborator";
 import { X } from "lucide-react";
 
 interface AgentMiniTerminalProps {
   sessionId: string;
   tool: ToolConfig;
   cwd: string | null;
+  /** Worktree metadata when the spawn was provisioned in a git repo (P1).
+   *  Forwarded to addAgent so the store record carries it for P2's
+   *  awaiting-approval gate; null = no worktree isolation for this agent. */
+  worktree?: WorktreeMetadata | null;
   onClose: (sessionId: string) => void;
 }
 
@@ -77,6 +81,7 @@ export function AgentMiniTerminal({
   sessionId,
   tool,
   cwd,
+  worktree = null,
   onClose,
 }: AgentMiniTerminalProps) {
   const collabSessionId = useCollabSessionId();
@@ -593,11 +598,19 @@ export function AgentMiniTerminal({
       // Register in store as "spawning" — not ready for messages yet.
       // The readiness detector below will set status to "running" and flush
       // any queued messages once the CLI tool's prompt appears.
+      //
+      // `worktree` is forwarded straight through `addAgent`'s spread so the
+      // SpawnedAgent record carries the worktree metadata for the lifetime
+      // of the agent. P2's awaiting-approval gate keys on `agent.worktree`
+      // being non-null to decide whether a `.done.json` arrival flips the
+      // task to `awaiting-approval` (D2 / LB1 freeze) vs straight to
+      // `completed`.
       useCollaboratorStore.getState().addAgent({
         sessionId,
         tool: tool.id,
         status: "spawning",
         collabSessionId,
+        worktree,
       });
 
       // ---- CLI readiness detection ----

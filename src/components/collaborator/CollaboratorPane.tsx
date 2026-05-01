@@ -9,7 +9,7 @@ import { AgentToolbar } from "./AgentToolbar";
 import { AgentMiniTerminal } from "./AgentMiniTerminal";
 import { InputPrompt } from "./InputPrompt";
 import { Zap, Cpu, X, Monitor } from "lucide-react";
-import type { ToolConfig } from "../../types/collaborator";
+import type { RepoInfo, ToolConfig, WorktreeMetadata } from "../../types/collaborator";
 
 interface CollaboratorPaneProps {
   /** Session ID from the pane tree — used as the collab session identifier. */
@@ -22,6 +22,102 @@ interface Spawn {
   cwd: string | null;
   /** True once the initial CWD has been resolved (or failed). */
   cwdReady: boolean;
+  /** Worktree metadata if the agent was spawned in a git repo (P1 backend
+   *  provisioning). null = either not a git repo, or provisioning failed.
+   *  Threaded into AgentMiniTerminal which forwards it to addAgent so the
+   *  store record carries it for P2's awaiting-approval gate. */
+  worktree: WorktreeMetadata | null;
+  /** Surface a one-line provisioning message in the spawn placeholder
+   *  (e.g., "Provisioning isolated worktree…", or "missing dev branch"). */
+  provisioningMessage: string | null;
+}
+
+/**
+ * Result of `provisionWorktreeForSpawn`. Exported for unit testing —
+ * the closure inside `handleSpawn` consumes this directly.
+ */
+export interface ProvisioningResult {
+  /** The cwd the PTY should actually run in. Falls back to the provided
+   *  `resolvedCwd` if provisioning was skipped or failed. */
+  cwd: string | null;
+  /** The created worktree, or null if not in a git repo / provisioning
+   *  failed. The caller stores this on `SpawnedAgent` for P2 gating. */
+  worktree: WorktreeMetadata | null;
+  /** One-line message for the spawn placeholder UI, or null. */
+  provisioningMessage: string | null;
+  /** Status-line message that should be surfaced to the collab session
+   *  via `setStatus`. null when there's nothing to show. */
+  errorStatus: string | null;
+}
+
+/**
+ * Decide whether `resolvedCwd` is a git repo and, if so, provision a
+ * fresh per-agent worktree from `origin/dev`. Pure-ish helper exported
+ * for testing: every effect is via the injected `invoke` shim.
+ *
+ * Failure (e.g., the missing-`dev` case) is non-fatal at the spawn
+ * layer — the agent still launches in `resolvedCwd` (no worktree
+ * isolation), but P2's awaiting-approval gate keys on `worktree` being
+ * non-null, so a non-isolated agent's tasks won't auto-flip. The caller
+ * surfaces the failure reason via the status line.
+ */
+export async function provisionWorktreeForSpawn(args: {
+  resolvedCwd: string | null;
+  collabId: string;
+  sessionId: string;
+  toolId: string;
+  invokeShim?: typeof invoke;
+}): Promise<ProvisioningResult> {
+  const inv = args.invokeShim ?? invoke;
+  const { resolvedCwd, collabId, sessionId, toolId } = args;
+  const fallback: ProvisioningResult = {
+    cwd: resolvedCwd,
+    worktree: null,
+    provisioningMessage: null,
+    errorStatus: null,
+  };
+  if (!resolvedCwd) return fallback;
+
+  let repo: RepoInfo | null;
+  try {
+    repo = await inv<RepoInfo | null>("git_detect_repo", { cwd: resolvedCwd });
+  } catch {
+    // git_detect_repo failure is unexpected (it's a local-only probe);
+    // proceed without isolation rather than blocking the spawn.
+    return fallback;
+  }
+  if (!repo) return fallback;
+
+  try {
+    const worktreePath = await inv<string>("compute_worktree_path", {
+      collabId,
+      sessionId,
+      toolId,
+    });
+    const branchName = `agent/${toolId}-${sessionId}`;
+    const worktree = await inv<WorktreeMetadata>("git_worktree_create", {
+      repoRoot: repo.root,
+      worktreePath,
+      branchName,
+      baseRef: "origin/dev",
+    });
+    return {
+      cwd: worktree.path,
+      worktree,
+      provisioningMessage: worktree.baseFresh
+        ? null
+        : "worktree based on stale local origin/dev (offline fallback)",
+      errorStatus: null,
+    };
+  } catch (err) {
+    const msg = String(err);
+    return {
+      cwd: resolvedCwd,
+      worktree: null,
+      provisioningMessage: `worktree provisioning failed: ${msg}`,
+      errorStatus: `Spawn proceeding without worktree isolation. ${msg}`,
+    };
+  }
 }
 
 export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
@@ -95,41 +191,93 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Spawn a new agent — show UI tile immediately, resolve CWD before starting PTY
-  const handleSpawn = useCallback((tool: ToolConfig) => {
-    const sessionId = generateSessionId();
-    // Add spawn immediately for instant UI feedback (tile visible, but PTY waits for CWD)
-    setSpawns((prev) => [...prev, { sessionId, tool, cwd: null, cwdReady: false }]);
+  // Spawn a new agent — show UI tile immediately, resolve CWD + provision
+  // an isolated git worktree (if cwd is in a repo) before starting PTY.
+  //
+  // The worktree-provisioning step is the L1 load-bearing layer of the
+  // worktree-isolation policy (v5 §2). When cwd is inside a git repo, we
+  // call git_worktree_create to spawn the agent into ~/.cache/canvas-
+  // terminal/worktrees/<collab>/<tool>-<session> on a fresh agent/
+  // branch from origin/dev. If the repo lacks origin/dev (or local dev),
+  // the spawn surfaces an actionable error in the status line — the full
+  // missing-`dev` modal (D7) is P5 polish work.
+  const handleSpawn = useCallback(
+    (tool: ToolConfig) => {
+      const sessionId = generateSessionId();
+      // Add spawn immediately for instant UI feedback.
+      setSpawns((prev) => [
+        ...prev,
+        {
+          sessionId,
+          tool,
+          cwd: null,
+          cwdReady: false,
+          worktree: null,
+          provisioningMessage: null,
+        },
+      ]);
 
-    // Resolve CWD asynchronously with a timeout, then mark ready so AgentMiniTerminal mounts.
-    // If lsof stalls or takes too long, proceed with null cwd (home directory) after 2s.
-    (async () => {
-      let resolved: string | null = null;
-      try {
-        const activeSession = getActiveSessionId();
-        if (activeSession) {
-          const cwdPromise = invoke<string>("get_pty_cwd", {
-            sessionId: activeSession,
-          });
-          const timeoutPromise = new Promise<null>((resolve) =>
-            setTimeout(() => resolve(null), 2000),
-          );
-          resolved = await Promise.race([cwdPromise, timeoutPromise]);
+      (async () => {
+        // Phase 1: resolve CWD (existing behavior, lsof-based with 2s budget).
+        let resolved: string | null = null;
+        try {
+          const activeSession = getActiveSessionId();
+          if (activeSession) {
+            const cwdPromise = invoke<string>("get_pty_cwd", {
+              sessionId: activeSession,
+            });
+            const timeoutPromise = new Promise<null>((resolve) =>
+              setTimeout(() => resolve(null), 2000),
+            );
+            resolved = await Promise.race([cwdPromise, timeoutPromise]);
+          }
+        } catch {
+          // Fall back to null (home directory).
         }
-      } catch {
-        // Fall back to null (home directory)
-      }
-      if (mountedRef.current) {
-        setSpawns((prev) =>
-          prev.map((s) =>
-            s.sessionId === sessionId
-              ? { ...s, cwd: resolved, cwdReady: true }
-              : s,
-          ),
-        );
-      }
-    })();
-  }, []);
+
+        // Phase 2: provision an isolated worktree if cwd is in a git repo.
+        // Show the "Provisioning isolated worktree…" message synchronously
+        // so the user sees feedback during the network-bounded fetch.
+        if (resolved && mountedRef.current) {
+          setSpawns((prev) =>
+            prev.map((s) =>
+              s.sessionId === sessionId
+                ? { ...s, provisioningMessage: "Provisioning isolated worktree…" }
+                : s,
+            ),
+          );
+        }
+        const result = await provisionWorktreeForSpawn({
+          resolvedCwd: resolved,
+          collabId,
+          sessionId,
+          toolId: tool.id,
+        });
+        if (result.errorStatus) {
+          useCollaboratorStore
+            .getState()
+            .setStatus(result.errorStatus, collabId, "persistent");
+        }
+
+        if (mountedRef.current) {
+          setSpawns((prev) =>
+            prev.map((s) =>
+              s.sessionId === sessionId
+                ? {
+                    ...s,
+                    cwd: result.cwd,
+                    cwdReady: true,
+                    worktree: result.worktree,
+                    provisioningMessage: result.provisioningMessage,
+                  }
+                : s,
+            ),
+          );
+        }
+      })();
+    },
+    [collabId],
+  );
 
   // Close a single agent
   const handleClose = useCallback((sessionId: string) => {
@@ -208,6 +356,7 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                     sessionId={spawn.sessionId}
                     tool={spawn.tool}
                     cwd={spawn.cwd}
+                    worktree={spawn.worktree}
                     onClose={handleClose}
                   />
                 ) : (
@@ -221,8 +370,8 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                         {spawn.tool.label}
                       </span>
                     </div>
-                    <div className="flex-1 flex items-center justify-center text-text-dim text-xs font-mono">
-                      Starting...
+                    <div className="flex-1 flex items-center justify-center text-text-dim text-xs font-mono px-2 text-center">
+                      {spawn.provisioningMessage ?? "Starting..."}
                     </div>
                   </div>
                 ),
