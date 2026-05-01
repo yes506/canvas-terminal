@@ -4,6 +4,7 @@ import {
   agentDisplayName,
   toolLabel,
   slugify,
+  findWorktreeLeaseConflict,
 } from "../../stores/collaboratorStore";
 import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps";
 import type { CollabTask, SpawnedAgent, TaskStatus } from "../../types/collaborator";
@@ -46,20 +47,14 @@ export function isTaskWorktreeBacked(
 }
 
 /**
- * LB5 helper (claude3 task-46 ISS-2): find an existing non-terminal
- * worktree-backed task assigned to the given agent handle in the same
- * session. Used by `/task assign` and `/task add` to refuse a second
- * concurrent git-write assignment to the same agent — diff co-mingling
- * across two tasks in one worktree would defeat the per-task approval
- * gate.
+ * LB5 nice-UX helper for slash commands. Delegates to the store's
+ * lease-based `findWorktreeLeaseConflict` — see that function's doc for
+ * the full criteria (round-10 lease-based rule per codex1 task-81 H1).
  *
- * "Worktree-backed" here means the agent has a worktree AND the task is
- * non-terminal (pending | in-progress | awaiting-approval |
- * approved-merging | merge-conflict). Tasks already in `completed` or
- * `blocked` are fine — they're done; the worktree from the prior task
- * has either merged + been removed OR been preserved as exited.
- *
- * Returns the conflicting task, or undefined if no conflict.
+ * The structural gate inside `addTask`/`updateTask` is the load-bearing
+ * enforcement; this helper exists so the slash-command surfaces can
+ * surface the conflict reason BEFORE invoking the mutator (giving the
+ * user a more actionable error message than "Assignee update dropped").
  */
 export function findActiveWorktreeTaskForAgent(
   assigneeToken: string,
@@ -67,17 +62,7 @@ export function findActiveWorktreeTaskForAgent(
   tasks: CollabTask[],
   collabSessionId: string,
 ): CollabTask | undefined {
-  const handle = assigneeToken.replace(/^@/, "");
-  const agent = agents.find(
-    (a) => a.collabSessionId === collabSessionId && a.handle === handle,
-  );
-  if (!agent?.worktree) return undefined;
-  return tasks.find(
-    (t) =>
-      t.assignee === `@${handle}` &&
-      t.status !== "completed" &&
-      t.status !== "blocked",
-  );
+  return findWorktreeLeaseConflict(assigneeToken, agents, tasks, collabSessionId);
 }
 
 export interface ParsedCommand {

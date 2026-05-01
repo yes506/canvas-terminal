@@ -2856,17 +2856,62 @@ describe("LB4 — /task done and /task status completed gate refusal (codex2 tas
     expect(tasks.every((t) => t.assignee === "@claude1")).toBe(true);
   });
 
-  it("/task assign allows reassigning when the existing task is terminal", async () => {
-    // Terminal tasks (completed/blocked) are no longer "active" — no
-    // diff co-mingling concern. Re-assignment to the agent should work.
+  it("/task assign refuses reassignment when prior task blocked but worktree lease still held (round-10 codex1 H1)", async () => {
+    // Round-10 lease-based rule: `blocked` does NOT release the
+    // worktree (LB1 fail-closed preserves it for inspection; manual
+    // `/task status blocked` is abandonment, not cleanup). While
+    // agent.worktree is set, no new git-write task may be assigned
+    // to the same handle — the worktree's diff state is unreviewed
+    // and a new task would co-mingle.
     setupAgent({ withWorktree: true });
     const store = useCollaboratorStore.getState();
     const old = store.addTask(
       { title: "first", objective: "first", assignee: "@claude1" },
       LB4_SESSION,
     );
-    // Mark the old task blocked (explicit abandonment).
+    // Block the prior task. Worktree is still preserved on the agent.
     store.updateTask(old.id, { status: "blocked" }, LB4_SESSION);
+    const next = store.addTask(
+      { title: "second", objective: "second" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput(`/task ${next.id} assign @claude1`),
+      LB4_SESSION,
+    );
+    // Refused: lease still held by `old` even though it's blocked.
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === next.id);
+    expect(updated?.assignee).toBeNull();
+    const status = useCollaboratorStore.getState().statusMessages[LB4_SESSION];
+    expect(status).toContain("active worktree-backed task");
+  });
+
+  it("/task assign allows reassignment after the worktree lease is released (escape hatch)", async () => {
+    // The lease is released by either:
+    //   - merge of the prior task (orchestrator clears agent.worktree
+    //     after git_worktree_remove), OR
+    //   - explicit Discard via D14 (future) clears agent.worktree, OR
+    //   - the agent record being removed entirely (no agent → no lease).
+    // Test (b): simulate Discard by clearing agent.worktree directly.
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    const old = store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    store.updateTask(old.id, { status: "blocked" }, LB4_SESSION);
+
+    // Simulate the Discard action releasing the lease.
+    useCollaboratorStore.setState({
+      agents: useCollaboratorStore
+        .getState()
+        .agents.map((a) =>
+          a.handle === "claude1" ? { ...a, worktree: null } : a,
+        ),
+    });
+
     const next = store.addTask(
       { title: "second", objective: "second" },
       LB4_SESSION,
@@ -2879,6 +2924,58 @@ describe("LB4 — /task done and /task status completed gate refusal (codex2 tas
       .getState()
       .tasksBySession[LB4_SESSION]?.find((t) => t.id === next.id);
     expect(updated?.assignee).toBe("@claude1");
+  });
+
+  it("addTask structural gate refuses programmatic assignment to held lease (round-10 claude3 O1)", async () => {
+    // The structural gate inside addTask catches paths that bypass the
+    // slash command — e.g., sendToAgent's auto-create, future UI
+    // buttons, programmatic helpers. Test directly via store.addTask().
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    // Suppress the expected console.warn from the structural gate.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Direct addTask call (not through slash command).
+    const second = store.addTask(
+      { title: "second", objective: "second", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    // Task created but assignee dropped (silent structural refusal).
+    expect(second.assignee).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("LB5: refused to assign"),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("updateTask structural gate refuses programmatic reassignment to held lease (round-10 claude3 O1)", async () => {
+    // Direct store.updateTask call should also be gated. Tests the
+    // structural backstop for any caller that bypasses the slash
+    // command (future UI assign button, programmatic helper).
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    const second = store.addTask(
+      { title: "second", objective: "second" },
+      LB4_SESSION,
+    );
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Direct updateTask({assignee}) should be silently refused.
+    store.updateTask(second.id, { assignee: "@claude1" }, LB4_SESSION);
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === second.id);
+    expect(updated?.assignee).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("LB5: refused to reassign"),
+    );
+    warnSpy.mockRestore();
   });
 
   // Round-8: cover the live-record gap (codex1+codex2+claude3 convergent).

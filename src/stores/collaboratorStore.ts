@@ -626,6 +626,62 @@ function resolveTaskAuthor(task: CollabTask): string | null {
 }
 
 /**
+ * LB5 lease-based conflict detector (v5 RESID-6 structural gate, hardened
+ * by round-10 reviewer feedback codex1 task-81 H1 + codex2 task-83 H1+M1).
+ *
+ * The "worktree lease" is held by an agent for as long as its
+ * SpawnedAgent record has `worktree !== null`. While the lease is held,
+ * NO new git-write task may be assigned to the same handle — running
+ * two tasks on the same worktree branch would co-mingle their diffs and
+ * the per-task approval gate would land work the user never reviewed
+ * for either task individually.
+ *
+ * Rule (lease-based, broader than v4's status-only check):
+ *   - Agent has worktree → ANY non-completed task assigned to this
+ *     handle is a conflict, INCLUDING `blocked`. Reason: `blocked`
+ *     doesn't release the worktree (LB1 fail-closed preserves it for
+ *     manual inspection; manual `/task status blocked` is abandonment,
+ *     not cleanup).
+ *   - Agent has no worktree (or no record) → defense-in-depth fallback:
+ *     any task with `pendingMerge !== null` still counts (gate engaged,
+ *     state pending review). After round-8 cleanup-on-close, the agent
+ *     record should always survive when worktree has work, so this
+ *     branch is rare but eliminates a record-loss bypass class.
+ *
+ * Returns the conflicting task (caller can format error message), or
+ * `undefined` if the assignment is safe.
+ *
+ * `excludeTaskId`: skip this task in the lookup. Used by `updateTask`
+ * when reassigning a task — the task being reassigned isn't conflicting
+ * with itself.
+ */
+export function findWorktreeLeaseConflict(
+  assigneeToken: string,
+  agents: SpawnedAgent[],
+  tasks: CollabTask[],
+  collabSessionId: string,
+  excludeTaskId?: string,
+): CollabTask | undefined {
+  const handle = assigneeToken.replace(/^@/, "");
+  const filtered = excludeTaskId
+    ? tasks.filter((t) => t.id !== excludeTaskId)
+    : tasks;
+  const agent = agents.find(
+    (a) => a.collabSessionId === collabSessionId && a.handle === handle,
+  );
+  if (agent?.worktree) {
+    // Lease held: any non-completed task on this handle conflicts.
+    return filtered.find(
+      (t) => t.assignee === `@${handle}` && t.status !== "completed",
+    );
+  }
+  // Agent record gone or no worktree → fallback to pendingMerge check.
+  return filtered.find(
+    (t) => t.assignee === `@${handle}` && t.pendingMerge !== null,
+  );
+}
+
+/**
  * Render an agent reference with both its canonical handle (the immutable
  * `@<handle>` identity used for handle-keyed lookups and protocol strings)
  * AND, when known, its current human-readable nickname in parentheses.
@@ -2025,6 +2081,32 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   // -- Task management ----------------------------------------------------
 
   addTask: (opts, forSession) => {
+    // LB5 structural gate (round-10 placement fix per claude3 task-84 O1
+    // + codex2 task-83 H1: helper here in the store mutator catches all
+    // assignment paths — slash commands, sendToAgent auto-create,
+    // broadcastToAll auto-create, future UI buttons. Lease-based per
+    // codex1 task-81 H1: blocked doesn't release the worktree).
+    let effectiveAssignee = opts.assignee ?? null;
+    if (effectiveAssignee) {
+      const state = get();
+      const sessionTasks = state.tasksBySession[forSession] ?? [];
+      const conflict = findWorktreeLeaseConflict(
+        effectiveAssignee,
+        state.agents,
+        sessionTasks,
+        forSession,
+      );
+      if (conflict) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[collab/store] LB5: refused to assign new task to ${effectiveAssignee} ` +
+            `— worktree lease still held by task ${conflict.id} (status: ${conflict.status}). ` +
+            "Task created without an assignee.",
+        );
+        effectiveAssignee = null;
+      }
+    }
+
     taskCounter++;
     const now = new Date().toISOString();
     const task: CollabTask = {
@@ -2033,7 +2115,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       objective: opts.objective,
       context: opts.context ?? "",
       deliverables: opts.deliverables ?? [],
-      assignee: opts.assignee ?? null,
+      assignee: effectiveAssignee,
       dependencies: opts.dependencies ?? [],
       status: "pending",
       reasoning: null,
@@ -2106,6 +2188,40 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     const cleanUpdates = Object.fromEntries(
       Object.entries(updates).filter(([, v]) => v !== undefined),
     ) as typeof updates;
+
+    // LB5 structural gate (round-10 placement fix per claude3 task-84 O1).
+    // If the update would change the assignee to a handle whose worktree
+    // lease is still held by another task, drop the assignee field
+    // silently and warn. Caller-side slash-command checks fire FIRST
+    // with a nicer message; this is the structural backstop for
+    // programmatic / future-UI callers (also closes codex2 task-83 H1
+    // for sendToAgent's bumpAssignedAt path which doesn't change
+    // assignees but ensures any direct updateTask({assignee}) bypass
+    // is also caught).
+    if (
+      cleanUpdates.assignee !== null &&
+      cleanUpdates.assignee !== undefined &&
+      prevTask &&
+      cleanUpdates.assignee !== prevTask.assignee
+    ) {
+      const sessionTasks = get().tasksBySession[forSession] ?? [];
+      const conflict = findWorktreeLeaseConflict(
+        cleanUpdates.assignee as string,
+        get().agents,
+        sessionTasks,
+        forSession,
+        taskId,
+      );
+      if (conflict) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[collab/store] LB5: refused to reassign task ${taskId} to ${cleanUpdates.assignee} ` +
+            `— worktree lease still held by task ${conflict.id} (status: ${conflict.status}). ` +
+            "Assignee update dropped.",
+        );
+        delete (cleanUpdates as { assignee?: string | null }).assignee;
+      }
+    }
 
     // codex2 task-67 H1: enforce pendingMerge terminal cleanup centrally,
     // not at every caller. Without this guard, a legacy callsite that
