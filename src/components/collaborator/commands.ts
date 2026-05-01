@@ -6,7 +6,35 @@ import {
   slugify,
 } from "../../stores/collaboratorStore";
 import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps";
-import type { SpawnedAgent, TaskStatus } from "../../types/collaborator";
+import type { CollabTask, SpawnedAgent, TaskStatus } from "../../types/collaborator";
+
+/**
+ * LB4 helper (codex2 task-59 H1): a task is "worktree-backed" if its
+ * assignee's SpawnedAgent record has a non-null `worktree`. Those tasks
+ * are gated by the P2 awaiting-approval flow in scanForTaskCompletions
+ * and must not be completed via slash-command bypass paths
+ * (`/task done`, `/task status completed`).
+ *
+ * Returns false when:
+ *   - task has no assignee
+ *   - assignee's agent isn't in the session (already exited / removed)
+ *   - agent has no worktree (spawned outside a git repo)
+ *
+ * In those cases the slash command's manual transition is fine because
+ * there's no gate to bypass.
+ */
+export function isTaskWorktreeBacked(
+  task: CollabTask,
+  agents: SpawnedAgent[],
+  collabSessionId: string,
+): boolean {
+  if (!task.assignee) return false;
+  const handle = task.assignee.replace(/^@/, "");
+  const agent = agents.find(
+    (a) => a.collabSessionId === collabSessionId && a.handle === handle,
+  );
+  return Boolean(agent?.worktree);
+}
 
 export interface ParsedCommand {
   type:
@@ -455,6 +483,21 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             status(`Task not found: ${taskId}`);
             break;
           }
+          // LB4 (codex2 task-59 H1): refuse manual `completed` on
+          // worktree-backed tasks. The slash-command path bypasses the
+          // P2 awaiting-approval gate that scanForTaskCompletions enforces
+          // for agent-authored .done.json. Manual `blocked` is fine —
+          // user is explicitly choosing to abandon the task.
+          if (
+            newStatus === "completed" &&
+            isTaskWorktreeBacked(task, store.agents, collabSessionId)
+          ) {
+            status(
+              `Task ${task.id} is assigned to a worktree-backed agent — manual /task status completed bypasses the approval gate. ` +
+                `Use the agent's .done.json (auto-routes through the gate) or /task ${task.id} status blocked to abandon.`,
+            );
+            break;
+          }
           store.updateTask(task.id, { status: newStatus as TaskStatus }, collabSessionId);
           status(`Task ${task.id} → ${newStatus}`);
           break;
@@ -501,6 +544,20 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           const task = store.getTasks(collabSessionId).find((t) => t.id === taskId || t.id.startsWith(taskId));
           if (!task) {
             status(`Task not found: ${taskId}`);
+            break;
+          }
+          // LB4 (codex2 task-59 H1): refuse manual /task done for
+          // worktree-backed tasks. This slash-command bypasses the P2
+          // awaiting-approval gate. The agent should write .done.json
+          // (which routes through scanForTaskCompletions and engages
+          // the gate). Manual completion would silently mark the task
+          // `completed` without orchestrator review of the worktree's
+          // diff.
+          if (isTaskWorktreeBacked(task, store.agents, collabSessionId)) {
+            status(
+              `Task ${task.id} is assigned to a worktree-backed agent — /task done bypasses the approval gate. ` +
+                `Use the agent's .done.json flow (auto-routes through the gate) or /task ${task.id} status blocked to abandon.`,
+            );
             break;
           }
           store.updateTask(task.id, {

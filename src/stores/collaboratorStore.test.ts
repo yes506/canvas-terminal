@@ -2647,6 +2647,141 @@ describe("Copilot CLI roster registration", () => {
 // prevents stale merge metadata accumulating once LB1 starts populating it.
 // ---------------------------------------------------------------------------
 
+describe("LB4 — /task done and /task status completed gate refusal (codex2 task-59 H1)", () => {
+  // The slash-command path was a known approval-gate bypass: an agent
+  // (or user) running /task done on a worktree-backed task would skip
+  // the awaiting-approval flow that scanForTaskCompletions enforces
+  // for .done.json. Now refused with an actionable message; user must
+  // either let the agent write .done.json (auto-routes through gate)
+  // or use /task status blocked to abandon explicitly.
+  const LB4_SESSION = "collab-lb4-tests";
+
+  beforeEach(() => {
+    _resetWriteStateForTests();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  function setupAgent(opts: { withWorktree: boolean }) {
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: LB4_SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Claude Code #1",
+          nicknameSlug: "claude-code-1",
+          nameHistory: [
+            {
+              nickname: "Claude Code #1",
+              setAt: "2024-01-01T00:00:00.000Z",
+              setBy: "system",
+            },
+          ],
+          worktree: opts.withWorktree
+            ? {
+                repoRoot: "/r",
+                path: "/wt",
+                branch: "agent/claude_code-session-1",
+                baseRef: "origin/dev",
+                baseSha: "abc",
+                baseFresh: true,
+                createdAtMs: 1,
+              }
+            : null,
+        },
+      ],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [LB4_SESSION]: [] },
+      logEntriesBySession: { [LB4_SESSION]: [] },
+      statusMessages: {},
+    });
+  }
+
+  it("/task done refuses worktree-backed tasks with an actionable message", async () => {
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput(`/task ${task.id} done with notes`),
+      LB4_SESSION,
+    );
+    // Task is unchanged — gate refused the manual completion.
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("pending");
+    // Status line surfaces the actionable message.
+    const status = useCollaboratorStore.getState().statusMessages[LB4_SESSION];
+    expect(status).toContain("worktree-backed agent");
+    expect(status).toContain("bypasses the approval gate");
+  });
+
+  it("/task done succeeds for tasks without a worktree-backed assignee", async () => {
+    setupAgent({ withWorktree: false });
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput(`/task ${task.id} done all good`),
+      LB4_SESSION,
+    );
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("completed");
+    expect(updated?.conclusion).toBe("all good");
+  });
+
+  it("/task status completed refuses worktree-backed tasks", async () => {
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput(`/task ${task.id} status completed`),
+      LB4_SESSION,
+    );
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("pending");
+    const status = useCollaboratorStore.getState().statusMessages[LB4_SESSION];
+    expect(status).toContain("worktree-backed agent");
+  });
+
+  it("/task status blocked succeeds for worktree-backed tasks (explicit abandonment is allowed)", async () => {
+    // Manual `blocked` is fine — the user is explicitly choosing to
+    // abandon the task. Only `completed` bypasses the gate's "did the
+    // agent's work get reviewed?" question.
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput(`/task ${task.id} status blocked`),
+      LB4_SESSION,
+    );
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("blocked");
+  });
+});
+
 describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
   // Each test uses a unique session so the module-level `nextOrdinal`
   // counter (which resetStores can't reach) doesn't cause an agent's
