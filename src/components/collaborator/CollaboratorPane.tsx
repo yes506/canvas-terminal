@@ -149,6 +149,12 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
           <span className="text-text-dim">
             {agents.length} agent{agents.length !== 1 ? "s" : ""}
           </span>
+          <span
+            className="font-mono text-text-dim min-w-0 max-w-[40%] truncate"
+            title={collabId}
+          >
+            {collabId}
+          </span>
           <div className="flex-1" />
           <button
             type="button"

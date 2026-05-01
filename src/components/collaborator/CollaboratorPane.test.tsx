@@ -232,3 +232,29 @@ describe("Phase 1.1 — CollaboratorPane polling fallback (task-31 implementatio
     warnSpy.mockRestore();
   });
 });
+
+describe("CollaboratorPane header — collab session id", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+    vi.mocked(invoke).mockReset();
+    vi.mocked(invoke).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  it("renders the full paneSessionId in the header so users can correlate the pane with dashboard files", () => {
+    const { getByText, getByTitle } = render(
+      <CollaboratorPane paneSessionId={PANE_SESSION} />,
+    );
+    // getByText works under `truncate` because CSS overflow:hidden clips visually only;
+    // the full string remains in the DOM textContent.
+    expect(getByText(PANE_SESSION)).toBeInTheDocument();
+    // The title attribute carries the full id for tooltip on hover even when truncated.
+    expect(getByTitle(PANE_SESSION)).toBeInTheDocument();
+  });
+});
