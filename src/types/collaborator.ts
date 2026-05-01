@@ -143,6 +143,69 @@ export type TaskStatus =
   | "completed"
   | "blocked";
 
+/**
+ * Round-28 (claude3 task-139 O3): classify a `TaskStatus` by its
+ * position in the task lifecycle. Centralizing the classification
+ * here means adding a new status to `TaskStatus` is a single-point
+ * edit — TypeScript's exhaustiveness check on the switch below
+ * forces every consumer to handle the new state.
+ *
+ * Phases:
+ *   - "active":         agent is actively working; PTY alive; can
+ *                       receive `inject_into_pty`. Currently
+ *                       `pending` | `in-progress`. Used by
+ *                       sendToAgent / broadcastToAll's refresh
+ *                       decision.
+ *   - "review-or-merge": agent has finished writing; task is in the
+ *                       P2 approval/merge pipeline; PTY killed by
+ *                       LB1 design. User action may be required
+ *                       (`awaiting-approval`, `merge-conflict`) or
+ *                       merge is in flight (`approved-merging`).
+ *   - "terminal":       task is done — `completed` (success) or
+ *                       `blocked` (abandoned).
+ *
+ * The bug fixed in round-27 (status mismatch) was rooted in
+ * inconsistent status classification across consumers. The
+ * predicates below replace inline `=== "completed" || === "blocked"`
+ * checks at every call site so the same drift can't recur.
+ */
+export type TaskLifecyclePhase = "active" | "review-or-merge" | "terminal";
+
+export function classifyTaskStatus(status: TaskStatus): TaskLifecyclePhase {
+  switch (status) {
+    case "pending":
+    case "in-progress":
+      return "active";
+    case "awaiting-approval":
+    case "approved-merging":
+    case "merge-conflict":
+      return "review-or-merge";
+    case "completed":
+    case "blocked":
+      return "terminal";
+    default: {
+      // Round-29 (codex1 task-140 #4 + claude3 task-143 O1): explicit
+      // `assertNever`-style exhaustiveness. TypeScript's flow analysis
+      // would already flag a non-returning function under `strict`,
+      // but assigning the variable to `never` produces an immediate,
+      // localized type error at the unhandled case — making the
+      // exhaustiveness contract visible at the switch itself rather
+      // than as a "Not all code paths return" error elsewhere.
+      const _exhaustive: never = status;
+      return _exhaustive;
+    }
+  }
+}
+
+/** Convenience: true iff status is a terminal state (completed/blocked). */
+export function isTerminalStatus(s: TaskStatus): boolean {
+  return classifyTaskStatus(s) === "terminal";
+}
+/** Convenience: true iff status is active (pending/in-progress; PTY alive). */
+export function isActiveStatus(s: TaskStatus): boolean {
+  return classifyTaskStatus(s) === "active";
+}
+
 /** Worktree-isolation v5 §4 P2.a `pendingMerge` snapshot — captured at
  *  `awaiting-approval` flip, used by the Approve UI to render the diff
  *  and by `git_merge_worktree` to identify the agent branch. Self-

@@ -21,6 +21,12 @@ import {
   checkBranchProtection,
   _clearVerifiedProtectedCacheForTests,
 } from "../components/collaborator/commands";
+import {
+  classifyTaskStatus,
+  isActiveStatus,
+  isTerminalStatus,
+} from "../types/collaborator";
+import type { TaskStatus } from "../types/collaborator";
 import { useTerminalStore } from "./terminalStore";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -139,6 +145,129 @@ describe("task-16 — 3-state agent task machine + 5 s completed TTL", () => {
     const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
     const state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
     expect(state.kind).toBe("idle");
+  });
+
+  // Round-28 (claude3 task-139 O3): centralized status classifier.
+  // Maintainability fix — the round-27 helpers had inline string
+  // comparisons that future TaskStatus additions could miss.
+
+  it("classifyTaskStatus: maps every TaskStatus to its lifecycle phase (round-28 exhaustiveness lock)", () => {
+    // Round-28: this test is the load-bearing exhaustiveness lock.
+    // If a new TaskStatus is added without updating classifyTaskStatus,
+    // TypeScript's switch-exhaustiveness check fails AND this test
+    // fails to cover the new branch — both signals point implementers
+    // at the centralized classifier.
+    const cases: Array<[TaskStatus, "active" | "review-or-merge" | "terminal"]> = [
+      ["pending", "active"],
+      ["in-progress", "active"],
+      ["awaiting-approval", "review-or-merge"],
+      ["approved-merging", "review-or-merge"],
+      ["merge-conflict", "review-or-merge"],
+      ["completed", "terminal"],
+      ["blocked", "terminal"],
+    ];
+    for (const [status, expectedPhase] of cases) {
+      expect(classifyTaskStatus(status)).toBe(expectedPhase);
+    }
+  });
+
+  it("isActiveStatus + isTerminalStatus: predicates match classifyTaskStatus", () => {
+    expect(isActiveStatus("pending")).toBe(true);
+    expect(isActiveStatus("in-progress")).toBe(true);
+    expect(isActiveStatus("awaiting-approval")).toBe(false);
+    expect(isActiveStatus("approved-merging")).toBe(false);
+    expect(isActiveStatus("merge-conflict")).toBe(false);
+    expect(isActiveStatus("completed")).toBe(false);
+    expect(isActiveStatus("blocked")).toBe(false);
+
+    expect(isTerminalStatus("pending")).toBe(false);
+    expect(isTerminalStatus("in-progress")).toBe(false);
+    expect(isTerminalStatus("awaiting-approval")).toBe(false);
+    expect(isTerminalStatus("approved-merging")).toBe(false);
+    expect(isTerminalStatus("merge-conflict")).toBe(false);
+    expect(isTerminalStatus("completed")).toBe(true);
+    expect(isTerminalStatus("blocked")).toBe(true);
+  });
+
+  // Round-27: status-mismatch bug fix. The indicator must surface ALL
+  // 5 non-terminal task statuses, not just pending/in-progress. The
+  // prior helper filter let awaiting-approval / approved-merging /
+  // merge-conflict tasks fall through to "idle" or stale "completed".
+
+  it("getAgentTaskState reports `in_progress` for awaiting-approval tasks (round-27 status-mismatch fix)", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { objective: "ship", title: "ship feature", assignee: "@claude1" },
+      SESSION,
+    );
+    store.updateTask(task.id, { status: "awaiting-approval", pendingMerge: {
+      branch: "agent/x", worktreePath: "/wt", repoRoot: "/r",
+      baseRef: "origin/dev", baseSha: "abc", baseFresh: true,
+      diffSummary: { committed: ["a.ts"], staged: [], unstaged: [], untracked: [] },
+      agentHandle: "@claude1",
+    } }, SESSION);
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(
+      SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession,
+    );
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskStatus).toBe("awaiting-approval");
+    expect(state.taskTitle).toBe("ship feature");
+  });
+
+  it("getAgentTaskState reports `in_progress` for approved-merging tasks (round-27)", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { objective: "ship", title: "ship feature", assignee: "@claude1" },
+      SESSION,
+    );
+    store.updateTask(task.id, { status: "awaiting-approval", pendingMerge: {
+      branch: "agent/x", worktreePath: "/wt", repoRoot: "/r",
+      baseRef: "origin/dev", baseSha: "abc", baseFresh: true,
+      diffSummary: { committed: ["a.ts"], staged: [], unstaged: [], untracked: [] },
+      agentHandle: "@claude1",
+    } }, SESSION);
+    store.updateTask(task.id, { status: "approved-merging" }, SESSION);
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(
+      SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession,
+    );
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskStatus).toBe("approved-merging");
+  });
+
+  it("getAgentTaskState reports `in_progress` for merge-conflict tasks (round-27)", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { objective: "ship", title: "ship feature", assignee: "@claude1" },
+      SESSION,
+    );
+    store.updateTask(task.id, { status: "awaiting-approval", pendingMerge: {
+      branch: "agent/x", worktreePath: "/wt", repoRoot: "/r",
+      baseRef: "origin/dev", baseSha: "abc", baseFresh: true,
+      diffSummary: { committed: ["a.ts"], staged: [], unstaged: [], untracked: [] },
+      agentHandle: "@claude1",
+    } }, SESSION);
+    store.updateTask(task.id, { status: "merge-conflict" }, SESSION);
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(
+      SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession,
+    );
+    expect(state.kind).toBe("in_progress");
+    expect(state.taskStatus).toBe("merge-conflict");
+  });
+
+  it("getAgentTaskState includes taskStatus 'pending' for plain pending tasks (round-27 contract)", () => {
+    const store = useCollaboratorStore.getState();
+    store.addTask({ objective: "ship", title: "ship", assignee: "@claude1" }, SESSION);
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
+    const state = getAgentTaskState(
+      SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession,
+    );
+    expect(state.kind).toBe("in_progress");
+    // The taskStatus field is now always populated for non-terminal tasks
+    // so the renderer can distinguish active work from review/merge states.
+    expect(state.taskStatus).toBe("pending");
   });
 });
 
@@ -572,12 +701,32 @@ describe("task-37 — robustness + indicator presentation coverage", () => {
 // (lifecycle × task state × outcomeKind) decision matrix without
 // stand-up cost for an xterm/PTY-spawning component.
 describe("task-37 — getIndicatorPresentation precedence matrix", () => {
-  it("`exited` lifecycle wins over any task state", () => {
+  it("`exited` lifecycle wins over in_progress with NO taskStatus (back-compat with pre-round-27 callers)", () => {
+    // Round-27 (status mismatch bug): only the P2 review/merge
+    // statuses (awaiting-approval/approved-merging/merge-conflict)
+    // override the `exited` lifecycle. Plain in_progress with no
+    // taskStatus still defers to lifecycle so an exited PTY shows
+    // "exited" rather than ghost-rendering a stale active task.
     const r = getIndicatorPresentation("exited", { kind: "in_progress", taskTitle: "x" });
     expect(r.label).toBe("exited");
     expect(r.color).toBe("bg-gray-500");
     expect(r.pulse).toBe(false);
     expect(r.ping).toBe(false);
+  });
+
+  it("`exited` lifecycle still shows P2 task state when taskStatus is non-terminal review/merge (round-27 status-mismatch fix)", () => {
+    // Round-27 fix: when LB1 kills the PTY at awaiting-approval flip,
+    // agent.status becomes "exited". The prior code returned "exited"
+    // gray, hiding the fact that the task is awaiting user review.
+    // The fix: P2 review/merge taskStatus values override "exited".
+    const r = getIndicatorPresentation("exited", {
+      kind: "in_progress",
+      taskTitle: "ship it",
+      taskStatus: "awaiting-approval",
+    });
+    expect(r.label).toBe("awaiting approval: ship it");
+    expect(r.color).toBe("bg-violet-400");
+    expect(r.ping).toBe(true);
   });
 
   it("`spawning` lifecycle wins over any task state", () => {
@@ -632,6 +781,68 @@ describe("task-37 — getIndicatorPresentation precedence matrix", () => {
     expect(r.pulse).toBe(false);
     expect(r.ping).toBe(false);
     expect(r.label).toBe("idle");
+  });
+
+  // Round-27: P2-aware indicator presentations for the 3 review/merge statuses.
+
+  it("running + in_progress with taskStatus 'awaiting-approval' → violet + 'awaiting approval' label (round-27)", () => {
+    const r = getIndicatorPresentation("running", {
+      kind: "in_progress",
+      taskTitle: "ship it",
+      taskStatus: "awaiting-approval",
+    });
+    expect(r.color).toBe("bg-violet-400");
+    expect(r.ping).toBe(true);
+    expect(r.label).toBe("awaiting approval: ship it");
+    expect(r.tone).toBe("text-violet-300");
+  });
+
+  it("running + in_progress with taskStatus 'approved-merging' → cyan + 'merging' label (round-27)", () => {
+    const r = getIndicatorPresentation("running", {
+      kind: "in_progress",
+      taskTitle: "ship it",
+      taskStatus: "approved-merging",
+    });
+    expect(r.color).toBe("bg-cyan-400");
+    expect(r.pulse).toBe(true);
+    expect(r.label).toBe("merging: ship it");
+  });
+
+  it("running + in_progress with taskStatus 'merge-conflict' → amber + ⚠ label + alert role (round-27)", () => {
+    const r = getIndicatorPresentation("running", {
+      kind: "in_progress",
+      taskTitle: "ship it",
+      taskStatus: "merge-conflict",
+    });
+    expect(r.color).toBe("bg-amber-500");
+    expect(r.label).toBe("⚠ merge conflict: ship it");
+    expect(r.liveRole).toBe("alert");
+    expect(r.liveLevel).toBe("assertive");
+  });
+
+  it("running + in_progress with taskStatus 'pending' → blue 'in progress' (back-compat with default behavior)", () => {
+    const r = getIndicatorPresentation("running", {
+      kind: "in_progress",
+      taskTitle: "ship it",
+      taskStatus: "pending",
+    });
+    expect(r.color).toBe("bg-sky-400");
+    expect(r.label).toBe("in progress: ship it");
+  });
+
+  it("exited + completed (recent outcome) → ✓ label, NOT 'exited' (round-27 — recent outcome trumps exited)", () => {
+    // After a successful Approve: agent.status === "exited" (LB1
+    // killed PTY), task is completed, recent-outcome ping should
+    // dominate. Without the round-27 fix, the prior precedence
+    // returned "exited" gray, hiding the success ping.
+    const r = getIndicatorPresentation("exited", {
+      kind: "completed",
+      taskTitle: "shipped",
+      outcomeKind: "completed",
+    });
+    expect(r.color).toBe("bg-emerald-400");
+    expect(r.label).toBe("✓ shipped");
+    expect(r.ping).toBe(true);
   });
 });
 
@@ -1423,6 +1634,32 @@ describe("task-47 — formatTaskSummaryForAgent slimming", () => {
     expect(out).toContain("pending one");
     expect(out).not.toContain("completed one");
     expect(out).not.toContain("blocked one");
+  });
+
+  it("drops P2 review/merge tasks too — only PTY-alive 'active' status surfaces (round-29 codex2 task-142 follow-up)", () => {
+    // Round-29 (codex2 task-142 follow-up): the agent-prompt summary
+    // should reflect PTY-alive active work only. Tasks in P2 review/
+    // merge states (awaiting-approval, approved-merging, merge-conflict)
+    // already have their PTY killed by LB1 design; surfacing them as
+    // "your active tasks" misleads the agent. The round-28 centralized
+    // `isActiveStatus` predicate now drives this filter — adding a
+    // new TaskStatus that's NOT 'active' will automatically exclude
+    // it from the summary.
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1", title: "pending one", status: "pending", assignee: "@claude1" }),
+      mkTask({ id: "task-2", title: "in-progress one", status: "in-progress", assignee: "@claude1" }),
+      mkTask({ id: "task-3", title: "awaiting-approval one", status: "awaiting-approval", assignee: "@claude1" }),
+      mkTask({ id: "task-4", title: "approved-merging one", status: "approved-merging", assignee: "@claude1" }),
+      mkTask({ id: "task-5", title: "merge-conflict one", status: "merge-conflict", assignee: "@claude1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    expect(out).toContain("pending one");
+    expect(out).toContain("in-progress one");
+    // P2 review/merge states must NOT appear (PTY is killed; not actionable
+    // by the agent's next inject_into_pty).
+    expect(out).not.toContain("awaiting-approval one");
+    expect(out).not.toContain("approved-merging one");
+    expect(out).not.toContain("merge-conflict one");
   });
 
   it("splits 'yours' vs 'others' when recipient is known", () => {
