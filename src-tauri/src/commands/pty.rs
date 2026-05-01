@@ -63,7 +63,10 @@ fn start_reader_thread(
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     let errno = e.raw_os_error();
-                    if matches!(errno, Some(libc::EIO) | Some(libc::EBADF) | Some(libc::ENOTTY)) {
+                    if matches!(
+                        errno,
+                        Some(libc::EIO) | Some(libc::EBADF) | Some(libc::ENOTTY)
+                    ) {
                         break;
                     }
                     eprintln!("PTY read error for {}: {}", event_id, e);
@@ -91,8 +94,14 @@ fn apply_baseline_env(cmd: &mut CommandBuilder) {
 
 /// Env vars that are explicitly set by apply_baseline_env — don't override these from cache.
 const BASELINE_ENV_KEYS: &[&str] = &[
-    "TERM", "LANG", "LC_ALL", "LC_CTYPE",
-    "GIT_TERMINAL_PROMPT", "SSH_ASKPASS", "GIT_ASKPASS", "HOME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "GIT_TERMINAL_PROMPT",
+    "SSH_ASKPASS",
+    "GIT_ASKPASS",
+    "HOME",
 ];
 
 /// Apply CWD to a CommandBuilder if valid.
@@ -126,10 +135,7 @@ fn inject_cached_env(cmd: &mut CommandBuilder, state: &State<'_, AppState>) {
 /// Uses `env -0` (NUL-separated) for robust parsing — env values can contain
 /// newlines, so newline-delimited output is unreliable.
 #[tauri::command]
-pub fn bootstrap_env(
-    state: State<'_, AppState>,
-    force: Option<bool>,
-) -> Result<(), String> {
+pub fn bootstrap_env(state: State<'_, AppState>, force: Option<bool>) -> Result<(), String> {
     // Already cached? Skip (unless force=true).
     if !force.unwrap_or(false) {
         let cached = state.cached_env.lock().map_err(|e| e.to_string())?;
@@ -236,7 +242,12 @@ pub fn spawn_process(
     let pty_system = native_pty_system();
 
     let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| e.to_string())?;
 
     let resolved_program = resolve_program(&program, &state)?;
@@ -359,9 +370,7 @@ pub fn write_to_pty(
     }
 
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-    let session = sessions
-        .get_mut(&session_id)
-        .ok_or("Session not found")?;
+    let session = sessions.get_mut(&session_id).ok_or("Session not found")?;
 
     loop {
         match session.writer.write_all(data.as_bytes()) {
@@ -408,10 +417,7 @@ pub fn get_pty_cwd(state: State<'_, AppState>, session_id: String) -> Result<Str
     let pid = {
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions.get(&session_id).ok_or("Session not found")?;
-        session
-            .child
-            .process_id()
-            .ok_or("Cannot get child PID")?
+        session.child.process_id().ok_or("Cannot get child PID")?
     };
 
     // On macOS, use lsof to get the CWD of the child process
@@ -489,10 +495,7 @@ pub fn inject_into_pty(
         .get_mut(&session_id)
         .ok_or_else(|| format!("PTY session '{}' not found after delay", session_id))?;
 
-    session
-        .writer
-        .write_all(b"\r")
-        .map_err(|e| e.to_string())?;
+    session.writer.write_all(b"\r").map_err(|e| e.to_string())?;
     session.writer.flush().map_err(|e| e.to_string())?;
 
     Ok(())
@@ -528,7 +531,8 @@ pub fn list_directory(path: String) -> Result<Vec<(String, bool, String)>, Strin
     }
     result.sort_by(|a, b| {
         // Directories first, then alphabetical
-        b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
     });
 
     Ok(result)

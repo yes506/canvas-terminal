@@ -4379,6 +4379,160 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(status).toContain("test note");
   });
 
+  it("checkBranchProtection: queries /branches/dev/protection NOT /branches/main (round-13 codex1 H1)", async () => {
+    // Round-13 codex1 H1 (load-bearing): the LB3 check must verify the
+    // actual landing branch, not `main`. Approve merges/pushes `dev`
+    // (per APPROVAL_TARGET_BRANCH); checking `main` while `dev` is
+    // unprotected would silently pass the gate on the wrong branch.
+    let calledArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        calledArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    await checkBranchProtection("/r", fakeInvoke as unknown as typeof invoke);
+    expect(calledArgs[0]).toBe("/repos/owner/repo/branches/dev/protection");
+    expect(calledArgs[0]).not.toContain("/main/");
+  });
+
+  it("checkBranchProtection: 200 with empty protection body → verified-unprotected (round-13 codex2 H1)", async () => {
+    // Round-13 codex2 H1 (load-bearing): a 200 response from the
+    // protection endpoint only proves the protection object exists.
+    // It does NOT prove the rule actually blocks direct pushes. An
+    // empty protection JSON (or one with all meaningful fields null)
+    // must NOT pass as `verified-protected`.
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_status_checks":null,"restrictions":null,"required_pull_request_reviews":null}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-unprotected");
+  });
+
+  it("checkBranchProtection: 200 with required_status_checks active → verified-protected", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_status_checks":{"strict":true,"contexts":["ci/test"]},"restrictions":null,"required_pull_request_reviews":null}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+  });
+
+  it("checkBranchProtection: 200 with restrictions active → verified-protected", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_status_checks":null,"restrictions":{"users":[],"teams":[],"apps":[]},"required_pull_request_reviews":null}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+  });
+
+  it("checkBranchProtection: 200 with malformed JSON body → unknown (defensive)", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return { exitCode: 0, stdout: "not-json-at-all", stderr: "" };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    // Defensive: without parseable response, can't claim verified-protected.
+    expect(state).toBe("verified-unprotected");
+  });
+
+  it("/branch-protection accept-limited: falls back to task pendingMerge.repoRoot when no agent record (round-13 codex2 M1)", async () => {
+    // Round-13 codex2 M1: `/task approve` uses `task.pendingMerge.repoRoot`,
+    // so it can identify the repo even after agent-record loss. The
+    // `/branch-protection` subcommands must have the same fallback —
+    // otherwise Approve refuses with "run accept-limited" but
+    // accept-limited says it can't identify a repo.
+    useCollaboratorStore.setState({
+      // NO agents — record loss scenario.
+      agents: [],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [D14_SESSION]: [] },
+      logEntriesBySession: { [D14_SESSION]: [] },
+      statusMessages: {},
+      branchProtectionAcks: {},
+    });
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      D14_SESSION,
+    );
+    // Simulate the gate having engaged before the agent record was lost.
+    store.updateTask(
+      task.id,
+      {
+        status: "awaiting-approval",
+        pendingMerge: {
+          branch: "agent/x",
+          worktreePath: "/wt-orphan",
+          repoRoot: "/r-from-task",
+          baseRef: "origin/dev",
+          baseSha: "abc",
+          baseFresh: true,
+          diffSummary: { committed: ["x.ts"], staged: [], unstaged: [], untracked: [] },
+          agentHandle: "@claude1",
+        },
+      },
+      D14_SESSION,
+    );
+
+    await executeCommand(
+      parseInput("/branch-protection accept-limited -- record-loss recovery"),
+      D14_SESSION,
+    );
+
+    // Ack should land on the task's pendingMerge.repoRoot.
+    const acks = useCollaboratorStore.getState().branchProtectionAcks;
+    expect(acks["/r-from-task"]).toBeDefined();
+    expect(acks["/r-from-task"].note).toBe("record-loss recovery");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("Limited guarantee accepted");
+  });
+
   it("checkBranchProtection: returns 'unknown' for non-GitHub remotes (no gh API call)", async () => {
     const fakeInvoke = vi.fn(async (cmd: string) => {
       if (cmd === "git_get_remote_url") return "https://gitlab.com/owner/repo.git";

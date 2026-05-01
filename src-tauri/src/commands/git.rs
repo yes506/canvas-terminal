@@ -1055,8 +1055,7 @@ pub fn git_merge_worktree(
     // Capture the original branch so we can restore it on completion.
     // Detached-HEAD case returns an error; treat as "no branch to
     // restore" and skip the restore at the end.
-    let original_branch =
-        git_capture_opt(Some(&repo_path), &["symbolic-ref", "--short", "HEAD"]);
+    let original_branch = git_capture_opt(Some(&repo_path), &["symbolic-ref", "--short", "HEAD"]);
 
     // Switch to the target branch. May fail if dev is checked out in
     // another worktree (e.g., the agent's). In v1 we'd treat that as a
@@ -1159,18 +1158,12 @@ pub fn git_merge_worktree(
 
     let mut pushed = false;
     if push {
-        if let Err(stderr) = git_capture(
-            Some(&repo_path),
-            &["push", "origin", &target_branch],
-        ) {
+        if let Err(stderr) = git_capture(Some(&repo_path), &["push", "origin", &target_branch]) {
             // codex2 task-63 H1: local merge succeeded but push failed.
             // Surface as PushFailedAfterMerge so the frontend doesn't
             // retry-as-merge a now-redundant merge.
             restore_branch_best_effort(&repo_path, original_branch.as_deref());
-            return Err(GitError::PushFailedAfterMerge {
-                merged_sha,
-                stderr,
-            });
+            return Err(GitError::PushFailedAfterMerge { merged_sha, stderr });
         }
         pushed = true;
     }
@@ -1278,10 +1271,7 @@ impl Drop for MergeLock {
 #[tauri::command]
 pub fn git_get_remote_url(repo_root: String, remote_name: String) -> Result<String, String> {
     let repo_path = PathBuf::from(&repo_root);
-    git_capture(
-        Some(&repo_path),
-        &["remote", "get-url", &remote_name],
-    )
+    git_capture(Some(&repo_path), &["remote", "get-url", &remote_name])
 }
 
 /// Output of `run_gh_api`. `exit_code: 0` means success; the body is
@@ -2027,11 +2017,8 @@ mod tests {
         run_git_with_committer_identity(&repo, &["add", "README.md"]).unwrap();
         run_git_with_committer_identity(&repo, &["commit", "-m", "dev edit 2"]).unwrap();
         let new_dev_sha = git_capture(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
-        run_git_with_committer_identity(
-            &repo,
-            &["update-ref", "refs/heads/dev", &new_dev_sha],
-        )
-        .unwrap();
+        run_git_with_committer_identity(&repo, &["update-ref", "refs/heads/dev", &new_dev_sha])
+            .unwrap();
 
         // Run `git merge --no-ff dev` from inside the worktree (which is
         // on agent/test-conflict). Conflict expected.
@@ -2041,11 +2028,7 @@ mod tests {
         );
         match merge_attempt {
             Err((stderr, code)) => {
-                let err = GitError::from_command_failure(
-                    "git merge dev".to_string(),
-                    stderr,
-                    code,
-                );
+                let err = GitError::from_command_failure("git merge dev".to_string(), stderr, code);
                 match err {
                     GitError::MergeConflict { .. } => {} // expected
                     other => panic!("expected MergeConflict variant; got {:?}", other),
@@ -2134,11 +2117,7 @@ mod tests {
         // affected (no-op for this test's repo because each test has its
         // own; just being defensive).
         let _ = git_capture(Some(&repo), &["checkout", "--", "README.md"]);
-        let _ = git_worktree_remove(
-            repo.to_string_lossy().to_string(),
-            wt_str,
-            meta.branch,
-        );
+        let _ = git_worktree_remove(repo.to_string_lossy().to_string(), wt_str, meta.branch);
     }
 
     #[test]
@@ -2181,11 +2160,8 @@ mod tests {
         run_git_with_committer_identity(&repo, &["add", "README.md"]).unwrap();
         run_git_with_committer_identity(&repo, &["commit", "-m", "dev edit 2"]).unwrap();
         let new_dev_sha = git_capture(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
-        run_git_with_committer_identity(
-            &repo,
-            &["update-ref", "refs/heads/dev", &new_dev_sha],
-        )
-        .unwrap();
+        run_git_with_committer_identity(&repo, &["update-ref", "refs/heads/dev", &new_dev_sha])
+            .unwrap();
         // Restore parent to main for the merge.
         run_git_with_committer_identity(&repo, &["checkout", "main"]).unwrap();
 
@@ -2215,8 +2191,7 @@ mod tests {
             "MERGE_HEAD should be cleared after conflict (codex1 task-61 H1)"
         );
         // (b) parent repo's working tree must have no unmerged entries
-        let porcelain =
-            git_capture_raw(Some(&repo), &["status", "--porcelain", "-z"]).unwrap();
+        let porcelain = git_capture_raw(Some(&repo), &["status", "--porcelain", "-z"]).unwrap();
         assert!(
             !porcelain.contains("UU "),
             "parent repo should have no unmerged entries; got porcelain: {:?}",
@@ -2231,7 +2206,10 @@ mod tests {
         );
         // (d) main itself is unchanged (the conflict happened on dev)
         let main_tip_after = git_capture(Some(&repo), &["rev-parse", "main"]).unwrap();
-        assert_eq!(main_tip_before, main_tip_after, "main tip should be unchanged");
+        assert_eq!(
+            main_tip_before, main_tip_after,
+            "main tip should be unchanged"
+        );
 
         // Step 6: subsequent merge attempt is NOT poisoned. We can't
         // re-attempt the same merge (it'll conflict again), but we CAN
@@ -2275,13 +2253,12 @@ mod tests {
         assert!(result.is_ok(), "merge should succeed: {:?}", result);
         // Verify HEAD restored to main.
         let head = git_capture(Some(&repo), &["symbolic-ref", "--short", "HEAD"]).unwrap();
-        assert_eq!(head, "main", "parent HEAD should be restored to original branch");
-
-        let _ = git_worktree_remove(
-            repo.to_string_lossy().to_string(),
-            wt_str,
-            meta.branch,
+        assert_eq!(
+            head, "main",
+            "parent HEAD should be restored to original branch"
         );
+
+        let _ = git_worktree_remove(repo.to_string_lossy().to_string(), wt_str, meta.branch);
     }
 
     // ----- LB3 branch-protection wizard support -----
@@ -2294,14 +2271,16 @@ mod tests {
         // so the remote doesn't have to be reachable.
         git_capture(
             Some(&repo),
-            &["remote", "add", "origin", "https://github.com/owner/repo.git"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
         )
         .unwrap();
-        let url = git_get_remote_url(
-            repo.to_string_lossy().to_string(),
-            "origin".to_string(),
-        )
-        .unwrap();
+        let url =
+            git_get_remote_url(repo.to_string_lossy().to_string(), "origin".to_string()).unwrap();
         assert_eq!(url, "https://github.com/owner/repo.git");
     }
 
@@ -2309,11 +2288,8 @@ mod tests {
     fn get_remote_url_errors_when_remote_missing() {
         let repo = make_test_repo();
         // No remote configured.
-        let err = git_get_remote_url(
-            repo.to_string_lossy().to_string(),
-            "origin".to_string(),
-        )
-        .unwrap_err();
+        let err = git_get_remote_url(repo.to_string_lossy().to_string(), "origin".to_string())
+            .unwrap_err();
         assert!(
             err.contains("No such remote") || err.contains("error"),
             "expected git error, got: {}",
@@ -2329,11 +2305,8 @@ mod tests {
             &["remote", "add", "origin", "git@github.com:owner/repo.git"],
         )
         .unwrap();
-        let url = git_get_remote_url(
-            repo.to_string_lossy().to_string(),
-            "origin".to_string(),
-        )
-        .unwrap();
+        let url =
+            git_get_remote_url(repo.to_string_lossy().to_string(), "origin".to_string()).unwrap();
         assert_eq!(url, "git@github.com:owner/repo.git");
     }
 

@@ -139,14 +139,32 @@ export function formatGitError(err: unknown): string {
 }
 
 /**
+ * The branch that the orchestrator merges approved tasks into. Hardcoded
+ * to `dev` for v1 because every task created from a worktree is based
+ * on `origin/dev` (per the worktree-isolation policy v5 spec). This is
+ * the branch LB3 must verify protection on — NOT `main`. round-13
+ * codex1 H1 caught the wrong-branch bug: verifying `main` would silently
+ * pass when `dev` (the actual landing branch) is unprotected.
+ *
+ * Future configurability: derive from `pendingMerge.targetBranch` once
+ * non-`dev` bases are supported. For now, all merge sites and LB3 call
+ * sites must use this constant.
+ */
+export const APPROVAL_TARGET_BRANCH = "dev";
+
+/**
  * LB3 branch-protection three-state model (v5 §4 P2.h). Returned by
  * `checkBranchProtection`. Routing per state:
- *   - `verified-protected`: silent; Approve proceeds.
- *   - `verified-unprotected`: refuse Approve until user enables
+ *   - `verified-protected`: silent; Approve proceeds. Means a non-empty
+ *     protection rule exists AND it has at least one direct-push-blocking
+ *     field set (round-13 codex2 H1: bare 200 isn't enough).
+ *   - `verified-unprotected`: refuse Approve until user enables real
  *     protection on GitHub OR runs `/branch-protection accept-limited`.
+ *     Includes the case where a protection object exists but has no
+ *     meaningful rules (empty or weak).
  *   - `unknown`: cannot verify (non-GitHub remote, missing gh, auth/
- *     network failure, rate-limited). Refuse Approve until user runs
- *     `/branch-protection accept-limited`.
+ *     network failure, rate-limited, malformed JSON). Refuse Approve
+ *     until user runs `/branch-protection accept-limited`.
  */
 export type BranchProtectionState =
   | "verified-protected"
@@ -177,16 +195,64 @@ function parseGithubOwnerRepo(url: string): { owner: string; repo: string } | nu
 }
 
 /**
+ * Round-13 codex2 H1: a 200 response from the GitHub branch-protection
+ * endpoint only proves a protection object exists. It does NOT prove
+ * the rule actually blocks direct pushes. A protection record may have
+ * every meaningful field null/empty, satisfying the API while leaving
+ * the branch effectively unprotected.
+ *
+ * For LB3's no-direct-push guarantee, at least one of these meaningful
+ * fields must be non-null:
+ *   - `required_pull_request_reviews` — direct push refused; PR required.
+ *   - `required_status_checks` — direct push refused unless checks pass
+ *     (and even then typically requires PR via branch policy).
+ *   - `restrictions` — push restricted to specific users/teams/apps.
+ *
+ * Returns true when the parsed protection object has at least one of
+ * those fields populated (non-null, non-empty). Returns false when the
+ * object is empty, all relevant fields are null, OR the body fails to
+ * parse as JSON (defensive default — without parseable response, we
+ * can't claim the branch is meaningfully protected).
+ */
+function hasMeaningfulProtection(stdoutBody: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdoutBody);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object") return false;
+  const obj = parsed as Record<string, unknown>;
+  // Each of these fields is either null OR an object with config when
+  // the rule is active. `null` literally means "this rule type is not
+  // configured for this branch."
+  return (
+    obj.required_pull_request_reviews != null ||
+    obj.required_status_checks != null ||
+    obj.restrictions != null
+  );
+}
+
+/**
  * Run the LB3 three-state branch-protection check for a repo.
  *
  * The implementation is order-sensitive:
  *   1. Resolve `origin` URL — non-existent remote → `unknown`.
  *   2. GitHub host check — non-GitHub → `unknown` (no API to call).
  *   3. Parse owner/repo — malformed URL → `unknown`.
- *   4. Run `gh api /repos/<owner>/<repo>/branches/main/protection`:
- *      - exit 0  → `verified-protected` (body is the protection rules JSON).
- *      - exit non-zero with stderr matching 404/Not Found → `verified-unprotected`.
- *      - any other failure (auth, network, gh missing) → `unknown`.
+ *   4. Run `gh api /repos/<owner>/<repo>/branches/<targetBranch>/protection`:
+ *      - exit 0 + protection JSON has meaningful fields → `verified-protected`.
+ *      - exit 0 + empty/weak protection (round-13 codex2 H1) →
+ *        `verified-unprotected` (the rule exists but doesn't block direct
+ *        pushes; treat the same as no protection at all).
+ *      - exit non-zero with stderr matching 404/Not Found →
+ *        `verified-unprotected`.
+ *      - any other failure (auth, network, gh missing, malformed JSON,
+ *        rate limit) → `unknown`.
+ *
+ * The target branch defaults to `APPROVAL_TARGET_BRANCH` (currently
+ * `dev`) per round-13 codex1 H1: the check must verify the actual
+ * landing branch, not `main`.
  *
  * The Tauri command `run_gh_api` does NOT fail Rust-side on non-zero
  * exits — it returns `{exitCode, stdout, stderr}` so this routing
@@ -195,6 +261,7 @@ function parseGithubOwnerRepo(url: string): { owner: string; repo: string } | nu
 export async function checkBranchProtection(
   repoRoot: string,
   invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> = invoke,
+  targetBranch: string = APPROVAL_TARGET_BRANCH,
 ): Promise<BranchProtectionState> {
   let remoteUrl: string;
   try {
@@ -215,14 +282,22 @@ export async function checkBranchProtection(
     res = await invokeFn<{ exitCode: number; stdout: string; stderr: string }>(
       "run_gh_api",
       {
-        args: [`/repos/${parsed.owner}/${parsed.repo}/branches/main/protection`],
+        args: [
+          `/repos/${parsed.owner}/${parsed.repo}/branches/${targetBranch}/protection`,
+        ],
       },
     );
   } catch {
     // gh not installed, network failure, etc. → unknown.
     return "unknown";
   }
-  if (res.exitCode === 0) return "verified-protected";
+  if (res.exitCode === 0) {
+    // Round-13 codex2 H1: 200 alone is insufficient. Parse the body
+    // and require at least one meaningful protection field.
+    return hasMeaningfulProtection(res.stdout)
+      ? "verified-protected"
+      : "verified-unprotected";
+  }
   // `gh api` returns exit 4 (or non-zero with stderr containing
   // "Not Found") for 404. Match defensively on the stderr text.
   const stderrLc = res.stderr.toLowerCase();
@@ -860,7 +935,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             const protectionState = await checkBranchProtection(snapshot.repoRoot);
             if (protectionState === "verified-unprotected") {
               status(
-                `Branch protection NOT enabled on origin/main for ${snapshot.repoRoot}. ` +
+                `Branch protection NOT enabled on origin/${APPROVAL_TARGET_BRANCH} for ${snapshot.repoRoot}. ` +
                   `Enable it via the GitHub repo's Settings → Branches page, OR run ` +
                   `'/branch-protection accept-limited' to proceed with limited guarantee. ` +
                   `Approve refused for task ${task.id}.`,
@@ -869,7 +944,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             }
             if (protectionState === "unknown") {
               status(
-                `Cannot verify branch protection on origin/main for ${snapshot.repoRoot} ` +
+                `Cannot verify branch protection on origin/${APPROVAL_TARGET_BRANCH} for ${snapshot.repoRoot} ` +
                   `(non-GitHub remote, missing 'gh', or auth/network failure). ` +
                   `Run '/branch-protection accept-limited [-- <note>]' to confirm equivalent ` +
                   `protection elsewhere and proceed. Approve refused for task ${task.id}.`,
@@ -970,7 +1045,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
               {
                 repoRoot: snapshot.repoRoot,
                 branchName: snapshot.branch,
-                targetBranch: "dev",
+                targetBranch: APPROVAL_TARGET_BRANCH,
                 push: wantsPush,
               },
             );
@@ -1061,7 +1136,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           if (pushFailedAfterMerge) {
             status(
               `${lgPrefix}Task ${task.id} approved & merged locally as ${pushFailedAfterMerge.sha}, but push failed: ${pushFailedAfterMerge.stderr.split("\n")[0]}. ` +
-                `Re-push manually with 'git push origin dev'.${cleanupWarn}`,
+                `Re-push manually with 'git push origin ${APPROVAL_TARGET_BRANCH}'.${cleanupWarn}`,
             );
           } else {
             status(
@@ -1221,11 +1296,32 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
         }
         const sub = cmd.message ?? "";
 
-        // Find the repo root from any agent in the session that has a
-        // worktree. All agents in a single collab session share the
-        // same parent repo root.
+        // Find the repo root, preferring a live agent record. Round-13
+        // codex2 M1 fallback: if no agent has a worktree (e.g., the
+        // close-pane race or a manual record removal stripped the
+        // SpawnedAgent record), look at the freshest task with
+        // `pendingMerge`. The pendingMerge snapshot is self-contained
+        // (RESID-5) and carries `repoRoot` independent of the agent
+        // record, so accept-limited can still identify the repo when
+        // the user needs it most — i.e., when an Approve has just
+        // refused with "run accept-limited" but the agent record was
+        // lost in between.
         const sessionAgent = scopedAgents.find((a) => a.worktree);
-        const activeRepoRoot = sessionAgent?.worktree?.repoRoot;
+        let activeRepoRoot = sessionAgent?.worktree?.repoRoot;
+        if (!activeRepoRoot && collabSessionId) {
+          const sessionTasks = store.getTasks(collabSessionId);
+          // Prefer awaiting-approval / merge-conflict (the states where
+          // the user actually needs to ack to proceed) over any random
+          // task with a stale pendingMerge.
+          const candidates = sessionTasks
+            .filter((t) => t.pendingMerge)
+            .sort((a, b) => {
+              const priority = (s: string): number =>
+                s === "awaiting-approval" || s === "merge-conflict" ? 0 : 1;
+              return priority(a.status) - priority(b.status);
+            });
+          activeRepoRoot = candidates[0]?.pendingMerge?.repoRoot;
+        }
 
         if (sub === "" || sub === "status") {
           if (!activeRepoRoot) {
@@ -1245,7 +1341,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           } else {
             status(
               `No limited-guarantee ack for ${activeRepoRoot}. ` +
-                "Run '/branch-protection check' to verify origin/main protection.",
+                `Run '/branch-protection check' to verify origin/${APPROVAL_TARGET_BRANCH} protection.`,
             );
           }
           break;
@@ -1262,12 +1358,12 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           const state = await checkBranchProtection(activeRepoRoot);
           if (state === "verified-protected") {
             status(
-              `Branch protection verified on origin/main for ${activeRepoRoot}. ` +
+              `Branch protection verified on origin/${APPROVAL_TARGET_BRANCH} for ${activeRepoRoot}. ` +
                 "Approve will run silently.",
             );
           } else if (state === "verified-unprotected") {
             status(
-              `Branch protection NOT enabled on origin/main for ${activeRepoRoot}. ` +
+              `Branch protection NOT enabled on origin/${APPROVAL_TARGET_BRANCH} for ${activeRepoRoot}. ` +
                 "Enable via Settings → Branches, OR run " +
                 "'/branch-protection accept-limited' to proceed with limited guarantee.",
             );
