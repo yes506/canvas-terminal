@@ -5716,6 +5716,180 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(status).toContain("Branch protection NOT enabled");
   });
 
+  // -------------------------------------------------------------------------
+  // Round-23: codex2 task-125 BLOCKING — early-return paths must invalidate
+  // stale protected cache (full-symmetry invariant)
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtectionDetail: useCache:false with origin missing invalidates stale protected cache (round-23 codex2 task-125 BLOCKING — git_get_remote_url throw path)", async () => {
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let originExists = true;
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") {
+        if (!originExists) throw "No such remote 'origin'";
+        return "https://github.com/owner/repo.git";
+      }
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    // Step 1: prime cache with verified-protected.
+    const v1 = await checkBranchProtectionDetail(
+      "/r-origin",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v1.state).toBe("verified-protected");
+    // Step 2: simulate origin removal.
+    originExists = false;
+    // Step 3: explicit re-check via useCache:false → unknown.
+    const v2 = await checkBranchProtectionDetail(
+      "/r-origin",
+      fakeInvoke as unknown as typeof invoke,
+      undefined,
+      { useCache: false },
+    );
+    expect(v2.state).toBe("unknown");
+    // Step 4: subsequent default (cached) call — must NOT return
+    // stale verified-protected. Cache should have been invalidated
+    // by the early-return path.
+    const v3 = await checkBranchProtectionDetail(
+      "/r-origin",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v3.state).toBe("unknown");
+  });
+
+  it("checkBranchProtectionDetail: useCache:false with non-GitHub remote invalidates cache (round-23 — !host path)", async () => {
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let isGithub = true;
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") {
+        return isGithub
+          ? "https://github.com/owner/repo.git"
+          : "https://gitlab.com/owner/repo.git";
+      }
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const v1 = await checkBranchProtectionDetail(
+      "/r-host",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v1.state).toBe("verified-protected");
+    // User changes remote to non-GitHub host.
+    isGithub = false;
+    const v2 = await checkBranchProtectionDetail(
+      "/r-host",
+      fakeInvoke as unknown as typeof invoke,
+      undefined,
+      { useCache: false },
+    );
+    expect(v2.state).toBe("unknown");
+    // Subsequent cached call must NOT serve the stale protected entry.
+    const v3 = await checkBranchProtectionDetail(
+      "/r-host",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v3.state).toBe("unknown");
+  });
+
+  it("checkBranchProtectionDetail: useCache:false with run_gh_api throw invalidates cache (round-23 — gh api catch path)", async () => {
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let ghThrows = false;
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        if (ghThrows) throw "network unreachable";
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const v1 = await checkBranchProtectionDetail(
+      "/r-network",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v1.state).toBe("verified-protected");
+    // Network failure simulated.
+    ghThrows = true;
+    const v2 = await checkBranchProtectionDetail(
+      "/r-network",
+      fakeInvoke as unknown as typeof invoke,
+      undefined,
+      { useCache: false },
+    );
+    expect(v2.state).toBe("unknown");
+    // Subsequent cached call must NOT serve stale protected entry.
+    const v3 = await checkBranchProtectionDetail(
+      "/r-network",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v3.state).toBe("unknown");
+  });
+
+  it("checkBranchProtectionDetail: useCache:false with malformed URL invalidates cache (round-23 — !parsed path)", async () => {
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let urlOk = true;
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") {
+        return urlOk
+          ? "https://github.com/owner/repo.git"
+          // detectGithubHost recognizes the host, but parseGithubOwnerRepo
+          // can't extract owner/repo from this shape (no owner/repo
+          // path segments after the host).
+          : "https://github.com/";
+      }
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const v1 = await checkBranchProtectionDetail(
+      "/r-malformed",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v1.state).toBe("verified-protected");
+    urlOk = false;
+    const v2 = await checkBranchProtectionDetail(
+      "/r-malformed",
+      fakeInvoke as unknown as typeof invoke,
+      undefined,
+      { useCache: false },
+    );
+    expect(v2.state).toBe("unknown");
+    const v3 = await checkBranchProtectionDetail(
+      "/r-malformed",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v3.state).toBe("unknown");
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [

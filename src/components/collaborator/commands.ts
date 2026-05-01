@@ -491,11 +491,22 @@ export async function checkBranchProtectionDetail(
   // user action and re-running the check on each Approve gives the
   // user up-to-date diagnostic info if they fixed the underlying
   // issue between attempts.
+  // Round-23 (codex2 task-125 BLOCKING fix + claude3 task-126 O3):
+  // hoist cacheKey to the top so EVERY non-protected return path can
+  // invalidate the cache. The round-22 fix only covered post-`run_gh_
+  // api` paths; the early-return paths (origin missing, non-GitHub
+  // remote, malformed URL, run_gh_api throw) still left stale
+  // verified-protected entries alive after an explicit user re-check
+  // that returned `unknown`.
+  //
+  // Invariant: every fresh fetch must either WRITE the cache (when
+  // verified-protected) or DELETE the stale entry (anything else,
+  // including `unknown`). The invariant is total — no early-return
+  // path may skip the reconciliation.
+  const cacheKey = verifiedCacheKey(repoRoot, targetBranch);
   const useCache = options.useCache ?? true;
   if (useCache) {
-    const cached = verifiedProtectedCache.get(
-      verifiedCacheKey(repoRoot, targetBranch),
-    );
+    const cached = verifiedProtectedCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       return cached.verdict;
     }
@@ -507,12 +518,23 @@ export async function checkBranchProtectionDetail(
       remoteName: "origin",
     });
   } catch {
+    // Round-23: origin disappeared / git_get_remote_url failed —
+    // invalidate any stale protected cache entry.
+    verifiedProtectedCache.delete(cacheKey);
     return { state: "unknown" };
   }
   const host = detectGithubHost(remoteUrl);
-  if (!host) return { state: "unknown" };
+  if (!host) {
+    // Round-23: remote is not a recognizable GitHub host — invalidate.
+    verifiedProtectedCache.delete(cacheKey);
+    return { state: "unknown" };
+  }
   const parsed = parseGithubOwnerRepo(remoteUrl);
-  if (!parsed) return { state: "unknown", host };
+  if (!parsed) {
+    // Round-23: malformed owner/repo URL — invalidate.
+    verifiedProtectedCache.delete(cacheKey);
+    return { state: "unknown", host };
+  }
   // Round-20 codex1 round7 + codex2 task-116 H1 (BLOCKING fix): pass
   // `--hostname <host>` to `gh api` for non-default GitHub hosts so
   // the request actually targets the GHE installation, not the user's
@@ -529,6 +551,8 @@ export async function checkBranchProtectionDetail(
       { args },
     );
   } catch {
+    // Round-23: gh api threw (network failure, IPC error) — invalidate.
+    verifiedProtectedCache.delete(cacheKey);
     return { state: "unknown", host };
   }
   // Round-22 (codex2 task-122 BLOCKING fix): every fresh fetch must
@@ -543,7 +567,6 @@ export async function checkBranchProtectionDetail(
   //      Approve on the now-unprotected branch
   // …would silently bypass LB3 at exactly the explicit-user-re-check
   // point. The cacheKey-aware update below ensures freshness wins.
-  const cacheKey = verifiedCacheKey(repoRoot, targetBranch);
   if (res.exitCode === 0) {
     const detail = classifyProtectionBody(res.stdout);
     if (detail.classification === "meaningful") {
