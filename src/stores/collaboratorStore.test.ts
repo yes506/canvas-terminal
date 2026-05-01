@@ -5561,6 +5561,161 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(ghApiCalls).toBe(2);
   });
 
+  // -------------------------------------------------------------------------
+  // Round-22: codex2 task-122 BLOCKING fix — explicit re-check invalidates
+  // stale protected cache when fresh result is unprotected
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtectionDetail: useCache:false with fresh unprotected result invalidates stale protected cache (round-22 codex2 task-122 BLOCKING)", async () => {
+    // Round-22 codex2 task-122 BLOCKING: scenario:
+    //   1. Cache holds verified-protected for /r (prior successful check).
+    //   2. Protection disabled on GitHub.
+    //   3. User runs /branch-protection check → useCache:false bypasses,
+    //      returns fresh verified-unprotected.
+    //   4. PRIOR BUG: stale protected entry survived in cache. Next
+    //      /task approve hit cache → returned stale verified-protected
+    //      → Approve proceeded silently on now-unprotected branch.
+    //   5. ROUND-22 FIX: fresh non-protected verdict deletes the stale
+    //      cache entry, so subsequent Approves re-fetch and refuse.
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let ghCallCount = 0;
+    let ghReturnsProtected = true;
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        ghCallCount++;
+        if (ghReturnsProtected) {
+          return {
+            exitCode: 0,
+            stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+            stderr: "",
+          };
+        }
+        return { exitCode: 4, stdout: "", stderr: "Not Found (HTTP 404)" };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+
+    // Step 1: prime the cache with verified-protected.
+    const v1 = await checkBranchProtectionDetail(
+      "/r-toctou",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v1.state).toBe("verified-protected");
+    expect(ghCallCount).toBe(1);
+
+    // Step 2: simulate protection being disabled on GitHub.
+    ghReturnsProtected = false;
+
+    // Step 3: explicit user re-check via useCache:false → returns fresh
+    // verified-unprotected.
+    const v2 = await checkBranchProtectionDetail(
+      "/r-toctou",
+      fakeInvoke as unknown as typeof invoke,
+      undefined,
+      { useCache: false },
+    );
+    expect(v2.state).toBe("verified-unprotected");
+    expect(ghCallCount).toBe(2);
+
+    // Step 4: subsequent default (cached) call must NOT return the
+    // stale verified-protected entry. The cache should have been
+    // invalidated by step 3's fresh non-protected result.
+    const v3 = await checkBranchProtectionDetail(
+      "/r-toctou",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v3.state).toBe("verified-unprotected");
+    // CRITICAL: ghCallCount must have incremented — the cache lookup
+    // missed (because step 3 invalidated) and a fresh fetch fired.
+    expect(ghCallCount).toBe(3);
+  });
+
+  it("/task approve after /branch-protection check sees protection-disabled (round-22 end-to-end TOCTOU regression)", async () => {
+    // End-to-end version of the round-22 BLOCKING fix: the user's
+    // mental model is "I just ran /check and it said unprotected,
+    // therefore Approve should ask for accept-limited". The prior
+    // bug let Approve silently proceed via the stale protected cache.
+    const { taskId } = setupAwaitingApprovalTask({
+      hasResidue: false,
+      ackProtection: false,
+    });
+    let ghReturnsProtected = true;
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        if (ghReturnsProtected) {
+          return {
+            exitCode: 0,
+            stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+            stderr: "",
+          };
+        }
+        return { exitCode: 4, stdout: "", stderr: "Not Found (HTTP 404)" };
+      }
+      if (cmd === "git_merge_worktree") return { mergedSha: "abc", pushed: false };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+
+    // Step 1: prime via initial Approve attempt (verified-protected,
+    // proceeds, caches the verdict).
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    let task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("completed");
+
+    // Reset task to awaiting-approval for the next attempt (simulating
+    // a new agent task on the same repo).
+    useCollaboratorStore.setState((s) => ({
+      tasksBySession: {
+        ...s.tasksBySession,
+        [D14_SESSION]: s.tasksBySession[D14_SESSION].map((t) =>
+          t.id === taskId
+            ? {
+                ...t,
+                status: "awaiting-approval" as const,
+                pendingMerge: {
+                  branch: "agent/x",
+                  worktreePath: "/wt2",
+                  repoRoot: "/r",
+                  baseRef: "origin/dev",
+                  baseSha: "abc",
+                  baseFresh: true,
+                  diffSummary: { committed: ["a.ts"], staged: [], unstaged: [], untracked: [] },
+                  agentHandle: "@claude1",
+                },
+              }
+            : t,
+        ),
+      },
+    }));
+
+    // Step 2: protection disabled on GitHub.
+    ghReturnsProtected = false;
+
+    // Step 3: user runs /branch-protection check explicitly. Sees
+    // unprotected. The check invalidates the cache.
+    await executeCommand(parseInput("/branch-protection check"), D14_SESSION);
+
+    // Step 4: user runs /task approve. Round-22 fix: the stale
+    // verified-protected cache was invalidated in step 3, so Approve
+    // re-checks gh api, sees unprotected, refuses with accept-limited
+    // guidance.
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    // CRITICAL: status must remain awaiting-approval (refused), not
+    // re-completed via stale cache.
+    expect(task?.status).toBe("awaiting-approval");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("Branch protection NOT enabled");
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [

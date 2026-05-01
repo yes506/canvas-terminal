@@ -531,6 +531,19 @@ export async function checkBranchProtectionDetail(
   } catch {
     return { state: "unknown", host };
   }
+  // Round-22 (codex2 task-122 BLOCKING fix): every fresh fetch must
+  // either WRITE the new verdict into the cache (when verified-
+  // protected) OR DELETE any stale entry (when not verified-protected).
+  // Without the delete branch, a sequence like:
+  //   1. cache holds verified-protected for /r
+  //   2. protection disabled on GitHub
+  //   3. /branch-protection check (useCache:false) returns fresh
+  //      verified-unprotected — but cache entry untouched
+  //   4. /task approve uses cache → stale verified-protected → silent
+  //      Approve on the now-unprotected branch
+  // …would silently bypass LB3 at exactly the explicit-user-re-check
+  // point. The cacheKey-aware update below ensures freshness wins.
+  const cacheKey = verifiedCacheKey(repoRoot, targetBranch);
   if (res.exitCode === 0) {
     const detail = classifyProtectionBody(res.stdout);
     if (detail.classification === "meaningful") {
@@ -544,17 +557,23 @@ export async function checkBranchProtectionDetail(
       // skip the gh api round-trip. ONLY verified-protected is
       // cached — other verdicts gate on user action and benefit
       // from per-call freshness.
-      verifiedProtectedCache.set(
-        verifiedCacheKey(repoRoot, targetBranch),
-        { expiresAt: Date.now() + VERIFIED_PROTECTED_TTL_MS, verdict },
-      );
+      verifiedProtectedCache.set(cacheKey, {
+        expiresAt: Date.now() + VERIFIED_PROTECTED_TTL_MS,
+        verdict,
+      });
       return verdict;
     }
+    // Round-22 codex2 task-122 BLOCKING fix: fresh non-protected
+    // verdict invalidates any stale protected entry.
+    verifiedProtectedCache.delete(cacheKey);
     if (detail.classification === "unparseable") {
       return { state: "unknown", detail, host };
     }
     return { state: "verified-unprotected", detail, host };
   }
+  // Non-zero exit (404, auth failure, etc.) — also invalidate any
+  // stale protected entry for the same reason.
+  verifiedProtectedCache.delete(cacheKey);
   const stderrLc = res.stderr.toLowerCase();
   if (stderrLc.includes("not found") || stderrLc.includes("404")) {
     return { state: "verified-unprotected", host };
