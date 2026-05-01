@@ -212,10 +212,18 @@ pub fn write_app_config_file(
         nanos,
     ));
     {
+        // Round-26 P5 (codex1 round-13 #4): use `create_new(true)`
+        // instead of `create(true).truncate(true)` so the OS
+        // ENFORCES tmp-file uniqueness via O_EXCL. PID+nanos already
+        // makes collision practically negligible, but `create_new`
+        // turns the negligible-probability assumption into a hard
+        // invariant: if the unique tmp path somehow exists from a
+        // prior crashed process or stale dir contents, the write
+        // surfaces as an error rather than silently appending to /
+        // truncating someone else's content.
         let mut f = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp_path)
             .map_err(|e| format!("Cannot open temp file: {}", e))?;

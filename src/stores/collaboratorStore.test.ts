@@ -6148,6 +6148,70 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(state).toBe("unknown");
   });
 
+  // -------------------------------------------------------------------------
+  // Round-26 P5: HTTPS-with-port host stripping for GHE
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtection: HTTPS-with-port URL strips port from --hostname (round-26 claude2 task-133 Concern 2)", async () => {
+    // Round-26 (claude2 task-133 Concern 2): URL like
+    // `https://github.acme.com:8443/owner/repo` previously left the
+    // host as `"github.acme.com:8443"` (port included). When passed
+    // as `gh api --hostname github.acme.com:8443`, gh would treat
+    // the entire string as the hostname and likely fail (or
+    // misroute). The HTTPS branch now captures host without port and
+    // matches the optional `:port` separately.
+    let calledArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "https://github.acme.com:8443/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        calledArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r-https-port",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+    // CRITICAL: --hostname must be `github.acme.com` (no port), not
+    // the verbatim host:port string.
+    expect(calledArgs).toContain("--hostname");
+    const hostnameIdx = calledArgs.indexOf("--hostname");
+    expect(calledArgs[hostnameIdx + 1]).toBe("github.acme.com");
+    // The path itself extracts owner/repo correctly.
+    expect(calledArgs[0]).toBe("/repos/owner/repo/branches/dev/protection");
+  });
+
+  it("checkBranchProtection: HTTPS-with-port to github.com does NOT pass --hostname (default host preserved)", async () => {
+    // Defensive regression: `https://github.com:443/owner/repo` should
+    // still resolve to `github.com` (default host, no --hostname flag
+    // needed). The round-26 host-stripping must not break this case.
+    let calledArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "https://github.com:443/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        calledArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    await checkBranchProtection(
+      "/r-github-port",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(calledArgs).not.toContain("--hostname");
+    expect(calledArgs[0]).toBe("/repos/owner/repo/branches/dev/protection");
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [

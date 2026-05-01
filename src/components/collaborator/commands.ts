@@ -203,14 +203,24 @@ function detectGithubHost(url: string): string | null {
     if (host === "github.com" || host.startsWith("github.")) return host;
     return null;
   }
-  // HTTPS/HTTP: https://<host>/owner/repo(.git)?
-  const httpsMatch = url.match(/^https?:\/\/([^/\s]+)\//);
+  // HTTPS/HTTP: https://<host>[:port]/owner/repo(.git)?
+  // Round-26 P5 (claude2 task-133 Concern 2): strip optional port
+  // from the host BEFORE returning. The prior `[^/\s]+` regex
+  // captured `github.acme.com:8443` as the host string, which then
+  // got passed verbatim as `gh api --hostname github.acme.com:8443`
+  // — and `gh` expects a hostname without port. Excluding `:` from
+  // the host capture and consuming the optional `:port` separately
+  // gives us the right hostname for both the LB3 wizard messages
+  // and the `--hostname` plumbing.
+  const httpsMatch = url.match(/^https?:\/\/([^/\s:]+)(?::\d+)?\//);
   if (httpsMatch) {
     const host = httpsMatch[1].toLowerCase();
     if (host === "github.com" || host.startsWith("github.")) return host;
     return null;
   }
   // SCP-like SSH (no protocol): user@<host>:owner/repo(.git)?
+  // Note: the `:` here is a path separator (SCP convention), NOT a
+  // port. `[^:\s]+` already excludes it from the host capture.
   const scpMatch = url.match(/^[^@\s]+@([^:\s]+):/);
   if (scpMatch) {
     const host = scpMatch[1].toLowerCase();
