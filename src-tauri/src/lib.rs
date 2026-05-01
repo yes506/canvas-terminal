@@ -147,6 +147,10 @@ pub fn run() {
             commands::git::git_worktree_status,
             commands::git::git_diff_summary,
             commands::git::compute_worktree_path,
+            // Worktree-isolation policy P2 backend — orchestrator-owned
+            // approval commit + merge with file-lock + structured GitError
+            commands::git::git_create_approval_commit,
+            commands::git::git_merge_worktree,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
