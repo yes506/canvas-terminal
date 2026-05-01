@@ -8,6 +8,7 @@ import type {
   AgentNameRecord,
   PendingMerge,
   RenameResult,
+  TaskStatus,
 } from "../types/collaborator";
 import { TOOL_CONFIGS } from "../types/collaborator";
 import { muteCapture } from "../lib/agentOutputCapture";
@@ -52,6 +53,16 @@ export interface AgentTaskState {
   taskId?: string;
   taskTitle?: string;
   outcomeKind?: "completed" | "blocked";
+  /**
+   * Round-27: when `kind === "in_progress"`, the task's actual status.
+   * Lets the renderer distinguish the 5 non-terminal statuses
+   * (pending, in-progress, awaiting-approval, approved-merging,
+   * merge-conflict) instead of collapsing them all to a generic
+   * "in progress" — fixes the bug where awaiting-approval /
+   * merge-conflict tasks rendered as "idle" or "exited" because the
+   * indicator couldn't see them.
+   */
+  taskStatus?: TaskStatus;
 }
 
 export const RECENT_OUTCOME_TTL_MS = 5000;
@@ -131,24 +142,17 @@ export function getIndicatorPresentation(
   const liveRole: "status" | "alert" = isBlockedOutcome ? "alert" : "status";
   const liveLevel: "polite" | "assertive" = isBlockedOutcome ? "assertive" : "polite";
 
-  if (lifecycle === "exited") {
-    return { color: "bg-gray-500", ringColor: "ring-gray-400/40", pulse: false, ping: false, label: "exited", tone: "text-text-dim", liveRole, liveLevel };
-  }
+  // Step 1 — spawning/pre-registration ALWAYS wins. The PTY isn't
+  // running yet so no task work is happening; whatever state was
+  // captured in `taskState` is stale.
   if (lifecycle === "spawning" || lifecycle === "pre-registration") {
     return { color: "bg-yellow-400", ringColor: "ring-yellow-300/40", pulse: true, ping: false, label: "starting…", tone: "text-yellow-300", liveRole, liveLevel };
   }
-  if (taskState.kind === "in_progress") {
-    return {
-      color: "bg-sky-400",
-      ringColor: "ring-sky-300/40",
-      pulse: true,
-      ping: false,
-      label: taskState.taskTitle ? `in progress: ${taskState.taskTitle}` : "in progress",
-      tone: "text-sky-300",
-      liveRole,
-      liveLevel,
-    };
-  }
+
+  // Step 2 — completed (recent outcome) wins over `exited`. The
+  // success/blocked flash is informative and the user expects to see
+  // it after a successful Approve (which leaves agent.status='exited'
+  // because LB1 killed the PTY at the awaiting-approval flip).
   if (taskState.kind === "completed") {
     if (isBlockedOutcome) {
       return {
@@ -173,6 +177,87 @@ export function getIndicatorPresentation(
       liveLevel,
     };
   }
+
+  // Step 3 — Round-27: P2 review/merge taskStatus values
+  // (awaiting-approval / approved-merging / merge-conflict) override
+  // the `exited` lifecycle. LB1 kills the PTY by design at the
+  // awaiting-approval flip, so an exited agent with a mid-P2 task
+  // should surface the task state, not "exited".
+  if (taskState.kind === "in_progress") {
+    if (taskState.taskStatus === "awaiting-approval") {
+      return {
+        // Violet: distinct from blue (active work) and emerald
+        // (success). Signals "user action pending."
+        color: "bg-violet-400",
+        ringColor: "ring-violet-300/60",
+        pulse: false,
+        ping: true,
+        label: taskState.taskTitle
+          ? `awaiting approval: ${taskState.taskTitle}`
+          : "awaiting approval",
+        tone: "text-violet-300",
+        liveRole,
+        liveLevel,
+      };
+    }
+    if (taskState.taskStatus === "approved-merging") {
+      return {
+        color: "bg-cyan-400",
+        ringColor: "ring-cyan-300/60",
+        pulse: true,
+        ping: false,
+        label: taskState.taskTitle
+          ? `merging: ${taskState.taskTitle}`
+          : "merging…",
+        tone: "text-cyan-300",
+        liveRole,
+        liveLevel,
+      };
+    }
+    if (taskState.taskStatus === "merge-conflict") {
+      return {
+        // Amber matches the "blocked" outcome treatment — both are
+        // "user action required."
+        color: "bg-amber-500",
+        ringColor: "ring-amber-300/70",
+        pulse: true,
+        ping: true,
+        label: taskState.taskTitle
+          ? `⚠ merge conflict: ${taskState.taskTitle}`
+          : "⚠ merge conflict",
+        tone: "text-amber-300",
+        liveRole: "alert",
+        liveLevel: "assertive",
+      };
+    }
+    // pending / in-progress / undefined fall through — they don't
+    // override `exited`. Step 4 (exited) sees them next.
+  }
+
+  // Step 4 — exited lifecycle. Wins over plain in_progress (no
+  // P2-status override) and over idle. After steps 2+3 already let
+  // completed and P2-review states pre-empt, anything reaching here
+  // with `lifecycle === "exited"` should render gray "exited".
+  if (lifecycle === "exited") {
+    return { color: "bg-gray-500", ringColor: "ring-gray-400/40", pulse: false, ping: false, label: "exited", tone: "text-text-dim", liveRole, liveLevel };
+  }
+
+  // Step 5 — running + in_progress (pending/in-progress taskStatus,
+  // or undefined for back-compat). Standard "active work" blue.
+  if (taskState.kind === "in_progress") {
+    return {
+      color: "bg-sky-400",
+      ringColor: "ring-sky-300/40",
+      pulse: true,
+      ping: false,
+      label: taskState.taskTitle ? `in progress: ${taskState.taskTitle}` : "in progress",
+      tone: "text-sky-300",
+      liveRole,
+      liveLevel,
+    };
+  }
+
+  // Step 6 — running + idle.
   return { color: "bg-green-400/60", ringColor: "ring-green-400/0", pulse: false, ping: false, label: "idle", tone: "text-text-dim", liveRole, liveLevel };
 }
 
@@ -214,13 +299,15 @@ export function getAgentTaskState(
   const recent = recentOutcomesBySession[collabSessionId]?.[handle];
   const recentValid = !!recent && Date.now() - recent.at < RECENT_OUTCOME_TTL_MS;
 
-  // Delegate the "freshest active task" pick to the shared helper so the
-  // selection rule lives in exactly one place. Without this, drift between
-  // the indicator's display logic and `bumpAssignedAt`'s target picker is
-  // exactly the bug @codex3 found in round 5 (oldest-vs-freshest). The
-  // helper also returns the parsed ms so we don't re-parse `assignedAt`
-  // for the freshness gate (claude1 D1 + claude3 D3 from round 7).
-  const found = findFreshestActiveTaskForMention(tasks, mention);
+  // Round-27: use the NON-TERMINAL helper so the indicator can surface
+  // all 5 non-terminal task statuses (pending, in-progress, awaiting-
+  // approval, approved-merging, merge-conflict). The strict
+  // `findFreshestActiveTaskForMention` (used by sendToAgent /
+  // broadcastToAll) only considers pending/in-progress because those
+  // are the states where the PTY is alive and a fresh inject_into_pty
+  // makes sense — but for the indicator label, the user wants to see
+  // the agent's actual current state across the full P2 flow.
+  const found = findFreshestNonTerminalTaskForMention(tasks, mention);
 
   if (found) {
     // "Freshly assigned" = no recent outcome to honor, OR the active task
@@ -231,7 +318,16 @@ export function getAgentTaskState(
     // `assignedAt` is strictly less than `recent.at`.
     const freshAfterOutcome = !recentValid || found.assignedAtMs >= recent!.at;
     if (freshAfterOutcome) {
-      return { kind: "in_progress", taskId: found.task.id, taskTitle: found.task.title };
+      return {
+        kind: "in_progress",
+        taskId: found.task.id,
+        taskTitle: found.task.title,
+        // Round-27: pass the actual status so the renderer can
+        // distinguish pending/in-progress (active work) from
+        // awaiting-approval (review pending) / approved-merging
+        // (merging…) / merge-conflict (needs resolution).
+        taskStatus: found.task.status,
+      };
     }
   }
 
@@ -583,9 +679,21 @@ function taskFileRelativePath(collabSessionId: string): string {
  * Pick the freshest active (pending/in-progress) task assigned to a given
  * mention — i.e., the one with the largest `assignedAt`. Returns the
  * parsed ms timestamp alongside the task so callers don't re-parse the
- * ISO string (`getAgentTaskState` needs `assignedAtMs` for the freshness
- * gate; `bumpAssignedAt` callers can ignore it). Single-pass scan, no
- * `.sort()` copy.
+ * ISO string (`bumpAssignedAt` callers can ignore it). Single-pass scan,
+ * no `.sort()` copy.
+ *
+ * STRICT pending/in-progress filter — used by sendToAgent and
+ * broadcastToAll's auto-create/refresh decision. The strictness is
+ * load-bearing: the awaiting-approval / approved-merging /
+ * merge-conflict states have a killed PTY (LB1 design), so refreshing
+ * via `inject_into_pty` would fail. The lease check at sendToAgent
+ * (round-11) handles those non-terminal states by refusing the entire
+ * send when a worktree lease is held with no fresh active task.
+ *
+ * For the INDICATOR (`getAgentTaskState`), use
+ * `findFreshestNonTerminalTaskForMention` instead — the indicator
+ * needs to surface ALL non-terminal task states, not just the ones
+ * where the PTY is alive.
  */
 function findFreshestActiveTaskForMention(
   tasks: CollabTask[],
@@ -596,6 +704,41 @@ function findFreshestActiveTaskForMention(
   for (const t of tasks) {
     if (t.assignee !== mention) continue;
     if (t.status !== "pending" && t.status !== "in-progress") continue;
+    const ms = new Date(t.assignedAt).getTime();
+    if (ms > freshestMs) {
+      freshest = t;
+      freshestMs = ms;
+    }
+  }
+  return freshest ? { task: freshest, assignedAtMs: freshestMs } : null;
+}
+
+/**
+ * Round-27: pick the freshest NON-TERMINAL task assigned to a given
+ * mention. "Non-terminal" = anything except `completed` or `blocked`,
+ * covering the full P2 status machine:
+ *   - pending, in-progress (active, PTY alive)
+ *   - awaiting-approval, approved-merging, merge-conflict (in
+ *     P2 review/merge flow, PTY killed by LB1 design)
+ *
+ * Used by the indicator (`getAgentTaskState`) so the agent's mini-
+ * terminal label correctly reflects mid-P2-flow tasks. Without this,
+ * awaiting-approval / approved-merging / merge-conflict tasks fell
+ * through the strict `findFreshestActiveTaskForMention` filter and
+ * the indicator showed "idle" (or stale "completed" outcome) when
+ * the task was very much alive — the bug shape the user-reported
+ * status mismatch surfaced.
+ */
+function findFreshestNonTerminalTaskForMention(
+  tasks: CollabTask[],
+  mention: string,
+): { task: CollabTask; assignedAtMs: number } | null {
+  let freshest: CollabTask | null = null;
+  let freshestMs = -Infinity;
+  for (const t of tasks) {
+    if (t.assignee !== mention) continue;
+    // Exclude only the two terminal statuses — accept all 5 non-terminal.
+    if (t.status === "completed" || t.status === "blocked") continue;
     const ms = new Date(t.assignedAt).getTime();
     if (ms > freshestMs) {
       freshest = t;
