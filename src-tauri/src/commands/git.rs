@@ -842,6 +842,20 @@ pub struct MergeResult {
 /// by the Approve flow when the agent left uncommitted/untracked work
 /// behind (codex2 #1: prevents no-op merges).
 ///
+/// **Contract (codex2 task-67 H3):** the frontend MUST call this only
+/// when `pendingMerge.diffSummary` shows non-empty `staged | unstaged |
+/// untracked` lists. For agent branches with **only** committed delta
+/// (no working-tree residue), this command will return `EmptyCommit`
+/// because `git add -A` produces nothing to stage — that's the wrong
+/// classification for committed-only branches. The Approve UI's logic
+/// should be:
+///
+///   if (diffSummary.staged.length || diffSummary.unstaged.length ||
+///       diffSummary.untracked.length) {
+///     await invoke("git_create_approval_commit", ...);   // capture residue
+///   }
+///   await invoke("git_merge_worktree", ...);             // always run
+///
 /// RESID-4 + POLISH-5: explicit committer identity via `-c user.name=`
 /// + `-c user.email=` (works on fresh worktrees with no global git config)
 /// AND author attribution preserves the agent handle for traceability.

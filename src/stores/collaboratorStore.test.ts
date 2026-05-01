@@ -2640,4 +2640,98 @@ describe("Copilot CLI roster registration", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// codex2 task-67 H1 — central pendingMerge cleanup on terminal transitions.
+// updateTask must clear pendingMerge when status flips to a terminal state
+// (completed | blocked) regardless of whether the caller passed it. This
+// prevents stale merge metadata accumulating once LB1 starts populating it.
+// ---------------------------------------------------------------------------
+
+describe("updateTask central pendingMerge cleanup (codex2 task-67 H1)", () => {
+  beforeEach(() => {
+    resetStores();
+  });
+
+  const fakePendingMerge = {
+    branch: "agent/test-1",
+    worktreePath: "/tmp/wt",
+    repoRoot: "/tmp/repo",
+    baseRef: "origin/dev",
+    baseSha: "abc123",
+    baseFresh: true,
+    diffSummary: {
+      committed: ["src/foo.ts"],
+      staged: [],
+      unstaged: [],
+      untracked: [],
+    },
+    agentHandle: "@claude2",
+  };
+
+  it("clears pendingMerge when status transitions to completed", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ title: "x", objective: "x" }, SESSION);
+    // Simulate the awaiting-approval gate having populated pendingMerge.
+    store.updateTask(
+      task.id,
+      { status: "awaiting-approval", pendingMerge: fakePendingMerge },
+      SESSION,
+    );
+    const beforeTerminal = store.getTasks(SESSION).find((t) => t.id === task.id);
+    expect(beforeTerminal?.pendingMerge).not.toBeNull();
+
+    // Caller transitions to completed WITHOUT explicitly passing pendingMerge.
+    // The central cleanup must still null it.
+    store.updateTask(task.id, { status: "completed" }, SESSION);
+    const afterTerminal = store.getTasks(SESSION).find((t) => t.id === task.id);
+    expect(afterTerminal?.status).toBe("completed");
+    expect(afterTerminal?.pendingMerge).toBeNull();
+  });
+
+  it("clears pendingMerge when status transitions to blocked", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ title: "x", objective: "x" }, SESSION);
+    store.updateTask(
+      task.id,
+      { status: "merge-conflict", pendingMerge: fakePendingMerge },
+      SESSION,
+    );
+    store.updateTask(task.id, { status: "blocked" }, SESSION);
+    const after = store.getTasks(SESSION).find((t) => t.id === task.id);
+    expect(after?.status).toBe("blocked");
+    expect(after?.pendingMerge).toBeNull();
+  });
+
+  it("warns when transitioning to a P2 non-terminal without a snapshot", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ title: "x", objective: "x" }, SESSION);
+    // No pendingMerge supplied; existing task has none either.
+    store.updateTask(task.id, { status: "awaiting-approval" }, SESSION);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("without pendingMerge snapshot"),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("does NOT warn when an existing pendingMerge is preserved across non-terminal transitions", () => {
+    // E.g., awaiting-approval → approved-merging while keeping the same
+    // snapshot. Caller doesn't need to re-supply.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ title: "x", objective: "x" }, SESSION);
+    store.updateTask(
+      task.id,
+      { status: "awaiting-approval", pendingMerge: fakePendingMerge },
+      SESSION,
+    );
+    warnSpy.mockClear();
+    // Transition awaiting-approval → approved-merging. Caller doesn't
+    // re-supply pendingMerge; the existing snapshot satisfies the rule.
+    store.updateTask(task.id, { status: "approved-merging" }, SESSION);
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+});
+
 

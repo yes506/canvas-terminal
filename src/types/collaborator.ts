@@ -111,7 +111,12 @@ export type RenameResult =
  *   pending             — created, may or may not be assigned
  *   in-progress         — agent is actively working
  *   awaiting-approval   — P2 gate: agent wrote .done.json AND the task
- *                         touched git-tracked files in a worktree.
+ *                         produced a "source delta" in its worktree.
+ *                         Source delta = D2 broadened scope: any of
+ *                         (a) committed changes against baseSha,
+ *                         (b) staged-but-uncommitted changes,
+ *                         (c) unstaged changes to tracked files,
+ *                         (d) untracked-non-ignored files.
  *                         The agent's PTY is killed at the flip
  *                         (LB1, claude3 task-46 R2 ordering: kill BEFORE
  *                         snapshot). User must Approve / Request Changes

@@ -6,6 +6,7 @@ import type {
   ToolId,
   CollabTask,
   AgentNameRecord,
+  PendingMerge,
   RenameResult,
 } from "../types/collaborator";
 import { TOOL_CONFIGS } from "../types/collaborator";
@@ -1916,6 +1917,54 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     const cleanUpdates = Object.fromEntries(
       Object.entries(updates).filter(([, v]) => v !== undefined),
     ) as typeof updates;
+
+    // codex2 task-67 H1: enforce pendingMerge terminal cleanup centrally,
+    // not at every caller. Without this guard, a legacy callsite that
+    // does `updateTask(id, { status: "completed" })` without explicitly
+    // setting `pendingMerge: null` would leave stale merge metadata on
+    // the terminal task once LB1 starts populating pendingMerge.
+    //
+    // Rule:
+    //   - status transitioning to `completed` or `blocked` → force
+    //     `pendingMerge: null` unless the caller explicitly opted in
+    //     to keep it (no current callsites need that).
+    //   - status transitioning to a P2 non-terminal (`awaiting-approval`
+    //     | `approved-merging` | `merge-conflict`) → caller MUST supply
+    //     `pendingMerge` in the same updates batch. We can't hard-fail
+    //     in production (would break legacy paths under construction)
+    //     but we log a dev-mode warning so the next commit (LB1 wiring)
+    //     surfaces any forgotten snapshots.
+    if (cleanUpdates.status === "completed" || cleanUpdates.status === "blocked") {
+      // Caller may set pendingMerge to anything (including the previous
+      // value); we override to null. The clean-updates spread happens
+      // BEFORE this so the override wins.
+      (cleanUpdates as { pendingMerge: PendingMerge | null }).pendingMerge = null;
+    } else if (
+      cleanUpdates.status === "awaiting-approval" ||
+      cleanUpdates.status === "approved-merging" ||
+      cleanUpdates.status === "merge-conflict"
+    ) {
+      const merging = cleanUpdates as { pendingMerge?: PendingMerge | null };
+      const willHaveSnapshot =
+        merging.pendingMerge !== undefined && merging.pendingMerge !== null;
+      // If the caller didn't supply a fresh snapshot AND the existing
+      // task doesn't already have one, we'd flip into the awaiting-
+      // approval state with no merge metadata — a real lifecycle bug.
+      // Best-effort warning until LB1 lands; can be promoted to a hard
+      // assertion once the gate is wired.
+      if (!willHaveSnapshot) {
+        const existing = (get().tasksBySession[forSession] ?? []).find(
+          (t) => t.id === taskId,
+        );
+        if (!existing?.pendingMerge) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[collab/store] updateTask ${taskId} → ${cleanUpdates.status} without pendingMerge snapshot ` +
+              `(codex2 task-67 H1: every P2 non-terminal transition should carry a fresh PendingMerge).`,
+          );
+        }
+      }
+    }
 
     set((s) => ({
       tasksBySession: {
