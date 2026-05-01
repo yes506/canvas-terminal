@@ -884,6 +884,19 @@ interface CollaboratorState {
     sessionId: string,
     status: SpawnedAgent["status"],
   ) => void;
+  /**
+   * Release the worktree lease on an agent record, scoped to a session.
+   *
+   * Clears `agent.worktree` for the matching agent. Used by the D14
+   * Approve / Discard flow once the orchestrator has either merged or
+   * removed the worktree — the agent record is then no longer holding
+   * the lease, and a new task can be assigned (LB5 lease-based criteria).
+   *
+   * No-op when no matching agent exists. The caller is responsible for
+   * having already removed the worktree on disk; this only mutates
+   * in-memory state.
+   */
+  releaseAgentWorktree: (handle: string, forSession: string) => void;
   /** Flush queued messages for an agent that has become ready. */
   flushPendingMessages: (sessionId: string) => Promise<void>;
   killAllAgents: (forSession?: string) => Promise<void>;
@@ -1644,6 +1657,18 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     set((s) => ({
       agents: s.agents.map((a) =>
         a.sessionId === sessionId ? { ...a, status } : a,
+      ),
+    }));
+  },
+
+  releaseAgentWorktree: (handle, forSession) => {
+    // Strip leading @ defensively — callers may pass either form.
+    const normalized = handle.replace(/^@/, "");
+    set((s) => ({
+      agents: s.agents.map((a) =>
+        a.collabSessionId === forSession && a.handle === normalized
+          ? { ...a, worktree: null }
+          : a,
       ),
     }));
   },

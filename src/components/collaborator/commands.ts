@@ -65,6 +65,72 @@ export function findActiveWorktreeTaskForAgent(
   return findWorktreeLeaseConflict(assigneeToken, agents, tasks, collabSessionId);
 }
 
+/**
+ * Shape of the LB6 structured GitError tagged-union, mirrored from
+ * `src-tauri/src/commands/git.rs` (kind discriminator + variant fields).
+ * Used by the D14 Approve flow to route on `kind` for actionable status
+ * messages and the right task-status transition.
+ */
+export interface GitErrorShape {
+  kind?:
+    | "emptyCommit"
+    | "hookFailed"
+    | "mergeConflict"
+    | "targetBranchStale"
+    | "parentRepoDirty"
+    | "pushFailedAfterMerge"
+    | "authorIdentityMissing"
+    | "genericFailure";
+  message?: string;
+  stage?: string;
+  stderr?: string;
+  branch?: string;
+  files?: string[];
+  target?: string;
+  repoRoot?: string;
+  mergedSha?: string;
+  command?: string;
+  exitCode?: number;
+}
+
+/**
+ * Render a GitError variant into a single-line actionable status message.
+ * Falls back to `String(err)` for non-tagged-union errors (network /
+ * IPC failures that didn't come from the structured backend path).
+ */
+export function formatGitError(err: unknown): string {
+  if (!err || typeof err !== "object") return String(err);
+  const e = err as GitErrorShape;
+  switch (e.kind) {
+    case "emptyCommit":
+      return `nothing to commit (${e.message ?? "working tree was already clean"})`;
+    case "hookFailed":
+      return `pre-${e.stage ?? "commit"} hook failed: ${(e.stderr ?? "").split("\n")[0]}`;
+    case "mergeConflict": {
+      const fileList = (e.files ?? []).slice(0, 5).join(", ");
+      const more =
+        (e.files?.length ?? 0) > 5 ? ` (+${(e.files?.length ?? 0) - 5} more)` : "";
+      return `merge conflict on branch ${e.branch ?? "?"}${fileList ? ` in ${fileList}${more}` : ""}. Resolve manually or Discard.`;
+    }
+    case "targetBranchStale":
+      return `local '${e.target ?? "dev"}' can't fast-forward to origin. Run 'git pull' first. ${(e.message ?? "").split("\n")[0]}`;
+    case "parentRepoDirty": {
+      const fileList = (e.files ?? []).slice(0, 5).join(", ");
+      const more =
+        (e.files?.length ?? 0) > 5 ? ` (+${(e.files?.length ?? 0) - 5} more)` : "";
+      return `parent repo has uncommitted changes${fileList ? `: ${fileList}${more}` : ""}. Commit or stash, then retry.`;
+    }
+    case "pushFailedAfterMerge":
+      return `merge OK (${e.mergedSha ?? "?"}) but push failed: ${(e.stderr ?? "").split("\n")[0]}`;
+    case "authorIdentityMissing":
+      return `git committer identity unresolved. Set user.name / user.email and retry.`;
+    case "genericFailure":
+      return `${e.command ?? "git"} exited ${e.exitCode ?? "?"}: ${(e.stderr ?? "").split("\n")[0]}`;
+    default:
+      return String(err);
+  }
+}
+
 export interface ParsedCommand {
   type:
     | "send"
@@ -229,6 +295,8 @@ export function getHelpText(): string {
     "Tasks: /task list  /task add <title> | <objective> [@agent]",
     "       /task <id> status <pending|in-progress|completed|blocked>",
     "       /task <id> assign @<agent>  /task <id> done [notes]",
+    "       /task <id> approve [--push] [-- <message>]   (worktree-backed only)",
+    "       /task <id> discard [<reason>]                (worktree-backed only)",
     "Canvas: /canvas-export [msg]  /canvas-export @agent [msg]  /canvas-import @agent",
     "Memory: /context <text>  /memory list|read|delete|clear",
     "Agents: @claude @codex @gemini @copilot  Indexed: @claude1 @claude2  Or by nickname: @bug-hunter",
@@ -609,6 +677,278 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           break;
         }
 
+        // /task <id> approve [--push] [-- <commit message>]
+        // D14 (codex2 task-67 H3, claude2 task-50): the user-facing surface
+        // that consumes pendingMerge. Runs the orchestrator-owned merge
+        // sequence:
+        //   1. (conditional) git_create_approval_commit when the diff
+        //      summary shows uncommitted residue (staged|unstaged|untracked).
+        //   2. git_merge_worktree(repoRoot, branch, "dev", push) — always.
+        //   3. On success: git_worktree_remove + transition task to
+        //      `completed` + release the agent's worktree lease.
+        //   4. On structured GitError: surface actionable text; transition
+        //      task to `merge-conflict` for the merge-failure subset, or
+        //      restore `awaiting-approval` for retryable preconditions
+        //      (TargetBranchStale, ParentRepoDirty, AuthorIdentityMissing).
+        // Worktree is NEVER auto-removed on failure (LB6 invariant).
+        const approveMatch = sub.match(
+          /^(\S+)\s+approve(?:\s+--push)?(?:\s+--\s+(.+))?$/s,
+        );
+        if (approveMatch) {
+          if (!collabSessionId) {
+            status("Task commands require a collaborator session.");
+            break;
+          }
+          const wantsPush = /\s--push(\s|$)/.test(sub);
+          const [, taskId, customMessage] = approveMatch;
+          const task = store
+            .getTasks(collabSessionId)
+            .find((t) => t.id === taskId || t.id.startsWith(taskId));
+          if (!task) {
+            status(`Task not found: ${taskId}`);
+            break;
+          }
+          if (!task.pendingMerge) {
+            status(
+              `Task ${task.id} has no pending merge — Approve only applies to ` +
+                `tasks in awaiting-approval (or merge-conflict for retry). ` +
+                `Current status: ${task.status}.`,
+            );
+            break;
+          }
+          if (
+            task.status !== "awaiting-approval" &&
+            task.status !== "merge-conflict"
+          ) {
+            status(
+              `Task ${task.id} status is ${task.status} — Approve only fires for ` +
+                `awaiting-approval or merge-conflict (retry).`,
+            );
+            break;
+          }
+          const snapshot = task.pendingMerge;
+          const message =
+            customMessage?.trim() ||
+            `Approve task ${task.id}: ${task.title}`;
+
+          // In-flight indicator. The user-facing footer shows a clear
+          // progression: awaiting-approval → approved-merging → completed.
+          store.updateTask(
+            task.id,
+            { status: "approved-merging" },
+            collabSessionId,
+          );
+          status(`Approving task ${task.id}…`);
+
+          // Step 1: capture uncommitted residue if present. Skip when the
+          // diff summary shows committed-only delta — calling
+          // git_create_approval_commit on a clean tree returns EmptyCommit
+          // which we'd then have to special-case (see backend doc on
+          // line 845 of git.rs).
+          const ds = snapshot.diffSummary;
+          const hasResidue =
+            ds.staged.length > 0 ||
+            ds.unstaged.length > 0 ||
+            ds.untracked.length > 0;
+          if (hasResidue) {
+            try {
+              await invoke("git_create_approval_commit", {
+                worktreePath: snapshot.worktreePath,
+                message,
+                agentHandle: snapshot.agentHandle,
+              });
+            } catch (err) {
+              // Structured GitError → surface variant. Restore status
+              // to awaiting-approval so the user can fix and retry.
+              store.updateTask(
+                task.id,
+                { status: "awaiting-approval" },
+                collabSessionId,
+              );
+              status(`Approval-commit failed for ${task.id}: ${formatGitError(err)}`);
+              break;
+            }
+          }
+
+          // Step 2: merge into dev.
+          let mergedSha: string | undefined;
+          let pushed = false;
+          let pushFailedAfterMerge: { sha: string; stderr: string } | null = null;
+          try {
+            const result = await invoke<{ mergedSha: string; pushed: boolean }>(
+              "git_merge_worktree",
+              {
+                repoRoot: snapshot.repoRoot,
+                branchName: snapshot.branch,
+                targetBranch: "dev",
+                push: wantsPush,
+              },
+            );
+            mergedSha = result.mergedSha;
+            pushed = result.pushed;
+          } catch (err) {
+            // Structured GitError → variant-specific status routing.
+            const gitErr = err as GitErrorShape;
+            const kind = gitErr?.kind;
+            // PushFailedAfterMerge is special: the local merge succeeded;
+            // only the push failed. Treat as merge-locally-completed; the
+            // user can re-push manually with `git push origin dev`.
+            if (kind === "pushFailedAfterMerge") {
+              pushFailedAfterMerge = {
+                sha: gitErr.mergedSha ?? "(unknown sha)",
+                stderr: gitErr.stderr ?? "",
+              };
+              mergedSha = gitErr.mergedSha;
+              pushed = false;
+            } else {
+              // Merge-conflict subset → status `merge-conflict`. The
+              // worktree is preserved (backend ran `git merge --abort`
+              // on the parent, leaving the worktree itself intact).
+              const isMergeFailure =
+                kind === "mergeConflict" ||
+                kind === "hookFailed";
+              const newStatus: TaskStatus = isMergeFailure
+                ? "merge-conflict"
+                : "awaiting-approval";
+              store.updateTask(
+                task.id,
+                { status: newStatus },
+                collabSessionId,
+              );
+              status(`Merge failed for ${task.id}: ${formatGitError(err)}`);
+              break;
+            }
+          }
+
+          // Step 3: cleanup the worktree on disk + release the lease.
+          // Never block on cleanup failure — the merge is the load-bearing
+          // outcome; cleanup residue is recoverable. Surface as a warning
+          // appended to the status, but treat the task as completed.
+          let cleanupWarn = "";
+          try {
+            const outcome = await invoke<unknown>("git_worktree_remove", {
+              repoRoot: snapshot.repoRoot,
+              worktreePath: snapshot.worktreePath,
+              branchName: snapshot.branch,
+            });
+            // Recognize the WorktreeRemovedBranchPreserved variant so the
+            // user knows the branch survived (cleanup needed manually).
+            if (
+              outcome &&
+              typeof outcome === "object" &&
+              "kind" in outcome &&
+              (outcome as { kind?: string }).kind ===
+                "worktreeRemovedBranchPreserved"
+            ) {
+              cleanupWarn = ` (worktree removed; branch ${snapshot.branch} preserved — delete manually if desired)`;
+            }
+          } catch (err) {
+            cleanupWarn = ` (cleanup warning: ${err})`;
+          }
+          // Even if the worktree-remove call failed, we successfully
+          // merged the work into dev. Release the lease so a new task
+          // can be assigned to this agent.
+          store.releaseAgentWorktree(snapshot.agentHandle, collabSessionId);
+
+          // Step 4: transition task to terminal `completed`. The central
+          // pendingMerge cleanup in updateTask auto-clears the snapshot.
+          const conclusion = pushFailedAfterMerge
+            ? `Approved & merged locally as ${pushFailedAfterMerge.sha} (push failed: ${pushFailedAfterMerge.stderr.split("\n")[0]})`
+            : pushed
+            ? `Approved, merged, and pushed: ${mergedSha}`
+            : `Approved & merged locally: ${mergedSha}`;
+          store.updateTask(
+            task.id,
+            { status: "completed", conclusion },
+            collabSessionId,
+          );
+
+          if (pushFailedAfterMerge) {
+            status(
+              `Task ${task.id} approved & merged locally as ${pushFailedAfterMerge.sha}, but push failed: ${pushFailedAfterMerge.stderr.split("\n")[0]}. ` +
+                `Re-push manually with 'git push origin dev'.${cleanupWarn}`,
+            );
+          } else {
+            status(
+              `Task ${task.id} approved${pushed ? " & pushed" : " & merged locally"}: ${mergedSha}${cleanupWarn}`,
+            );
+          }
+          break;
+        }
+
+        // /task <id> discard [<reason>]
+        // D14: explicitly throw away the worktree + branch. Used when the
+        // reviewer rejects the agent's work entirely. Runs:
+        //   1. git_worktree_remove (force)
+        //   2. git_branch_force_delete (the user's explicit decision to
+        //      destroy unmerged work)
+        //   3. transition task to `blocked` (the abandoned terminal state;
+        //      central cleanup auto-clears pendingMerge), with reason in
+        //      the conclusion.
+        //   4. release the agent's worktree lease.
+        const discardMatch = sub.match(/^(\S+)\s+discard(?:\s+(.+))?$/s);
+        if (discardMatch) {
+          if (!collabSessionId) {
+            status("Task commands require a collaborator session.");
+            break;
+          }
+          const [, taskId, reason] = discardMatch;
+          const task = store
+            .getTasks(collabSessionId)
+            .find((t) => t.id === taskId || t.id.startsWith(taskId));
+          if (!task) {
+            status(`Task not found: ${taskId}`);
+            break;
+          }
+          if (!task.pendingMerge) {
+            status(
+              `Task ${task.id} has no pending merge to discard — Discard only ` +
+                `applies to tasks in awaiting-approval or merge-conflict.`,
+            );
+            break;
+          }
+          const snapshot = task.pendingMerge;
+
+          // Step 1: remove the worktree from disk.
+          let removeWarn = "";
+          try {
+            await invoke("git_worktree_remove", {
+              repoRoot: snapshot.repoRoot,
+              worktreePath: snapshot.worktreePath,
+              branchName: snapshot.branch,
+            });
+          } catch (err) {
+            // Continue — discard is destructive; partial cleanup is still
+            // a Discard. Surface in the final status.
+            removeWarn = ` (worktree-remove warning: ${err})`;
+          }
+
+          // Step 2: force-delete the branch (Discard explicitly throws
+          // away the work; -d would refuse on unmerged commits).
+          try {
+            await invoke("git_branch_force_delete", {
+              repoRoot: snapshot.repoRoot,
+              branchName: snapshot.branch,
+            });
+          } catch (err) {
+            removeWarn += ` (branch-delete warning: ${err})`;
+          }
+
+          // Step 3: release the lease and mark task blocked. The central
+          // pendingMerge cleanup in updateTask clears the snapshot.
+          store.releaseAgentWorktree(snapshot.agentHandle, collabSessionId);
+          const conclusion = reason?.trim()
+            ? `Discarded: ${reason.trim()}`
+            : "Discarded";
+          store.updateTask(
+            task.id,
+            { status: "blocked", conclusion },
+            collabSessionId,
+          );
+          status(`Task ${task.id} discarded${removeWarn}`);
+          break;
+        }
+
         // /task <id> done [notes]
         const doneMatch = sub.match(/^(\S+)\s+done(?:\s+(.+))?$/s);
         if (doneMatch) {
@@ -644,7 +984,7 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           break;
         }
 
-        status("Usage: /task list | add <title> | <id> status|assign|done");
+        status("Usage: /task list | add <title> | <id> status|assign|done|approve|discard");
       } catch (err) {
         status(`Task error: ${err}`);
       }

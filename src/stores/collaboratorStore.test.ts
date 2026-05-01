@@ -3689,4 +3689,448 @@ describe("updateTask central pendingMerge cleanup (codex2 task-67 H1)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// D14 — Approve / Discard slash commands (orchestrator-owned merge surface)
+// ---------------------------------------------------------------------------
+//
+// Approve flow: optional git_create_approval_commit (when residue exists) →
+// git_merge_worktree → git_worktree_remove → release lease + transition
+// task to `completed`. Each GitError variant routes to a specific status
+// transition: merge-conflict / hook failure → `merge-conflict`; stale base /
+// dirty parent / empty commit → restore `awaiting-approval`; push-failed-
+// after-merge → `completed` with warning (local merge already happened).
+//
+// Discard flow: git_worktree_remove + git_branch_force_delete → release
+// lease + transition task to `blocked`.
+//
+// Both flows release the agent's worktree lease so a follow-up task can be
+// assigned to the same agent (LB5 lease-based).
 
+describe("D14 — /task approve and /task discard slash commands", () => {
+  const D14_SESSION = "collab-d14-tests";
+
+  beforeEach(() => {
+    _resetWriteStateForTests();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  function setupAwaitingApprovalTask(opts: {
+    hasResidue: boolean;
+  } = { hasResidue: true }) {
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "exited", // round-8: PTY exits after LB1 flip; record persists
+          collabSessionId: D14_SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Claude Code #1",
+          nicknameSlug: "claude-code-1",
+          nameHistory: [
+            { nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" },
+          ],
+          worktree: {
+            repoRoot: "/r",
+            path: "/wt",
+            branch: "agent/claude_code-session-1",
+            baseRef: "origin/dev",
+            baseSha: "abc",
+            baseFresh: true,
+            createdAtMs: 1,
+          },
+        },
+      ],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [D14_SESSION]: [] },
+      logEntriesBySession: { [D14_SESSION]: [] },
+      statusMessages: {},
+    });
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "feat", objective: "feat", assignee: "@claude1" },
+      D14_SESSION,
+    );
+    store.updateTask(
+      task.id,
+      {
+        status: "awaiting-approval",
+        pendingMerge: {
+          branch: "agent/claude_code-session-1",
+          worktreePath: "/wt",
+          repoRoot: "/r",
+          baseRef: "origin/dev",
+          baseSha: "abc",
+          baseFresh: true,
+          diffSummary: opts.hasResidue
+            ? { committed: ["a.ts"], staged: ["b.ts"], unstaged: [], untracked: [] }
+            : { committed: ["a.ts"], staged: [], unstaged: [], untracked: [] },
+          agentHandle: "@claude1",
+        },
+      },
+      D14_SESSION,
+    );
+    return { taskId: task.id };
+  }
+
+  it("/task approve: happy path — runs approval-commit + merge + cleanup, releases lease, marks completed", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_create_approval_commit") return { commitSha: "deadbeef", stagedCount: 1 };
+      if (cmd === "git_merge_worktree") return { mergedSha: "abcd1234", pushed: false };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("completed");
+    expect(task?.pendingMerge).toBeNull();
+    expect(task?.conclusion).toContain("abcd1234");
+    // Lease released.
+    const agent = useCollaboratorStore.getState().agents[0];
+    expect(agent.worktree).toBeNull();
+    // Verify all three git IPCs fired in order (filter out persistence
+    // calls like read_memory_file / write_memory_file).
+    const gitOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_"));
+    expect(gitOrder).toEqual([
+      "git_create_approval_commit",
+      "git_merge_worktree",
+      "git_worktree_remove",
+    ]);
+  });
+
+  it("/task approve: skips approval-commit when diffSummary has no working-tree residue", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") return { mergedSha: "abcd1234", pushed: false };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const gitOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_"));
+    // git_create_approval_commit NOT called (committed-only branch).
+    expect(gitOrder).toEqual(["git_merge_worktree", "git_worktree_remove"]);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("completed");
+  });
+
+  it("/task approve --push: passes push=true to merge", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") return { mergedSha: "abcd1234", pushed: true };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve --push`), D14_SESSION);
+    const mergeCall = vi
+      .mocked(invoke)
+      .mock.calls.find((c) => c[0] === "git_merge_worktree");
+    expect((mergeCall![1] as { push: boolean }).push).toBe(true);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("pushed");
+  });
+
+  it("/task approve -- <message>: passes the custom message to approval-commit", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_create_approval_commit") return { commitSha: "x", stagedCount: 1 };
+      if (cmd === "git_merge_worktree") return { mergedSha: "y", pushed: false };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+    await executeCommand(
+      parseInput(`/task ${taskId} approve -- Custom commit subject`),
+      D14_SESSION,
+    );
+    const acCall = vi
+      .mocked(invoke)
+      .mock.calls.find((c) => c[0] === "git_create_approval_commit");
+    expect((acCall![1] as { message: string }).message).toBe("Custom commit subject");
+  });
+
+  it("/task approve: refuses when task has no pendingMerge", async () => {
+    setupAwaitingApprovalTask();
+    const store = useCollaboratorStore.getState();
+    const plain = store.addTask({ title: "x", objective: "x" }, D14_SESSION);
+    await executeCommand(parseInput(`/task ${plain.id} approve`), D14_SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("no pending merge");
+  });
+
+  it("/task approve: refuses when status is not awaiting-approval / merge-conflict", async () => {
+    const { taskId } = setupAwaitingApprovalTask();
+    // Move to in-progress (won't auto-clear pendingMerge per central rule).
+    useCollaboratorStore.setState((s) => ({
+      tasksBySession: {
+        ...s.tasksBySession,
+        [D14_SESSION]: s.tasksBySession[D14_SESSION].map((t) =>
+          t.id === taskId ? { ...t, status: "in-progress" } : t,
+        ),
+      },
+    }));
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("Approve only fires for");
+  });
+
+  it("/task approve: hookFailed → task transitions to merge-conflict, worktree preserved", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") {
+        throw { kind: "hookFailed", stage: "commit", stderr: "pre-commit hook rejected" };
+      }
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("merge-conflict");
+    // pendingMerge is NOT cleared on merge-conflict (still pending review).
+    expect(task?.pendingMerge).not.toBeNull();
+    // Worktree remove NOT called.
+    const ipcOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_"));
+    expect(ipcOrder).not.toContain("git_worktree_remove");
+    // Lease still held.
+    const agent = useCollaboratorStore.getState().agents[0];
+    expect(agent.worktree).not.toBeNull();
+  });
+
+  it("/task approve: mergeConflict → task transitions to merge-conflict with file list in status", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") {
+        throw { kind: "mergeConflict", branch: "agent/x", files: ["src/a.ts", "src/b.ts"] };
+      }
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("merge-conflict");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("merge conflict");
+    expect(status).toContain("src/a.ts");
+  });
+
+  it("/task approve: targetBranchStale → restores awaiting-approval (retryable precondition)", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") {
+        throw { kind: "targetBranchStale", target: "dev", message: "non-fast-forward" };
+      }
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    // Stale-base is retryable: user can `git pull` and re-Approve.
+    expect(task?.status).toBe("awaiting-approval");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("can't fast-forward");
+  });
+
+  it("/task approve: parentRepoDirty → restores awaiting-approval, surfaces dirty file list", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") {
+        throw { kind: "parentRepoDirty", repoRoot: "/r", files: ["docs/x.md"] };
+      }
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("awaiting-approval");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("parent repo");
+    expect(status).toContain("docs/x.md");
+  });
+
+  it("/task approve: pushFailedAfterMerge → marks completed but warns (local merge already done)", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") {
+        throw { kind: "pushFailedAfterMerge", mergedSha: "deadbeef", stderr: "remote rejected" };
+      }
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve --push`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    // Local merge succeeded, so task is completed.
+    expect(task?.status).toBe("completed");
+    expect(task?.conclusion).toContain("deadbeef");
+    expect(task?.conclusion).toContain("push failed");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("push failed");
+    // Worktree cleanup still ran.
+    const ipcOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_"));
+    expect(ipcOrder).toContain("git_worktree_remove");
+    // Lease released even on push failure (local merge happened).
+    const agent = useCollaboratorStore.getState().agents[0];
+    expect(agent.worktree).toBeNull();
+  });
+
+  it("/task approve: approval-commit failure restores awaiting-approval, never proceeds to merge", async () => {
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_create_approval_commit") {
+        throw { kind: "hookFailed", stage: "commit", stderr: "lint error" };
+      }
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("awaiting-approval");
+    expect(task?.pendingMerge).not.toBeNull();
+    // Merge MUST NOT fire after approval-commit failure.
+    const ipcOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_"));
+    expect(ipcOrder).not.toContain("git_merge_worktree");
+  });
+
+  it("/task discard: happy path — removes worktree, force-deletes branch, releases lease, marks blocked", async () => {
+    const { taskId } = setupAwaitingApprovalTask();
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      if (cmd === "git_branch_force_delete") return null;
+      return null;
+    });
+    await executeCommand(
+      parseInput(`/task ${taskId} discard reviewer rejected`),
+      D14_SESSION,
+    );
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("blocked");
+    expect(task?.pendingMerge).toBeNull();
+    expect(task?.conclusion).toBe("Discarded: reviewer rejected");
+    // Lease released.
+    const agent = useCollaboratorStore.getState().agents[0];
+    expect(agent.worktree).toBeNull();
+    // Both IPCs fired.
+    const ipcOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_"));
+    expect(ipcOrder).toContain("git_worktree_remove");
+    expect(ipcOrder).toContain("git_branch_force_delete");
+  });
+
+  it("/task discard: refuses when task has no pendingMerge", async () => {
+    setupAwaitingApprovalTask();
+    const store = useCollaboratorStore.getState();
+    const plain = store.addTask({ title: "x", objective: "x" }, D14_SESSION);
+    await executeCommand(parseInput(`/task ${plain.id} discard`), D14_SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("no pending merge");
+    // Original status unchanged.
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === plain.id);
+    expect(task?.status).toBe("pending");
+  });
+
+  it("/task discard: surfaces partial-cleanup warnings but still completes the discard transition", async () => {
+    const { taskId } = setupAwaitingApprovalTask();
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_worktree_remove") throw "could not lock index";
+      if (cmd === "git_branch_force_delete") return null;
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} discard`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    // Task still ends in `blocked` despite the cleanup warning.
+    expect(task?.status).toBe("blocked");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("warning");
+  });
+
+  it("/task discard: also fires for tasks already in merge-conflict (post-failed-Approve cleanup)", async () => {
+    const { taskId } = setupAwaitingApprovalTask();
+    // Move to merge-conflict (simulating a failed Approve that left the
+    // worktree preserved). pendingMerge is still set per central rule.
+    useCollaboratorStore.setState((s) => ({
+      tasksBySession: {
+        ...s.tasksBySession,
+        [D14_SESSION]: s.tasksBySession[D14_SESSION].map((t) =>
+          t.id === taskId ? { ...t, status: "merge-conflict" } : t,
+        ),
+      },
+    }));
+    vi.mocked(invoke).mockImplementation(async () => null);
+    await executeCommand(parseInput(`/task ${taskId} discard`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("blocked");
+  });
+
+  it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: "session-A",
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "C1",
+          nicknameSlug: "c1",
+          nameHistory: [{ nickname: "C1", setAt: "x", setBy: "system" }],
+          worktree: { repoRoot: "/r", path: "/wtA", branch: "agent/a", baseRef: "origin/dev", baseSha: "x", baseFresh: true, createdAtMs: 1 },
+        },
+        // Same handle on a different session — must NOT be released.
+        {
+          sessionId: "pty-2",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: "session-B",
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "C1",
+          nicknameSlug: "c1",
+          nameHistory: [{ nickname: "C1", setAt: "x", setBy: "system" }],
+          worktree: { repoRoot: "/r2", path: "/wtB", branch: "agent/b", baseRef: "origin/dev", baseSha: "x", baseFresh: true, createdAtMs: 1 },
+        },
+      ],
+    });
+    useCollaboratorStore.getState().releaseAgentWorktree("@claude1", "session-A");
+    const agents = useCollaboratorStore.getState().agents;
+    expect(agents.find((a) => a.collabSessionId === "session-A")?.worktree).toBeNull();
+    expect(agents.find((a) => a.collabSessionId === "session-B")?.worktree).not.toBeNull();
+  });
+});
