@@ -4286,7 +4286,7 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
       if (cmd === "run_gh_api") {
-        return { exitCode: 0, stdout: '{"required_status_checks":{}}', stderr: "" };
+        return { exitCode: 0, stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}', stderr: "" };
       }
       if (cmd === "git_merge_worktree") return { mergedSha: "abcd", pushed: false };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
@@ -4356,7 +4356,7 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
       if (cmd === "run_gh_api") {
-        return { exitCode: 0, stdout: '{"required_status_checks":{}}', stderr: "" };
+        return { exitCode: 0, stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}', stderr: "" };
       }
       return null;
     });
@@ -4426,7 +4426,13 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(state).toBe("verified-unprotected");
   });
 
-  it("checkBranchProtection: 200 with required_status_checks active → verified-protected", async () => {
+  it("checkBranchProtection: 200 with required_status_checks ALONE → verified-unprotected (round-14 codex2 H1)", async () => {
+    // Round-14 codex2 H1: per GitHub docs, status checks gate direct
+    // pushes on checks passing — they don't BLOCK direct pushes. After
+    // the required checks pass, anyone with write access can `git push
+    // origin <branch>` directly. For LB3's no-direct-push guarantee,
+    // status-checks alone is NOT sufficient; the user needs PR-review
+    // or non-empty push restrictions.
     const fakeInvoke = vi.fn(async (cmd: string) => {
       if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
       if (cmd === "run_gh_api") {
@@ -4442,10 +4448,54 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       "/r",
       fakeInvoke as unknown as typeof invoke,
     );
+    expect(state).toBe("verified-unprotected");
+  });
+
+  it("checkBranchProtection: 200 with required_pull_request_reviews → verified-protected", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true},"required_status_checks":null,"restrictions":null}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
     expect(state).toBe("verified-protected");
   });
 
-  it("checkBranchProtection: 200 with restrictions active → verified-protected", async () => {
+  it("checkBranchProtection: 200 with restrictions populated (allowlisted user) → verified-protected", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          // round-14: restrictions must have at least one allowlisted
+          // user/team/app to count as meaningful — empty arrays don't.
+          stdout: '{"required_status_checks":null,"restrictions":{"users":[{"login":"admin"}],"teams":[],"apps":[]},"required_pull_request_reviews":null}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+  });
+
+  it("checkBranchProtection: 200 with restrictions present but empty arrays → verified-unprotected (round-14)", async () => {
+    // Empty restrictions {users:[],teams:[],apps:[]} doesn't actually
+    // restrict anyone — GitHub serves this shape even when restrictions
+    // are unconfigured for certain account types. Conservative: require
+    // at least one allowlisted entry.
     const fakeInvoke = vi.fn(async (cmd: string) => {
       if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
       if (cmd === "run_gh_api") {
@@ -4461,10 +4511,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       "/r",
       fakeInvoke as unknown as typeof invoke,
     );
-    expect(state).toBe("verified-protected");
+    expect(state).toBe("verified-unprotected");
   });
 
-  it("checkBranchProtection: 200 with malformed JSON body → unknown (defensive)", async () => {
+  it("checkBranchProtection: 200 with malformed JSON body → unknown (round-14 codex2 M1 + claude2 O3)", async () => {
+    // Round-14: parse failure routes to `unknown`, not `verified-
+    // unprotected`. The user might have valid protection but `gh`
+    // returned a body we can't classify (truncation, wrapping, etc.).
+    // The right diagnostic is "cannot verify, run accept-limited",
+    // NOT "enable protection" (which the user may already have done).
     const fakeInvoke = vi.fn(async (cmd: string) => {
       if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
       if (cmd === "run_gh_api") {
@@ -4476,8 +4531,7 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       "/r",
       fakeInvoke as unknown as typeof invoke,
     );
-    // Defensive: without parseable response, can't claim verified-protected.
-    expect(state).toBe("verified-unprotected");
+    expect(state).toBe("unknown");
   });
 
   it("/branch-protection accept-limited: falls back to task pendingMerge.repoRoot when no agent record (round-13 codex2 M1)", async () => {

@@ -195,42 +195,86 @@ function parseGithubOwnerRepo(url: string): { owner: string; repo: string } | nu
 }
 
 /**
- * Round-13 codex2 H1: a 200 response from the GitHub branch-protection
- * endpoint only proves a protection object exists. It does NOT prove
- * the rule actually blocks direct pushes. A protection record may have
- * every meaningful field null/empty, satisfying the API while leaving
- * the branch effectively unprotected.
+ * Result discriminator for the protection-body classifier — separates
+ * "parsed cleanly, here's the verdict" from "couldn't parse the body
+ * at all" so the caller can distinguish `verified-unprotected` (no
+ * meaningful rule) from `unknown` (couldn't determine state).
  *
- * For LB3's no-direct-push guarantee, at least one of these meaningful
- * fields must be non-null:
- *   - `required_pull_request_reviews` — direct push refused; PR required.
- *   - `required_status_checks` — direct push refused unless checks pass
- *     (and even then typically requires PR via branch policy).
- *   - `restrictions` — push restricted to specific users/teams/apps.
- *
- * Returns true when the parsed protection object has at least one of
- * those fields populated (non-null, non-empty). Returns false when the
- * object is empty, all relevant fields are null, OR the body fails to
- * parse as JSON (defensive default — without parseable response, we
- * can't claim the branch is meaningfully protected).
+ * Round-14 (codex2 M1 + claude2 O3 + claude3 O1): the prior version
+ * folded parse failures into "unprotected", causing the user to see
+ * "Enable protection" guidance when they may already have valid
+ * protection but `gh` returned an unparseable body. The right routing
+ * is `unknown` so they get the "cannot verify, run accept-limited"
+ * path with note about what failed.
  */
-function hasMeaningfulProtection(stdoutBody: string): boolean {
+type ProtectionClassification = "meaningful" | "weak-or-empty" | "unparseable";
+
+/**
+ * Classify a GitHub branch-protection response body into the three
+ * categories that drive `checkBranchProtection`'s routing.
+ *
+ * Round-14 (codex2 H1, load-bearing): `required_status_checks` alone
+ * is NOT sufficient for the no-direct-push guarantee. Per GitHub docs,
+ * after required checks pass, commits CAN be pushed directly to the
+ * protected branch by anyone with write access. A merchant-of-record
+ * "no agent direct-pushes the landing branch" guarantee requires a
+ * rule that blocks the push itself, not one that gates it on checks
+ * passing. The two GitHub fields that actually block direct pushes are:
+ *
+ *   - `required_pull_request_reviews` — non-null means the branch
+ *     accepts changes ONLY via approved PRs. Direct push refused.
+ *   - `restrictions` — when populated with at least one user / team /
+ *     app entry, only those actors may push directly. Treat an empty
+ *     restrictions object (`{users: [], teams: [], apps: []}`) as
+ *     non-restrictive.
+ *
+ * `required_status_checks` alone routes to `weak-or-empty`. Users who
+ * actually need direct-push protection should configure either reviews
+ * or non-empty restrictions; users who consciously want only status
+ * checks gate their merges via `accept-limited`.
+ */
+function classifyProtectionBody(stdoutBody: string): ProtectionClassification {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdoutBody);
   } catch {
-    return false;
+    // Round-14: parse failure is "can't verify", not "no protection".
+    // The body might have been truncated, wrapped, or the gh CLI may
+    // have returned something we don't understand. Don't claim the
+    // user has no protection — surface as `unknown` so they see the
+    // "cannot verify" path with `accept-limited` guidance.
+    return "unparseable";
   }
-  if (!parsed || typeof parsed !== "object") return false;
+  if (!parsed || typeof parsed !== "object") return "unparseable";
   const obj = parsed as Record<string, unknown>;
-  // Each of these fields is either null OR an object with config when
-  // the rule is active. `null` literally means "this rule type is not
-  // configured for this branch."
-  return (
-    obj.required_pull_request_reviews != null ||
-    obj.required_status_checks != null ||
-    obj.restrictions != null
-  );
+  // Direct-push-blocking field #1: PR-required.
+  if (obj.required_pull_request_reviews != null) return "meaningful";
+  // Direct-push-blocking field #2: restrictions populated with at
+  // least one allowed pusher. Empty arrays for users/teams/apps mean
+  // "nobody is allowed to push" — but in practice GitHub serves an
+  // empty-arrays object even when restrictions are unconfigured for
+  // certain account types, so be conservative: require at least one
+  // allowlisted entry.
+  if (
+    obj.restrictions != null &&
+    typeof obj.restrictions === "object" &&
+    restrictionsHasAllowlistedEntries(obj.restrictions as Record<string, unknown>)
+  ) {
+    return "meaningful";
+  }
+  // Round-14: required_status_checks alone is NOT enough — see the
+  // header comment. Falls through to weak-or-empty even when
+  // required_status_checks is non-null.
+  return "weak-or-empty";
+}
+
+/** Returns true when `restrictions` allowlist has at least one user/team/app. */
+function restrictionsHasAllowlistedEntries(r: Record<string, unknown>): boolean {
+  const sumLen = (k: string) => {
+    const v = r[k];
+    return Array.isArray(v) ? v.length : 0;
+  };
+  return sumLen("users") + sumLen("teams") + sumLen("apps") > 0;
 }
 
 /**
@@ -292,11 +336,22 @@ export async function checkBranchProtection(
     return "unknown";
   }
   if (res.exitCode === 0) {
-    // Round-13 codex2 H1: 200 alone is insufficient. Parse the body
-    // and require at least one meaningful protection field.
-    return hasMeaningfulProtection(res.stdout)
-      ? "verified-protected"
-      : "verified-unprotected";
+    // Round-13 codex2 H1 + Round-14 (codex2 H1, claude2 O3, claude3 O1):
+    // 200 alone is insufficient. Classify the body:
+    //   - meaningful → verified-protected (PR-required OR restrictions
+    //     with allowlisted entries; status-checks alone is NOT enough
+    //     per round-14).
+    //   - weak-or-empty → verified-unprotected (rule exists but doesn't
+    //     block direct pushes; user should add PR review/restrictions
+    //     or run accept-limited).
+    //   - unparseable → unknown (gh response we can't classify; user
+    //     might have valid protection — surface as cannot-verify
+    //     rather than tell them to "enable protection" they may
+    //     already have).
+    const classification = classifyProtectionBody(res.stdout);
+    if (classification === "meaningful") return "verified-protected";
+    if (classification === "weak-or-empty") return "verified-unprotected";
+    return "unknown";
   }
   // `gh api` returns exit 4 (or non-zero with stderr containing
   // "Not Found") for 404. Match defensively on the stderr text.
