@@ -385,6 +385,9 @@ export function _resetWriteStateForTests(): void {
   // the file — function bodies don't read at parse time.
   branchProtectionAcksWriteChain = Promise.resolve();
   sessionClears.clear();
+  // Round-21 verified-protected cache reset is in commands.ts; tests
+  // call _clearVerifiedProtectedCacheForTests directly to avoid a
+  // circular import.
 }
 
 /**

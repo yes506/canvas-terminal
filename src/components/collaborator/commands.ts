@@ -407,69 +407,6 @@ function restrictionsHasAllowlistedEntries(r: Record<string, unknown>): boolean 
  * exits — it returns `{exitCode, stdout, stderr}` so this routing
  * logic owns the state determination.
  */
-export async function checkBranchProtection(
-  repoRoot: string,
-  invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> = invoke,
-  targetBranch: string = APPROVAL_TARGET_BRANCH,
-): Promise<BranchProtectionState> {
-  let remoteUrl: string;
-  try {
-    remoteUrl = await invokeFn<string>("git_get_remote_url", {
-      repoRoot,
-      remoteName: "origin",
-    });
-  } catch {
-    // Missing `origin` remote → cannot verify. The repo may be local-
-    // only or use a non-standard remote name. Surface as `unknown`.
-    return "unknown";
-  }
-  const host = detectGithubHost(remoteUrl);
-  if (!host) return "unknown";
-  const parsed = parseGithubOwnerRepo(remoteUrl);
-  if (!parsed) return "unknown";
-  // Round-20 codex1 round7 + codex2 task-116 H1 (BLOCKING fix): pass
-  // `--hostname <host>` to `gh api` for non-default GitHub hosts so
-  // the request actually targets the GHE installation, not the user's
-  // default-authed `github.com`. Without this, a public github.com
-  // repo with the same owner/repo could mask the GHE branch's true
-  // protection state. Per `gh api --help`: "--hostname string ...
-  // override default host (default: github.com)".
-  const args: string[] = [
-    `/repos/${parsed.owner}/${parsed.repo}/branches/${targetBranch}/protection`,
-  ];
-  if (host !== "github.com") {
-    args.push("--hostname", host);
-  }
-  let res: { exitCode: number; stdout: string; stderr: string };
-  try {
-    res = await invokeFn<{ exitCode: number; stdout: string; stderr: string }>(
-      "run_gh_api",
-      { args },
-    );
-  } catch {
-    // gh not installed, network failure, etc. → unknown.
-    return "unknown";
-  }
-  if (res.exitCode === 0) {
-    // Round-13 codex2 H1 + Round-14 (codex2 H1, claude2 O3, claude3 O1):
-    // 200 alone is insufficient. Classify the body.
-    const detail = classifyProtectionBody(res.stdout);
-    if (detail.classification === "meaningful") return "verified-protected";
-    if (detail.classification === "unparseable") return "unknown";
-    // weak | empty both route to verified-unprotected (same user
-    // action: configure stronger protection or accept-limited).
-    return "verified-unprotected";
-  }
-  // `gh api` returns exit 4 (or non-zero with stderr containing
-  // "Not Found") for 404. Match defensively on the stderr text.
-  const stderrLc = res.stderr.toLowerCase();
-  if (stderrLc.includes("not found") || stderrLc.includes("404")) {
-    return "verified-unprotected";
-  }
-  // Any other non-zero (auth failure, rate limit, etc.) → unknown.
-  return "unknown";
-}
-
 /**
  * Round-20 (codex2 task-116 M1 + claude3 task-117 O1): rich variant
  * of `checkBranchProtection` that returns the full classification
@@ -496,11 +433,73 @@ export interface BranchProtectionVerdict {
   host?: string;
 }
 
+/**
+ * Round-21 P5 (claude3 task-99 O5): in-memory TTL cache for
+ * `verified-protected` verdicts. Each Approve previously incurred a
+ * ~1s `gh api` round-trip even when the protection state hadn't
+ * changed since the last check. Cache only the protected verdict
+ * (the only state that lets Approve proceed silently); the other
+ * states already gate on user action so caching them adds no value.
+ *
+ * Keyed by `${repoRoot}|${targetBranch}` so a repo with multiple
+ * tracked branches doesn't false-positive across them. TTL is 5
+ * minutes — long enough to amortize the gh latency for typical
+ * "approve a few tasks in a row" sessions, short enough that a user
+ * who toggles protection on GitHub sees the change after a brief
+ * wait. `/branch-protection check` always bypasses the cache (the
+ * user explicitly asked to re-evaluate); `clear-ack` invalidates
+ * the cache for that repoRoot. Backed off the per-process map; not
+ * persisted to disk.
+ */
+const VERIFIED_PROTECTED_TTL_MS = 5 * 60 * 1000;
+const verifiedProtectedCache = new Map<string, { expiresAt: number; verdict: BranchProtectionVerdict }>();
+
+function verifiedCacheKey(repoRoot: string, targetBranch: string): string {
+  return `${repoRoot}|${targetBranch}`;
+}
+
+/** Test-only: clear the verified-protected cache. Exported so the
+ * test suite's _resetWriteStateForTests can flush it for isolation. */
+export function _clearVerifiedProtectedCacheForTests(): void {
+  verifiedProtectedCache.clear();
+}
+
+/**
+ * Invalidate any cached verified-protected verdict for a specific
+ * repoRoot. Called by the LB3 ack lifecycle (`clear-ack` should
+ * force the next Approve to re-check) and by `/branch-protection
+ * check` (explicit user re-evaluation request).
+ */
+export function invalidateVerifiedProtectedCache(repoRoot: string): void {
+  // Drop every entry whose key starts with the repoRoot prefix —
+  // covers all targetBranch variants for this repo.
+  const prefix = `${repoRoot}|`;
+  for (const key of verifiedProtectedCache.keys()) {
+    if (key.startsWith(prefix)) verifiedProtectedCache.delete(key);
+  }
+}
+
 export async function checkBranchProtectionDetail(
   repoRoot: string,
   invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> = invoke,
   targetBranch: string = APPROVAL_TARGET_BRANCH,
+  options: { useCache?: boolean } = { useCache: true },
 ): Promise<BranchProtectionVerdict> {
+  // Round-21 (claude3 task-99 O5): cache hit returns the prior
+  // verified-protected verdict without an IPC. Other verdicts
+  // (verified-unprotected, unknown) are NOT cached — they gate on
+  // user action and re-running the check on each Approve gives the
+  // user up-to-date diagnostic info if they fixed the underlying
+  // issue between attempts.
+  const useCache = options.useCache ?? true;
+  if (useCache) {
+    const cached = verifiedProtectedCache.get(
+      verifiedCacheKey(repoRoot, targetBranch),
+    );
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.verdict;
+    }
+  }
   let remoteUrl: string;
   try {
     remoteUrl = await invokeFn<string>("git_get_remote_url", {
@@ -514,6 +513,11 @@ export async function checkBranchProtectionDetail(
   if (!host) return { state: "unknown" };
   const parsed = parseGithubOwnerRepo(remoteUrl);
   if (!parsed) return { state: "unknown", host };
+  // Round-20 codex1 round7 + codex2 task-116 H1 (BLOCKING fix): pass
+  // `--hostname <host>` to `gh api` for non-default GitHub hosts so
+  // the request actually targets the GHE installation, not the user's
+  // default-authed `github.com`. Per `gh api --help`: "--hostname
+  // string ... override default host (default: github.com)".
   const args: string[] = [
     `/repos/${parsed.owner}/${parsed.repo}/branches/${targetBranch}/protection`,
   ];
@@ -530,7 +534,21 @@ export async function checkBranchProtectionDetail(
   if (res.exitCode === 0) {
     const detail = classifyProtectionBody(res.stdout);
     if (detail.classification === "meaningful") {
-      return { state: "verified-protected", detail, host };
+      const verdict: BranchProtectionVerdict = {
+        state: "verified-protected",
+        detail,
+        host,
+      };
+      // Round-21 (claude3 task-99 O5): cache the protected verdict
+      // for ~5min. Subsequent Approves on the same repoRoot+branch
+      // skip the gh api round-trip. ONLY verified-protected is
+      // cached — other verdicts gate on user action and benefit
+      // from per-call freshness.
+      verifiedProtectedCache.set(
+        verifiedCacheKey(repoRoot, targetBranch),
+        { expiresAt: Date.now() + VERIFIED_PROTECTED_TTL_MS, verdict },
+      );
+      return verdict;
     }
     if (detail.classification === "unparseable") {
       return { state: "unknown", detail, host };
@@ -542,6 +560,28 @@ export async function checkBranchProtectionDetail(
     return { state: "verified-unprotected", host };
   }
   return { state: "unknown", host };
+}
+
+/**
+ * Round-21 refactor (codex1 round-8 + codex2 task-119 + claude2
+ * task-118 Concern 1 convergent): the prior `checkBranchProtection`
+ * duplicated the entire IPC sequence + classification logic from
+ * `checkBranchProtectionDetail`. A future fix to one would have
+ * required a parallel fix to the other; drift risk. Now wraps the
+ * detail variant and projects out the `state` field. Single source
+ * of truth.
+ */
+export async function checkBranchProtection(
+  repoRoot: string,
+  invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> = invoke,
+  targetBranch: string = APPROVAL_TARGET_BRANCH,
+): Promise<BranchProtectionState> {
+  const verdict = await checkBranchProtectionDetail(
+    repoRoot,
+    invokeFn,
+    targetBranch,
+  );
+  return verdict.state;
 }
 
 export interface ParsedCommand {
@@ -1603,7 +1643,16 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           }
           // Round-20: use the detail-returning variant so we can render
           // weak-vs-empty diagnostic specificity per claude3 task-99 O4.
-          const verdict = await checkBranchProtectionDetail(activeRepoRoot);
+          // Round-21 (claude3 task-99 O5): /branch-protection check is
+          // an explicit user re-evaluation request — bypass the cache
+          // so the user sees fresh protection state, e.g., after they
+          // just enabled protection on GitHub.
+          const verdict = await checkBranchProtectionDetail(
+            activeRepoRoot,
+            undefined,
+            undefined,
+            { useCache: false },
+          );
           // Show the detected host (GHE-aware) when available, otherwise
           // the canonical origin/<branch> name.
           const branchLabel = verdict.host
@@ -1708,6 +1757,13 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             break;
           }
           store.clearBranchProtectionAck(target);
+          // Round-21 (claude3 task-99 O5): also flush any cached
+          // verified-protected verdict so the next Approve re-checks
+          // gh api. Without this, a user clearing the ack would still
+          // hit a cached "verified-protected" entry (if they happened
+          // to be acked AND had a cached protected verdict) and skip
+          // the wizard. Cache flush ensures the next check is fresh.
+          invalidateVerifiedProtectedCache(target);
           status(
             `Cleared limited-guarantee ack for ${target}. Next /task approve ` +
               "will re-run the branch-protection wizard.",

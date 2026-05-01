@@ -13,7 +13,14 @@ import {
   hydrateBranchProtectionAcks,
 } from "./collaboratorStore";
 import type { CollabTask, SpawnedAgent } from "../types/collaborator";
-import { parseInput, resolveAgent, executeCommand, getHelpText, checkBranchProtection } from "../components/collaborator/commands";
+import {
+  parseInput,
+  resolveAgent,
+  executeCommand,
+  getHelpText,
+  checkBranchProtection,
+  _clearVerifiedProtectedCacheForTests,
+} from "../components/collaborator/commands";
 import { useTerminalStore } from "./terminalStore";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -44,6 +51,11 @@ function resetStores() {
   // A teardown-race test can leave an abort marker that would short-circuit
   // a subsequent test using the same SESSION ID — clear it here for isolation.
   _resetWriteStateForTests();
+  // Round-21 (claude3 task-99 O5): the verified-protected TTL cache
+  // is module-level state in commands.ts and would leak across tests.
+  // Imported directly to avoid the circular import that would result
+  // from triggering the reset from collaboratorStore.ts.
+  _clearVerifiedProtectedCacheForTests();
 }
 
 // (PR-A footer-status tests removed in task-16: the 4 s setStatus-on-terminal
@@ -3712,6 +3724,10 @@ describe("D14 — /task approve and /task discard slash commands", () => {
 
   beforeEach(() => {
     _resetWriteStateForTests();
+    // Round-21 (claude3 task-99 O5): flush the verified-protected TTL
+    // cache so cached protected verdicts from one test don't leak into
+    // another test that mocks a different protection state.
+    _clearVerifiedProtectedCacheForTests();
     vi.mocked(invoke).mockClear();
     vi.mocked(invoke).mockImplementation(async () => null);
   });
@@ -5395,6 +5411,154 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     // approval-commit IPC must receive the stripped form.
     expect(capturedHandle).toBe("claude1");
     expect(capturedHandle).not.toContain("@");
+  });
+
+  // -------------------------------------------------------------------------
+  // Round-21 P5: verified-protected TTL caching (claude3 task-99 O5)
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtectionDetail: caches verified-protected verdict so subsequent calls skip the IPC sequence (round-21 claude3 task-99 O5)", async () => {
+    // Round-21 (claude3 task-99 O5): each Approve previously incurred
+    // ~1s of `gh api` latency even when protection state hadn't
+    // changed. The TTL cache returns the prior verified-protected
+    // verdict without an IPC round-trip. Subsequent verified-protected
+    // calls should be cache hits — zero IPCs to git_get_remote_url
+    // or run_gh_api on the second call.
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let ipcCount = 0;
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") {
+        ipcCount++;
+        return "https://github.com/owner/repo.git";
+      }
+      if (cmd === "run_gh_api") {
+        ipcCount++;
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    // First call: full IPC round-trip.
+    const v1 = await checkBranchProtectionDetail(
+      "/r-cache-test",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v1.state).toBe("verified-protected");
+    const ipcsAfterFirst = ipcCount;
+    expect(ipcsAfterFirst).toBeGreaterThan(0);
+    // Second call: should hit cache, no new IPCs.
+    const v2 = await checkBranchProtectionDetail(
+      "/r-cache-test",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(v2.state).toBe("verified-protected");
+    expect(ipcCount).toBe(ipcsAfterFirst); // no new IPCs
+  });
+
+  it("checkBranchProtectionDetail: useCache:false bypasses cache (round-21)", async () => {
+    // /branch-protection check sets useCache: false to force a fresh
+    // re-evaluation when the user explicitly asks.
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let ghApiCalls = 0;
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        ghApiCalls++;
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    await checkBranchProtectionDetail(
+      "/r-bypass-test",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(ghApiCalls).toBe(1);
+    // Second call with useCache: false — must re-fetch.
+    await checkBranchProtectionDetail(
+      "/r-bypass-test",
+      fakeInvoke as unknown as typeof invoke,
+      undefined,
+      { useCache: false },
+    );
+    expect(ghApiCalls).toBe(2);
+  });
+
+  it("checkBranchProtectionDetail: only caches verified-protected (other states re-fetch each call)", async () => {
+    // verified-unprotected and unknown gate on user action; caching
+    // them would defeat the up-to-date diagnostic. Only the protected
+    // verdict — where the user just wants to skip the wizard quickly
+    // — gets cached.
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let ghApiCalls = 0;
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        ghApiCalls++;
+        return { exitCode: 4, stdout: "", stderr: "Not Found (HTTP 404)" };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    await checkBranchProtectionDetail(
+      "/r-unprotected",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(ghApiCalls).toBe(1);
+    // Second call: NOT cached, re-fetches.
+    await checkBranchProtectionDetail(
+      "/r-unprotected",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(ghApiCalls).toBe(2);
+  });
+
+  it("invalidateVerifiedProtectedCache: clearBranchProtectionAck flushes the cached protected verdict (round-21)", async () => {
+    // Round-21: when the user runs /branch-protection clear-ack, any
+    // cached verified-protected verdict for that repo must be flushed
+    // so the next Approve re-checks gh api. Without this, the user
+    // could clear the ack, expect the wizard to re-fire, but instead
+    // hit a cached "you're already protected" verdict and skip the
+    // wizard entirely.
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: true });
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+    let ghApiCalls = 0;
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        ghApiCalls++;
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      return null;
+    });
+    // Prime the cache.
+    await checkBranchProtectionDetail("/r");
+    expect(ghApiCalls).toBe(1);
+    // Verify cache hit.
+    await checkBranchProtectionDetail("/r");
+    expect(ghApiCalls).toBe(1);
+    // User runs /branch-protection clear-ack — should flush cache.
+    await executeCommand(parseInput("/branch-protection clear-ack"), D14_SESSION);
+    // Next call should re-fetch.
+    await checkBranchProtectionDetail("/r");
+    expect(ghApiCalls).toBe(2);
   });
 
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
