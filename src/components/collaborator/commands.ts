@@ -479,31 +479,51 @@ export function invalidateVerifiedProtectedCache(repoRoot: string): void {
   }
 }
 
+/**
+ * Round-24 (claude2 task-127 Concern 1): structural invariant
+ * helper. Every fresh-fetch path goes through `finalizeVerdict`
+ * which writes the cache on `verified-protected` and DELETES on
+ * everything else. Centralizing the cache-mutation site in ONE
+ * place means future code drift (a new return path added by a
+ * future commit) cannot violate the invariant — there is nothing
+ * left to remember. Replaces the round-22+23 explicit-call form
+ * where every return manually had to call `verifiedProtectedCache.
+ * delete(cacheKey)`. Five rounds caught the same write-or-delete
+ * asymmetry on different paths because the prior form was fragile;
+ * this refactor makes drift impossible.
+ */
+function finalizeVerdict(
+  verdict: BranchProtectionVerdict,
+  cacheKey: string,
+): BranchProtectionVerdict {
+  if (verdict.state === "verified-protected") {
+    verifiedProtectedCache.set(cacheKey, {
+      expiresAt: Date.now() + VERIFIED_PROTECTED_TTL_MS,
+      verdict,
+    });
+  } else {
+    // Every non-protected verdict (verified-unprotected, unknown,
+    // including the four early-return paths and the post-API
+    // non-protected/non-zero-exit paths) invalidates any stale
+    // protected entry. Round-22 + round-23 BLOCKING fixes are now
+    // expressed structurally — no manual calls needed.
+    verifiedProtectedCache.delete(cacheKey);
+  }
+  return verdict;
+}
+
 export async function checkBranchProtectionDetail(
   repoRoot: string,
   invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> = invoke,
   targetBranch: string = APPROVAL_TARGET_BRANCH,
   options: { useCache?: boolean } = { useCache: true },
 ): Promise<BranchProtectionVerdict> {
-  // Round-21 (claude3 task-99 O5): cache hit returns the prior
-  // verified-protected verdict without an IPC. Other verdicts
-  // (verified-unprotected, unknown) are NOT cached — they gate on
-  // user action and re-running the check on each Approve gives the
-  // user up-to-date diagnostic info if they fixed the underlying
-  // issue between attempts.
-  // Round-23 (codex2 task-125 BLOCKING fix + claude3 task-126 O3):
-  // hoist cacheKey to the top so EVERY non-protected return path can
-  // invalidate the cache. The round-22 fix only covered post-`run_gh_
-  // api` paths; the early-return paths (origin missing, non-GitHub
-  // remote, malformed URL, run_gh_api throw) still left stale
-  // verified-protected entries alive after an explicit user re-check
-  // that returned `unknown`.
-  //
-  // Invariant: every fresh fetch must either WRITE the cache (when
-  // verified-protected) or DELETE the stale entry (anything else,
-  // including `unknown`). The invariant is total — no early-return
-  // path may skip the reconciliation.
   const cacheKey = verifiedCacheKey(repoRoot, targetBranch);
+  // Round-21 (claude3 task-99 O5): cache hit short-circuits the
+  // entire fresh-fetch path. Cached verdicts are always
+  // `verified-protected` (we only cache that state — round-22).
+  // The cache hit does NOT go through `finalizeVerdict` because no
+  // new observation has happened to reconcile against.
   const useCache = options.useCache ?? true;
   if (useCache) {
     const cached = verifiedProtectedCache.get(cacheKey);
@@ -511,97 +531,64 @@ export async function checkBranchProtectionDetail(
       return cached.verdict;
     }
   }
-  let remoteUrl: string;
-  try {
-    remoteUrl = await invokeFn<string>("git_get_remote_url", {
-      repoRoot,
-      remoteName: "origin",
-    });
-  } catch {
-    // Round-23: origin disappeared / git_get_remote_url failed —
-    // invalidate any stale protected cache entry.
-    verifiedProtectedCache.delete(cacheKey);
-    return { state: "unknown" };
-  }
-  const host = detectGithubHost(remoteUrl);
-  if (!host) {
-    // Round-23: remote is not a recognizable GitHub host — invalidate.
-    verifiedProtectedCache.delete(cacheKey);
-    return { state: "unknown" };
-  }
-  const parsed = parseGithubOwnerRepo(remoteUrl);
-  if (!parsed) {
-    // Round-23: malformed owner/repo URL — invalidate.
-    verifiedProtectedCache.delete(cacheKey);
-    return { state: "unknown", host };
-  }
-  // Round-20 codex1 round7 + codex2 task-116 H1 (BLOCKING fix): pass
-  // `--hostname <host>` to `gh api` for non-default GitHub hosts so
-  // the request actually targets the GHE installation, not the user's
-  // default-authed `github.com`. Per `gh api --help`: "--hostname
-  // string ... override default host (default: github.com)".
-  const args: string[] = [
-    `/repos/${parsed.owner}/${parsed.repo}/branches/${targetBranch}/protection`,
-  ];
-  if (host !== "github.com") args.push("--hostname", host);
-  let res: { exitCode: number; stdout: string; stderr: string };
-  try {
-    res = await invokeFn<{ exitCode: number; stdout: string; stderr: string }>(
-      "run_gh_api",
-      { args },
-    );
-  } catch {
-    // Round-23: gh api threw (network failure, IPC error) — invalidate.
-    verifiedProtectedCache.delete(cacheKey);
-    return { state: "unknown", host };
-  }
-  // Round-22 (codex2 task-122 BLOCKING fix): every fresh fetch must
-  // either WRITE the new verdict into the cache (when verified-
-  // protected) OR DELETE any stale entry (when not verified-protected).
-  // Without the delete branch, a sequence like:
-  //   1. cache holds verified-protected for /r
-  //   2. protection disabled on GitHub
-  //   3. /branch-protection check (useCache:false) returns fresh
-  //      verified-unprotected — but cache entry untouched
-  //   4. /task approve uses cache → stale verified-protected → silent
-  //      Approve on the now-unprotected branch
-  // …would silently bypass LB3 at exactly the explicit-user-re-check
-  // point. The cacheKey-aware update below ensures freshness wins.
-  if (res.exitCode === 0) {
-    const detail = classifyProtectionBody(res.stdout);
-    if (detail.classification === "meaningful") {
-      const verdict: BranchProtectionVerdict = {
-        state: "verified-protected",
-        detail,
-        host,
-      };
-      // Round-21 (claude3 task-99 O5): cache the protected verdict
-      // for ~5min. Subsequent Approves on the same repoRoot+branch
-      // skip the gh api round-trip. ONLY verified-protected is
-      // cached — other verdicts gate on user action and benefit
-      // from per-call freshness.
-      verifiedProtectedCache.set(cacheKey, {
-        expiresAt: Date.now() + VERIFIED_PROTECTED_TTL_MS,
-        verdict,
+  // Round-24 (claude2 task-127 Concern 1): the entire fresh-fetch
+  // body lives in an inner async IIFE that returns a verdict. The
+  // outer function passes that verdict through `finalizeVerdict`
+  // which centralizes the cache write/delete. Future code can add
+  // new early-return paths inside the IIFE without touching cache
+  // logic — the structural invariant guarantees reconciliation.
+  const verdict = await (async (): Promise<BranchProtectionVerdict> => {
+    let remoteUrl: string;
+    try {
+      remoteUrl = await invokeFn<string>("git_get_remote_url", {
+        repoRoot,
+        remoteName: "origin",
       });
-      return verdict;
+    } catch {
+      return { state: "unknown" };
     }
-    // Round-22 codex2 task-122 BLOCKING fix: fresh non-protected
-    // verdict invalidates any stale protected entry.
-    verifiedProtectedCache.delete(cacheKey);
-    if (detail.classification === "unparseable") {
-      return { state: "unknown", detail, host };
+    const host = detectGithubHost(remoteUrl);
+    if (!host) return { state: "unknown" };
+    const parsed = parseGithubOwnerRepo(remoteUrl);
+    if (!parsed) return { state: "unknown", host };
+    // Round-20 (codex1 round-7 + codex2 task-116 H1 BLOCKING fix):
+    // pass `--hostname <host>` to `gh api` for non-default GitHub
+    // hosts so the request targets the GHE installation, not the
+    // user's default-authed `github.com`. Per `gh api --help`:
+    // "--hostname string ... override default host (default:
+    // github.com)".
+    const args: string[] = [
+      `/repos/${parsed.owner}/${parsed.repo}/branches/${targetBranch}/protection`,
+    ];
+    if (host !== "github.com") args.push("--hostname", host);
+    let res: { exitCode: number; stdout: string; stderr: string };
+    try {
+      res = await invokeFn<{
+        exitCode: number;
+        stdout: string;
+        stderr: string;
+      }>("run_gh_api", { args });
+    } catch {
+      return { state: "unknown", host };
     }
-    return { state: "verified-unprotected", detail, host };
-  }
-  // Non-zero exit (404, auth failure, etc.) — also invalidate any
-  // stale protected entry for the same reason.
-  verifiedProtectedCache.delete(cacheKey);
-  const stderrLc = res.stderr.toLowerCase();
-  if (stderrLc.includes("not found") || stderrLc.includes("404")) {
-    return { state: "verified-unprotected", host };
-  }
-  return { state: "unknown", host };
+    if (res.exitCode === 0) {
+      const detail = classifyProtectionBody(res.stdout);
+      if (detail.classification === "meaningful") {
+        return { state: "verified-protected", detail, host };
+      }
+      if (detail.classification === "unparseable") {
+        return { state: "unknown", detail, host };
+      }
+      return { state: "verified-unprotected", detail, host };
+    }
+    const stderrLc = res.stderr.toLowerCase();
+    if (stderrLc.includes("not found") || stderrLc.includes("404")) {
+      return { state: "verified-unprotected", host };
+    }
+    return { state: "unknown", host };
+  })();
+  // Single finalize site — write or delete based on verdict state.
+  return finalizeVerdict(verdict, cacheKey);
 }
 
 /**

@@ -5890,6 +5890,150 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(v3.state).toBe("unknown");
   });
 
+  // -------------------------------------------------------------------------
+  // Round-24: structural cache-reconciliation invariant
+  // (claude2 task-127 Concern 1)
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtectionDetail: structural invariant — all unknown-state outcomes consistently invalidate cache (round-24 claude2 task-127 Concern 1)", async () => {
+    // Round-24 invariant: the inner-IIFE + finalizeVerdict refactor
+    // means every non-protected verdict produced by the fresh-fetch
+    // path automatically invalidates the cache. This test exercises
+    // the full state-space (origin-throw, !host, !parsed, gh-throw,
+    // gh-404, gh-auth-failure, weak-protection, empty-protection,
+    // unparseable-body) and asserts: after each, the prior cached
+    // verified-protected entry is gone.
+    const { checkBranchProtectionDetail } = await import(
+      "../components/collaborator/commands"
+    );
+
+    type Scenario = {
+      name: string;
+      url?: string | null;
+      ghResponse?: { exitCode: number; stdout: string; stderr: string };
+      ghThrows?: boolean;
+      urlThrows?: boolean;
+      expectedState: "unknown" | "verified-unprotected";
+    };
+
+    const scenarios: Scenario[] = [
+      {
+        name: "origin missing (git_get_remote_url throw)",
+        urlThrows: true,
+        expectedState: "unknown",
+      },
+      {
+        name: "non-GitHub remote (!host)",
+        url: "https://gitlab.com/owner/repo.git",
+        expectedState: "unknown",
+      },
+      {
+        name: "malformed URL (!parsed)",
+        url: "https://github.com/",
+        expectedState: "unknown",
+      },
+      {
+        name: "run_gh_api throws (network failure)",
+        url: "https://github.com/owner/repo.git",
+        ghThrows: true,
+        expectedState: "unknown",
+      },
+      {
+        name: "gh api 404 (verified-unprotected)",
+        url: "https://github.com/owner/repo.git",
+        ghResponse: { exitCode: 4, stdout: "", stderr: "Not Found (HTTP 404)" },
+        expectedState: "verified-unprotected",
+      },
+      {
+        name: "gh api auth failure (unknown)",
+        url: "https://github.com/owner/repo.git",
+        ghResponse: { exitCode: 1, stdout: "", stderr: "authentication required" },
+        expectedState: "unknown",
+      },
+      {
+        name: "weak protection (status_checks only)",
+        url: "https://github.com/owner/repo.git",
+        ghResponse: {
+          exitCode: 0,
+          stdout:
+            '{"required_status_checks":{"strict":true},"required_pull_request_reviews":null,"restrictions":null}',
+          stderr: "",
+        },
+        expectedState: "verified-unprotected",
+      },
+      {
+        name: "empty protection (all null)",
+        url: "https://github.com/owner/repo.git",
+        ghResponse: {
+          exitCode: 0,
+          stdout: '{"required_status_checks":null,"required_pull_request_reviews":null,"restrictions":null}',
+          stderr: "",
+        },
+        expectedState: "verified-unprotected",
+      },
+      {
+        name: "unparseable body (treats as unknown)",
+        url: "https://github.com/owner/repo.git",
+        ghResponse: { exitCode: 0, stdout: "not json", stderr: "" },
+        expectedState: "unknown",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      // Reset cache between scenarios for isolation.
+      _clearVerifiedProtectedCacheForTests();
+
+      // Step 1: prime cache with verified-protected.
+      const primeMock = vi.fn(async (cmd: string) => {
+        if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+        if (cmd === "run_gh_api") {
+          return {
+            exitCode: 0,
+            stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+            stderr: "",
+          };
+        }
+        throw new Error(`unexpected IPC: ${cmd}`);
+      });
+      const primed = await checkBranchProtectionDetail(
+        `/r-scenario-${scenario.name}`,
+        primeMock as unknown as typeof invoke,
+      );
+      expect(primed.state).toBe("verified-protected");
+
+      // Step 2: simulate the scenario's failure / state-change.
+      const scenarioMock = vi.fn(async (cmd: string) => {
+        if (cmd === "git_get_remote_url") {
+          if (scenario.urlThrows) throw "no origin";
+          return scenario.url!;
+        }
+        if (cmd === "run_gh_api") {
+          if (scenario.ghThrows) throw "network unreachable";
+          return scenario.ghResponse!;
+        }
+        throw new Error(`unexpected IPC: ${cmd}`);
+      });
+      const v = await checkBranchProtectionDetail(
+        `/r-scenario-${scenario.name}`,
+        scenarioMock as unknown as typeof invoke,
+        undefined,
+        { useCache: false },
+      );
+      expect(v.state).toBe(scenario.expectedState);
+
+      // Step 3: subsequent default (cached) call must NOT serve stale
+      // protected — the round-24 finalizeVerdict invariant guarantees
+      // every non-protected verdict invalidated the cache.
+      const v2 = await checkBranchProtectionDetail(
+        `/r-scenario-${scenario.name}`,
+        scenarioMock as unknown as typeof invoke,
+      );
+      expect(v2.state).toBe(scenario.expectedState);
+      // Verify it actually re-fetched (not a cached protected hit).
+      expect(v2.state).not.toBe("verified-protected");
+    }
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [
