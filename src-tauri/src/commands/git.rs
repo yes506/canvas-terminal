@@ -737,11 +737,28 @@ pub enum GitError {
     HookFailed { stage: String, stderr: String },
     /// `git merge` left the repo in a conflicted state. Worktree NOT
     /// removed — user resolves manually via Discard or by editing.
+    /// `git_merge_worktree` runs `git merge --abort` before returning
+    /// this so the parent repo is left clean for subsequent attempts.
     MergeConflict { branch: String, files: Vec<String> },
     /// The merge target's local branch could not be fast-forwarded to
     /// `origin/<target>` before merging (caller must `git pull` first or
     /// the orchestrator can't safely merge into a stale local target).
     TargetBranchStale { target: String, message: String },
+    /// Pre-flight refused the merge because the parent repo's working
+    /// tree has uncommitted/untracked changes. Surfaces the file list so
+    /// the user knows what to commit/stash before retrying. Prevents the
+    /// silent-branch-switch footgun (claude3 task-64 C4) and the dirty-
+    /// switch error (claude2 task-62 Concern 1).
+    ParentRepoDirty {
+        repo_root: String,
+        files: Vec<String>,
+    },
+    /// Local merge succeeded but `git push origin <target>` failed.
+    /// `merged_sha` is on the local target branch already; the frontend
+    /// should treat the task as merged-locally and surface the push
+    /// failure separately (don't retry the merge — that would attempt
+    /// to merge an already-merged branch). codex2 task-63 H1.
+    PushFailedAfterMerge { merged_sha: String, stderr: String },
     /// `git_create_approval_commit` could not determine a committer
     /// identity. Should be impossible after RESID-4's explicit
     /// `-c user.name=... -c user.email=...` injection; treat as
@@ -934,13 +951,30 @@ fn run_git_with_committer_identity(repo: &Path, args: &[&str]) -> Result<(), (St
 ///
 /// Acquires a Rust-side file lock on `<repo_root>/.canvas-terminal.merge.lock`
 /// (D8) so concurrent Approve clicks don't interleave merges. Lock is
-/// released on Drop. If `target_branch` is on `main/master/...` the call
-/// is refused outright — the policy never lets the orchestrator merge
-/// into a protected branch.
+/// released on Drop.
 ///
-/// `push=false` by default (D12). The frontend Approve UI exposes "Push
-/// to origin after merge" as a separate checkbox; without it ticked, the
-/// merge stays local and no credentials are touched.
+/// **Pre-flight invariants (claude3 task-64 C4 + claude2 task-62 Concern 1):**
+///   1. Refuse if `target_branch` is in the protected family — orchestrator
+///      never lands source on `main/master/production/release` directly.
+///   2. Refuse if `branch_name` is outside the `agent/` namespace.
+///   3. Refuse if the parent repo has uncommitted/untracked changes
+///      (`ParentRepoDirty`). Otherwise `git switch <target>` would fail
+///      confusingly OR succeed silently and leave the user surprised.
+///
+/// **Branch-restore guarantee:** the orchestrator's `git switch <target>`
+/// changes the parent repo's HEAD. We capture the original branch up
+/// front and restore it before returning, regardless of merge success.
+///
+/// **Conflict cleanup (codex1 task-61 H1):** on conflict, run
+/// `git merge --abort` BEFORE returning so the parent repo is clean
+/// for subsequent merges. Worktree is preserved.
+///
+/// **Push partial-success (codex2 task-63 H1):** if push fails after a
+/// successful local merge, return `PushFailedAfterMerge { merged_sha, stderr }`
+/// so the frontend can distinguish from a failed-merge state and not
+/// re-trigger a now-redundant merge.
+///
+/// `push=false` by default (D12).
 #[tauri::command]
 pub fn git_merge_worktree(
     repo_root: String,
@@ -971,30 +1005,86 @@ pub fn git_merge_worktree(
         exit_code: -1,
     })?;
 
-    // Switch to the target branch.
-    git_capture(Some(&repo_path), &["switch", &target_branch]).map_err(|e| {
-        GitError::from_command_failure(format!("git switch {}", target_branch), e, -1)
+    // Pre-flight: refuse if parent has uncommitted work. Checking via
+    // `--porcelain --untracked-files=normal` matches the broader D2 sense
+    // (any working-tree state, including untracked files in the repo
+    // root). The user must commit/stash before re-trying Approve.
+    let parent_dirty = git_capture_raw(
+        Some(&repo_path),
+        &["status", "--porcelain", "--untracked-files=normal", "-z"],
+    )
+    .map_err(|e| GitError::GenericFailure {
+        command: "git status --porcelain (parent preflight)".to_string(),
+        stderr: e,
+        exit_code: -1,
     })?;
+    if !parent_dirty.is_empty() {
+        let files: Vec<String> = parent_dirty
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            // Each entry is "XY <path>"; strip the 3-byte prefix when
+            // present so the UI shows just the paths.
+            .map(|entry| {
+                if entry.len() >= 3 {
+                    entry[3..].to_string()
+                } else {
+                    entry.to_string()
+                }
+            })
+            .collect();
+        return Err(GitError::ParentRepoDirty {
+            repo_root: repo_root.clone(),
+            files,
+        });
+    }
+
+    // Capture the original branch so we can restore it on completion.
+    // Detached-HEAD case returns an error; treat as "no branch to
+    // restore" and skip the restore at the end.
+    let original_branch =
+        git_capture_opt(Some(&repo_path), &["symbolic-ref", "--short", "HEAD"]);
+
+    // Switch to the target branch. May fail if dev is checked out in
+    // another worktree (e.g., the agent's). In v1 we'd treat that as a
+    // genuine failure surfaced as GenericFailure; bigger redesign of
+    // "merge in detached HEAD via update-ref" is P5.
+    if let Err(stderr) = git_capture(Some(&repo_path), &["switch", &target_branch]) {
+        // Try to restore the original branch even on this early failure
+        // (best-effort; ignore restore error so we don't mask the
+        // original cause).
+        if let Some(orig) = original_branch.as_deref() {
+            let _ = git_capture(Some(&repo_path), &["switch", orig]);
+        }
+        return Err(GitError::from_command_failure(
+            format!("git switch {}", target_branch),
+            stderr,
+            -1,
+        ));
+    }
 
     // Fast-forward target to its remote tip when possible. If the local
     // target is behind origin AND has divergent commits, fail-fast with
-    // TargetBranchStale so the user pulls explicitly.
-    if let Ok(_) = git_capture(
+    // TargetBranchStale so the user pulls explicitly. Restore branch
+    // before returning.
+    if git_capture(
         Some(&repo_path),
         &["rev-parse", &format!("origin/{}", target_branch)],
-    ) {
-        // Has an upstream; try fast-forward only.
+    )
+    .is_ok()
+    {
+        // Has an upstream; try fast-forward only. (claude3 task-64 C3:
+        // dropped the dead-code "Already up to date" stderr check —
+        // git writes that to stdout, not stderr, and exits 0, so the
+        // err branch only fires on real failures.)
         if let Err(stderr) = git_capture(
             Some(&repo_path),
             &["merge", "--ff-only", &format!("origin/{}", target_branch)],
         ) {
-            // Tolerate "Already up to date." vs. genuine failure.
-            if !stderr.contains("Already up to date") && !stderr.is_empty() {
-                return Err(GitError::TargetBranchStale {
-                    target: target_branch.clone(),
-                    message: stderr,
-                });
-            }
+            restore_branch_best_effort(&repo_path, original_branch.as_deref());
+            return Err(GitError::TargetBranchStale {
+                target: target_branch.clone(),
+                message: stderr,
+            });
         }
     }
 
@@ -1010,7 +1100,7 @@ pub fn git_merge_worktree(
             stderr.0.clone(),
             stderr.1,
         );
-        // Enrich MergeConflict with the actual conflicting files and branch
+        // Enrich MergeConflict with the actual conflicting files + branch
         // (the classifier left them empty; supply them now from `status`).
         if let GitError::MergeConflict { .. } = &err {
             let conflicted = git_capture_raw(
@@ -1029,34 +1119,74 @@ pub fn git_merge_worktree(
                 branch: branch_name.clone(),
                 files: conflicted,
             };
+            // codex1 task-61 H1: clean up the parent repo's MERGE_HEAD /
+            // unmerged index so subsequent approvals don't run into a
+            // contaminated state. Best-effort — if abort fails we still
+            // restore the branch and surface the conflict, but a future
+            // `git switch` will at least detect the dirty state via the
+            // preflight guard.
+            let _ = git_capture(Some(&repo_path), &["merge", "--abort"]);
         }
+        restore_branch_best_effort(&repo_path, original_branch.as_deref());
         return Err(err);
     }
 
-    let merged_sha = git_capture(Some(&repo_path), &["rev-parse", "HEAD"]).map_err(|e| {
-        GitError::GenericFailure {
-            command: "git rev-parse HEAD".to_string(),
-            stderr: e,
-            exit_code: -1,
+    let merged_sha = match git_capture(Some(&repo_path), &["rev-parse", "HEAD"]) {
+        Ok(sha) => sha,
+        Err(e) => {
+            restore_branch_best_effort(&repo_path, original_branch.as_deref());
+            return Err(GitError::GenericFailure {
+                command: "git rev-parse HEAD".to_string(),
+                stderr: e,
+                exit_code: -1,
+            });
         }
-    })?;
+    };
 
     let mut pushed = false;
     if push {
-        git_capture(Some(&repo_path), &["push", "origin", &target_branch]).map_err(|e| {
-            GitError::from_command_failure(format!("git push origin {}", target_branch), e, -1)
-        })?;
+        if let Err(stderr) = git_capture(
+            Some(&repo_path),
+            &["push", "origin", &target_branch],
+        ) {
+            // codex2 task-63 H1: local merge succeeded but push failed.
+            // Surface as PushFailedAfterMerge so the frontend doesn't
+            // retry-as-merge a now-redundant merge.
+            restore_branch_best_effort(&repo_path, original_branch.as_deref());
+            return Err(GitError::PushFailedAfterMerge {
+                merged_sha,
+                stderr,
+            });
+        }
         pushed = true;
     }
 
+    restore_branch_best_effort(&repo_path, original_branch.as_deref());
     Ok(MergeResult { merged_sha, pushed })
 }
 
-/// File-lock guard for `git_merge_worktree`. Held on the repo's
-/// `.canvas-terminal.merge.lock` file; released on Drop. `acquire`
-/// blocks (with a short backoff) up to ACQUIRE_TIMEOUT_MS. On startup,
-/// a stale-lock detector elsewhere can `git merge --abort` if a prior
-/// merge crashed mid-flight.
+/// Best-effort restore of the parent repo's HEAD to a previously-checked-
+/// out branch. Called on every exit path of `git_merge_worktree` so the
+/// user's working state is unchanged regardless of merge success/failure.
+/// Detached-HEAD case (`original` is None) is a no-op.
+///
+/// Failure here doesn't cancel the caller's primary error — we already
+/// have something to surface; logging would just add noise. The user can
+/// `git switch` manually if the restore failed (extremely unlikely
+/// because we already verified the working tree was clean in the
+/// preflight, and we leave it clean on every failure path).
+fn restore_branch_best_effort(repo_path: &Path, original: Option<&str>) {
+    if let Some(branch) = original {
+        let _ = git_capture(Some(repo_path), &["switch", branch]);
+    }
+}
+
+/// File-lock guard for `git_merge_worktree`. Lock file lives **outside**
+/// the repo (at `~/.cache/canvas-terminal/locks/<repo-hash>.lock`) so it
+/// doesn't trip the parent-repo dirty preflight (round-5 review fix —
+/// would otherwise self-poison: lock file → status --porcelain reports
+/// untracked → ParentRepoDirty). Released on Drop. `acquire` blocks
+/// (with a short backoff) up to ACQUIRE_TIMEOUT_MS.
 struct MergeLock {
     _file: std::fs::File,
 }
@@ -1067,7 +1197,7 @@ impl MergeLock {
         const ACQUIRE_TIMEOUT_MS: u64 = 30_000;
         const POLL_MS: u64 = 50;
 
-        let lock_path = repo_root.join(".canvas-terminal.merge.lock");
+        let lock_path = locks_dir_for_repo(repo_root)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -1092,6 +1222,23 @@ impl MergeLock {
             }
         }
     }
+}
+
+/// Compute a stable, filesystem-safe per-repo lock file path under
+/// `~/.cache/canvas-terminal/locks/`. Distinct repos get distinct lock
+/// files because the leaf includes a hex hash of the repo's absolute
+/// path. Inside the repo would be wrong — see `MergeLock` doc.
+fn locks_dir_for_repo(repo_root: &Path) -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let dir = home.join(".cache").join("canvas-terminal").join("locks");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create locks dir: {}", e))?;
+    // Cheap stable hash — DefaultHasher is enough for path → filename
+    // uniqueness; this is not a cryptographic key.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    repo_root.hash(&mut hasher);
+    let hash = hasher.finish();
+    Ok(dir.join(format!("repo-{:016x}.lock", hash)))
 }
 
 impl Drop for MergeLock {
@@ -1708,15 +1855,18 @@ mod tests {
             "dev tip should advance after merge"
         );
 
-        // The merge produced a --no-ff merge commit, so HEAD has 2 parents.
-        let parent_count = git_capture(Some(&repo), &["rev-list", "--parents", "-n", "1", "HEAD"])
+        // The merge produced a --no-ff merge commit on dev. Since
+        // git_merge_worktree restores the parent's HEAD to the original
+        // branch (main) after the merge (claude3 task-64 C4 fix), query
+        // `dev` directly rather than HEAD to find the merge commit.
+        let parent_count = git_capture(Some(&repo), &["rev-list", "--parents", "-n", "1", "dev"])
             .unwrap()
             .split_whitespace()
             .count()
             - 1;
         assert_eq!(
             parent_count, 2,
-            "--no-ff merge should produce 2-parent commit"
+            "--no-ff merge should produce 2-parent commit on dev"
         );
 
         // Cleanup the agent worktree (branch will be merged so -d works).
@@ -1809,20 +1959,222 @@ mod tests {
     }
 
     #[test]
-    fn merge_lock_is_exclusive() {
-        // D8: concurrent merges must serialize. Hold the lock once and
-        // verify a second acquire blocks (or fails fast with our timeout).
-        // We use a very short timeout via direct MergeLock::acquire so
-        // the test doesn't sleep 30s.
+    fn merge_lock_creates_lock_file() {
+        // D8 smoke test: cross-process exclusivity requires a child-process
+        // harness which is out of scope here. This test verifies the lock
+        // file is created in the expected `~/.cache/canvas-terminal/locks/`
+        // location and that the MergeLock guard structure is sound
+        // (renamed from `_is_exclusive` per claude3 task-64 C1 — was
+        // misleading). The lock file lives OUTSIDE the repo to avoid
+        // tripping the parent-dirty preflight (round-5 review fix).
         let repo = make_test_repo();
         let _first = MergeLock::acquire(&repo).expect("first lock should succeed");
-        // Second acquire from the same process — fs2 file-locks are
-        // per-process advisory on macOS, so try_lock on the same fd would
-        // succeed. We test the cross-process semantics by spawning a
-        // child process that tries to take the same lock and times out.
-        // For the unit-test scope, just verify that the first lock file
-        // exists where we expect.
-        assert!(repo.join(".canvas-terminal.merge.lock").exists());
+        let expected_lock = locks_dir_for_repo(&repo).unwrap();
+        assert!(
+            expected_lock.exists(),
+            "lock file should exist at {} after acquire",
+            expected_lock.display()
+        );
+        // Lock is OUTSIDE the repo (not in repo.join(".canvas-terminal...")).
+        assert!(!repo.join(".canvas-terminal.merge.lock").exists());
         // The Drop impl releases the lock when `_first` goes out of scope.
+    }
+
+    // -------------------------------------------------------------------
+    // Round-5 review fixes — codex1 task-61 H1 (parent cleanup on
+    // conflict), codex2 task-63 H1 (push partial-success), claude2
+    // task-62 Concern 1 + claude3 task-64 C4 (parent dirty pre-check).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn merge_worktree_refuses_dirty_parent_with_structured_error() {
+        // claude3 task-64 C4 + claude2 task-62 Concern 1: if the user has
+        // uncommitted work on the parent repo's currently-checked-out
+        // branch, `git switch <target>` would fail confusingly. Pre-flight
+        // refuses with structured ParentRepoDirty so the UI can list the
+        // files and tell the user to commit/stash.
+        let repo = make_test_repo();
+        // Provision an agent worktree so we have a real branch to merge.
+        let wt_str = make_managed_worktree_path("dirty-parent");
+        let meta = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            wt_str.clone(),
+            "agent/test-dirty-parent".to_string(),
+            "dev".to_string(),
+        )
+        .unwrap();
+        // Dirty the parent repo's working tree.
+        std::fs::write(repo.join("README.md"), "user uncommitted edit\n").unwrap();
+
+        let result = git_merge_worktree(
+            repo.to_string_lossy().to_string(),
+            meta.branch.clone(),
+            "dev".to_string(),
+            false,
+        );
+        match result {
+            Err(GitError::ParentRepoDirty { repo_root, files }) => {
+                assert_eq!(repo_root, repo.to_string_lossy());
+                assert!(
+                    files.contains(&"README.md".to_string()),
+                    "dirty file list should include README.md; got {:?}",
+                    files
+                );
+            }
+            other => panic!("expected ParentRepoDirty; got {:?}", other),
+        }
+
+        // Cleanup: revert the dirty change so subsequent tests aren't
+        // affected (no-op for this test's repo because each test has its
+        // own; just being defensive).
+        let _ = git_capture(Some(&repo), &["checkout", "--", "README.md"]);
+        let _ = git_worktree_remove(
+            repo.to_string_lossy().to_string(),
+            wt_str,
+            meta.branch,
+        );
+    }
+
+    #[test]
+    fn merge_worktree_aborts_conflict_and_restores_branch_end_to_end() {
+        // codex1 task-61 H1: end-to-end conflict path through
+        // git_merge_worktree (not just the classifier). Asserts:
+        //  - returns GitError::MergeConflict { branch, files }
+        //  - .git/MERGE_HEAD is absent afterwards (--abort cleaned up)
+        //  - parent repo's status --porcelain has no unmerged entries
+        //  - parent repo HEAD is back on the original branch (main)
+        //  - subsequent merge attempts are not poisoned (lock released)
+        let repo = make_test_repo();
+        // Step 1: advance dev with a "dev side" commit (parent on main).
+        run_git_with_committer_identity(&repo, &["checkout", "dev"]).unwrap();
+        std::fs::write(repo.join("README.md"), "dev side\n").unwrap();
+        run_git_with_committer_identity(&repo, &["add", "README.md"]).unwrap();
+        run_git_with_committer_identity(&repo, &["commit", "-m", "dev edit"]).unwrap();
+        run_git_with_committer_identity(&repo, &["checkout", "main"]).unwrap();
+        let main_tip_before = git_capture(Some(&repo), &["rev-parse", "main"]).unwrap();
+
+        // Step 2: provision agent worktree, agent makes conflicting commit.
+        let wt_str = make_managed_worktree_path("e2e-conflict");
+        let meta = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            wt_str.clone(),
+            "agent/test-e2e-conflict".to_string(),
+            "dev".to_string(),
+        )
+        .unwrap();
+        let wt = PathBuf::from(&wt_str);
+        std::fs::write(wt.join("README.md"), "agent side\n").unwrap();
+        run_git_with_committer_identity(&wt, &["add", "README.md"]).unwrap();
+        run_git_with_committer_identity(&wt, &["commit", "-m", "agent edit"]).unwrap();
+
+        // Step 3: advance dev AGAIN via detached-HEAD + update-ref so the
+        // worktree's claim isn't disturbed.
+        let dev_tip = git_capture(Some(&repo), &["rev-parse", "dev"]).unwrap();
+        run_git_with_committer_identity(&repo, &["checkout", &dev_tip]).unwrap();
+        std::fs::write(repo.join("README.md"), "dev side v2\n").unwrap();
+        run_git_with_committer_identity(&repo, &["add", "README.md"]).unwrap();
+        run_git_with_committer_identity(&repo, &["commit", "-m", "dev edit 2"]).unwrap();
+        let new_dev_sha = git_capture(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
+        run_git_with_committer_identity(
+            &repo,
+            &["update-ref", "refs/heads/dev", &new_dev_sha],
+        )
+        .unwrap();
+        // Restore parent to main for the merge.
+        run_git_with_committer_identity(&repo, &["checkout", "main"]).unwrap();
+
+        // Step 4: invoke the merge. Should hit a conflict.
+        let result = git_merge_worktree(
+            repo.to_string_lossy().to_string(),
+            meta.branch.clone(),
+            "dev".to_string(),
+            false,
+        );
+        match result {
+            Err(GitError::MergeConflict { branch, files }) => {
+                assert_eq!(branch, meta.branch);
+                assert!(
+                    files.contains(&"README.md".to_string()),
+                    "should report README.md as conflicted; got {:?}",
+                    files
+                );
+            }
+            other => panic!("expected MergeConflict; got {:?}", other),
+        }
+
+        // Step 5: invariant checks AFTER conflict.
+        // (a) MERGE_HEAD must be absent (cleaned up by `git merge --abort`)
+        assert!(
+            !repo.join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD should be cleared after conflict (codex1 task-61 H1)"
+        );
+        // (b) parent repo's working tree must have no unmerged entries
+        let porcelain =
+            git_capture_raw(Some(&repo), &["status", "--porcelain", "-z"]).unwrap();
+        assert!(
+            !porcelain.contains("UU "),
+            "parent repo should have no unmerged entries; got porcelain: {:?}",
+            porcelain
+        );
+        // (c) parent repo's HEAD restored to the original branch (main)
+        let head_branch = git_capture(Some(&repo), &["symbolic-ref", "--short", "HEAD"])
+            .expect("HEAD should still be on a branch");
+        assert_eq!(
+            head_branch, "main",
+            "parent should be restored to original branch after conflict"
+        );
+        // (d) main itself is unchanged (the conflict happened on dev)
+        let main_tip_after = git_capture(Some(&repo), &["rev-parse", "main"]).unwrap();
+        assert_eq!(main_tip_before, main_tip_after, "main tip should be unchanged");
+
+        // Step 6: subsequent merge attempt is NOT poisoned. We can't
+        // re-attempt the same merge (it'll conflict again), but we CAN
+        // verify the lock was released by acquiring it directly.
+        let _second_lock =
+            MergeLock::acquire(&repo).expect("lock should be releasable after conflict");
+
+        let _ = git_worktree_remove(
+            repo.to_string_lossy().to_string(),
+            wt_str,
+            meta.branch.clone(),
+        );
+        let _ = git_capture(Some(&repo), &["branch", "-D", &meta.branch]);
+    }
+
+    #[test]
+    fn merge_worktree_restores_original_branch_on_happy_path() {
+        // claude3 task-64 C4: even on success, parent must end up on the
+        // original branch — not silently switched to `dev`.
+        let repo = make_test_repo();
+        let wt_str = make_managed_worktree_path("restore");
+        let meta = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            wt_str.clone(),
+            "agent/test-restore".to_string(),
+            "dev".to_string(),
+        )
+        .unwrap();
+        let wt = PathBuf::from(&wt_str);
+        std::fs::write(wt.join("x.txt"), "x\n").unwrap();
+        run_git_with_committer_identity(&wt, &["add", "x.txt"]).unwrap();
+        run_git_with_committer_identity(&wt, &["commit", "-m", "x"]).unwrap();
+
+        // Parent currently on `main` (per make_test_repo).
+        let result = git_merge_worktree(
+            repo.to_string_lossy().to_string(),
+            meta.branch.clone(),
+            "dev".to_string(),
+            false,
+        );
+        assert!(result.is_ok(), "merge should succeed: {:?}", result);
+        // Verify HEAD restored to main.
+        let head = git_capture(Some(&repo), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(head, "main", "parent HEAD should be restored to original branch");
+
+        let _ = git_worktree_remove(
+            repo.to_string_lossy().to_string(),
+            wt_str,
+            meta.branch,
+        );
     }
 }
