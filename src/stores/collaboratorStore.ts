@@ -1902,6 +1902,14 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         },
       };
     });
+    // Round-19 P5 (claude2 task-112 Concern 1 + claude3 task-114 O3
+    // convergent): if the user clear-acked this repo earlier in the
+    // same session, the sessionClears tracker still has it. Without
+    // this delete, hydration would filter the new accept out of
+    // onDisk on a subsequent re-hydration, causing a redundant write
+    // on every restart-after-re-accept. Cheap fix: clear the
+    // tracker on accept so the slate is clean.
+    sessionClears.delete(repoRoot);
     // Round-15: persist to disk on actual mutation. Fire-and-forget;
     // best-effort write — failure surfaces as a console.warn only.
     if (didMutate) {

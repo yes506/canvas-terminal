@@ -172,42 +172,103 @@ export type BranchProtectionState =
   | "unknown";
 
 /**
- * LB3 wizard's discriminator: detect GitHub remotes (the only host
- * where `gh api` can verify branch protection). Matches both HTTPS and
- * SSH forms: `https://github.com/...`, `git@github.com:...`. Anything
- * else routes to the `unknown` state.
+ * LB3 wizard's discriminator: extract the GitHub-flavored host from a
+ * remote URL. Returns the host string when the URL is a recognizable
+ * GitHub or GitHub Enterprise (GHE) remote, otherwise null.
+ *
+ * Round-19 P5 (claude3 task-99 O2 follow-up): GHE detection. The
+ * prior `isGithubRemote` only matched `github.com` literally. Self-
+ * hosted GHE installations (`github.acme.com`, etc.) routed to
+ * `unknown` even though `gh` can talk to them when authed (`gh api`
+ * uses the active host from `gh auth status`). Now any host that
+ * starts with `github.` (the canonical GHE convention) OR equals
+ * `github.com` is recognized. Other hosts still route to `unknown`.
+ *
+ * Recognized URL shapes (HTTPS + SSH):
+ *   https://github.com/owner/repo(.git)?
+ *   git@github.com:owner/repo(.git)?
+ *   https://github.acme.com/owner/repo(.git)?
+ *   git@github.acme.com:owner/repo(.git)?
  */
-function isGithubRemote(url: string): boolean {
-  return /github\.com[:/]/.test(url);
+function detectGithubHost(url: string): string | null {
+  // HTTPS: https://<host>/owner/repo(.git)?
+  const httpsMatch = url.match(/^https?:\/\/([^/]+)\//);
+  if (httpsMatch) {
+    const host = httpsMatch[1].toLowerCase();
+    if (host === "github.com" || host.startsWith("github.")) return host;
+    return null;
+  }
+  // SSH: git@<host>:owner/repo(.git)?
+  const sshMatch = url.match(/^[^@\s]+@([^:\s]+):/);
+  if (sshMatch) {
+    const host = sshMatch[1].toLowerCase();
+    if (host === "github.com" || host.startsWith("github.")) return host;
+    return null;
+  }
+  return null;
 }
 
 /**
  * Parse `<owner>/<repo>` from a remote URL. Strips the trailing `.git`
  * if present. Returns null on malformed input — caller treats null
  * as `unknown` state.
+ *
+ * Round-19 P5: parametric on the detected host (no longer hardcoded
+ * to `github.com`) so GHE URLs parse correctly.
  */
 function parseGithubOwnerRepo(url: string): { owner: string; repo: string } | null {
-  // HTTPS: https://github.com/owner/repo(.git)?
-  // SSH:   git@github.com:owner/repo(.git)?
-  const m = url.match(/github\.com[:/]([^/]+)\/([^/\s]+?)(?:\.git)?$/);
+  const host = detectGithubHost(url);
+  if (!host) return null;
+  // Build a host-anchored regex so we don't accidentally match
+  // `github.com` substring inside a path.
+  const escapedHost = host.replace(/\./g, "\\.");
+  const re = new RegExp(`${escapedHost}[:/]([^/]+)\\/([^/\\s]+?)(?:\\.git)?$`, "i");
+  const m = url.match(re);
   if (!m) return null;
   return { owner: m[1], repo: m[2] };
 }
 
 /**
- * Result discriminator for the protection-body classifier — separates
- * "parsed cleanly, here's the verdict" from "couldn't parse the body
- * at all" so the caller can distinguish `verified-unprotected` (no
- * meaningful rule) from `unknown` (couldn't determine state).
+ * Result discriminator for the protection-body classifier.
  *
- * Round-14 (codex2 M1 + claude2 O3 + claude3 O1): the prior version
- * folded parse failures into "unprotected", causing the user to see
- * "Enable protection" guidance when they may already have valid
- * protection but `gh` returned an unparseable body. The right routing
- * is `unknown` so they get the "cannot verify, run accept-limited"
- * path with note about what failed.
+ * Round-14 (codex2 M1 + claude2 O3 + claude3 O1): separates "parsed
+ * cleanly, here's the verdict" from "couldn't parse the body at all"
+ * so the caller can distinguish `verified-unprotected` (no meaningful
+ * rule) from `unknown` (couldn't determine state).
+ *
+ * Round-19 P5 (claude3 task-99 O4): diagnostic specificity. The prior
+ * `weak-or-empty` lumped two distinct sub-cases together:
+ *   - `weak`: protection rule exists with status-checks-only or other
+ *     non-blocking fields. User probably intended the branch to be
+ *     gated; just needs to add PR-required or push-restrictions to
+ *     get full protection.
+ *   - `empty`: protection rule exists but every meaningful field is
+ *     null. User configured something that does nothing.
+ * Both still route to `verified-unprotected`, but the diagnostic
+ * message can name the distinction so the user knows what they need
+ * to add.
  */
-type ProtectionClassification = "meaningful" | "weak-or-empty" | "unparseable";
+type ProtectionClassification =
+  | "meaningful"
+  | "weak"
+  | "empty"
+  | "unparseable";
+
+/**
+ * Round-19 P5: extracted result from classifyProtectionBody so the
+ * caller can render a more specific status message. The
+ * BranchProtectionState routing is unchanged (weak/empty still both
+ * map to verified-unprotected); the extra detail is consumed by the
+ * `/branch-protection check` slash command for actionable messages.
+ */
+export interface ProtectionDetail {
+  classification: ProtectionClassification;
+  /**
+   * For `weak`: the names of the non-blocking fields present (e.g.,
+   * `["required_status_checks"]`). Empty for other classifications.
+   */
+  nonBlockingFields: string[];
+}
 
 /**
  * Classify a GitHub branch-protection response body into the three
@@ -233,50 +294,70 @@ type ProtectionClassification = "meaningful" | "weak-or-empty" | "unparseable";
  * or non-empty restrictions; users who consciously want only status
  * checks gate their merges via `accept-limited`.
  */
-function classifyProtectionBody(stdoutBody: string): ProtectionClassification {
+function classifyProtectionBody(stdoutBody: string): ProtectionDetail {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdoutBody);
   } catch {
     // Round-14: parse failure is "can't verify", not "no protection".
-    // The body might have been truncated, wrapped, or the gh CLI may
-    // have returned something we don't understand. Don't claim the
-    // user has no protection — surface as `unknown` so they see the
-    // "cannot verify" path with `accept-limited` guidance.
-    return "unparseable";
+    return { classification: "unparseable", nonBlockingFields: [] };
   }
-  if (!parsed || typeof parsed !== "object") return "unparseable";
+  if (!parsed || typeof parsed !== "object") {
+    return { classification: "unparseable", nonBlockingFields: [] };
+  }
   const obj = parsed as Record<string, unknown>;
   // Direct-push-blocking field #1: PR-required.
-  if (obj.required_pull_request_reviews != null) return "meaningful";
+  if (obj.required_pull_request_reviews != null) {
+    return { classification: "meaningful", nonBlockingFields: [] };
+  }
   // Direct-push-blocking field #2: restrictions populated with at
-  // least one allowed pusher. Empty arrays for users/teams/apps mean
-  // "nobody is allowed to push" — but in practice GitHub serves an
-  // empty-arrays object even when restrictions are unconfigured for
-  // certain account types, so be conservative: require at least one
-  // allowlisted entry.
+  // least one allowed pusher.
   if (
     obj.restrictions != null &&
     typeof obj.restrictions === "object" &&
     restrictionsHasAllowlistedEntries(obj.restrictions as Record<string, unknown>)
   ) {
-    return "meaningful";
+    return { classification: "meaningful", nonBlockingFields: [] };
   }
-  // Direct-push-blocking field #3 (round-15 P5 polish, claude3 O2):
-  // `lock_branch.enabled === true` locks the branch entirely — no
-  // pushes by anyone, including via PR. Rare in practice but valid
-  // protection when present.
+  // Direct-push-blocking field #3: lock_branch.enabled (round-15).
   if (
     obj.lock_branch != null &&
     typeof obj.lock_branch === "object" &&
     (obj.lock_branch as Record<string, unknown>).enabled === true
   ) {
-    return "meaningful";
+    return { classification: "meaningful", nonBlockingFields: [] };
   }
-  // Round-14: required_status_checks alone is NOT enough — see the
-  // header comment. Falls through to weak-or-empty even when
-  // required_status_checks is non-null.
-  return "weak-or-empty";
+  // Round-19 P5 (claude3 task-99 O4): diagnostic specificity for
+  // weak-vs-empty. Collect any non-null non-blocking fields so the
+  // status message can name them ("status checks gate but don't
+  // block direct push; add PR-required or push-restrictions").
+  const nonBlockingFields: string[] = [];
+  if (obj.required_status_checks != null) nonBlockingFields.push("required_status_checks");
+  if (
+    obj.required_signatures != null &&
+    typeof obj.required_signatures === "object" &&
+    (obj.required_signatures as Record<string, unknown>).enabled === true
+  ) {
+    nonBlockingFields.push("required_signatures");
+  }
+  if (
+    obj.required_linear_history != null &&
+    typeof obj.required_linear_history === "object" &&
+    (obj.required_linear_history as Record<string, unknown>).enabled === true
+  ) {
+    nonBlockingFields.push("required_linear_history");
+  }
+  if (
+    obj.required_conversation_resolution != null &&
+    typeof obj.required_conversation_resolution === "object" &&
+    (obj.required_conversation_resolution as Record<string, unknown>).enabled === true
+  ) {
+    nonBlockingFields.push("required_conversation_resolution");
+  }
+  if (nonBlockingFields.length > 0) {
+    return { classification: "weak", nonBlockingFields };
+  }
+  return { classification: "empty", nonBlockingFields: [] };
 }
 
 /**
@@ -342,7 +423,7 @@ export async function checkBranchProtection(
     // only or use a non-standard remote name. Surface as `unknown`.
     return "unknown";
   }
-  if (!isGithubRemote(remoteUrl)) return "unknown";
+  if (!detectGithubHost(remoteUrl)) return "unknown";
   const parsed = parseGithubOwnerRepo(remoteUrl);
   if (!parsed) return "unknown";
   let res: { exitCode: number; stdout: string; stderr: string };
@@ -372,10 +453,13 @@ export async function checkBranchProtection(
     //     might have valid protection — surface as cannot-verify
     //     rather than tell them to "enable protection" they may
     //     already have).
-    const classification = classifyProtectionBody(res.stdout);
-    if (classification === "meaningful") return "verified-protected";
-    if (classification === "weak-or-empty") return "verified-unprotected";
-    return "unknown";
+    const detail = classifyProtectionBody(res.stdout);
+    if (detail.classification === "meaningful") return "verified-protected";
+    if (detail.classification === "unparseable") return "unknown";
+    // weak | empty both route to verified-unprotected (same user
+    // action: configure stronger protection or accept-limited). The
+    // diagnostic distinction is consumed via checkBranchProtectionDetail.
+    return "verified-unprotected";
   }
   // `gh api` returns exit 4 (or non-zero with stderr containing
   // "Not Found") for 404. Match defensively on the stderr text.

@@ -5144,6 +5144,135 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(useCollaboratorStore.getState().branchProtectionAcks).toEqual({});
   });
 
+  // -------------------------------------------------------------------------
+  // Round-19 P5 polish: GHE detection, sessionClears.delete on accept,
+  // weak-vs-empty diagnostic specificity
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtection: GHE host (github.acme.com) recognized as GitHub-flavored (round-19 claude3 task-99 O2 follow-up)", async () => {
+    // Round-19 P5: self-hosted GitHub Enterprise URLs should reach the
+    // gh api call — `gh` can talk to GHE when authed against the
+    // appropriate host. The prior code rejected non-`github.com` URLs
+    // unconditionally, forcing GHE users to always accept-limited.
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.acme.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+    // gh api must have been invoked (proves GHE host wasn't rejected
+    // at the host-detection step).
+    expect(fakeInvoke).toHaveBeenCalledWith(
+      "run_gh_api",
+      expect.objectContaining({
+        args: expect.arrayContaining([
+          expect.stringContaining("/repos/owner/repo/branches/dev/protection"),
+        ]),
+      }),
+    );
+  });
+
+  it("checkBranchProtection: GHE SSH form (git@github.acme.com:owner/repo) recognized", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "git@github.acme.com:owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+  });
+
+  it("checkBranchProtection: non-github host (gitlab.com) still routes to unknown", async () => {
+    // Regression check: the round-19 GHE detection broadened scope, but
+    // non-github hosts must still route to unknown.
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://gitlab.com/owner/repo.git";
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("unknown");
+  });
+
+  it("checkBranchProtection: a host like 'githubexample.com' (substring) does NOT match", async () => {
+    // Defense: prior `/github\.com[:/]/` regex would falsely match
+    // `https://githubexample.com/owner/repo` because of substring
+    // semantics. Round-19's host-anchored detection rejects this.
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://githubexample.com/owner/repo.git";
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("unknown");
+  });
+
+  it("acceptBranchProtectionLimited: removes repo from sessionClears (round-19 claude2 task-112 + claude3 task-114 O3)", async () => {
+    // Round-19 P5: clear-then-accept in same session must clean up the
+    // sessionClears tracker. Without this, a subsequent hydration
+    // (e.g., React 18 strict mode double-invocation) would filter the
+    // newly-acked repo out of onDisk and trigger a redundant write.
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    // First clear-ack records intent in sessionClears (in-memory was empty).
+    useCollaboratorStore.getState().clearBranchProtectionAck("/r");
+    // Now re-accept the SAME repo. sessionClears.delete should fire.
+    useCollaboratorStore.getState().acceptBranchProtectionLimited("/r", "re-accepted");
+    // Wait for the accept's write to drain through the chain.
+    await new Promise((r) => setTimeout(r, 10));
+    // Now switch the mock to track only writes that happen DURING
+    // (and after) the hydration call.
+    let writesAfterHydrationStart = 0;
+    let trackingActive = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "read_app_config_file") {
+        return JSON.stringify({
+          "/r": { acceptedAt: "re-accepted-ts", note: "re-accepted" },
+        });
+      }
+      if (
+        trackingActive &&
+        cmd === "write_app_config_file" &&
+        (args as { relativePath?: string } | undefined)?.relativePath ===
+          "branch-protection-acks.json"
+      ) {
+        writesAfterHydrationStart++;
+      }
+      return null;
+    });
+    trackingActive = true;
+    await hydrateBranchProtectionAcks();
+    await new Promise((r) => setTimeout(r, 10));
+    // No write should fire DURING hydration — disk and in-memory both
+    // have /r, sessionClears no longer has /r → no diff → no write.
+    expect(writesAfterHydrationStart).toBe(0);
+    expect(
+      useCollaboratorStore.getState().branchProtectionAcks["/r"],
+    ).toBeDefined();
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [
