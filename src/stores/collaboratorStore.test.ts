@@ -5273,6 +5273,130 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     ).toBeDefined();
   });
 
+  // -------------------------------------------------------------------------
+  // Round-20: GHE --hostname plumbing + nonBlockingFields rendering + @-strip
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtection: GHE call passes --hostname github.acme.com to gh api (round-20 codex1 round7 + codex2 task-116 H1 BLOCKING)", async () => {
+    // Round-20 codex1 round7 BLOCKING + codex2 task-116 H1 (convergent):
+    // GHE host detection alone is insufficient if `gh api` still
+    // targets the default github.com host. Without --hostname plumbing,
+    // a public github.com repo with the same owner/repo can mask the
+    // GHE branch's true protection state (false verified-protected
+    // for actually-unprotected GHE branch). The fix plumbs the
+    // detected host through to the gh api invocation.
+    let capturedArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "https://github.acme.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        capturedArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    await checkBranchProtection("/r", fakeInvoke as unknown as typeof invoke);
+    // CRITICAL: --hostname must be present and target the GHE host.
+    expect(capturedArgs).toContain("--hostname");
+    const hostnameIdx = capturedArgs.indexOf("--hostname");
+    expect(capturedArgs[hostnameIdx + 1]).toBe("github.acme.com");
+    // The path itself is unchanged.
+    expect(capturedArgs[0]).toBe("/repos/owner/repo/branches/dev/protection");
+  });
+
+  it("checkBranchProtection: github.com calls do NOT pass --hostname (default host, no flag needed)", async () => {
+    // Defensive regression: --hostname should only be added for non-
+    // default hosts. Adding it unconditionally would be a behavioral
+    // change against the prior round-19 contract (and would surface
+    // odd error messages if gh CLI rejects a redundant flag in some
+    // versions).
+    let capturedArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        capturedArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    await checkBranchProtection("/r", fakeInvoke as unknown as typeof invoke);
+    expect(capturedArgs).not.toContain("--hostname");
+    // Args should be just the path.
+    expect(capturedArgs).toEqual(["/repos/owner/repo/branches/dev/protection"]);
+  });
+
+  it("/branch-protection check: renders nonBlockingFields for weak protection (round-20 codex2 task-116 M1 + claude3 task-117 O1)", async () => {
+    // Round-20 (codex2 task-116 M1 + claude3 task-117 O1): the
+    // ProtectionDetail data added in round-19 must actually surface
+    // in the slash-command output. Weak protection (status_checks
+    // alone) should name the field in the user-facing message.
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_status_checks":{"strict":true,"contexts":["ci/test"]},"restrictions":null,"required_pull_request_reviews":null}',
+          stderr: "",
+        };
+      }
+      return null;
+    });
+    await executeCommand(parseInput("/branch-protection check"), D14_SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("required_status_checks");
+    expect(status).toContain("no direct-push-blocking field");
+  });
+
+  it("/branch-protection check: renders the GHE host in the status message (round-20)", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.acme.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      return null;
+    });
+    await executeCommand(parseInput("/branch-protection check"), D14_SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    // GHE host should appear in the status (not just generic "origin/dev").
+    expect(status).toContain("github.acme.com/dev");
+  });
+
+  it("/task approve: strips @ prefix from agentHandle before passing to git_create_approval_commit (round-20 P5 cosmetic)", async () => {
+    // Round-20 P5 (claude2 task-70 Concern 5 carry-over): the @ is a
+    // UI/mention sigil, not part of the actual handle. Stripping it
+    // before passing to git author makes the commit author render
+    // as `claude1 via orchestrator <…>` instead of `@claude1 via …`.
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
+    let capturedHandle: string | undefined;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "git_create_approval_commit") {
+        capturedHandle = (args as { agentHandle: string }).agentHandle;
+        return { commitSha: "abc", stagedCount: 1 };
+      }
+      if (cmd === "git_merge_worktree") return { mergedSha: "merged", pushed: false };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    // The pendingMerge snapshot has `agentHandle: "@claude1"`; the
+    // approval-commit IPC must receive the stripped form.
+    expect(capturedHandle).toBe("claude1");
+    expect(capturedHandle).not.toContain("@");
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [

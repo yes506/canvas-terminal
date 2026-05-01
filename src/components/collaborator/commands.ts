@@ -423,18 +423,28 @@ export async function checkBranchProtection(
     // only or use a non-standard remote name. Surface as `unknown`.
     return "unknown";
   }
-  if (!detectGithubHost(remoteUrl)) return "unknown";
+  const host = detectGithubHost(remoteUrl);
+  if (!host) return "unknown";
   const parsed = parseGithubOwnerRepo(remoteUrl);
   if (!parsed) return "unknown";
+  // Round-20 codex1 round7 + codex2 task-116 H1 (BLOCKING fix): pass
+  // `--hostname <host>` to `gh api` for non-default GitHub hosts so
+  // the request actually targets the GHE installation, not the user's
+  // default-authed `github.com`. Without this, a public github.com
+  // repo with the same owner/repo could mask the GHE branch's true
+  // protection state. Per `gh api --help`: "--hostname string ...
+  // override default host (default: github.com)".
+  const args: string[] = [
+    `/repos/${parsed.owner}/${parsed.repo}/branches/${targetBranch}/protection`,
+  ];
+  if (host !== "github.com") {
+    args.push("--hostname", host);
+  }
   let res: { exitCode: number; stdout: string; stderr: string };
   try {
     res = await invokeFn<{ exitCode: number; stdout: string; stderr: string }>(
       "run_gh_api",
-      {
-        args: [
-          `/repos/${parsed.owner}/${parsed.repo}/branches/${targetBranch}/protection`,
-        ],
-      },
+      { args },
     );
   } catch {
     // gh not installed, network failure, etc. → unknown.
@@ -442,23 +452,12 @@ export async function checkBranchProtection(
   }
   if (res.exitCode === 0) {
     // Round-13 codex2 H1 + Round-14 (codex2 H1, claude2 O3, claude3 O1):
-    // 200 alone is insufficient. Classify the body:
-    //   - meaningful → verified-protected (PR-required OR restrictions
-    //     with allowlisted entries; status-checks alone is NOT enough
-    //     per round-14).
-    //   - weak-or-empty → verified-unprotected (rule exists but doesn't
-    //     block direct pushes; user should add PR review/restrictions
-    //     or run accept-limited).
-    //   - unparseable → unknown (gh response we can't classify; user
-    //     might have valid protection — surface as cannot-verify
-    //     rather than tell them to "enable protection" they may
-    //     already have).
+    // 200 alone is insufficient. Classify the body.
     const detail = classifyProtectionBody(res.stdout);
     if (detail.classification === "meaningful") return "verified-protected";
     if (detail.classification === "unparseable") return "unknown";
     // weak | empty both route to verified-unprotected (same user
-    // action: configure stronger protection or accept-limited). The
-    // diagnostic distinction is consumed via checkBranchProtectionDetail.
+    // action: configure stronger protection or accept-limited).
     return "verified-unprotected";
   }
   // `gh api` returns exit 4 (or non-zero with stderr containing
@@ -469,6 +468,80 @@ export async function checkBranchProtection(
   }
   // Any other non-zero (auth failure, rate limit, etc.) → unknown.
   return "unknown";
+}
+
+/**
+ * Round-20 (codex2 task-116 M1 + claude3 task-117 O1): rich variant
+ * of `checkBranchProtection` that returns the full classification
+ * detail so callers can render diagnostic-specific messages
+ * ("rule includes status_checks but not PR-required" vs generic
+ * "no protection"). Same routing as `checkBranchProtection`; just
+ * exposes the inner `ProtectionDetail` for the verified-unprotected
+ * case.
+ */
+export interface BranchProtectionVerdict {
+  state: BranchProtectionState;
+  /**
+   * Populated when state is `verified-unprotected` AND the API
+   * returned a parseable body. Carries `nonBlockingFields` for
+   * `weak` classification so the slash-command surface can name
+   * which fields are present-but-non-blocking.
+   */
+  detail?: ProtectionDetail;
+  /**
+   * The detected GitHub host used for the API call (e.g.,
+   * `"github.acme.com"` for GHE). Useful for diagnostic messages
+   * ("checking origin/dev on github.acme.com…").
+   */
+  host?: string;
+}
+
+export async function checkBranchProtectionDetail(
+  repoRoot: string,
+  invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> = invoke,
+  targetBranch: string = APPROVAL_TARGET_BRANCH,
+): Promise<BranchProtectionVerdict> {
+  let remoteUrl: string;
+  try {
+    remoteUrl = await invokeFn<string>("git_get_remote_url", {
+      repoRoot,
+      remoteName: "origin",
+    });
+  } catch {
+    return { state: "unknown" };
+  }
+  const host = detectGithubHost(remoteUrl);
+  if (!host) return { state: "unknown" };
+  const parsed = parseGithubOwnerRepo(remoteUrl);
+  if (!parsed) return { state: "unknown", host };
+  const args: string[] = [
+    `/repos/${parsed.owner}/${parsed.repo}/branches/${targetBranch}/protection`,
+  ];
+  if (host !== "github.com") args.push("--hostname", host);
+  let res: { exitCode: number; stdout: string; stderr: string };
+  try {
+    res = await invokeFn<{ exitCode: number; stdout: string; stderr: string }>(
+      "run_gh_api",
+      { args },
+    );
+  } catch {
+    return { state: "unknown", host };
+  }
+  if (res.exitCode === 0) {
+    const detail = classifyProtectionBody(res.stdout);
+    if (detail.classification === "meaningful") {
+      return { state: "verified-protected", detail, host };
+    }
+    if (detail.classification === "unparseable") {
+      return { state: "unknown", detail, host };
+    }
+    return { state: "verified-unprotected", detail, host };
+  }
+  const stderrLc = res.stderr.toLowerCase();
+  if (stderrLc.includes("not found") || stderrLc.includes("404")) {
+    return { state: "verified-unprotected", host };
+  }
+  return { state: "unknown", host };
 }
 
 export interface ParsedCommand {
@@ -1145,12 +1218,18 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             ds.untracked.length > 0;
           if (hasResidue) {
             try {
+              // Round-20 P5 (claude2 task-70 Concern 5 carry-over):
+              // strip the leading `@` so the git author string renders
+              // as `claude1 via orchestrator <…>` instead of `@claude1
+              // via orchestrator <…>`. The `@` is a UI/mention sigil,
+              // not part of the actual handle.
+              const cleanAgentHandle = snapshot.agentHandle.replace(/^@/, "");
               const result = await invoke<{ commitSha: string; stagedCount: number }>(
                 "git_create_approval_commit",
                 {
                   worktreePath: snapshot.worktreePath,
                   message,
-                  agentHandle: snapshot.agentHandle,
+                  agentHandle: cleanAgentHandle,
                 },
               );
               // Normalize the snapshot so retries skip approval-commit.
@@ -1522,21 +1601,40 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             );
             break;
           }
-          const state = await checkBranchProtection(activeRepoRoot);
-          if (state === "verified-protected") {
+          // Round-20: use the detail-returning variant so we can render
+          // weak-vs-empty diagnostic specificity per claude3 task-99 O4.
+          const verdict = await checkBranchProtectionDetail(activeRepoRoot);
+          // Show the detected host (GHE-aware) when available, otherwise
+          // the canonical origin/<branch> name.
+          const branchLabel = verdict.host
+            ? `${verdict.host}/${APPROVAL_TARGET_BRANCH}`
+            : `origin/${APPROVAL_TARGET_BRANCH}`;
+          if (verdict.state === "verified-protected") {
             status(
-              `Branch protection verified on origin/${APPROVAL_TARGET_BRANCH} for ${activeRepoRoot}. ` +
+              `Branch protection verified on ${branchLabel} for ${activeRepoRoot}. ` +
                 "Approve will run silently.",
             );
-          } else if (state === "verified-unprotected") {
+          } else if (verdict.state === "verified-unprotected") {
+            // Round-20 (codex2 task-116 M1, claude3 task-117 O1): render
+            // the weak-vs-empty diagnostic. If the rule exists but only
+            // has non-blocking fields, name them so the user knows
+            // exactly what to add.
+            let detailMsg = "";
+            const d = verdict.detail;
+            if (d?.classification === "weak" && d.nonBlockingFields.length > 0) {
+              detailMsg =
+                ` (rule includes ${d.nonBlockingFields.join(", ")} but no direct-push-blocking field)`;
+            } else if (d?.classification === "empty") {
+              detailMsg = " (rule exists but every direct-push-blocking field is null)";
+            }
             status(
-              `Branch protection NOT enabled on origin/${APPROVAL_TARGET_BRANCH} for ${activeRepoRoot}. ` +
-                "Enable via Settings → Branches, OR run " +
+              `Branch protection NOT enabled on ${branchLabel} for ${activeRepoRoot}${detailMsg}. ` +
+                "Enable via Settings → Branches (add Required PR reviews or push restrictions), OR run " +
                 "'/branch-protection accept-limited' to proceed with limited guarantee.",
             );
           } else {
             status(
-              `Cannot verify branch protection for ${activeRepoRoot} ` +
+              `Cannot verify branch protection on ${branchLabel} for ${activeRepoRoot} ` +
                 "(non-GitHub remote, missing 'gh', or auth/network failure). " +
                 "Run '/branch-protection accept-limited [-- <note>]' to proceed.",
             );
