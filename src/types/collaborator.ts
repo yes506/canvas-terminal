@@ -183,6 +183,17 @@ export function classifyTaskStatus(status: TaskStatus): TaskLifecyclePhase {
     case "completed":
     case "blocked":
       return "terminal";
+    default: {
+      // Round-29 (codex1 task-140 #4 + claude3 task-143 O1): explicit
+      // `assertNever`-style exhaustiveness. TypeScript's flow analysis
+      // would already flag a non-returning function under `strict`,
+      // but assigning the variable to `never` produces an immediate,
+      // localized type error at the unhandled case — making the
+      // exhaustiveness contract visible at the switch itself rather
+      // than as a "Not all code paths return" error elsewhere.
+      const _exhaustive: never = status;
+      return _exhaustive;
+    }
   }
 }
 

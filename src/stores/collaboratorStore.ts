@@ -615,9 +615,13 @@ export function formatTaskSummaryForAgent(
   recipient: string | null,
   options: { othersCap?: number } = {},
 ): string {
-  const active = tasks.filter(
-    (t) => t.status === "pending" || t.status === "in-progress",
-  );
+  // Round-29 (codex2 task-142 follow-up): use the centralized
+  // classifier per claude3 task-139 O3 / round-28's
+  // `classifyTaskStatus`. The agent prompt summary should only
+  // include PTY-alive active work — tasks in P2 review/merge states
+  // already have their PTY killed by LB1 design and shouldn't be
+  // surfaced to the agent as "your active work."
+  const active = tasks.filter((t) => isActiveStatus(t.status));
   if (active.length === 0) return "";
 
   const mention = recipient ? `@${recipient}` : null;

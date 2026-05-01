@@ -1636,6 +1636,32 @@ describe("task-47 — formatTaskSummaryForAgent slimming", () => {
     expect(out).not.toContain("blocked one");
   });
 
+  it("drops P2 review/merge tasks too — only PTY-alive 'active' status surfaces (round-29 codex2 task-142 follow-up)", () => {
+    // Round-29 (codex2 task-142 follow-up): the agent-prompt summary
+    // should reflect PTY-alive active work only. Tasks in P2 review/
+    // merge states (awaiting-approval, approved-merging, merge-conflict)
+    // already have their PTY killed by LB1 design; surfacing them as
+    // "your active tasks" misleads the agent. The round-28 centralized
+    // `isActiveStatus` predicate now drives this filter — adding a
+    // new TaskStatus that's NOT 'active' will automatically exclude
+    // it from the summary.
+    const tasks: CollabTask[] = [
+      mkTask({ id: "task-1", title: "pending one", status: "pending", assignee: "@claude1" }),
+      mkTask({ id: "task-2", title: "in-progress one", status: "in-progress", assignee: "@claude1" }),
+      mkTask({ id: "task-3", title: "awaiting-approval one", status: "awaiting-approval", assignee: "@claude1" }),
+      mkTask({ id: "task-4", title: "approved-merging one", status: "approved-merging", assignee: "@claude1" }),
+      mkTask({ id: "task-5", title: "merge-conflict one", status: "merge-conflict", assignee: "@claude1" }),
+    ];
+    const out = formatTaskSummaryForAgent(tasks, "claude1");
+    expect(out).toContain("pending one");
+    expect(out).toContain("in-progress one");
+    // P2 review/merge states must NOT appear (PTY is killed; not actionable
+    // by the agent's next inject_into_pty).
+    expect(out).not.toContain("awaiting-approval one");
+    expect(out).not.toContain("approved-merging one");
+    expect(out).not.toContain("merge-conflict one");
+  });
+
   it("splits 'yours' vs 'others' when recipient is known", () => {
     const tasks: CollabTask[] = [
       mkTask({ id: "task-1-1777170000000", title: "mine A", assignee: "@claude1" }),
