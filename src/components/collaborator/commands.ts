@@ -184,24 +184,36 @@ export type BranchProtectionState =
  * starts with `github.` (the canonical GHE convention) OR equals
  * `github.com` is recognized. Other hosts still route to `unknown`.
  *
- * Recognized URL shapes (HTTPS + SSH):
- *   https://github.com/owner/repo(.git)?
+ * Round-25 P5 (claude2 task-115 carry-over): added `ssh://` URL
+ * scheme support (with and without explicit port). Recognized URL
+ * shapes:
+ *   https://github.com/owner/repo(.git)?(/)?
  *   git@github.com:owner/repo(.git)?
- *   https://github.acme.com/owner/repo(.git)?
- *   git@github.acme.com:owner/repo(.git)?
+ *   ssh://git@github.com/owner/repo(.git)?
+ *   ssh://git@github.com:22/owner/repo(.git)?
+ *   …same shapes for github.acme.com (GHE).
  */
 function detectGithubHost(url: string): string | null {
-  // HTTPS: https://<host>/owner/repo(.git)?
-  const httpsMatch = url.match(/^https?:\/\/([^/]+)\//);
+  // Round-25 P5: ssh:// URL form first — has explicit scheme so we
+  // don't conflict with the SCP-like form below.
+  // ssh://[user@]<host>[:port][/path]
+  const sshProtoMatch = url.match(/^ssh:\/\/(?:[^@/\s]+@)?([^:/\s]+)/);
+  if (sshProtoMatch) {
+    const host = sshProtoMatch[1].toLowerCase();
+    if (host === "github.com" || host.startsWith("github.")) return host;
+    return null;
+  }
+  // HTTPS/HTTP: https://<host>/owner/repo(.git)?
+  const httpsMatch = url.match(/^https?:\/\/([^/\s]+)\//);
   if (httpsMatch) {
     const host = httpsMatch[1].toLowerCase();
     if (host === "github.com" || host.startsWith("github.")) return host;
     return null;
   }
-  // SSH: git@<host>:owner/repo(.git)?
-  const sshMatch = url.match(/^[^@\s]+@([^:\s]+):/);
-  if (sshMatch) {
-    const host = sshMatch[1].toLowerCase();
+  // SCP-like SSH (no protocol): user@<host>:owner/repo(.git)?
+  const scpMatch = url.match(/^[^@\s]+@([^:\s]+):/);
+  if (scpMatch) {
+    const host = scpMatch[1].toLowerCase();
     if (host === "github.com" || host.startsWith("github.")) return host;
     return null;
   }
@@ -210,19 +222,32 @@ function detectGithubHost(url: string): string | null {
 
 /**
  * Parse `<owner>/<repo>` from a remote URL. Strips the trailing `.git`
- * if present. Returns null on malformed input — caller treats null
- * as `unknown` state.
+ * suffix and optional trailing slash. Returns null on malformed input
+ * — caller treats null as `unknown` state.
  *
  * Round-19 P5: parametric on the detected host (no longer hardcoded
  * to `github.com`) so GHE URLs parse correctly.
+ *
+ * Round-25 P5 (claude2 task-115 Concern 1 carry-over): handle SSH
+ * URL scheme with optional port (`ssh://git@host:22/owner/repo`)
+ * and trailing-slash URLs (`https://github.com/owner/repo/` from
+ * copy-paste). The `(?::\d+)?` allows an optional port number after
+ * the host; `/?` allows an optional trailing slash; the post-suffix
+ * `$` anchor still ensures we don't match arbitrary paths after.
  */
 function parseGithubOwnerRepo(url: string): { owner: string; repo: string } | null {
   const host = detectGithubHost(url);
   if (!host) return null;
   // Build a host-anchored regex so we don't accidentally match
-  // `github.com` substring inside a path.
+  // `github.com` substring inside a path. Allow optional `:port`
+  // after host (SSH URL form), then `[:/]` to step into the path
+  // (`:` for SCP form, `/` for HTTPS/SSH-URL forms), then capture
+  // owner and repo.
   const escapedHost = host.replace(/\./g, "\\.");
-  const re = new RegExp(`${escapedHost}[:/]([^/]+)\\/([^/\\s]+?)(?:\\.git)?$`, "i");
+  const re = new RegExp(
+    `${escapedHost}(?::\\d+)?[:/]([^/\\s]+)/([^/\\s]+?)(?:\\.git)?/?$`,
+    "i",
+  );
   const m = url.match(re);
   if (!m) return null;
   return { owner: m[1], repo: m[2] };

@@ -6034,6 +6034,120 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // Round-25 P5: SSH URL forms (with and without port) + trailing slash
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtection: ssh:// URL with explicit port (round-25 claude2 task-115 carry-over)", async () => {
+    // Round-25: ssh://git@github.com:22/owner/repo previously routed
+    // to !parsed (correct safe fallback) but with noisy "cannot
+    // verify" UX. The parser now handles the optional port.
+    let calledArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "ssh://git@github.com:22/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        calledArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r-ssh-port",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+    // Owner and repo extracted correctly (port stripped from path).
+    expect(calledArgs[0]).toBe("/repos/owner/repo/branches/dev/protection");
+  });
+
+  it("checkBranchProtection: ssh:// URL without explicit port (round-25)", async () => {
+    let calledArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "ssh://git@github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        calledArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r-ssh-noport",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+    expect(calledArgs[0]).toBe("/repos/owner/repo/branches/dev/protection");
+  });
+
+  it("checkBranchProtection: HTTPS URL with trailing slash (round-25 — copy-paste from browser)", async () => {
+    let calledArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo/";
+      if (cmd === "run_gh_api") {
+        calledArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r-trailing-slash",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+    expect(calledArgs[0]).toBe("/repos/owner/repo/branches/dev/protection");
+  });
+
+  it("checkBranchProtection: ssh:// URL with port to GHE host (round-25 cross-feature: GHE + ssh-with-port)", async () => {
+    let calledArgs: string[] = [];
+    const fakeInvoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "git_get_remote_url") return "ssh://git@github.acme.com:22/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        calledArgs = (args?.args as string[]) ?? [];
+        return {
+          exitCode: 0,
+          stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r-ghe-ssh-port",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+    // GHE --hostname must be passed alongside the parsed path.
+    expect(calledArgs[0]).toBe("/repos/owner/repo/branches/dev/protection");
+    expect(calledArgs).toContain("--hostname");
+    expect(calledArgs[calledArgs.indexOf("--hostname") + 1]).toBe("github.acme.com");
+  });
+
+  it("checkBranchProtection: malformed URL (no path after host) still routes to unknown (round-25 regression check)", async () => {
+    // The round-25 parser broadening must NOT accidentally accept
+    // pathless URLs. `https://github.com/` has no owner/repo segments;
+    // must remain unknown.
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/";
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r-pathless",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("unknown");
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [

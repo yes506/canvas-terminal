@@ -161,9 +161,34 @@ pub fn read_app_config_file(
 }
 
 /// Write content to a file in the app config dir. Atomic-ish: writes
-/// to a `<name>.tmp` sibling then renames over the target so a crash
-/// mid-write doesn't truncate the existing file. O_NOFOLLOW protects
-/// against symlink redirection at the final target.
+/// to a unique `<name>.tmp.<pid>.<nanos>` sibling then renames over
+/// the target so a crash mid-write doesn't truncate the existing file.
+///
+/// Round-25 P5 polish (claude2 task-118 carry-over: cross-process
+/// tmp-file race + claude3 task-117 O2: fsync hardening):
+///
+/// 1. **Unique per (process, nanos) tmp name**: prevents two
+///    concurrent canvas-terminal processes from corrupting each
+///    other's tmp file. Without this, both processes would open the
+///    same `<name>.tmp` with O_TRUNC and interleave writes.
+///
+/// 2. **fsync(tmp) before rename**: ensures the tmp file's content
+///    is durable on disk before publication. Without this, a system
+///    crash between rename and OS-buffer-flush could publish empty
+///    or partial content.
+///
+/// 3. **fsync(parent dir) after rename**: ensures the rename's
+///    metadata change is durable. Without this, a crash could lose
+///    the rename even though the tmp file content was fsynced.
+///    Best-effort — failure is logged via `let _` because the
+///    rename succeeded and the data is durable on the tmp file's
+///    inode at minimum.
+///
+/// O_NOFOLLOW on the tmp file open protects against symlink
+/// redirection at the temp target. The rename target inherits any
+/// symlink at `path` from the parent directory; that's outside the
+/// scope of this function (settings_path/app_config_dir is owned by
+/// Tauri).
 #[tauri::command]
 pub fn write_app_config_file(
     app: tauri::AppHandle,
@@ -171,9 +196,20 @@ pub fn write_app_config_file(
     content: String,
 ) -> Result<(), String> {
     let path = app_config_file_path(&app, &relative_path)?;
+    // Round-25: unique tmp name per (process, nanosecond) so two
+    // concurrent canvas-terminal processes don't race on the same
+    // tmp file. Pattern mirrors `commands::memory::write_memory_
+    // file_atomic`.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let tmp_path = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|s| s.to_str()).unwrap_or("dat")
+        "{}.tmp.{}.{}",
+        path.extension().and_then(|s| s.to_str()).unwrap_or("dat"),
+        pid,
+        nanos,
     ));
     {
         let mut f = fs::OpenOptions::new()
@@ -185,7 +221,20 @@ pub fn write_app_config_file(
             .map_err(|e| format!("Cannot open temp file: {}", e))?;
         f.write_all(content.as_bytes())
             .map_err(|e| format!("Cannot write temp file: {}", e))?;
+        // Round-25: fsync the tmp file before rename so the content
+        // is durable on disk before publication.
+        f.sync_all()
+            .map_err(|e| format!("Cannot fsync temp file: {}", e))?;
     }
     fs::rename(&tmp_path, &path).map_err(|e| format!("Cannot rename temp file: {}", e))?;
+    // Round-25: best-effort fsync of the parent dir so the rename's
+    // metadata change is durable. Failure here is non-fatal — the
+    // rename has already succeeded at the OS level and the data is
+    // safe on the tmp file's inode.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
