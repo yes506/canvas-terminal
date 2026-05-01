@@ -4919,6 +4919,132 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(acks["/r"]?.acceptedAt).toBe("new-ts");
   });
 
+  // -------------------------------------------------------------------------
+  // Round-17 polish: hydration-window write recovery + entry-shape validation
+  // -------------------------------------------------------------------------
+
+  it("hydrateBranchProtectionAcks: persists merged state to disk so hydration-window race doesn't lose previously-acked repos (round-17 claude2 task-106)", async () => {
+    // Round-17 claude2 task-106: scenario:
+    //   1. Run 1: user accepted /repoA → disk had /repoA. App exited.
+    //   2. Run 2: hydration starts; read fires, captures disk={/repoA}.
+    //   3. Before read resolves, user types accept-limited /repoB →
+    //      in-memory={/repoB}, write fires → disk now {/repoB}.
+    //      /repoA is LOST on disk.
+    //   4. Hydration's read resolves with old onDisk={/repoA}; merge
+    //      produces in-memory={/repoA, /repoB}. Good.
+    //   5. BUG: hydration didn't trigger a write. Disk stays {/repoB}.
+    //      App exits → /repoA permanently lost.
+    //
+    // Fix: hydration triggers persistBranchProtectionAcks() after the
+    // merge. The chain serializes; final disk state reflects the union.
+    useCollaboratorStore.setState({
+      // Simulates step 3: user accepted /repoB during hydration window.
+      branchProtectionAcks: {
+        "/repoB": { acceptedAt: "in-mem-ts", note: "added during hydration window" },
+      },
+    });
+    const writeCalls: Array<{ relativePath: string; content: string }> = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "read_app_config_file") {
+        // Disk still has /repoA from the prior session.
+        return JSON.stringify({
+          "/repoA": { acceptedAt: "old-ts", note: "from-prior-restart" },
+        });
+      }
+      if (cmd === "write_app_config_file") {
+        const a = args as { relativePath: string; content: string };
+        writeCalls.push(a);
+      }
+      return null;
+    });
+    await hydrateBranchProtectionAcks();
+    await new Promise((r) => setTimeout(r, 10));
+
+    // In-memory: union with both repos.
+    const acks = useCollaboratorStore.getState().branchProtectionAcks;
+    expect(acks["/repoA"]).toBeDefined();
+    expect(acks["/repoB"]).toBeDefined();
+
+    // CRITICAL: hydration must have triggered a persist write so disk
+    // reflects the merged union, not just the last in-flight write.
+    const ackPersistCall = writeCalls.find(
+      (c) => c.relativePath === "branch-protection-acks.json",
+    );
+    expect(ackPersistCall).toBeDefined();
+    const finalDiskState = JSON.parse(ackPersistCall!.content);
+    expect(finalDiskState["/repoA"]).toBeDefined();
+    expect(finalDiskState["/repoB"]).toBeDefined();
+  });
+
+  it("hydrateBranchProtectionAcks: does NOT trigger a write when in-memory is a subset of disk (no merge change)", async () => {
+    // If disk is the source of truth and in-memory has no extra entries,
+    // there's nothing to flush. Avoid spurious writes — they'd just be
+    // identity-rewrites adding wear to the file.
+    useCollaboratorStore.setState({ branchProtectionAcks: {} });
+    const writeCalls: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "read_app_config_file") {
+        return JSON.stringify({
+          "/repoA": { acceptedAt: "old-ts" },
+        });
+      }
+      if (
+        cmd === "write_app_config_file" &&
+        (args as { relativePath?: string } | undefined)?.relativePath ===
+          "branch-protection-acks.json"
+      ) {
+        writeCalls.push(cmd);
+      }
+      return null;
+    });
+    await hydrateBranchProtectionAcks();
+    await new Promise((r) => setTimeout(r, 10));
+    // No extra entries in memory → no need to re-persist disk.
+    expect(writeCalls).toHaveLength(0);
+  });
+
+  it("checkBranchProtection: 200 with restrictions {users:[null]} → verified-unprotected (round-17 claude3 task-102 O1)", async () => {
+    // Round-17 claude3 task-102 O1: validate that allowlist entries
+    // are non-null objects, not just that arrays have length > 0.
+    // Prevents `[null]` or `["malformed-string"]` from satisfying
+    // the meaningful-protection check.
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_status_checks":null,"restrictions":{"users":[null],"teams":[],"apps":[]},"required_pull_request_reviews":null}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-unprotected");
+  });
+
+  it("checkBranchProtection: 200 with restrictions {users:['malformed-string']} → verified-unprotected (round-17 claude3 task-102 O1)", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_status_checks":null,"restrictions":{"users":["scalar-string-not-object"],"teams":[],"apps":[]},"required_pull_request_reviews":null}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-unprotected");
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [

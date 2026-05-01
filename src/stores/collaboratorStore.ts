@@ -836,18 +836,40 @@ function persistBranchProtectionAcks(): void {
  * is the prior-restart source of truth; in-memory accumulates new
  * acks since boot. Final state = union; conflict resolution prefers
  * the in-memory entry (the user's most recent action wins).
+ *
+ * Round-17 (claude2 task-106): persist the merged state back to disk.
+ * Without this, a user-accept that fires between read and merge
+ * writes a partial state to disk (only the new ack) and the
+ * previously-persisted repos from disk are never re-saved. The
+ * promise-chain serialization in `persistBranchProtectionAcks`
+ * guarantees this hydration write lands AFTER any user-triggered
+ * writes, so the final disk state correctly reflects the union.
  */
 export async function hydrateBranchProtectionAcks(): Promise<void> {
   const onDisk = await readBranchProtectionAcks();
-  useCollaboratorStore.setState((s) => ({
-    branchProtectionAcks: {
+  let mergedDifferedFromDisk = false;
+  useCollaboratorStore.setState((s) => {
+    const merged: typeof s.branchProtectionAcks = {
       ...onDisk,
       // In-memory entries (made between mount and hydration resolution)
       // override disk entries. The user explicitly chose them this
       // session and they haven't been clobbered yet.
       ...s.branchProtectionAcks,
-    },
-  }));
+    };
+    // Detect whether the merge introduced anything not on disk yet.
+    // If so, we need to flush the merged state to disk to recover from
+    // the hydration-window data-loss scenario (claude2 task-106).
+    for (const repo of Object.keys(merged)) {
+      if (!Object.prototype.hasOwnProperty.call(onDisk, repo)) {
+        mergedDifferedFromDisk = true;
+        break;
+      }
+    }
+    return { branchProtectionAcks: merged };
+  });
+  if (mergedDifferedFromDisk) {
+    persistBranchProtectionAcks();
+  }
 }
 
 function ensureSessionMemoryFiles(collabSessionId: string): void {

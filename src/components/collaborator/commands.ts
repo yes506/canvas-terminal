@@ -279,13 +279,26 @@ function classifyProtectionBody(stdoutBody: string): ProtectionClassification {
   return "weak-or-empty";
 }
 
-/** Returns true when `restrictions` allowlist has at least one user/team/app. */
+/**
+ * Returns true when `restrictions` allowlist has at least one valid
+ * user/team/app entry. Round-17 (claude3 task-102 O1): validate the
+ * entries themselves are non-null objects, not just that the arrays
+ * are non-empty. Prevents `[null]` or `["malformed"]` from being
+ * treated as a valid allowlist when GitHub's response shape drifts
+ * or a future user supplies adversarial input.
+ */
 function restrictionsHasAllowlistedEntries(r: Record<string, unknown>): boolean {
-  const sumLen = (k: string) => {
+  const countValid = (k: string) => {
     const v = r[k];
-    return Array.isArray(v) ? v.length : 0;
+    if (!Array.isArray(v)) return 0;
+    // An entry is valid if it's a non-null object. GitHub serves these
+    // as objects with `{login, id, ...}` or `{slug, id, ...}` shapes;
+    // we don't pin specific fields because they vary across endpoint
+    // versions, but the entry MUST be an object (not a string, null,
+    // or scalar) to count.
+    return v.filter((entry) => entry != null && typeof entry === "object").length;
   };
-  return sumLen("users") + sumLen("teams") + sumLen("apps") > 0;
+  return countValid("users") + countValid("teams") + countValid("apps") > 0;
 }
 
 /**
