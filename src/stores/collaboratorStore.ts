@@ -10,7 +10,11 @@ import type {
   RenameResult,
   TaskStatus,
 } from "../types/collaborator";
-import { TOOL_CONFIGS } from "../types/collaborator";
+import {
+  TOOL_CONFIGS,
+  isActiveStatus,
+  isTerminalStatus,
+} from "../types/collaborator";
 import { muteCapture } from "../lib/agentOutputCapture";
 import { useTerminalStore } from "./terminalStore";
 
@@ -703,7 +707,11 @@ function findFreshestActiveTaskForMention(
   let freshestMs = -Infinity;
   for (const t of tasks) {
     if (t.assignee !== mention) continue;
-    if (t.status !== "pending" && t.status !== "in-progress") continue;
+    // Round-28: use the centralized classifier (claude3 task-139 O3).
+    // Adding a new TaskStatus is a single-point edit in
+    // `classifyTaskStatus`; this filter doesn't need to know the
+    // specific status names, just the lifecycle phase.
+    if (!isActiveStatus(t.status)) continue;
     const ms = new Date(t.assignedAt).getTime();
     if (ms > freshestMs) {
       freshest = t;
@@ -737,8 +745,11 @@ function findFreshestNonTerminalTaskForMention(
   let freshestMs = -Infinity;
   for (const t of tasks) {
     if (t.assignee !== mention) continue;
-    // Exclude only the two terminal statuses — accept all 5 non-terminal.
-    if (t.status === "completed" || t.status === "blocked") continue;
+    // Round-28: use the centralized classifier. Future TaskStatus
+    // additions classified as "terminal" automatically get excluded;
+    // those classified as "active" or "review-or-merge" automatically
+    // get included.
+    if (isTerminalStatus(t.status)) continue;
     const ms = new Date(t.assignedAt).getTime();
     if (ms > freshestMs) {
       freshest = t;
@@ -1429,16 +1440,12 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
           continue;
         }
 
-        if (
-          task.status === "completed" ||
-          task.status === "blocked" ||
-          task.status === "awaiting-approval" ||
-          task.status === "approved-merging" ||
-          task.status === "merge-conflict"
-        ) {
-          // The race winner already terminalized this task OR the
-          // approval gate already engaged. Best-effort delete the signal
-          // file; ignore if it's gone.
+        if (!isActiveStatus(task.status)) {
+          // Round-28 (claude3 task-139 O3): centralized classification.
+          // `!isActiveStatus` covers `terminal` (race winner already
+          // terminalized) AND `review-or-merge` (P2 gate already
+          // engaged). Both share the same response: best-effort delete
+          // the signal file; ignore if it's gone.
           //
           // The new P2 non-terminal states are handled here too because
           // a duplicate `.done.json` arriving after the gate flipped
@@ -2786,10 +2793,11 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     //     in production (would break legacy paths under construction)
     //     but we log a dev-mode warning so the next commit (LB1 wiring)
     //     surfaces any forgotten snapshots.
-    if (cleanUpdates.status === "completed" || cleanUpdates.status === "blocked") {
-      // Caller may set pendingMerge to anything (including the previous
-      // value); we override to null. The clean-updates spread happens
-      // BEFORE this so the override wins.
+    if (cleanUpdates.status !== undefined && isTerminalStatus(cleanUpdates.status)) {
+      // Round-28: use the centralized classifier. Caller may set
+      // pendingMerge to anything (including the previous value); we
+      // override to null. The clean-updates spread happens BEFORE
+      // this so the override wins.
       (cleanUpdates as { pendingMerge: PendingMerge | null }).pendingMerge = null;
     } else if (
       cleanUpdates.status === "awaiting-approval" ||
@@ -2836,7 +2844,8 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     const task = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
     if (task) {
       // Append a structured task report when status changes to a terminal state
-      const isTerminal = task.status === "completed" || task.status === "blocked";
+      // Round-28: use the centralized classifier (claude3 task-139 O3).
+      const isTerminal = isTerminalStatus(task.status);
       const statusChanged = task.status !== prevStatus;
       if (isTerminal && statusChanged) {
         // Decorate the resolved author handle with its current nickname,

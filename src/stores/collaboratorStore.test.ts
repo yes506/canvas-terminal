@@ -21,6 +21,12 @@ import {
   checkBranchProtection,
   _clearVerifiedProtectedCacheForTests,
 } from "../components/collaborator/commands";
+import {
+  classifyTaskStatus,
+  isActiveStatus,
+  isTerminalStatus,
+} from "../types/collaborator";
+import type { TaskStatus } from "../types/collaborator";
 import { useTerminalStore } from "./terminalStore";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -139,6 +145,48 @@ describe("task-16 — 3-state agent task machine + 5 s completed TTL", () => {
     const tasks = useCollaboratorStore.getState().tasksBySession[SESSION] ?? [];
     const state = getAgentTaskState(SESSION, "claude1", tasks, useCollaboratorStore.getState().recentOutcomesBySession);
     expect(state.kind).toBe("idle");
+  });
+
+  // Round-28 (claude3 task-139 O3): centralized status classifier.
+  // Maintainability fix — the round-27 helpers had inline string
+  // comparisons that future TaskStatus additions could miss.
+
+  it("classifyTaskStatus: maps every TaskStatus to its lifecycle phase (round-28 exhaustiveness lock)", () => {
+    // Round-28: this test is the load-bearing exhaustiveness lock.
+    // If a new TaskStatus is added without updating classifyTaskStatus,
+    // TypeScript's switch-exhaustiveness check fails AND this test
+    // fails to cover the new branch — both signals point implementers
+    // at the centralized classifier.
+    const cases: Array<[TaskStatus, "active" | "review-or-merge" | "terminal"]> = [
+      ["pending", "active"],
+      ["in-progress", "active"],
+      ["awaiting-approval", "review-or-merge"],
+      ["approved-merging", "review-or-merge"],
+      ["merge-conflict", "review-or-merge"],
+      ["completed", "terminal"],
+      ["blocked", "terminal"],
+    ];
+    for (const [status, expectedPhase] of cases) {
+      expect(classifyTaskStatus(status)).toBe(expectedPhase);
+    }
+  });
+
+  it("isActiveStatus + isTerminalStatus: predicates match classifyTaskStatus", () => {
+    expect(isActiveStatus("pending")).toBe(true);
+    expect(isActiveStatus("in-progress")).toBe(true);
+    expect(isActiveStatus("awaiting-approval")).toBe(false);
+    expect(isActiveStatus("approved-merging")).toBe(false);
+    expect(isActiveStatus("merge-conflict")).toBe(false);
+    expect(isActiveStatus("completed")).toBe(false);
+    expect(isActiveStatus("blocked")).toBe(false);
+
+    expect(isTerminalStatus("pending")).toBe(false);
+    expect(isTerminalStatus("in-progress")).toBe(false);
+    expect(isTerminalStatus("awaiting-approval")).toBe(false);
+    expect(isTerminalStatus("approved-merging")).toBe(false);
+    expect(isTerminalStatus("merge-conflict")).toBe(false);
+    expect(isTerminalStatus("completed")).toBe(true);
+    expect(isTerminalStatus("blocked")).toBe(true);
   });
 
   // Round-27: status-mismatch bug fix. The indicator must surface ALL
