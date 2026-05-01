@@ -2781,6 +2781,106 @@ describe("LB4 — /task done and /task status completed gate refusal (codex2 tas
     expect(updated?.status).toBe("blocked");
   });
 
+  // Round-9: LB5 multi-task-per-agent gate (claude3 task-46 ISS-2).
+
+  it("/task assign refuses worktree-backed agent that already has an active task", async () => {
+    // Two concurrent git-write tasks in one worktree would co-mingle
+    // diffs and defeat the per-task approval gate. Refuse re-assignment
+    // when the target agent already has a non-terminal task.
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    // Existing task assigned to @claude1, status pending.
+    const existing = store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    // Try to assign a SECOND task to @claude1.
+    const second = store.addTask(
+      { title: "second", objective: "second" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput(`/task ${second.id} assign @claude1`),
+      LB4_SESSION,
+    );
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === second.id);
+    // Second task NOT assigned (refused).
+    expect(updated?.assignee).toBeNull();
+    // Status line surfaces the refusal with conflicting task id.
+    const status = useCollaboratorStore.getState().statusMessages[LB4_SESSION];
+    expect(status).toContain("active worktree-backed task");
+    expect(status).toContain(existing.id);
+  });
+
+  it("/task add refuses to assign to worktree-backed agent that already has an active task", async () => {
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput("/task add second-title | second-obj @claude1"),
+      LB4_SESSION,
+    );
+    // Second task NOT created (refused before addTask). Verify only the
+    // first task exists.
+    const tasks = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION] ?? [];
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].title).toBe("first");
+    const status = useCollaboratorStore.getState().statusMessages[LB4_SESSION];
+    expect(status).toContain("active worktree-backed task");
+  });
+
+  it("/task add allows assigning to a non-worktree-backed agent that already has tasks", async () => {
+    // The LB5 invariant only applies when the agent has a worktree.
+    // Read-only investigators (no worktree) can have multiple tasks.
+    setupAgent({ withWorktree: false });
+    const store = useCollaboratorStore.getState();
+    store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput("/task add second-title | second-obj @claude1"),
+      LB4_SESSION,
+    );
+    const tasks = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION] ?? [];
+    expect(tasks).toHaveLength(2);
+    expect(tasks.every((t) => t.assignee === "@claude1")).toBe(true);
+  });
+
+  it("/task assign allows reassigning when the existing task is terminal", async () => {
+    // Terminal tasks (completed/blocked) are no longer "active" — no
+    // diff co-mingling concern. Re-assignment to the agent should work.
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    const old = store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    // Mark the old task blocked (explicit abandonment).
+    store.updateTask(old.id, { status: "blocked" }, LB4_SESSION);
+    const next = store.addTask(
+      { title: "second", objective: "second" },
+      LB4_SESSION,
+    );
+    await executeCommand(
+      parseInput(`/task ${next.id} assign @claude1`),
+      LB4_SESSION,
+    );
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === next.id);
+    expect(updated?.assignee).toBe("@claude1");
+  });
+
   // Round-8: cover the live-record gap (codex1+codex2+claude3 convergent).
 
   it("/task done refuses tasks whose pendingMerge is set even after the agent record is gone", async () => {

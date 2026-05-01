@@ -45,6 +45,41 @@ export function isTaskWorktreeBacked(
   return Boolean(agent?.worktree);
 }
 
+/**
+ * LB5 helper (claude3 task-46 ISS-2): find an existing non-terminal
+ * worktree-backed task assigned to the given agent handle in the same
+ * session. Used by `/task assign` and `/task add` to refuse a second
+ * concurrent git-write assignment to the same agent — diff co-mingling
+ * across two tasks in one worktree would defeat the per-task approval
+ * gate.
+ *
+ * "Worktree-backed" here means the agent has a worktree AND the task is
+ * non-terminal (pending | in-progress | awaiting-approval |
+ * approved-merging | merge-conflict). Tasks already in `completed` or
+ * `blocked` are fine — they're done; the worktree from the prior task
+ * has either merged + been removed OR been preserved as exited.
+ *
+ * Returns the conflicting task, or undefined if no conflict.
+ */
+export function findActiveWorktreeTaskForAgent(
+  assigneeToken: string,
+  agents: SpawnedAgent[],
+  tasks: CollabTask[],
+  collabSessionId: string,
+): CollabTask | undefined {
+  const handle = assigneeToken.replace(/^@/, "");
+  const agent = agents.find(
+    (a) => a.collabSessionId === collabSessionId && a.handle === handle,
+  );
+  if (!agent?.worktree) return undefined;
+  return tasks.find(
+    (t) =>
+      t.assignee === `@${handle}` &&
+      t.status !== "completed" &&
+      t.status !== "blocked",
+  );
+}
+
 export interface ParsedCommand {
   type:
     | "send"
@@ -469,6 +504,27 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             break;
           }
 
+          // LB5 (claude3 task-46 ISS-2): if assigning to a worktree-backed
+          // agent that already has a non-terminal task, refuse — running
+          // two concurrent git-write tasks in the same worktree would
+          // co-mingle their diffs and defeat the per-task approval gate.
+          if (assignee) {
+            const conflict = findActiveWorktreeTaskForAgent(
+              assignee,
+              store.agents,
+              store.getTasks(collabSessionId),
+              collabSessionId,
+            );
+            if (conflict) {
+              status(
+                `Cannot assign new task to ${assignee} — already has active worktree-backed task ` +
+                  `${conflict.id} (status: ${conflict.status}). Approve, discard, or finish that task first, ` +
+                  `or create this task without an assignee.`,
+              );
+              break;
+            }
+          }
+
           const task = store.addTask({ title, objective, assignee }, collabSessionId);
           status(`Task created: ${task.id} — "${task.title}"${assignee ? ` → ${assignee}` : ""}`);
           break;
@@ -537,8 +593,34 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             status(`Agent "${agent}" not found.`);
             break;
           }
-          store.updateTask(task.id, { assignee: `@${resolved.handle}` }, collabSessionId);
-          status(`Task ${task.id} assigned to @${resolved.handle}`);
+          // LB5 (claude3 task-46 ISS-2): refuse re-assignment to a
+          // worktree-backed agent that already has a different non-
+          // terminal task. Same reasoning as /task add — co-mingled
+          // diffs in one worktree defeat the per-task approval gate.
+          // The conflict lookup excludes THIS task so re-assigning to
+          // the same agent (no-op) doesn't trip the check.
+          const newAssignee = `@${resolved.handle}`;
+          // Don't fire the check when the assignee isn't actually changing.
+          if (task.assignee !== newAssignee) {
+            const otherTasks = store
+              .getTasks(collabSessionId)
+              .filter((t) => t.id !== task.id);
+            const conflict = findActiveWorktreeTaskForAgent(
+              newAssignee,
+              store.agents,
+              otherTasks,
+              collabSessionId,
+            );
+            if (conflict) {
+              status(
+                `Cannot reassign ${task.id} to ${newAssignee} — already has active worktree-backed task ` +
+                  `${conflict.id} (status: ${conflict.status}). Approve, discard, or finish that task first.`,
+              );
+              break;
+            }
+          }
+          store.updateTask(task.id, { assignee: newAssignee }, collabSessionId);
+          status(`Task ${task.id} assigned to ${newAssignee}`);
           break;
         }
 
