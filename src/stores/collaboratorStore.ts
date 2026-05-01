@@ -1003,21 +1003,142 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
           continue;
         }
 
-        if (task.status === "completed" || task.status === "blocked") {
-          // The race winner already terminalized this task. Best-effort
-          // delete so the file doesn't accumulate; ignore if it's gone.
+        if (
+          task.status === "completed" ||
+          task.status === "blocked" ||
+          task.status === "awaiting-approval" ||
+          task.status === "approved-merging" ||
+          task.status === "merge-conflict"
+        ) {
+          // The race winner already terminalized this task OR the
+          // approval gate already engaged. Best-effort delete the signal
+          // file; ignore if it's gone.
+          //
+          // The new P2 non-terminal states are handled here too because
+          // a duplicate `.done.json` arriving after the gate flipped
+          // shouldn't reset the task or trigger another flip.
           await invoke("delete_memory_file", { relativePath: relPath }).catch(() => {});
           continue;
         }
 
-        const status = data.status === "blocked" ? "blocked" : "completed";
-        store.updateTask(task.id, {
-          status: status as CollabTask["status"],
-          reasoning: data.reasoning ?? null,
-          conclusion: data.conclusion ?? null,
-          output: data.output ?? null,
-          completedBy: data.author ?? data.agent ?? null,
-        }, forSession);
+        const requestedStatus =
+          data.status === "blocked" ? "blocked" : "completed";
+        const completedBy = data.author ?? data.agent ?? null;
+
+        // ---------------------------------------------------------------
+        // LB1: P2 awaiting-approval gate.
+        //
+        // If the task's assignee/author has a worktree-backed agent record
+        // AND the worktree shows a source delta against baseSha (D2
+        // broadened scope), flip to `awaiting-approval` instead of
+        // terminalizing directly. The sequence (claude3 task-46 R2):
+        //
+        //   1. Detect .done.json (above)
+        //   2. Find the worktree-backed agent
+        //   3. Kill the PTY SYNCHRONOUSLY — freezes worktree state BEFORE
+        //      the snapshot so the agent can't race new commits in
+        //   4. Snapshot diff summary from the frozen worktree
+        //   5. updateTask({ status: "awaiting-approval", pendingMerge })
+        //
+        // If steps 2-4 don't apply (no agent, no worktree, or no delta),
+        // fall through to the existing terminalization below. Worktree
+        // metadata is captured BEFORE killing the PTY because removeAgent
+        // (which fires on PTY exit) will discard the SpawnedAgent record;
+        // we'd otherwise lose access to repoRoot/baseRef/etc.
+        // ---------------------------------------------------------------
+        const authorHandle = (completedBy ?? task.assignee ?? "").replace(/^@/, "");
+        const agent = authorHandle
+          ? store.agents.find(
+              (a) =>
+                a.collabSessionId === forSession && a.handle === authorHandle,
+            )
+          : undefined;
+
+        let routedToApproval = false;
+        if (
+          requestedStatus === "completed" &&
+          agent?.worktree &&
+          agent.sessionId
+        ) {
+          // Snapshot worktree metadata FIRST — kill_pty triggers
+          // removeAgent which discards the SpawnedAgent record.
+          const wt = agent.worktree;
+          const ptySid = agent.sessionId;
+          try {
+            // Step 3: kill PTY synchronously (kill BEFORE snapshot —
+            // claude3 task-46 R2 ordering invariant).
+            await invoke("kill_pty", { sessionId: ptySid });
+            // Step 4: snapshot from the frozen worktree.
+            const diff = await invoke<{
+              hasChanges: boolean;
+              committed: string[];
+              staged: string[];
+              unstaged: string[];
+              untracked: string[];
+            }>("git_diff_summary", {
+              worktreePath: wt.path,
+              baseSha: wt.baseSha,
+            });
+            if (diff.hasChanges) {
+              // Step 5: flip to awaiting-approval with the frozen snapshot.
+              const pendingMerge: PendingMerge = {
+                branch: wt.branch,
+                worktreePath: wt.path,
+                repoRoot: wt.repoRoot,
+                baseRef: wt.baseRef,
+                baseSha: wt.baseSha,
+                baseFresh: wt.baseFresh,
+                diffSummary: {
+                  committed: diff.committed,
+                  staged: diff.staged,
+                  unstaged: diff.unstaged,
+                  untracked: diff.untracked,
+                },
+                agentHandle: `@${authorHandle}`,
+              };
+              store.updateTask(
+                task.id,
+                {
+                  status: "awaiting-approval",
+                  reasoning: data.reasoning ?? null,
+                  conclusion: data.conclusion ?? null,
+                  output: data.output ?? null,
+                  completedBy,
+                  pendingMerge,
+                },
+                forSession,
+              );
+              routedToApproval = true;
+            }
+            // diff.hasChanges === false: agent worked in a worktree but
+            // produced no source delta (e.g., read-only investigation).
+            // Fall through to terminalize as `completed`.
+          } catch (err) {
+            // kill_pty or git_diff_summary failed. The PTY may already
+            // have exited; the worktree may already be gone. Don't strand
+            // the task — fall through to the existing terminalization
+            // path so the user isn't left with a stuck `in-progress`.
+            // eslint-disable-next-line no-console
+            console.warn(
+              "[collab/scan] LB1 gate failed; falling through to direct terminalization:",
+              err,
+            );
+          }
+        }
+
+        if (!routedToApproval) {
+          store.updateTask(
+            task.id,
+            {
+              status: requestedStatus as CollabTask["status"],
+              reasoning: data.reasoning ?? null,
+              conclusion: data.conclusion ?? null,
+              output: data.output ?? null,
+              completedBy,
+            },
+            forSession,
+          );
+        }
 
         // Delete the signal file after processing
         await invoke("delete_memory_file", { relativePath: relPath });

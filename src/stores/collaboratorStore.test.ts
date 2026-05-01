@@ -2647,6 +2647,248 @@ describe("Copilot CLI roster registration", () => {
 // prevents stale merge metadata accumulating once LB1 starts populating it.
 // ---------------------------------------------------------------------------
 
+describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
+  // Each test uses a unique session so the module-level `nextOrdinal`
+  // counter (which resetStores can't reach) doesn't cause an agent's
+  // handle to drift across tests. Without per-test sessions, test 1's
+  // claude_code spawn gets handle `claude1`; test 2's gets `claude2`;
+  // and tests asserting `@claude1` would silently mis-resolve.
+  let sessionCounter = 0;
+  let lb1Session: string;
+
+  beforeEach(() => {
+    sessionCounter += 1;
+    lb1Session = `lb1-test-${sessionCounter}`;
+    resetStores();
+    vi.mocked(invoke).mockReset();
+    vi.mocked(invoke).mockResolvedValue(null);
+  });
+  afterEach(() => {
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  const fakeWorktree = {
+    repoRoot: "/r",
+    path: "/wt",
+    branch: "agent/claude_code-session-1",
+    baseRef: "origin/dev",
+    baseSha: "abc123",
+    baseFresh: true,
+    createdAtMs: 1,
+  };
+
+  function setupAgentWithWorktree() {
+    const store = useCollaboratorStore.getState();
+    store.addAgent({
+      sessionId: "pty-1",
+      tool: "claude_code",
+      status: "running",
+      collabSessionId: lb1Session,
+      worktree: fakeWorktree,
+    });
+  }
+
+  it("flips a worktree-backed task with source delta to awaiting-approval (LB1)", async () => {
+    setupAgentWithWorktree();
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      lb1Session,
+    );
+    const doneJson = JSON.stringify({
+      task_id: task.id,
+      status: "completed",
+      author: "@claude1",
+    });
+    let deleted = false;
+    let killPtyCalled = false;
+    let diffSummaryCalledAt: number | null = null;
+    let killPtyCalledAt: number | null = null;
+    let nextCallIdx = 0;
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      const idx = nextCallIdx++;
+      if (cmd === "list_memory_files")
+        return deleted ? [] : [`${task.id}.done.json`];
+      if (cmd === "read_memory_file") return deleted ? null : doneJson;
+      if (cmd === "delete_memory_file") {
+        deleted = true;
+        return null;
+      }
+      if (cmd === "kill_pty") {
+        killPtyCalled = true;
+        killPtyCalledAt = idx;
+        return null;
+      }
+      if (cmd === "git_diff_summary") {
+        diffSummaryCalledAt = idx;
+        return {
+          hasChanges: true,
+          committed: ["src/foo.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(lb1Session);
+
+    // Invariant: status is awaiting-approval, NOT completed.
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[lb1Session]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("awaiting-approval");
+    // Invariant: pendingMerge is populated with the snapshot.
+    expect(updated?.pendingMerge).not.toBeNull();
+    expect(updated?.pendingMerge?.branch).toBe(fakeWorktree.branch);
+    expect(updated?.pendingMerge?.worktreePath).toBe(fakeWorktree.path);
+    expect(updated?.pendingMerge?.baseSha).toBe(fakeWorktree.baseSha);
+    expect(updated?.pendingMerge?.diffSummary.committed).toEqual(["src/foo.ts"]);
+    expect(updated?.pendingMerge?.agentHandle).toBe("@claude1");
+    // Invariant: kill_pty was called.
+    expect(killPtyCalled).toBe(true);
+    // Invariant: kill_pty was called BEFORE git_diff_summary
+    // (claude3 task-46 R2 ordering — frozen worktree before snapshot).
+    expect(killPtyCalledAt).not.toBeNull();
+    expect(diffSummaryCalledAt).not.toBeNull();
+    expect(killPtyCalledAt!).toBeLessThan(diffSummaryCalledAt!);
+  });
+
+  it("auto-completes a worktree-backed task with NO source delta", async () => {
+    // Agent worked in a worktree but produced no changes (e.g., read-only
+    // investigation). Should terminalize as completed, not awaiting-approval.
+    setupAgentWithWorktree();
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      lb1Session,
+    );
+    const doneJson = JSON.stringify({
+      task_id: task.id,
+      status: "completed",
+      author: "@claude1",
+    });
+    let deleted = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "list_memory_files")
+        return deleted ? [] : [`${task.id}.done.json`];
+      if (cmd === "read_memory_file") return deleted ? null : doneJson;
+      if (cmd === "delete_memory_file") {
+        deleted = true;
+        return null;
+      }
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: false,
+          committed: [],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(lb1Session);
+
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[lb1Session]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("completed");
+    expect(updated?.pendingMerge).toBeNull();
+  });
+
+  it("auto-completes when the agent has no worktree (no-isolation path)", async () => {
+    // Agent spawned outside a git repo (no worktree provisioned).
+    // Existing behavior: terminalize directly to completed.
+    const store = useCollaboratorStore.getState();
+    store.addAgent({
+      sessionId: "pty-2",
+      tool: "claude_code",
+      status: "running",
+      collabSessionId: lb1Session,
+      worktree: null,
+    });
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      lb1Session,
+    );
+    const doneJson = JSON.stringify({
+      task_id: task.id,
+      status: "completed",
+      author: "@claude1",
+    });
+    let deleted = false;
+    let gitDiffCalled = false;
+    let killPtyCalled = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "list_memory_files")
+        return deleted ? [] : [`${task.id}.done.json`];
+      if (cmd === "read_memory_file") return deleted ? null : doneJson;
+      if (cmd === "delete_memory_file") {
+        deleted = true;
+        return null;
+      }
+      if (cmd === "kill_pty") killPtyCalled = true;
+      if (cmd === "git_diff_summary") gitDiffCalled = true;
+      return null;
+    });
+
+    await scanForTaskCompletions(lb1Session);
+
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[lb1Session]?.find((t) => t.id === task.id);
+    expect(updated?.status).toBe("completed");
+    expect(updated?.pendingMerge).toBeNull();
+    // No worktree → don't kill PTY or scan diff.
+    expect(killPtyCalled).toBe(false);
+    expect(gitDiffCalled).toBe(false);
+  });
+
+  it("falls through to terminalization when kill_pty fails", async () => {
+    // PTY may already have exited; scan must not strand the task.
+    setupAgentWithWorktree();
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      lb1Session,
+    );
+    const doneJson = JSON.stringify({
+      task_id: task.id,
+      status: "completed",
+      author: "@claude1",
+    });
+    let deleted = false;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "list_memory_files")
+        return deleted ? [] : [`${task.id}.done.json`];
+      if (cmd === "read_memory_file") return deleted ? null : doneJson;
+      if (cmd === "delete_memory_file") {
+        deleted = true;
+        return null;
+      }
+      if (cmd === "kill_pty") throw new Error("PTY already exited");
+      return null;
+    });
+
+    await scanForTaskCompletions(lb1Session);
+
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[lb1Session]?.find((t) => t.id === task.id);
+    // Task is still terminalized (not stuck in-progress).
+    expect(updated?.status).toBe("completed");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("LB1 gate failed"),
+      expect.any(Error),
+    );
+    warnSpy.mockRestore();
+  });
+});
+
 describe("updateTask central pendingMerge cleanup (codex2 task-67 H1)", () => {
   beforeEach(() => {
     resetStores();
