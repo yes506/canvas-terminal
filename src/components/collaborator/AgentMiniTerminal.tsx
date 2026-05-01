@@ -232,6 +232,7 @@ export function AgentMiniTerminal({
   const imeOverlayRef = useRef<HTMLSpanElement | null>(null);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disposed = useRef(false);
+  const initRunRef = useRef(0);
   const [focused, setFocused] = useState(false);
   // Inline-rename state for the header label. `editing === false` shows the
   // <span>; `editing === true` shows an <input value={draft}>. The store action
@@ -242,7 +243,9 @@ export function AgentMiniTerminal({
   const renameInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
+    const runId = ++initRunRef.current;
     disposed.current = false;
+    const isCurrentRun = () => !disposed.current && initRunRef.current === runId;
 
     const initTerminal = async () => {
       if (!termRef.current || terminalRef.current) return;
@@ -291,12 +294,12 @@ export function AgentMiniTerminal({
           buf.baseY - buf.viewportY <= 2 ||
           document.activeElement === terminal.textarea;
         terminal.write(payload, () => {
-          if (disposed.current) return;
+          if (!isCurrentRun()) return;
           if (shouldFollow) terminal.scrollToBottom();
         });
       };
 
-      if (disposed.current) {
+      if (!isCurrentRun()) {
         terminal.dispose();
         return;
       }
@@ -304,6 +307,7 @@ export function AgentMiniTerminal({
       // ResizeObserver
       const observer = new ResizeObserver(() => {
         if (
+          isCurrentRun() &&
           termRef.current &&
           termRef.current.offsetWidth > 0 &&
           termRef.current.offsetHeight > 0
@@ -331,32 +335,33 @@ export function AgentMiniTerminal({
       registerCapture(sessionId, capture);
 
       // Listen for PTY output
-      unlistenDataRef.current = await listen<string>(
+      const dataUnlisten = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
           }
         },
       );
 
-      if (disposed.current) {
-        unlistenDataRef.current?.();
+      if (!isCurrentRun()) {
+        dataUnlisten();
         observer.disconnect();
         terminal.dispose();
         return;
       }
+      unlistenDataRef.current = dataUnlisten;
 
       // Listen for PTY exit. Logic is delegated to `handlePtyExit` (above)
       // so it can be unit-tested without xterm/PTY plumbing. Tauri's
       // listen() accepts async callbacks and does not block event dispatch
       // on the returned promise — no back-pressure.
-      unlistenExitRef.current = await listen(
+      const exitUnlisten = await listen(
         `pty-exit-${sessionId}`,
         () => {
           void handlePtyExit({
-            disposed: disposed.current,
+            disposed: !isCurrentRun(),
             capture: captureRef.current,
             writeProcessExitedLine: () =>
               writeWithFollowBottom("\r\n\x1b[33m[Process exited]\x1b[0m\r\n"),
@@ -366,17 +371,19 @@ export function AgentMiniTerminal({
         },
       );
 
-      if (disposed.current) {
+      if (!isCurrentRun()) {
         unlistenDataRef.current?.();
-        unlistenExitRef.current?.();
+        exitUnlisten();
         observer.disconnect();
         terminal.dispose();
         return;
       }
+      unlistenExitRef.current = exitUnlisten;
 
       // Spawn the CLI tool — try direct process first, fall back to shell
       const [program, ...programArgs] = tool.command.split(/\s+/);
       let spawnedViaShell = false;
+      let ptyStarted = false;
 
       try {
         await invoke("spawn_process", {
@@ -388,6 +395,7 @@ export function AgentMiniTerminal({
           cols: terminal.cols,
           rows: terminal.rows,
         });
+        ptyStarted = true;
       } catch {
         // Fallback: spawn shell then type the command
         spawnedViaShell = true;
@@ -399,8 +407,9 @@ export function AgentMiniTerminal({
             cwd: cwd ?? null,
             login: !isEnvBootstrapped(),
           });
+          ptyStarted = true;
         } catch (shellErr) {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             writeWithFollowBottom(
               `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
             );
@@ -409,7 +418,12 @@ export function AgentMiniTerminal({
         }
       }
 
-      if (disposed.current) return;
+      if (!isCurrentRun()) {
+        if (ptyStarted) {
+          invoke("kill_pty", { sessionId }).catch(() => {});
+        }
+        return;
+      }
 
       // Let app-level shortcuts bubble past xterm
       terminal.attachCustomKeyEventHandler((e) => {
@@ -689,7 +703,7 @@ export function AgentMiniTerminal({
 
       // Forward user keystrokes to PTY
       terminal.onData((data) => {
-        if (disposed.current) return;
+        if (!isCurrentRun()) return;
         invoke("write_to_pty", { sessionId, data }).catch(() => {});
         // S2 fix: user typing is explicit "I want to see the prompt" intent.
         // Always snap to bottom on input — prevents the case where the user
@@ -706,19 +720,24 @@ export function AgentMiniTerminal({
       terminal.textarea?.addEventListener("focus", () => {
         setFocused(true);
         requestAnimationFrame(() => {
-          if (!disposed.current && document.activeElement === terminal.textarea) {
+          if (isCurrentRun() && document.activeElement === terminal.textarea) {
             terminal.scrollToBottom();
           }
         });
       });
       terminal.textarea?.addEventListener("blur", () => setFocused(false));
 
-      // If we fell back to shell spawn, type the CLI tool command into the shell
+      // If we fell back to shell spawn, replace the shell with the CLI tool
+      // via `exec`. Without `exec`, the CLI runs as a job under zsh, so
+      // kill_pty's SIGHUP (sent to the immediate child = zsh) makes zsh
+      // print "zsh: warning: 1 jobs SIGHUPed" before forwarding the signal
+      // to the CLI. With `exec`, zsh is replaced by the CLI and there is no
+      // wrapper shell to emit that warning when the PTY is torn down.
       if (spawnedViaShell) {
         try {
           await invoke("write_to_pty", {
             sessionId,
-            data: tool.command + "\n",
+            data: "exec " + tool.command + "\n",
           });
         } catch {
           // Shell may have exited already
@@ -758,7 +777,7 @@ export function AgentMiniTerminal({
       const READY_BUF_MAX = 200;
       // Also use a fallback timer in case prompt pattern isn't matched
       readyTimeoutRef.current = setTimeout(() => {
-        if (!readyDetected && !disposed.current) {
+        if (!readyDetected && isCurrentRun()) {
           readyDetected = true;
           const store = useCollaboratorStore.getState();
           store.setAgentStatus(sessionId, "running");
@@ -784,26 +803,31 @@ export function AgentMiniTerminal({
 
       // Tap into the existing data listener to also check readiness
       const origDataUnlisten = unlistenDataRef.current;
-      unlistenDataRef.current = await listen<string>(
+      const readyDataUnlisten = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
             checkReady(event.payload);
           }
         },
       );
+      if (!isCurrentRun()) {
+        readyDataUnlisten();
+        return;
+      }
+      unlistenDataRef.current = readyDataUnlisten;
       // Unlisten the original listener that was set up before
       origDataUnlisten?.();
 
       // Handle resize
       let resizeTimer: ReturnType<typeof setTimeout> | null = null;
       terminal.onResize(({ cols, rows }) => {
-        if (disposed.current) return;
+        if (!isCurrentRun()) return;
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             invoke("resize_pty", { sessionId, cols, rows }).catch(() => {});
           }
         }, 80);
@@ -813,6 +837,9 @@ export function AgentMiniTerminal({
     initTerminal();
 
     return () => {
+      if (initRunRef.current === runId) {
+        initRunRef.current += 1;
+      }
       if (readyTimeoutRef.current) {
         clearTimeout(readyTimeoutRef.current);
         readyTimeoutRef.current = null;
