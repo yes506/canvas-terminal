@@ -138,6 +138,15 @@ pub fn run() {
             commands::dashboard::open_dashboard,
             commands::dashboard::get_dashboard_info,
             commands::dashboard::copy_dashboard_url_with_token,
+            // Worktree-isolation policy P1 backend (v5.1 implementation kickoff)
+            commands::git::git_detect_repo,
+            commands::git::git_worktree_create,
+            commands::git::git_worktree_remove,
+            commands::git::git_branch_force_delete,
+            commands::git::git_worktree_list,
+            commands::git::git_worktree_status,
+            commands::git::git_diff_summary,
+            commands::git::compute_worktree_path,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
