@@ -1769,6 +1769,41 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         return;
       }
 
+      // LB5 lease check (round-11 codex2 task-87 H1): the structural
+      // gate at addTask refuses ledger writes, but PTY injection still
+      // proceeded — agent could receive fresh work in the same held
+      // worktree, just under a no-assignee task. Refuse the ENTIRE send
+      // operation when the assignee's lease is held AND there's no
+      // active task to refresh (i.e., we'd otherwise auto-create).
+      //
+      // We deliberately allow the send when an active pending/in-progress
+      // task exists, even if the agent has a held worktree from prior
+      // work — that send refreshes assignedAt on an already-assigned task,
+      // not a new assignment. The user's intent is to drive the existing
+      // task forward, which is correct.
+      if (agentCollabId && agent) {
+        const existing = tasksBySession[agentCollabId] ?? [];
+        const found = findFreshestActiveTaskForMention(existing, `@${mention}`);
+        if (!found) {
+          // No active task to refresh → would auto-create. Check for lease.
+          const conflict = findWorktreeLeaseConflict(
+            `@${mention}`,
+            get().agents,
+            existing,
+            agentCollabId,
+          );
+          if (conflict) {
+            get().setStatus(
+              `Cannot send to @${mention} — worktree lease still held by task ${conflict.id} (status: ${conflict.status}). ` +
+                `Approve, discard, or finish that task first.`,
+              agentCollabId,
+              "persistent",
+            );
+            return;
+          }
+        }
+      }
+
       // Auto-create a task if none exist for this session, OR refresh the
       // assignedAt of the existing active task. The refresh closes the
       // claude2/claude3/codex3 cross-validated freshness gap: from the
@@ -1891,10 +1926,53 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   broadcastToAll: async (content, forSession) => {
     const { agents, tasksBySession } = get();
     const sid = forSession ?? null;
-    const targetAgents = sid ? agents.filter((a) => a.collabSessionId === sid) : agents;
-    if (targetAgents.length === 0) {
+    const allTargets = sid ? agents.filter((a) => a.collabSessionId === sid) : agents;
+    if (allTargets.length === 0) {
       if (sid) get().setStatus("No agents running. Launch a tool first.", sid);
       return;
+    }
+    // LB5 lease check (round-11 codex2 task-87 H1): per-agent, refuse the
+    // broadcast for any agent whose worktree lease is held AND has no
+    // active task to refresh. Skipping vs aborting the whole broadcast is
+    // less disruptive — partial fan-out is allowed; the user gets a status
+    // line listing skipped agents.
+    let targetAgents = allTargets;
+    const skippedHandles: string[] = [];
+    if (sid) {
+      const existing = tasksBySession[sid] ?? [];
+      targetAgents = allTargets.filter((agent) => {
+        const mention = `@${agent.handle}`;
+        const found = findFreshestActiveTaskForMention(existing, mention);
+        if (found) return true; // has active task → refresh path, no auto-create
+        const conflict = findWorktreeLeaseConflict(
+          mention,
+          allTargets,
+          existing,
+          sid,
+        );
+        if (conflict) {
+          skippedHandles.push(agent.handle);
+          return false;
+        }
+        return true;
+      });
+      if (targetAgents.length === 0) {
+        // Nothing to send — every agent had a held lease. Surface the
+        // skip status before returning early.
+        if (skippedHandles.length > 0) {
+          get().setStatus(
+            `Skipped ${skippedHandles.length} agent(s) with held worktree leases: ${skippedHandles
+              .map((h) => "@" + h)
+              .join(", ")}. Approve, discard, or finish their pending tasks first.`,
+            sid,
+            "persistent",
+          );
+        }
+        return;
+      }
+      // Skip status is deferred until after the broadcast completes (see
+      // the final setStatus block) so it isn't overwritten by the
+      // "Broadcast sent to N agent(s)" transient.
     }
     // Auto-create tasks for each agent if none exist; otherwise refresh
     // the assignedAt of the existing active task so the indicator promotes
@@ -1996,7 +2074,21 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       }
     }
     if (sid) {
-      get().setStatus(`Broadcast sent to ${sent} agent${sent !== 1 ? "s" : ""}`, sid);
+      // Round-11: combine the broadcast acknowledgement with the LB5
+      // skip notice when both are relevant. The base "Broadcast sent to
+      // N" message is transient; appending "; skipped …" preserves the
+      // skip information without losing the acknowledgement.
+      let msg = `Broadcast sent to ${sent} agent${sent !== 1 ? "s" : ""}`;
+      if (skippedHandles.length > 0) {
+        msg += `; skipped ${skippedHandles.length} with held worktree leases: ${skippedHandles
+          .map((h) => "@" + h)
+          .join(", ")}. Approve, discard, or finish their pending tasks first.`;
+      }
+      get().setStatus(
+        msg,
+        sid,
+        skippedHandles.length > 0 ? "persistent" : "transient",
+      );
     }
   },
 
@@ -2170,7 +2262,12 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     //   3. The diff against `prevTask.assignee` skips no-op same-assignee
     //      writes that share the partial with other field updates.
     const assigneeProvided = Object.prototype.hasOwnProperty.call(updates, "assignee");
-    const reassigned =
+    // Round-11 codex2 task-87 M1: declare as `let` so the LB5 structural
+    // gate can reset this to false if it drops the assignee field. Without
+    // the reset, a refused reassignment would still bump assignedAt —
+    // contradicting the surrounding rule that no-op assignee changes
+    // shouldn't refresh the freshness timestamp.
+    let reassigned =
       assigneeProvided
       && updates.assignee !== undefined
       && prevTask !== undefined
@@ -2220,6 +2317,11 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
             "Assignee update dropped.",
         );
         delete (cleanUpdates as { assignee?: string | null }).assignee;
+        // codex2 task-87 M1: also clear the reassigned flag so assignedAt
+        // doesn't bump for a refused reassignment. A no-op assignee change
+        // (which is what this becomes after the drop) shouldn't refresh
+        // the freshness timestamp.
+        reassigned = false;
       }
     }
 

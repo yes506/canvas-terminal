@@ -2978,6 +2978,211 @@ describe("LB4 — /task done and /task status completed gate refusal (codex2 tas
     warnSpy.mockRestore();
   });
 
+  // Round-11: codex2 task-87 H1+M1 — sendToAgent/broadcastToAll lease check
+  // and updateTask assignedAt fix when LB5 drops the assignee field.
+
+  it("updateTask: refused reassignment does NOT bump assignedAt (round-11 codex2 M1)", async () => {
+    // M1: when LB5 drops the assignee field via the structural gate, the
+    // surrounding `reassigned` flag must also be cleared. Otherwise the
+    // task's assignedAt is bumped as if a real reassignment happened —
+    // surfacing the rejected handle as "fresh" in the indicator UI.
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    // Existing task assigned to @claude1 holds the lease.
+    store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    // A second task initially unassigned.
+    const second = store.addTask(
+      { title: "second", objective: "second" },
+      LB4_SESSION,
+    );
+    const before = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === second.id);
+    const initialAssignedAt = before?.assignedAt;
+    // Wait long enough that a real reassignment would produce a strictly
+    // greater timestamp. Without the M1 fix this test would observe a
+    // bumped assignedAt; with the fix it must equal initialAssignedAt.
+    await new Promise((r) => setTimeout(r, 5));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Try to reassign to @claude1 — LB5 drops the assignee field.
+    store.updateTask(second.id, { assignee: "@claude1" }, LB4_SESSION);
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === second.id);
+    // assignee untouched (refused).
+    expect(updated?.assignee).toBeNull();
+    // assignedAt NOT bumped — refused reassignment is a no-op for
+    // freshness purposes.
+    expect(updated?.assignedAt).toBe(initialAssignedAt);
+    warnSpy.mockRestore();
+  });
+
+  it("sendToAgent refuses the operation when target's worktree lease is held and no active task exists (round-11 codex2 H1)", async () => {
+    // H1: structural gate at addTask refuses the ledger write but
+    // sendToAgent's PTY injection still proceeded — so an agent could
+    // receive a fresh prompt that lands inside the held worktree under a
+    // task with no assignee. The send must be refused outright when:
+    //   (a) target's worktree lease is held, AND
+    //   (b) no active task exists for the target (so we'd auto-create).
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    // Existing task assigned to @claude1, status awaiting-approval — past
+    // pending/in-progress, so findFreshestActiveTaskForMention returns null
+    // and would otherwise fall through to auto-create.
+    const existing = store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    store.updateTask(existing.id, { status: "awaiting-approval" }, LB4_SESSION);
+    vi.mocked(invoke).mockClear();
+
+    await store.sendToAgent("pty-1", "do another thing");
+
+    // Send refused: NO inject_into_pty call.
+    const injects = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "inject_into_pty");
+    expect(injects).toHaveLength(0);
+    // No new task auto-created either; only the original task remains.
+    const tasks = useCollaboratorStore.getState().tasksBySession[LB4_SESSION] ?? [];
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].id).toBe(existing.id);
+    // Status surfaces actionable refusal mentioning the conflicting task.
+    const status = useCollaboratorStore.getState().statusMessages[LB4_SESSION];
+    expect(status).toContain("worktree lease still held");
+    expect(status).toContain(existing.id);
+  });
+
+  it("sendToAgent allows the operation when target has an active pending task (refresh path, no auto-create)", async () => {
+    // The lease check ONLY fires when sendToAgent would otherwise
+    // auto-create. If an active pending/in-progress task exists for the
+    // target, the send refreshes assignedAt — driving the existing task
+    // forward, which is correct even if the worktree is reuse-pending.
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    store.addTask(
+      { title: "first", objective: "first", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    vi.mocked(invoke).mockClear();
+
+    await store.sendToAgent("pty-1", "follow-up");
+
+    const injects = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "inject_into_pty");
+    expect(injects).toHaveLength(1);
+  });
+
+  it("broadcastToAll skips agents with held worktree leases AND continues with the rest (round-11 codex2 H1)", async () => {
+    // Per-agent: each agent that would auto-create AND has a held lease
+    // is skipped. Agents that have an active task to refresh, or no held
+    // lease, still receive the broadcast. Status line surfaces skipped
+    // handles with actionable advice.
+    useCollaboratorStore.setState({
+      agents: [
+        {
+          sessionId: "pty-1",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: LB4_SESSION,
+          ordinal: 1,
+          handle: "claude1",
+          nickname: "Claude Code #1",
+          nicknameSlug: "claude-code-1",
+          nameHistory: [
+            { nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" },
+          ],
+          worktree: {
+            repoRoot: "/r",
+            path: "/wt1",
+            branch: "agent/claude_code-session-1",
+            baseRef: "origin/dev",
+            baseSha: "abc",
+            baseFresh: true,
+            createdAtMs: 1,
+          },
+        },
+        {
+          sessionId: "pty-2",
+          tool: "claude_code",
+          status: "running",
+          collabSessionId: LB4_SESSION,
+          ordinal: 2,
+          handle: "claude2",
+          nickname: "Claude Code #2",
+          nicknameSlug: "claude-code-2",
+          nameHistory: [
+            { nickname: "Claude Code #2", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" },
+          ],
+          worktree: {
+            repoRoot: "/r",
+            path: "/wt2",
+            branch: "agent/claude_code-session-2",
+            baseRef: "origin/dev",
+            baseSha: "def",
+            baseFresh: true,
+            createdAtMs: 2,
+          },
+        },
+      ],
+      contextSentByAgent: {},
+      pendingMessagesByAgent: {},
+      tasksBySession: { [LB4_SESSION]: [] },
+      logEntriesBySession: { [LB4_SESSION]: [] },
+      statusMessages: {},
+    });
+    const store = useCollaboratorStore.getState();
+    // @claude1 holds a lease; its task is awaiting-approval (no active task).
+    const c1Task = store.addTask(
+      { title: "c1-task", objective: "c1", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    store.updateTask(c1Task.id, { status: "awaiting-approval" }, LB4_SESSION);
+    // @claude2 has no task — nothing held; broadcast should auto-create.
+    vi.mocked(invoke).mockClear();
+
+    await store.broadcastToAll("everyone work on this", LB4_SESSION);
+
+    // Exactly 1 inject — to @claude2 (pty-2) only. @claude1 was skipped.
+    const injects = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "inject_into_pty");
+    expect(injects).toHaveLength(1);
+    expect((injects[0][1] as { sessionId: string }).sessionId).toBe("pty-2");
+    // Combined status: broadcast acknowledgement + skip notice.
+    const status = useCollaboratorStore.getState().statusMessages[LB4_SESSION];
+    expect(status).toContain("Broadcast sent to 1 agent");
+    expect(status).toContain("skipped 1");
+    expect(status).toContain("@claude1");
+  });
+
+  it("broadcastToAll: when ALL targets have held leases, sends nothing", async () => {
+    // Edge case: every target is lease-blocked. Skip status fires; no
+    // fan-out happens (the function returns early after the filter).
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    const t = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    store.updateTask(t.id, { status: "awaiting-approval" }, LB4_SESSION);
+    vi.mocked(invoke).mockClear();
+
+    await store.broadcastToAll("blast", LB4_SESSION);
+
+    const injects = vi
+      .mocked(invoke)
+      .mock.calls.filter((c) => c[0] === "inject_into_pty");
+    expect(injects).toHaveLength(0);
+    const status = useCollaboratorStore.getState().statusMessages[LB4_SESSION];
+    expect(status).toContain("Skipped");
+    expect(status).toContain("@claude1");
+  });
+
   // Round-8: cover the live-record gap (codex1+codex2+claude3 convergent).
 
   it("/task done refuses tasks whose pendingMerge is set even after the agent record is gone", async () => {
