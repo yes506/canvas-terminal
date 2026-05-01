@@ -31,6 +31,136 @@ interface AgentMiniTerminalProps {
 }
 
 /**
+ * Cleanup helper for worktree-backed agents — extracted from the
+ * AgentMiniTerminal unmount cleanup hook so the decision tree is
+ * testable in isolation. Exported for unit testing.
+ *
+ * Sequence (round-9 ordering fix per codex1 task-77 H1, mirrors LB1's
+ * freeze-before-snapshot invariant):
+ *
+ *   1. kill_pty AWAITED — freezes the worktree so the diff captures a
+ *      stable state. Failure is non-fatal (a dead PTY is already
+ *      frozen) — log and continue.
+ *   2. git_diff_summary — snapshot from the now-frozen worktree.
+ *   3. Branch on diff.hasChanges:
+ *      - false → git_worktree_remove + removeAgent (truly nothing to
+ *        gate)
+ *      - true  → setAgentStatus("exited"), preserve worktree+record
+ *        (LB1 scan / LB4 helper still find them)
+ *   4. On any IPC error: preserve record defensively (unknown state
+ *      ≠ silent cleanup).
+ *
+ * Fire-and-forget by design: React useEffect cleanup is synchronous and
+ * cannot await. The caller invokes this with `void cleanupWorktreedAgent
+ * (...)` and the helper updates the store eventually.
+ */
+export async function cleanupWorktreedAgent(args: {
+  sessionId: string;
+  worktree: WorktreeMetadata;
+  storeOps: {
+    removeAgent: (sessionId: string) => void;
+    setAgentStatus: (
+      sessionId: string,
+      status: "spawning" | "running" | "exited",
+    ) => void;
+  };
+  invokeShim?: typeof invoke;
+}): Promise<void> {
+  const inv = args.invokeShim ?? invoke;
+  const { sessionId, worktree, storeOps } = args;
+
+  // Step 1: kill_pty AWAITED. Frozen worktree before snapshot mirrors
+  // LB1's R2 ordering invariant. Failure is non-fatal because a PTY
+  // that has already exited is already frozen.
+  try {
+    await inv("kill_pty", { sessionId });
+  } catch (err) {
+    console.warn(
+      "[collab/cleanup] kill_pty failed; PTY may already be exited. Continuing with diff snapshot.",
+      err,
+    );
+  }
+
+  // Step 2: snapshot from the (now-frozen) worktree.
+  let diff: {
+    hasChanges: boolean;
+    committed: string[];
+    staged: string[];
+    unstaged: string[];
+    untracked: string[];
+  };
+  try {
+    diff = await inv<{
+      hasChanges: boolean;
+      committed: string[];
+      staged: string[];
+      unstaged: string[];
+      untracked: string[];
+    }>("git_diff_summary", {
+      worktreePath: worktree.path,
+      baseSha: worktree.baseSha,
+    });
+  } catch (err) {
+    // Diff probe failed (e.g., worktree gone, IPC error). Preserve
+    // record defensively — unknown state shouldn't silently cleanup.
+    console.warn(
+      "[collab/cleanup] worktree diff probe failed; preserving agent record defensively:",
+      err,
+    );
+    storeOps.setAgentStatus(sessionId, "exited");
+    return;
+  }
+
+  // Step 3: branch on diff result.
+  if (!diff.hasChanges) {
+    // Truly nothing to preserve. Auto-remove worktree + branch, then
+    // remove the agent record.
+    try {
+      const outcome = await inv<
+        | { kind: "fullyRemoved" }
+        | {
+            kind: "worktreeRemovedBranchPreserved";
+            branch: string;
+            reason: string;
+          }
+      >("git_worktree_remove", {
+        repoRoot: worktree.repoRoot,
+        worktreePath: worktree.path,
+        branchName: worktree.branch,
+      });
+      if (outcome.kind === "worktreeRemovedBranchPreserved") {
+        console.warn(
+          `[collab/cleanup] worktree removed but branch '${outcome.branch}' preserved: ${outcome.reason}. ` +
+            "P2 startup janitor / Discard flow will reclaim it.",
+        );
+      }
+    } catch (err) {
+      // Worktree-remove failed. Don't escalate; preserve record so the
+      // future Discard flow can clean up what's left.
+      console.warn(
+        "[collab/cleanup] git_worktree_remove failed; preserving agent record defensively:",
+        err,
+      );
+      storeOps.setAgentStatus(sessionId, "exited");
+      return;
+    }
+    storeOps.removeAgent(sessionId);
+  } else {
+    // PRESERVE both worktree and agent record. Mark exited so the UI
+    // knows it's no longer interactive, but the record stays in the
+    // store with `worktree` intact. LB1 scan + LB4 isTaskWorktreeBacked
+    // still find it.
+    console.warn(
+      `[collab/cleanup] preserving worktree ${worktree.path} + agent record ` +
+        `(committed=${diff.committed.length}, staged=${diff.staged.length}, ` +
+        `unstaged=${diff.unstaged.length}, untracked=${diff.untracked.length}). ` +
+        "P2 Discard flow will reclaim.",
+    );
+    storeOps.setAgentStatus(sessionId, "exited");
+  }
+}
+
+/**
  * PTY-exit handler logic, extracted as a pure function for testability.
  *
  * Statement order is load-bearing:
@@ -716,96 +846,54 @@ export function AgentMiniTerminal({
         imeHandlersRef.current = null;
       }
 
-      // Kill PTY
-      invoke("kill_pty", { sessionId }).catch(() => {});
-
-      // P1+P2 cleanup-on-close (round-8 round of fixes from codex1
-      // task-73 H1, codex2 task-75 H1+H2, claude3 task-76 O3 — all three
-      // reviewers convergent: the gate depended on the live SpawnedAgent
-      // record, so closing the pane DURING the polling window caused
-      // .done.json arrivals to fall through the gate. Fix: the
-      // SpawnedAgent record's lifetime now matches the worktree's
-      // lifetime, not the UI tile's lifetime.
+      // P1+P2 cleanup-on-close (round-8/round-9 fixes from codex1
+      // task-73 H1, codex2 task-75 H1+H2, claude3 task-76 O3, codex1
+      // task-77 H1 — all reviewers convergent: the gate depended on the
+      // live SpawnedAgent record, so closing the pane DURING the polling
+      // window caused .done.json arrivals to fall through the gate.
+      // Fix: the SpawnedAgent record's lifetime now matches the
+      // worktree's lifetime, not the UI tile's lifetime.
       //
-      // Decision tree:
-      //   - No worktree → safe to remove agent record immediately.
-      //   - Worktree exists, diff says no changes → auto-remove worktree
-      //       AND remove agent record (no pending work to gate).
-      //   - Worktree exists, diff says changes → PRESERVE worktree AND
-      //       PRESERVE agent record (status: "exited"). Subsequent scan
-      //       ticks find the record + worktree, so the gate engages
-      //       correctly even though the user closed the UI tile.
-      //   - Diff probe failed → preserve both defensively (unknown
-      //       state shouldn't trigger silent cleanup).
+      // Round-9 ordering fix (codex1 task-77 H1): for worktree-backed
+      // agents, kill_pty is now AWAITED inside the cleanup helper before
+      // git_diff_summary fires — same freeze-before-snapshot invariant
+      // LB1 enforces in the scanner. Without this, a still-running PTY
+      // could mutate the worktree between the kill IPC and the diff,
+      // mis-classifying it as clean and triggering silent cleanup.
       //
-      // The Discard action in the future P2 Approve UI will explicitly
-      // remove the record + worktree when the user is done with it.
+      // The cleanup IS fire-and-forget — React useEffect cleanup is
+      // synchronous and cannot await (claude3 task-80 Issue 1: prior
+      // commit's "synchronous (await)" comment was inaccurate). The
+      // helper runs in the background; when its IPC chain resolves it
+      // updates the store. Subsequent scan ticks (independent 2s timer)
+      // and slash commands see the eventually-consistent state.
+      //
+      // KNOWN LIMITATION (claude2 task-78 Concern 1, claude3 task-80
+      // Issue 2):
+      //   - Pane-close (closing the entire CollaboratorPane) wipes ALL
+      //     records via killAllAgents regardless of preserved-worktree
+      //     state. Tile-close preserves; pane-close doesn't. Orphan
+      //     worktrees on disk are reclaimed by the future startup
+      //     janitor (P5 deferred).
+      //   - For read-only tasks (no source delta), if cleanup-clean-
+      //     remove races with a concurrent scan tick, the scan can fail
+      //     to find the worktree → fail-closed → status `blocked`
+      //     instead of `completed`. Low-probability and recoverable
+      //     (user can /task done after blocked).
       const store = useCollaboratorStore.getState();
       if (worktree) {
-        // Need to wait for the diff probe before deciding whether to
-        // remove the agent record. Run synchronously (await), not
-        // fire-and-forget, so the unmount completes only after the
-        // record state matches the on-disk worktree state.
-        (async () => {
-          try {
-            const diff = await invoke<{
-              hasChanges: boolean;
-              committed: string[];
-              staged: string[];
-              unstaged: string[];
-              untracked: string[];
-            }>("git_diff_summary", {
-              worktreePath: worktree.path,
-              baseSha: worktree.baseSha,
-            });
-            if (!diff.hasChanges) {
-              // Truly nothing to preserve. Auto-remove worktree + branch,
-              // then remove the agent record.
-              const outcome = await invoke<
-                | { kind: "fullyRemoved" }
-                | {
-                    kind: "worktreeRemovedBranchPreserved";
-                    branch: string;
-                    reason: string;
-                  }
-              >("git_worktree_remove", {
-                repoRoot: worktree.repoRoot,
-                worktreePath: worktree.path,
-                branchName: worktree.branch,
-              });
-              if (outcome.kind === "worktreeRemovedBranchPreserved") {
-                console.warn(
-                  `[collab/cleanup] worktree removed but branch '${outcome.branch}' preserved: ${outcome.reason}. ` +
-                    "P2 startup janitor / Discard flow will reclaim it.",
-                );
-              }
-              store.removeAgent(sessionId);
-            } else {
-              // PRESERVE both worktree and agent record. Mark exited so
-              // the UI knows it's no longer interactive, but the record
-              // stays in the store with `worktree` intact. LB1 scan +
-              // LB4 isTaskWorktreeBacked still find it.
-              console.warn(
-                `[collab/cleanup] preserving worktree ${worktree.path} + agent record ` +
-                  `(committed=${diff.committed.length}, staged=${diff.staged.length}, ` +
-                  `unstaged=${diff.unstaged.length}, untracked=${diff.untracked.length}). ` +
-                  "P2 Discard flow will reclaim.",
-              );
-              store.setAgentStatus(sessionId, "exited");
-            }
-          } catch (err) {
-            // Worktree may already be gone OR diff probe failed. Defensive:
-            // preserve agent record so a future scan/slash-command path
-            // doesn't see an unknown state.
-            console.warn(
-              "[collab/cleanup] worktree cleanup probe failed; preserving agent record defensively:",
-              err,
-            );
-            store.setAgentStatus(sessionId, "exited");
-          }
-        })();
+        void cleanupWorktreedAgent({
+          sessionId,
+          worktree,
+          storeOps: {
+            removeAgent: store.removeAgent,
+            setAgentStatus: store.setAgentStatus,
+          },
+        });
       } else {
-        // No worktree → no pending work to gate, safe to remove.
+        // No worktree → no gate decision depends on PTY state. Fire-and-
+        // forget kill_pty, immediate record removal.
+        invoke("kill_pty", { sessionId }).catch(() => {});
         store.removeAgent(sessionId);
       }
 
