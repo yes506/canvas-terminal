@@ -2780,6 +2780,57 @@ describe("LB4 — /task done and /task status completed gate refusal (codex2 tas
       .tasksBySession[LB4_SESSION]?.find((t) => t.id === task.id);
     expect(updated?.status).toBe("blocked");
   });
+
+  // Round-8: cover the live-record gap (codex1+codex2+claude3 convergent).
+
+  it("/task done refuses tasks whose pendingMerge is set even after the agent record is gone", async () => {
+    // Round-8 round of fixes: gate must hold even if the live
+    // SpawnedAgent record disappears (e.g., user clicked X mid-flow).
+    // pendingMerge being non-null means the gate already engaged; a
+    // slash-command `completed` here would silently bypass an
+    // already-running approval flow.
+    setupAgent({ withWorktree: true });
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { title: "x", objective: "x", assignee: "@claude1" },
+      LB4_SESSION,
+    );
+    // Simulate the gate having already engaged.
+    store.updateTask(
+      task.id,
+      {
+        status: "awaiting-approval",
+        pendingMerge: {
+          branch: "agent/test",
+          worktreePath: "/wt",
+          repoRoot: "/r",
+          baseRef: "origin/dev",
+          baseSha: "abc",
+          baseFresh: true,
+          diffSummary: { committed: ["x.ts"], staged: [], unstaged: [], untracked: [] },
+          agentHandle: "@claude1",
+        },
+      },
+      LB4_SESSION,
+    );
+    // Now wipe the agent record — simulating UI-tile-dismissed-while-
+    // worktree-was-clean OR any other transient state.
+    useCollaboratorStore.setState({ agents: [] });
+
+    await executeCommand(
+      parseInput(`/task ${task.id} done forced`),
+      LB4_SESSION,
+    );
+
+    const updated = useCollaboratorStore
+      .getState()
+      .tasksBySession[LB4_SESSION]?.find((t) => t.id === task.id);
+    // Refused: status unchanged from awaiting-approval.
+    expect(updated?.status).toBe("awaiting-approval");
+    // pendingMerge intact (central cleanup didn't fire because no
+    // terminal transition happened).
+    expect(updated?.pendingMerge).not.toBeNull();
+  });
 });
 
 describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {

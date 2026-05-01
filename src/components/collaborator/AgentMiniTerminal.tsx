@@ -719,19 +719,34 @@ export function AgentMiniTerminal({
       // Kill PTY
       invoke("kill_pty", { sessionId }).catch(() => {});
 
-      // P1 cleanup-on-close (codex2 task-55 Med-#2 + task-59 High-#2,
-      // claude2 task-58 Concern 1, codex1 task-57 C1): if this agent was
-      // running in an isolated worktree, decide whether to auto-remove
-      // based on the FULL diff summary (committed + staged + unstaged +
-      // untracked) — not just `git_worktree_status` (which is uncommitted-
-      // only). A worktree where the agent committed all its work cleanly
-      // would otherwise have status.clean = true and we'd auto-remove,
-      // destroying the diff context P2's Approve UI will need. The fix is
-      // to gate auto-remove on `git_diff_summary.has_changes`.
+      // P1+P2 cleanup-on-close (round-8 round of fixes from codex1
+      // task-73 H1, codex2 task-75 H1+H2, claude3 task-76 O3 — all three
+      // reviewers convergent: the gate depended on the live SpawnedAgent
+      // record, so closing the pane DURING the polling window caused
+      // .done.json arrivals to fall through the gate. Fix: the
+      // SpawnedAgent record's lifetime now matches the worktree's
+      // lifetime, not the UI tile's lifetime.
       //
-      // Cleanup is fire-and-forget — don't block the unmount on it.
+      // Decision tree:
+      //   - No worktree → safe to remove agent record immediately.
+      //   - Worktree exists, diff says no changes → auto-remove worktree
+      //       AND remove agent record (no pending work to gate).
+      //   - Worktree exists, diff says changes → PRESERVE worktree AND
+      //       PRESERVE agent record (status: "exited"). Subsequent scan
+      //       ticks find the record + worktree, so the gate engages
+      //       correctly even though the user closed the UI tile.
+      //   - Diff probe failed → preserve both defensively (unknown
+      //       state shouldn't trigger silent cleanup).
+      //
+      // The Discard action in the future P2 Approve UI will explicitly
+      // remove the record + worktree when the user is done with it.
+      const store = useCollaboratorStore.getState();
       if (worktree) {
-        void (async () => {
+        // Need to wait for the diff probe before deciding whether to
+        // remove the agent record. Run synchronously (await), not
+        // fire-and-forget, so the unmount completes only after the
+        // record state matches the on-disk worktree state.
+        (async () => {
           try {
             const diff = await invoke<{
               hasChanges: boolean;
@@ -744,8 +759,8 @@ export function AgentMiniTerminal({
               baseSha: worktree.baseSha,
             });
             if (!diff.hasChanges) {
-              // Truly nothing to preserve — committed/staged/unstaged/
-              // untracked all empty. Safe to auto-remove.
+              // Truly nothing to preserve. Auto-remove worktree + branch,
+              // then remove the agent record.
               const outcome = await invoke<
                 | { kind: "fullyRemoved" }
                 | {
@@ -758,33 +773,41 @@ export function AgentMiniTerminal({
                 worktreePath: worktree.path,
                 branchName: worktree.branch,
               });
-              // codex2 task-55 Med + claude2 task-58 Concern 3: surface the
-              // structured outcome instead of silently dropping it. The
-              // backend returns this variant specifically so partial
-              // cleanup is visible.
               if (outcome.kind === "worktreeRemovedBranchPreserved") {
                 console.warn(
                   `[collab/cleanup] worktree removed but branch '${outcome.branch}' preserved: ${outcome.reason}. ` +
                     "P2 startup janitor / Discard flow will reclaim it.",
                 );
               }
+              store.removeAgent(sessionId);
             } else {
+              // PRESERVE both worktree and agent record. Mark exited so
+              // the UI knows it's no longer interactive, but the record
+              // stays in the store with `worktree` intact. LB1 scan +
+              // LB4 isTaskWorktreeBacked still find it.
               console.warn(
-                `[collab/cleanup] preserving worktree ${worktree.path} with unmerged work ` +
+                `[collab/cleanup] preserving worktree ${worktree.path} + agent record ` +
                   `(committed=${diff.committed.length}, staged=${diff.staged.length}, ` +
                   `unstaged=${diff.unstaged.length}, untracked=${diff.untracked.length}). ` +
-                  "P2 startup janitor / Discard flow will handle.",
+                  "P2 Discard flow will reclaim.",
               );
+              store.setAgentStatus(sessionId, "exited");
             }
           } catch (err) {
-            // Worktree may already be gone (e.g., user manually removed it,
-            // or P2 janitor cleaned up). Don't escalate.
-            console.warn("[collab/cleanup] worktree cleanup failed:", err);
+            // Worktree may already be gone OR diff probe failed. Defensive:
+            // preserve agent record so a future scan/slash-command path
+            // doesn't see an unknown state.
+            console.warn(
+              "[collab/cleanup] worktree cleanup probe failed; preserving agent record defensively:",
+              err,
+            );
+            store.setAgentStatus(sessionId, "exited");
           }
         })();
+      } else {
+        // No worktree → no pending work to gate, safe to remove.
+        store.removeAgent(sessionId);
       }
-
-      useCollaboratorStore.getState().removeAgent(sessionId);
 
       // Dispose xterm
       const term = terminalRef.current;

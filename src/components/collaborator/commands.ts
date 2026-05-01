@@ -9,25 +9,34 @@ import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps
 import type { CollabTask, SpawnedAgent, TaskStatus } from "../../types/collaborator";
 
 /**
- * LB4 helper (codex2 task-59 H1): a task is "worktree-backed" if its
- * assignee's SpawnedAgent record has a non-null `worktree`. Those tasks
- * are gated by the P2 awaiting-approval flow in scanForTaskCompletions
- * and must not be completed via slash-command bypass paths
- * (`/task done`, `/task status completed`).
+ * LB4 helper (codex2 task-59 H1, hardened in round-8 per codex2 task-75
+ * H2 + claude2 Concern feedback): a task is "worktree-backed" if ANY of:
  *
- * Returns false when:
- *   - task has no assignee
- *   - assignee's agent isn't in the session (already exited / removed)
- *   - agent has no worktree (spawned outside a git repo)
+ *   1. `task.pendingMerge !== null` — gate already engaged. Manual
+ *      `/task done` here would bypass an already-running approval flow.
  *
- * In those cases the slash command's manual transition is fine because
- * there's no gate to bypass.
+ *   2. The assignee's SpawnedAgent record (status `running` OR `exited`)
+ *      has a non-null `worktree`. Round-8 keeps the SpawnedAgent record
+ *      in the store after PTY exit when the worktree was preserved, so
+ *      `agent.status === "exited"` no longer means "agent is gone for
+ *      gate purposes" — it means "PTY exited but worktree work is
+ *      still pending review/discard."
+ *
+ * Returns false when none of those apply: no assignee, no agent record,
+ * agent has no worktree. In those cases the slash command's manual
+ * transition is fine because there's no gate to bypass.
  */
 export function isTaskWorktreeBacked(
   task: CollabTask,
   agents: SpawnedAgent[],
   collabSessionId: string,
 ): boolean {
+  // (1) The gate has already engaged → don't allow slash-command bypass
+  // even if the SpawnedAgent record was somehow lost.
+  if (task.pendingMerge !== null) return true;
+  // (2) Live OR exited-with-worktree agent record signals the gate
+  // applies. After round-8, agent records persist when their worktree
+  // has uncommitted/unmerged work.
   if (!task.assignee) return false;
   const handle = task.assignee.replace(/^@/, "");
   const agent = agents.find(
