@@ -99,6 +99,28 @@ pub struct DiffSummary {
     pub untracked: Vec<String>,
 }
 
+/// Outcome of `git_worktree_remove`. Distinguishes a fully-clean removal
+/// from a partial cleanup so the caller (P2) can surface a "cleanup-needed"
+/// state instead of treating partial success as success (codex2 #4).
+///
+/// Note: this stays as a small typed enum even in P1 because cleanup
+/// semantics are user-visible — an orphaned branch from a partially-failed
+/// Discard is exactly the kind of state-loss claude2 Gap-4 / LB6 flagged.
+/// The full `GitError` enum (LB6) lands with the merge/approval commands
+/// in P2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum WorktreeRemoveOutcome {
+    /// Both worktree and branch were deleted.
+    FullyRemoved,
+    /// Worktree was removed but the branch could not be deleted (most
+    /// commonly because the branch has unmerged commits and was passed to
+    /// `git_worktree_remove` which uses `branch -d`, not `-D`). Callers
+    /// that want destructive deletion should use `git_branch_force_delete`
+    /// after `git_worktree_remove`.
+    WorktreeRemovedBranchPreserved { branch: String, reason: String },
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -113,8 +135,7 @@ pub(crate) fn worktrees_root() -> Result<PathBuf, String> {
         .join(".cache")
         .join("canvas-terminal")
         .join("worktrees");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create worktrees root: {}", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create worktrees root: {}", e))?;
     Ok(dir)
 }
 
@@ -161,11 +182,7 @@ fn git_capture_opt(repo: Option<&Path>, args: &[&str]) -> Option<String> {
 /// Stdio is silenced — this helper is used for `git fetch` whose failure is
 /// intentionally a soft fallback (offline / no-remote case). Surfacing
 /// stderr would be noise.
-fn git_with_timeout(
-    repo: Option<&Path>,
-    args: &[&str],
-    timeout_secs: u64,
-) -> Result<(), String> {
+fn git_with_timeout(repo: Option<&Path>, args: &[&str], timeout_secs: u64) -> Result<(), String> {
     let mut cmd = Command::new("git");
     if let Some(path) = repo {
         cmd.args(["-C", path.to_str().ok_or("non-utf8 repo path")?]);
@@ -215,6 +232,108 @@ fn validate_base_ref(base_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reject `base_ref` strings that target a non-`origin` remote. v1 only
+/// supports `origin` as the upstream — passing `upstream/dev` or
+/// `fork/dev` would silently produce wrong fetch behavior (claude2 Gap-1).
+fn validate_remote_in_base_ref(base_ref: &str) -> Result<(), String> {
+    if let Some((remote, _)) = base_ref.split_once('/') {
+        // Anything that looks like `<remote>/<branch>` must use `origin`.
+        // Bare branch names (no `/`) and `refs/heads/...` paths are fine.
+        if remote != "origin" && remote != "refs" {
+            return Err(format!(
+                "base ref '{}' targets remote '{}'. v1 only supports `origin/<branch>` or a bare branch name.",
+                base_ref, remote
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Confirm that `worktree_path` is under the canvas-terminal-managed
+/// worktree root. This is the host-side enforcement that the plan's
+/// L1 guarantee depends on (codex2 High-#1) — without it, a frontend bug
+/// could ask the backend to provision/clean up arbitrary paths.
+///
+/// Uses canonicalized paths to handle `/var → /private/var`-style symlinks
+/// on macOS. The worktree path may not exist yet at provisioning time, so
+/// we canonicalize the parent and append the leaf name when the path
+/// itself is not yet on disk.
+fn validate_managed_worktree_path(worktree_path: &str) -> Result<PathBuf, String> {
+    let root = worktrees_root()?;
+    let canonical_root = std::fs::canonicalize(&root)
+        .map_err(|e| format!("failed to canonicalize worktree root: {}", e))?;
+
+    let candidate = PathBuf::from(worktree_path);
+    let canonical_candidate = if candidate.exists() {
+        std::fs::canonicalize(&candidate)
+            .map_err(|e| format!("failed to canonicalize worktree path: {}", e))?
+    } else {
+        // Path doesn't exist yet (provisioning case). Canonicalize the
+        // existing parent and graft the leaf back on.
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| format!("worktree path has no parent: {}", worktree_path))?;
+        let leaf = candidate
+            .file_name()
+            .ok_or_else(|| format!("worktree path has no leaf: {}", worktree_path))?;
+        // Walk up until we find an existing ancestor.
+        let mut cursor = parent.to_path_buf();
+        while !cursor.exists() {
+            cursor = cursor
+                .parent()
+                .ok_or_else(|| {
+                    format!("no existing ancestor for worktree path: {}", worktree_path)
+                })?
+                .to_path_buf();
+        }
+        let canonical_ancestor = std::fs::canonicalize(&cursor)
+            .map_err(|e| format!("failed to canonicalize ancestor: {}", e))?;
+        // Reconstruct: canonical_ancestor + remaining-non-existing-segments + leaf.
+        let mut rebuilt = canonical_ancestor;
+        let suffix = candidate
+            .strip_prefix(&cursor)
+            .map_err(|e| format!("strip_prefix failed: {}", e))?;
+        rebuilt.push(suffix);
+        // Collapse: leaf was included in `suffix` already. Done.
+        let _ = leaf;
+        rebuilt
+    };
+
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(format!(
+            "worktree path '{}' is outside the managed worktree root ({}). \
+             Use `compute_worktree_path` to construct managed paths.",
+            worktree_path,
+            canonical_root.display()
+        ));
+    }
+    Ok(canonical_candidate)
+}
+
+/// Confirm that `branch_name` matches the canvas-terminal-managed agent
+/// branch namespace (`agent/...`). Prevents a future frontend bug from
+/// passing an arbitrary branch name to destructive operations
+/// (codex2 High-#2).
+fn validate_managed_branch_name(branch_name: &str) -> Result<(), String> {
+    if !branch_name.starts_with("agent/") {
+        return Err(format!(
+            "branch '{}' is not under the managed agent/ namespace. \
+             Destructive operations only accept branches the orchestrator created.",
+            branch_name
+        ));
+    }
+    // Defensive: still refuse any protected name even within the namespace
+    // (shouldn't be possible to reach here, but cheap insurance).
+    let tail = branch_name.rsplit('/').next().unwrap_or(branch_name);
+    if PROTECTED_BRANCHES.contains(&tail) {
+        return Err(format!(
+            "branch '{}' has a protected tail name. Refusing.",
+            branch_name
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -234,12 +353,16 @@ pub fn git_detect_repo(cwd: String) -> Result<Option<RepoInfo>, String> {
     };
     let root_path = PathBuf::from(&root);
     let current_branch = git_capture_opt(Some(&root_path), &["symbolic-ref", "--short", "HEAD"]);
-    let has_origin_dev =
-        git_capture_opt(Some(&root_path), &["show-ref", "--verify", "refs/remotes/origin/dev"])
-            .is_some();
-    let has_local_dev =
-        git_capture_opt(Some(&root_path), &["show-ref", "--verify", "refs/heads/dev"])
-            .is_some();
+    let has_origin_dev = git_capture_opt(
+        Some(&root_path),
+        &["show-ref", "--verify", "refs/remotes/origin/dev"],
+    )
+    .is_some();
+    let has_local_dev = git_capture_opt(
+        Some(&root_path),
+        &["show-ref", "--verify", "refs/heads/dev"],
+    )
+    .is_some();
     Ok(Some(RepoInfo {
         root,
         current_branch,
@@ -269,6 +392,12 @@ pub fn git_worktree_create(
     base_ref: String,
 ) -> Result<WorktreeMetadata, String> {
     validate_base_ref(&base_ref)?;
+    validate_remote_in_base_ref(&base_ref)?;
+    validate_managed_branch_name(&branch_name)?;
+    // Host-enforced managed-root invariant (codex2 High-#1). The frontend's
+    // call to `compute_worktree_path` is *advisory*; this check is the
+    // backend gate.
+    let _canonical_managed = validate_managed_worktree_path(&worktree_path)?;
 
     let repo_path = PathBuf::from(&repo_root);
     if !repo_path.exists() {
@@ -276,16 +405,17 @@ pub fn git_worktree_create(
     }
 
     // Strip the `origin/` prefix for `git fetch <remote> <ref>` — `git fetch
-    // origin origin/dev` is a parse error. Accept either form from the caller.
-    let (remote, fetch_ref) = match base_ref.split_once('/') {
-        Some((r, b)) if r == "origin" => ("origin", b),
-        _ => ("origin", base_ref.as_str()),
+    // origin origin/dev` is a parse error. validate_remote_in_base_ref above
+    // already rejected non-origin remotes.
+    let fetch_ref: &str = match base_ref.split_once('/') {
+        Some((r, b)) if r == "origin" => b,
+        _ => base_ref.as_str(),
     };
 
     // Try to refresh the remote ref. Bounded so spawn doesn't hang.
     let base_fresh = git_with_timeout(
         Some(&repo_path),
-        &["fetch", remote, fetch_ref],
+        &["fetch", "origin", fetch_ref],
         FETCH_TIMEOUT_SECS,
     )
     .is_ok();
@@ -295,13 +425,26 @@ pub fn git_worktree_create(
     // `dev` as the base unless user explicitly configured that." If the
     // caller passed `origin/dev` and it doesn't exist (no origin / fetch
     // failed), we fail fast so the missing-`dev` modal can surface.
-    let base_sha = git_capture_opt(Some(&repo_path), &["rev-parse", &base_ref])
-        .ok_or_else(|| {
+    //
+    // Three-state error message (claude2 Gap-2): distinguish offline-fetch,
+    // remote-lacks-ref, and bare-name-not-found so the user understands
+    // what to fix.
+    let base_sha =
+        git_capture_opt(Some(&repo_path), &["rev-parse", &base_ref]).ok_or_else(|| {
+            let context = if !base_fresh {
+                "Fetch from origin failed (offline or no origin remote configured). \
+                 Local copy of this ref does not exist either."
+            } else if base_ref.starts_with("origin/") {
+                "Fetch from origin succeeded but the remote does not have this ref. \
+                 The remote may have deleted it, or it never existed."
+            } else {
+                "Local ref does not exist (and remote was not consulted because the \
+                 base ref is a bare branch name, not `origin/<branch>`)."
+            };
             format!(
-                "base ref '{}' does not exist locally{}. \
+                "base ref '{}' could not be resolved. {} \
                  Configure a different non-main base via the missing-dev modal.",
-                base_ref,
-                if base_fresh { "" } else { " and fetch did not produce it" }
+                base_ref, context
             )
         })?;
 
@@ -318,7 +461,14 @@ pub fn git_worktree_create(
     // symbolic ref moves later.
     git_capture(
         Some(&repo_path),
-        &["worktree", "add", &worktree_path, "-b", &branch_name, &base_sha],
+        &[
+            "worktree",
+            "add",
+            &worktree_path,
+            "-b",
+            &branch_name,
+            &base_sha,
+        ],
     )?;
 
     Ok(WorktreeMetadata {
@@ -337,6 +487,14 @@ pub fn git_worktree_create(
 /// Takes parent metadata explicitly per codex1 C5 — don't infer the parent
 /// repo from a possibly-deleted-or-corrupt worktree.
 ///
+/// Validates managed-root + branch-namespace invariants (codex2 High-#1/#2).
+///
+/// Returns `WorktreeRemoveOutcome::WorktreeRemovedBranchPreserved` when the
+/// worktree was removed but the branch couldn't be deleted (most commonly
+/// because it has unmerged commits). Caller can then surface a
+/// "cleanup-needed" UI state instead of treating partial cleanup as
+/// success (codex2 #4).
+///
 /// **NEVER auto-removes a dirty worktree.** Per D10 + LB6, callers must
 /// only invoke this after (a) successful approved merge, (b) explicit user
 /// discard, OR (c) explicit confirmation that the worktree is clean.
@@ -345,7 +503,10 @@ pub fn git_worktree_remove(
     repo_root: String,
     worktree_path: String,
     branch_name: String,
-) -> Result<(), String> {
+) -> Result<WorktreeRemoveOutcome, String> {
+    validate_managed_worktree_path(&worktree_path)?;
+    validate_managed_branch_name(&branch_name)?;
+
     let repo_path = PathBuf::from(&repo_root);
     // `--force` because the worktree may have stale lock/index state from a
     // killed agent PTY. The caller is responsible for ensuring no live
@@ -355,26 +516,29 @@ pub fn git_worktree_remove(
         &["worktree", "remove", "--force", &worktree_path],
     )?;
     // Best-effort branch delete. `-d` (lowercase) refuses to delete unmerged
-    // branches; use that so we preserve work if the caller invoked us
-    // erroneously. The caller can pass `--force` separately via
-    // `git_branch_force_delete` (P2 implements that for the Discard path).
-    let _ = git_capture(Some(&repo_path), &["branch", "-d", &branch_name]);
-    Ok(())
+    // branches; we preserve work if the caller invoked us erroneously. The
+    // caller can pass `--force` separately via `git_branch_force_delete`
+    // (the Discard path).
+    match git_capture(Some(&repo_path), &["branch", "-d", &branch_name]) {
+        Ok(_) => Ok(WorktreeRemoveOutcome::FullyRemoved),
+        Err(reason) => Ok(WorktreeRemoveOutcome::WorktreeRemovedBranchPreserved {
+            branch: branch_name,
+            reason,
+        }),
+    }
 }
 
 /// Force-delete a branch (used by the Discard flow, which has user
 /// confirmation and intentionally destroys unmerged work).
+///
+/// Validates managed namespace (`agent/...`) and protected-name refusal
+/// (codex2 High-#2): a future frontend bug or misrouted call cannot
+/// destroy an arbitrary or protected branch through this entry point.
 #[tauri::command]
-pub fn git_branch_force_delete(
-    repo_root: String,
-    branch_name: String,
-) -> Result<(), String> {
-    if PROTECTED_BRANCHES.contains(&branch_name.as_str()) {
-        return Err(format!(
-            "refusing to force-delete protected branch '{}'",
-            branch_name
-        ));
-    }
+pub fn git_branch_force_delete(repo_root: String, branch_name: String) -> Result<(), String> {
+    // validate_managed_branch_name covers BOTH the agent/ prefix invariant
+    // AND the defensive protected-tail-name refusal.
+    validate_managed_branch_name(&branch_name)?;
     let repo_path = PathBuf::from(&repo_root);
     git_capture(Some(&repo_path), &["branch", "-D", &branch_name])?;
     Ok(())
@@ -458,10 +622,7 @@ pub fn git_worktree_status(worktree_path: String) -> Result<WorktreeStatus, Stri
 ///
 /// Per D2, the gate fires if **any** of the four classes is non-empty.
 #[tauri::command]
-pub fn git_diff_summary(
-    worktree_path: String,
-    base_sha: String,
-) -> Result<DiffSummary, String> {
+pub fn git_diff_summary(worktree_path: String, base_sha: String) -> Result<DiffSummary, String> {
     let wt = PathBuf::from(&worktree_path);
 
     // All `-z` outputs use NUL separators where leading whitespace can be
@@ -476,10 +637,7 @@ pub fn git_diff_summary(
         .map(String::from)
         .collect();
 
-    let staged_raw = git_capture_raw(
-        Some(&wt),
-        &["diff", "--name-only", "-z", "--cached"],
-    )?;
+    let staged_raw = git_capture_raw(Some(&wt), &["diff", "--name-only", "-z", "--cached"])?;
     let staged: Vec<String> = staged_raw
         .split('\0')
         .filter(|s| !s.is_empty())
@@ -536,7 +694,9 @@ pub fn compute_worktree_path(
         }
     }
     let root = worktrees_root()?;
-    let path = root.join(&collab_id).join(format!("{}-{}", tool_id, session_id));
+    let path = root
+        .join(&collab_id)
+        .join(format!("{}-{}", tool_id, session_id));
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -575,6 +735,16 @@ mod tests {
         repo
     }
 
+    /// Allocate a managed-root worktree path (passes the host-side
+    /// `validate_managed_worktree_path` check). Tests use this so they
+    /// exercise the same path policy as production callers.
+    fn make_managed_worktree_path(label: &str) -> String {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let collab = format!("test-{}-{}", label, n);
+        compute_worktree_path(collab, format!("session-{}", n), "claude_code".to_string())
+            .expect("compute_worktree_path should succeed for valid components")
+    }
+
     #[test]
     fn detect_repo_returns_none_for_non_repo() {
         let dir = std::env::temp_dir().join(format!(
@@ -603,7 +773,11 @@ mod tests {
     #[test]
     fn validate_base_ref_rejects_main_family() {
         for proto in ["main", "master", "production", "release"] {
-            assert!(validate_base_ref(proto).is_err(), "{} should be rejected", proto);
+            assert!(
+                validate_base_ref(proto).is_err(),
+                "{} should be rejected",
+                proto
+            );
             assert!(
                 validate_base_ref(&format!("origin/{}", proto)).is_err(),
                 "origin/{} should be rejected",
@@ -623,11 +797,8 @@ mod tests {
         // must fail because the local ref doesn't exist either.
         let result = git_worktree_create(
             repo.to_string_lossy().to_string(),
-            std::env::temp_dir()
-                .join("ct-wt-fail")
-                .to_string_lossy()
-                .to_string(),
-            "agent/test-1".to_string(),
+            make_managed_worktree_path("fail"),
+            "agent/test-fail".to_string(),
             "origin/dev".to_string(),
         );
         assert!(result.is_err(), "should fail when base ref is missing");
@@ -636,15 +807,15 @@ mod tests {
     #[test]
     fn worktree_create_succeeds_from_local_dev() {
         let repo = make_test_repo();
-        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let wt = std::env::temp_dir().join(format!("ct-wt-ok-{}", n));
+        let wt_str = make_managed_worktree_path("ok");
         let meta = git_worktree_create(
             repo.to_string_lossy().to_string(),
-            wt.to_string_lossy().to_string(),
-            format!("agent/test-{}", n),
+            wt_str.clone(),
+            "agent/test-ok".to_string(),
             "dev".to_string(), // local dev exists
         )
         .expect("should create worktree from local dev");
+        let wt = PathBuf::from(&wt_str);
         assert!(wt.exists(), "worktree path should exist on disk");
         assert!(wt.join(".git").exists(), "should have .git pointer");
         assert!(!meta.base_sha.is_empty());
@@ -652,7 +823,7 @@ mod tests {
         // Cleanup
         let _ = git_worktree_remove(
             repo.to_string_lossy().to_string(),
-            wt.to_string_lossy().to_string(),
+            wt_str,
             meta.branch.clone(),
         );
     }
@@ -660,23 +831,23 @@ mod tests {
     #[test]
     fn worktree_status_detects_dirty_states() {
         let repo = make_test_repo();
-        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let wt = std::env::temp_dir().join(format!("ct-wt-status-{}", n));
+        let wt_str = make_managed_worktree_path("status");
         let meta = git_worktree_create(
             repo.to_string_lossy().to_string(),
-            wt.to_string_lossy().to_string(),
-            format!("agent/test-status-{}", n),
+            wt_str.clone(),
+            "agent/test-status".to_string(),
             "dev".to_string(),
         )
         .unwrap();
+        let wt = PathBuf::from(&wt_str);
 
         // Initially clean
-        let s = git_worktree_status(wt.to_string_lossy().to_string()).unwrap();
+        let s = git_worktree_status(wt_str.clone()).unwrap();
         assert!(s.clean, "fresh worktree should be clean");
 
         // Add an untracked file → not clean
         std::fs::write(wt.join("new.txt"), "hello\n").unwrap();
-        let s = git_worktree_status(wt.to_string_lossy().to_string()).unwrap();
+        let s = git_worktree_status(wt_str.clone()).unwrap();
         assert!(!s.clean, "untracked file should make worktree dirty (D2)");
         assert_eq!(s.untracked_non_ignored, vec!["new.txt".to_string()]);
         assert!(s.modified.is_empty());
@@ -684,38 +855,43 @@ mod tests {
 
         // Modify an existing tracked file
         std::fs::write(wt.join("README.md"), "modified\n").unwrap();
-        let s = git_worktree_status(wt.to_string_lossy().to_string()).unwrap();
+        let s = git_worktree_status(wt_str.clone()).unwrap();
         assert!(!s.clean);
         assert!(s.modified.contains(&"README.md".to_string()));
 
-        // Cleanup
-        let _ = git_worktree_remove(
-            repo.to_string_lossy().to_string(),
-            wt.to_string_lossy().to_string(),
-            meta.branch,
+        // Stage a change → staged column populated (claude2 Gap-3 coverage)
+        git_capture(Some(&wt), &["add", "README.md"]).unwrap();
+        let s = git_worktree_status(wt_str.clone()).unwrap();
+        assert!(!s.clean);
+        assert!(
+            s.staged.contains(&"README.md".to_string()),
+            "staged column should populate after `git add`"
         );
+
+        // Cleanup
+        let _ = git_worktree_remove(repo.to_string_lossy().to_string(), wt_str, meta.branch);
     }
 
     #[test]
     fn diff_summary_includes_untracked() {
         let repo = make_test_repo();
-        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let wt = std::env::temp_dir().join(format!("ct-wt-diff-{}", n));
+        let wt_str = make_managed_worktree_path("diff");
         let meta = git_worktree_create(
             repo.to_string_lossy().to_string(),
-            wt.to_string_lossy().to_string(),
-            format!("agent/test-diff-{}", n),
+            wt_str.clone(),
+            "agent/test-diff".to_string(),
             "dev".to_string(),
         )
         .unwrap();
+        let wt = PathBuf::from(&wt_str);
 
         // No changes yet
-        let d = git_diff_summary(wt.to_string_lossy().to_string(), meta.base_sha.clone()).unwrap();
+        let d = git_diff_summary(wt_str.clone(), meta.base_sha.clone()).unwrap();
         assert!(!d.has_changes, "fresh worktree has no diff");
 
         // Untracked-only — D2 says this MUST flip has_changes=true.
         std::fs::write(wt.join("new-source.ts"), "export {};\n").unwrap();
-        let d = git_diff_summary(wt.to_string_lossy().to_string(), meta.base_sha.clone()).unwrap();
+        let d = git_diff_summary(wt_str.clone(), meta.base_sha.clone()).unwrap();
         assert!(
             d.has_changes,
             "untracked-non-ignored file must register as a change (D2 regression)"
@@ -724,11 +900,194 @@ mod tests {
         assert!(d.committed.is_empty());
 
         // Cleanup
+        let _ = git_worktree_remove(repo.to_string_lossy().to_string(), wt_str, meta.branch);
+    }
+
+    // -------------------------------------------------------------------
+    // codex2 High-#1/#2 + claude2 Gap-1/Gap-3 + codex2 #4 regression tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn worktree_create_rejects_unmanaged_path() {
+        let repo = make_test_repo();
+        let outside = std::env::temp_dir().join(format!(
+            "ct-outside-{}",
+            TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        // outside the worktrees root → backend must refuse even if the
+        // frontend forgets to call compute_worktree_path (codex2 High-#1).
+        let result = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            outside.to_string_lossy().to_string(),
+            "agent/test-outside".to_string(),
+            "dev".to_string(),
+        );
+        assert!(
+            result.is_err(),
+            "backend must refuse worktree paths outside ~/.cache/canvas-terminal/worktrees/"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("outside the managed worktree root"),
+            "error should explain the managed-root invariant: got {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn worktree_create_rejects_unmanaged_branch_namespace() {
+        let repo = make_test_repo();
+        // Branch not in `agent/...` namespace — backend must refuse
+        // (codex2 High-#2). `feature/x` is otherwise legal but isn't
+        // orchestrator-minted.
+        let result = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            make_managed_worktree_path("ns"),
+            "feature/x".to_string(),
+            "dev".to_string(),
+        );
+        assert!(result.is_err(), "non-agent/ branch must be refused");
+    }
+
+    #[test]
+    fn worktree_create_rejects_non_origin_remote() {
+        let repo = make_test_repo();
+        // claude2 Gap-1: passing `upstream/dev` would otherwise silently
+        // produce `git fetch origin upstream/dev` (wrong). Refuse upfront.
+        let result = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            make_managed_worktree_path("upstream"),
+            "agent/test-upstream".to_string(),
+            "upstream/dev".to_string(),
+        );
+        assert!(result.is_err(), "non-origin remote must be refused");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("only supports `origin/<branch>`"),
+            "error should call out the v1 limitation: got {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn worktree_remove_actually_removes_dir() {
+        // claude2 Gap-3 explicit regression — assert the worktree dir is
+        // actually gone after removal, don't just trust git's exit code.
+        let repo = make_test_repo();
+        let wt_str = make_managed_worktree_path("remove");
+        let meta = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            wt_str.clone(),
+            "agent/test-remove".to_string(),
+            "dev".to_string(),
+        )
+        .unwrap();
+        let wt = PathBuf::from(&wt_str);
+        assert!(wt.exists(), "precondition: worktree exists");
+        let outcome =
+            git_worktree_remove(repo.to_string_lossy().to_string(), wt_str, meta.branch).unwrap();
+        assert!(!wt.exists(), "worktree dir must be gone after remove");
+        // `git branch -d agent/test-remove` succeeds because the branch's
+        // tip is the same as origin/dev's tip (no unmerged commits).
+        assert!(matches!(outcome, WorktreeRemoveOutcome::FullyRemoved));
+    }
+
+    #[test]
+    fn worktree_remove_preserves_branch_with_unmerged_commits() {
+        // codex2 #4: when branch has unmerged work, return structured
+        // outcome instead of pretending success.
+        let repo = make_test_repo();
+        let wt_str = make_managed_worktree_path("unmerged");
+        let meta = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            wt_str.clone(),
+            "agent/test-unmerged".to_string(),
+            "dev".to_string(),
+        )
+        .unwrap();
+        let wt = PathBuf::from(&wt_str);
+        // Add an unmerged commit on the agent branch.
+        std::fs::write(wt.join("new.txt"), "agent work\n").unwrap();
+        git_capture(Some(&wt), &["add", "new.txt"]).unwrap();
+        git_capture(Some(&wt), &["commit", "-m", "agent work"]).unwrap();
+
+        let outcome = git_worktree_remove(
+            repo.to_string_lossy().to_string(),
+            wt_str,
+            meta.branch.clone(),
+        )
+        .unwrap();
+        match outcome {
+            WorktreeRemoveOutcome::WorktreeRemovedBranchPreserved { branch, reason: _ } => {
+                assert_eq!(branch, meta.branch);
+            }
+            WorktreeRemoveOutcome::FullyRemoved => {
+                panic!("expected branch to be preserved due to unmerged work");
+            }
+        }
+        // Cleanup the orphaned branch so subsequent tests aren't polluted.
+        let _ = git_capture(Some(&repo), &["branch", "-D", &meta.branch]);
+    }
+
+    #[test]
+    fn branch_force_delete_refuses_unmanaged_namespace() {
+        // codex2 High-#2 explicit test — a future frontend bug passing
+        // `main` or `feature/x` to force-delete must be refused at the
+        // backend.
+        let repo = make_test_repo();
+        for bad in ["main", "master", "feature/foo", "production"] {
+            let result =
+                git_branch_force_delete(repo.to_string_lossy().to_string(), bad.to_string());
+            assert!(
+                result.is_err(),
+                "force-delete of '{}' should be refused; got Ok",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn branch_force_delete_works_in_agent_namespace() {
+        // Happy path for the Discard flow.
+        let repo = make_test_repo();
+        let wt_str = make_managed_worktree_path("force");
+        let meta = git_worktree_create(
+            repo.to_string_lossy().to_string(),
+            wt_str.clone(),
+            "agent/test-force".to_string(),
+            "dev".to_string(),
+        )
+        .unwrap();
+        let wt = PathBuf::from(&wt_str);
+        // Make an unmerged commit so `branch -d` would refuse, forcing
+        // the test to exercise the `branch -D` path.
+        std::fs::write(wt.join("x.txt"), "x\n").unwrap();
+        git_capture(Some(&wt), &["add", "x.txt"]).unwrap();
+        git_capture(Some(&wt), &["commit", "-m", "x"]).unwrap();
+        // Remove the worktree first (it would block branch deletion).
         let _ = git_worktree_remove(
             repo.to_string_lossy().to_string(),
-            wt.to_string_lossy().to_string(),
-            meta.branch,
+            wt_str,
+            meta.branch.clone(),
         );
+        // Now force-delete the branch.
+        let result =
+            git_branch_force_delete(repo.to_string_lossy().to_string(), meta.branch.clone());
+        assert!(
+            result.is_ok(),
+            "force-delete of agent/ branch should succeed: {:?}",
+            result
+        );
+        // Verify it's gone.
+        let exists = git_capture_opt(
+            Some(&repo),
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", meta.branch),
+            ],
+        );
+        assert!(exists.is_none(), "branch should be gone after force-delete");
     }
 
     #[test]
@@ -750,30 +1109,27 @@ mod tests {
     #[test]
     fn worktree_list_returns_paths() {
         let repo = make_test_repo();
-        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let wt = std::env::temp_dir().join(format!("ct-wt-list-{}", n));
+        let wt_str = make_managed_worktree_path("list");
         let meta = git_worktree_create(
             repo.to_string_lossy().to_string(),
-            wt.to_string_lossy().to_string(),
-            format!("agent/test-list-{}", n),
+            wt_str.clone(),
+            "agent/test-list".to_string(),
             "dev".to_string(),
         )
         .unwrap();
+        let wt = PathBuf::from(&wt_str);
         let list = git_worktree_list(repo.to_string_lossy().to_string()).unwrap();
         // git canonicalizes paths (macOS /var → /private/var). Compare
         // canonicalized forms so the symlink resolution doesn't trip the test.
         let canonical_wt = std::fs::canonicalize(&wt).unwrap();
         assert!(
-            list.iter().any(|p| std::fs::canonicalize(p).ok() == Some(canonical_wt.clone())),
+            list.iter()
+                .any(|p| std::fs::canonicalize(p).ok() == Some(canonical_wt.clone())),
             "expected {:?} in {:?}",
             canonical_wt,
             list
         );
         // Cleanup
-        let _ = git_worktree_remove(
-            repo.to_string_lossy().to_string(),
-            wt.to_string_lossy().to_string(),
-            meta.branch,
-        );
+        let _ = git_worktree_remove(repo.to_string_lossy().to_string(), wt_str, meta.branch);
     }
 }
