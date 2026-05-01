@@ -151,6 +151,9 @@ pub fn run() {
             // approval commit + merge with file-lock + structured GitError
             commands::git::git_create_approval_commit,
             commands::git::git_merge_worktree,
+            // LB3 branch-protection wizard support
+            commands::git::git_get_remote_url,
+            commands::git::run_gh_api,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

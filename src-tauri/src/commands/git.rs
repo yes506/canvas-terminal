@@ -1264,6 +1264,98 @@ impl Drop for MergeLock {
 }
 
 // ---------------------------------------------------------------------------
+// LB3 — branch-protection wizard support (v5 §4 P2.h, three-state model)
+// ---------------------------------------------------------------------------
+
+/// Return the configured URL for a remote (e.g., `origin`). Used by LB3
+/// to decide whether the repo is hosted on GitHub (the only host where
+/// `gh api` can verify branch protection) — non-GitHub remotes route to
+/// the "unknown" state and the manual confirmation prompt.
+///
+/// Returns the trimmed first line of `git remote get-url <name>`. Bubbles
+/// up the git error verbatim on failure (typical case: remote doesn't
+/// exist, e.g., a freshly-cloned repo with no `origin`).
+#[tauri::command]
+pub fn git_get_remote_url(repo_root: String, remote_name: String) -> Result<String, String> {
+    let repo_path = PathBuf::from(&repo_root);
+    git_capture(
+        Some(&repo_path),
+        &["remote", "get-url", &remote_name],
+    )
+}
+
+/// Output of `run_gh_api`. `exit_code: 0` means success; the body is
+/// in `stdout`. Non-zero exit codes are NOT treated as a Rust-level
+/// error — the caller (LB3 wizard) needs to distinguish 404 (verified-
+/// unprotected) from auth/network failures (unknown). Caller parses
+/// `stderr` for diagnostic context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GhApiResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run `gh api <args>` and return the structured result. The frontend's
+/// LB3 wizard uses this to query
+/// `/repos/<owner>/<repo>/branches/main/protection`:
+///   - exit 0 with JSON body → branch protection IS enabled (`verified-
+///     protected`).
+///   - exit non-zero with stderr containing "Not Found" / 404 → branch
+///     protection NOT enabled (`verified-unprotected`).
+///   - any other failure (auth, network, gh missing, rate-limited) →
+///     `unknown` state, falls back to manual confirmation.
+///
+/// This is intentionally a thin wrapper — the exit code + stderr are
+/// surfaced to the frontend, which holds the routing logic. No timeout
+/// here; gh CLI handles its own network timeouts and the user can
+/// retry from the slash command.
+///
+/// Args are passed verbatim. Validation: must be non-empty (refuse a
+/// bare `gh api` invocation since that's a usage error). The first
+/// arg should be the API path (e.g., `/repos/owner/repo/branches/main/
+/// protection`); subsequent args are gh's standard flags.
+#[tauri::command]
+pub fn run_gh_api(args: Vec<String>) -> Result<GhApiResult, String> {
+    if args.is_empty() {
+        return Err("run_gh_api: args must contain at least the API path".to_string());
+    }
+    // Refuse args that look like an attempt to inject a different gh
+    // subcommand. The first arg must look like an API path (starts with
+    // `/`) — defense in depth against a future caller that confuses
+    // `gh api` with `gh auth`. Non-path first args are treated as a
+    // usage error.
+    if !args[0].starts_with('/') {
+        return Err(format!(
+            "run_gh_api: first arg must be an API path starting with '/', got '{}'",
+            args[0]
+        ));
+    }
+    let mut cmd = Command::new("gh");
+    cmd.arg("api");
+    for a in &args {
+        cmd.arg(a);
+    }
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            // Distinguish "gh not found" from other spawn errors. The
+            // frontend treats either as the `unknown` state.
+            return Err(format!("failed to spawn gh: {}", e));
+        }
+    };
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    Ok(GhApiResult {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2190,5 +2282,75 @@ mod tests {
             wt_str,
             meta.branch,
         );
+    }
+
+    // ----- LB3 branch-protection wizard support -----
+
+    #[test]
+    fn get_remote_url_returns_configured_url() {
+        let repo = make_test_repo();
+        // Configure a fake origin pointing at a GitHub URL — the LB3
+        // wizard's hostname check is a regex match on the URL string,
+        // so the remote doesn't have to be reachable.
+        git_capture(
+            Some(&repo),
+            &["remote", "add", "origin", "https://github.com/owner/repo.git"],
+        )
+        .unwrap();
+        let url = git_get_remote_url(
+            repo.to_string_lossy().to_string(),
+            "origin".to_string(),
+        )
+        .unwrap();
+        assert_eq!(url, "https://github.com/owner/repo.git");
+    }
+
+    #[test]
+    fn get_remote_url_errors_when_remote_missing() {
+        let repo = make_test_repo();
+        // No remote configured.
+        let err = git_get_remote_url(
+            repo.to_string_lossy().to_string(),
+            "origin".to_string(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("No such remote") || err.contains("error"),
+            "expected git error, got: {}",
+            err,
+        );
+    }
+
+    #[test]
+    fn get_remote_url_handles_ssh_format() {
+        let repo = make_test_repo();
+        git_capture(
+            Some(&repo),
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        )
+        .unwrap();
+        let url = git_get_remote_url(
+            repo.to_string_lossy().to_string(),
+            "origin".to_string(),
+        )
+        .unwrap();
+        assert_eq!(url, "git@github.com:owner/repo.git");
+    }
+
+    #[test]
+    fn run_gh_api_refuses_empty_args() {
+        let result = run_gh_api(vec![]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least the API path"));
+    }
+
+    #[test]
+    fn run_gh_api_refuses_non_path_first_arg() {
+        // Defense-in-depth: `gh api auth status` would shell out to a
+        // different gh subcommand surface. Refuse anything that doesn't
+        // look like an API path (must start with `/`).
+        let result = run_gh_api(vec!["auth".to_string(), "status".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must be an API path"));
     }
 }

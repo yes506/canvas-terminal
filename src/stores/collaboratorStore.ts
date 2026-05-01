@@ -841,6 +841,23 @@ interface CollaboratorState {
    */
   contextSentByAgent: Record<string, true | "inflight">;
 
+  /**
+   * LB3 branch-protection state, keyed by absolute repoRoot. Set when
+   * the user explicitly accepts the limited guarantee for a repo whose
+   * `origin/main` protection cannot be verified (non-GitHub remote,
+   * missing `gh`, auth/network failure) OR is verified-unprotected and
+   * the user knowingly skips the wizard. When set, every Approve
+   * status message is prefixed with `[limited-guarantee]` (P7 banner
+   * equivalent for the slash-command surface).
+   *
+   * Map shape: `{ [repoRoot]: { acceptedAt, note? } }`. Currently
+   * in-memory only — restart resets the flag, which re-prompts the
+   * user on the next Approve. File-backed persistence is a P5 polish
+   * item; the in-memory shape is sufficient for v1 because the
+   * Approve flow is the only consumer and the prompt is cheap.
+   */
+  branchProtectionAcks: Record<string, { acceptedAt: string; note?: string }>;
+
   // Session lifecycle
   startSession: (id: string) => void;
   /**
@@ -897,6 +914,16 @@ interface CollaboratorState {
    * in-memory state.
    */
   releaseAgentWorktree: (handle: string, forSession: string) => void;
+  /**
+   * LB3: persist the user's explicit acceptance of the limited
+   * guarantee for a specific repoRoot. Records the acceptance time
+   * and an optional note. Future Approve calls for the same repoRoot
+   * will skip the protection check and prefix `[limited-guarantee]`
+   * in their status output.
+   *
+   * No-op when the same repoRoot is already acked (idempotent).
+   */
+  acceptBranchProtectionLimited: (repoRoot: string, note?: string) => void;
   /** Flush queued messages for an agent that has become ready. */
   flushPendingMessages: (sessionId: string) => Promise<void>;
   killAllAgents: (forSession?: string) => Promise<void>;
@@ -1441,6 +1468,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   pendingMessagesByAgent: {},
   recentOutcomesBySession: {},
   contextSentByAgent: {},
+  branchProtectionAcks: {},
 
   // -- Session lifecycle --------------------------------------------------
 
@@ -1671,6 +1699,23 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
           : a,
       ),
     }));
+  },
+
+  acceptBranchProtectionLimited: (repoRoot, note) => {
+    set((s) => {
+      // Idempotent: if already acked, leave the original timestamp/note
+      // alone (don't shadow the historical first-acceptance metadata).
+      if (s.branchProtectionAcks[repoRoot]) return {};
+      return {
+        branchProtectionAcks: {
+          ...s.branchProtectionAcks,
+          [repoRoot]: {
+            acceptedAt: new Date().toISOString(),
+            ...(note ? { note } : {}),
+          },
+        },
+      };
+    });
   },
 
   flushPendingMessages: async (sessionId) => {

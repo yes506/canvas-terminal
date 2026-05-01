@@ -12,7 +12,7 @@ import {
   slugify,
 } from "./collaboratorStore";
 import type { CollabTask, SpawnedAgent } from "../types/collaborator";
-import { parseInput, resolveAgent, executeCommand, getHelpText } from "../components/collaborator/commands";
+import { parseInput, resolveAgent, executeCommand, getHelpText, checkBranchProtection } from "../components/collaborator/commands";
 import { useTerminalStore } from "./terminalStore";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -3717,7 +3717,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
 
   function setupAwaitingApprovalTask(opts: {
     hasResidue: boolean;
+    /**
+     * Default: pre-ack the branch-protection limited guarantee for "/r"
+     * so LB3 doesn't gate the Approve flow in D14 tests. Tests
+     * specifically exercising the LB3 wizard pass `ackProtection: false`
+     * to opt into the protection-state IPC sequence.
+     */
+    ackProtection?: boolean;
   } = { hasResidue: true }) {
+    const ackProtection = opts.ackProtection ?? true;
     useCollaboratorStore.setState({
       agents: [
         {
@@ -3748,6 +3756,9 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       tasksBySession: { [D14_SESSION]: [] },
       logEntriesBySession: { [D14_SESSION]: [] },
       statusMessages: {},
+      branchProtectionAcks: ackProtection
+        ? { "/r": { acceptedAt: "2024-01-01T00:00:00.000Z" } }
+        : {},
     });
     const store = useCollaboratorStore.getState();
     const task = store.addTask(
@@ -4215,6 +4226,213 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       .getState()
       .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
     expect(task?.status).toBe("blocked");
+  });
+
+  // -------------------------------------------------------------------------
+  // LB3 — branch-protection three-state wizard (round-13)
+  // -------------------------------------------------------------------------
+
+  it("/task approve: refuses when LB3 reports verified-unprotected and repo is not acked", async () => {
+    const { taskId } = setupAwaitingApprovalTask({
+      hasResidue: false,
+      ackProtection: false,
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") return { exitCode: 4, stdout: "", stderr: "Not Found (HTTP 404)" };
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    // Approve refused: status unchanged, no merge attempted.
+    expect(task?.status).toBe("awaiting-approval");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("Branch protection NOT enabled");
+    expect(status).toContain("accept-limited");
+    // Verify no merge IPCs fired.
+    const ipcOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_merge"));
+    expect(ipcOrder).toHaveLength(0);
+  });
+
+  it("/task approve: refuses when LB3 reports unknown (non-GitHub remote) and repo is not acked", async () => {
+    const { taskId } = setupAwaitingApprovalTask({
+      hasResidue: false,
+      ackProtection: false,
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://gitlab.com/owner/repo.git";
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("awaiting-approval");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("Cannot verify branch protection");
+    expect(status).toContain("accept-limited");
+  });
+
+  it("/task approve: proceeds silently when LB3 reports verified-protected (no [limited-guarantee] prefix)", async () => {
+    const { taskId } = setupAwaitingApprovalTask({
+      hasResidue: false,
+      ackProtection: false,
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return { exitCode: 0, stdout: '{"required_status_checks":{}}', stderr: "" };
+      }
+      if (cmd === "git_merge_worktree") return { mergedSha: "abcd", pushed: false };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("completed");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    // No [limited-guarantee] prefix on verified-protected path.
+    expect(status).not.toContain("[limited-guarantee]");
+    expect(status).toContain("approved");
+  });
+
+  it("/task approve: proceeds with [limited-guarantee] prefix when repo is acked", async () => {
+    const { taskId } = setupAwaitingApprovalTask({
+      hasResidue: false,
+      ackProtection: true, // acked, LB3 check should be skipped entirely
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") return { mergedSha: "abcd", pushed: false };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("completed");
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("[limited-guarantee]");
+    // LB3 check IPCs should NOT have fired (early-skip when acked).
+    const ipcs = vi.mocked(invoke).mock.calls.map((c) => c[0]);
+    expect(ipcs).not.toContain("git_get_remote_url");
+    expect(ipcs).not.toContain("run_gh_api");
+  });
+
+  it("/branch-protection accept-limited: persists ack per-repo and is idempotent", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    await executeCommand(
+      parseInput("/branch-protection accept-limited -- corporate self-hosted GitLab"),
+      D14_SESSION,
+    );
+    const acks = useCollaboratorStore.getState().branchProtectionAcks;
+    expect(acks["/r"]).toBeDefined();
+    expect(acks["/r"].note).toBe("corporate self-hosted GitLab");
+    const status1 = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status1).toContain("Limited guarantee accepted");
+
+    // Second call should be a no-op (idempotent) — same timestamp preserved.
+    const originalTs = acks["/r"].acceptedAt;
+    await executeCommand(
+      parseInput("/branch-protection accept-limited -- different note"),
+      D14_SESSION,
+    );
+    const acks2 = useCollaboratorStore.getState().branchProtectionAcks;
+    expect(acks2["/r"].acceptedAt).toBe(originalTs);
+    expect(acks2["/r"].note).toBe("corporate self-hosted GitLab"); // unchanged
+    const status2 = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status2).toContain("already accepted");
+  });
+
+  it("/branch-protection check: reports verified-protected without mutating ack state", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return { exitCode: 0, stdout: '{"required_status_checks":{}}', stderr: "" };
+      }
+      return null;
+    });
+    await executeCommand(parseInput("/branch-protection check"), D14_SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("Branch protection verified");
+    // /check is read-only; should NOT have set the ack flag.
+    const acks = useCollaboratorStore.getState().branchProtectionAcks;
+    expect(acks["/r"]).toBeUndefined();
+  });
+
+  it("/branch-protection list-acks: lists acked repos with notes", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    useCollaboratorStore.getState().acceptBranchProtectionLimited("/r", "test note");
+    useCollaboratorStore.getState().acceptBranchProtectionLimited("/other", undefined);
+    await executeCommand(parseInput("/branch-protection list-acks"), D14_SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("/r");
+    expect(status).toContain("/other");
+    expect(status).toContain("test note");
+  });
+
+  it("checkBranchProtection: returns 'unknown' for non-GitHub remotes (no gh API call)", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://gitlab.com/owner/repo.git";
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("unknown");
+    // Confirm gh wasn't called.
+    expect(fakeInvoke).not.toHaveBeenCalledWith("run_gh_api", expect.anything());
+  });
+
+  it("checkBranchProtection: returns 'unknown' when origin remote is missing", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") throw "No such remote 'origin'";
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("unknown");
+  });
+
+  it("checkBranchProtection: 404 from gh API → verified-unprotected", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "git@github.com:owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return { exitCode: 4, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-unprotected");
+  });
+
+  it("checkBranchProtection: auth/network failure (non-404 error) → unknown", async () => {
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return { exitCode: 1, stdout: "", stderr: "gh: authentication required" };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("unknown");
   });
 
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {

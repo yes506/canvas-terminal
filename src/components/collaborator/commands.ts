@@ -138,6 +138,101 @@ export function formatGitError(err: unknown): string {
   }
 }
 
+/**
+ * LB3 branch-protection three-state model (v5 §4 P2.h). Returned by
+ * `checkBranchProtection`. Routing per state:
+ *   - `verified-protected`: silent; Approve proceeds.
+ *   - `verified-unprotected`: refuse Approve until user enables
+ *     protection on GitHub OR runs `/branch-protection accept-limited`.
+ *   - `unknown`: cannot verify (non-GitHub remote, missing gh, auth/
+ *     network failure, rate-limited). Refuse Approve until user runs
+ *     `/branch-protection accept-limited`.
+ */
+export type BranchProtectionState =
+  | "verified-protected"
+  | "verified-unprotected"
+  | "unknown";
+
+/**
+ * LB3 wizard's discriminator: detect GitHub remotes (the only host
+ * where `gh api` can verify branch protection). Matches both HTTPS and
+ * SSH forms: `https://github.com/...`, `git@github.com:...`. Anything
+ * else routes to the `unknown` state.
+ */
+function isGithubRemote(url: string): boolean {
+  return /github\.com[:/]/.test(url);
+}
+
+/**
+ * Parse `<owner>/<repo>` from a remote URL. Strips the trailing `.git`
+ * if present. Returns null on malformed input — caller treats null
+ * as `unknown` state.
+ */
+function parseGithubOwnerRepo(url: string): { owner: string; repo: string } | null {
+  // HTTPS: https://github.com/owner/repo(.git)?
+  // SSH:   git@github.com:owner/repo(.git)?
+  const m = url.match(/github\.com[:/]([^/]+)\/([^/\s]+?)(?:\.git)?$/);
+  if (!m) return null;
+  return { owner: m[1], repo: m[2] };
+}
+
+/**
+ * Run the LB3 three-state branch-protection check for a repo.
+ *
+ * The implementation is order-sensitive:
+ *   1. Resolve `origin` URL — non-existent remote → `unknown`.
+ *   2. GitHub host check — non-GitHub → `unknown` (no API to call).
+ *   3. Parse owner/repo — malformed URL → `unknown`.
+ *   4. Run `gh api /repos/<owner>/<repo>/branches/main/protection`:
+ *      - exit 0  → `verified-protected` (body is the protection rules JSON).
+ *      - exit non-zero with stderr matching 404/Not Found → `verified-unprotected`.
+ *      - any other failure (auth, network, gh missing) → `unknown`.
+ *
+ * The Tauri command `run_gh_api` does NOT fail Rust-side on non-zero
+ * exits — it returns `{exitCode, stdout, stderr}` so this routing
+ * logic owns the state determination.
+ */
+export async function checkBranchProtection(
+  repoRoot: string,
+  invokeFn: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> = invoke,
+): Promise<BranchProtectionState> {
+  let remoteUrl: string;
+  try {
+    remoteUrl = await invokeFn<string>("git_get_remote_url", {
+      repoRoot,
+      remoteName: "origin",
+    });
+  } catch {
+    // Missing `origin` remote → cannot verify. The repo may be local-
+    // only or use a non-standard remote name. Surface as `unknown`.
+    return "unknown";
+  }
+  if (!isGithubRemote(remoteUrl)) return "unknown";
+  const parsed = parseGithubOwnerRepo(remoteUrl);
+  if (!parsed) return "unknown";
+  let res: { exitCode: number; stdout: string; stderr: string };
+  try {
+    res = await invokeFn<{ exitCode: number; stdout: string; stderr: string }>(
+      "run_gh_api",
+      {
+        args: [`/repos/${parsed.owner}/${parsed.repo}/branches/main/protection`],
+      },
+    );
+  } catch {
+    // gh not installed, network failure, etc. → unknown.
+    return "unknown";
+  }
+  if (res.exitCode === 0) return "verified-protected";
+  // `gh api` returns exit 4 (or non-zero with stderr containing
+  // "Not Found") for 404. Match defensively on the stderr text.
+  const stderrLc = res.stderr.toLowerCase();
+  if (stderrLc.includes("not found") || stderrLc.includes("404")) {
+    return "verified-unprotected";
+  }
+  // Any other non-zero (auth failure, rate limit, etc.) → unknown.
+  return "unknown";
+}
+
 export interface ParsedCommand {
   type:
     | "send"
@@ -152,6 +247,7 @@ export interface ParsedCommand {
     | "memory"
     | "task"
     | "rename"
+    | "branch-protection"
     | "unknown";
   target?: string;
   message?: string;
@@ -196,6 +292,19 @@ export function parseInput(input: string): ParsedCommand {
   if (trimmed === "/task" || trimmed.startsWith("/task ")) {
     const rest = trimmed.slice("/task".length).trim();
     return { type: "task", message: rest || undefined, raw: trimmed };
+  }
+
+  // /branch-protection <subcommand> — LB3 wizard surface
+  if (
+    trimmed === "/branch-protection" ||
+    trimmed.startsWith("/branch-protection ")
+  ) {
+    const rest = trimmed.slice("/branch-protection".length).trim();
+    return {
+      type: "branch-protection",
+      message: rest || undefined,
+      raw: trimmed,
+    };
   }
 
   // /rename @<agent> <new-nickname>
@@ -304,6 +413,7 @@ export function getHelpText(): string {
     "       /task <id> assign @<agent>  /task <id> done [notes]",
     "       /task <id> approve [--push] [-- <message>]   (worktree-backed only)",
     "       /task <id> discard [<reason>]                (worktree-backed only)",
+    "Protection: /branch-protection [status|check|accept-limited [-- <note>]|list-acks]",
     "Canvas: /canvas-export [msg]  /canvas-export @agent [msg]  /canvas-import @agent",
     "Memory: /context <text>  /memory list|read|delete|clear",
     "Agents: @claude @codex @gemini @copilot  Indexed: @claude1 @claude2  Or by nickname: @bug-hunter",
@@ -738,6 +848,37 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             customMessage?.trim() ||
             `Approve task ${task.id}: ${task.title}`;
 
+          // LB3 (round-13): branch-protection three-state check. Refuse
+          // Approve when the repo's protection cannot be verified or
+          // is verified-unprotected, UNLESS the user has explicitly
+          // accepted the limited guarantee (`/branch-protection
+          // accept-limited`). The flag is per-repoRoot so a single ack
+          // covers all subsequent Approves for the same repo.
+          const ackedRepo = !!store.branchProtectionAcks[snapshot.repoRoot];
+          let limitedGuarantee = ackedRepo;
+          if (!ackedRepo) {
+            const protectionState = await checkBranchProtection(snapshot.repoRoot);
+            if (protectionState === "verified-unprotected") {
+              status(
+                `Branch protection NOT enabled on origin/main for ${snapshot.repoRoot}. ` +
+                  `Enable it via the GitHub repo's Settings → Branches page, OR run ` +
+                  `'/branch-protection accept-limited' to proceed with limited guarantee. ` +
+                  `Approve refused for task ${task.id}.`,
+              );
+              break;
+            }
+            if (protectionState === "unknown") {
+              status(
+                `Cannot verify branch protection on origin/main for ${snapshot.repoRoot} ` +
+                  `(non-GitHub remote, missing 'gh', or auth/network failure). ` +
+                  `Run '/branch-protection accept-limited [-- <note>]' to confirm equivalent ` +
+                  `protection elsewhere and proceed. Approve refused for task ${task.id}.`,
+              );
+              break;
+            }
+            // verified-protected → silent, proceed (no flag set).
+          }
+
           // In-flight indicator. The user-facing footer shows a clear
           // progression: awaiting-approval → approved-merging → completed.
           store.updateTask(
@@ -912,14 +1053,19 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             collabSessionId,
           );
 
+          // LB3 P7: prefix `[limited-guarantee]` on the final status when
+          // the user has accepted the limited guarantee for this repo.
+          // Equivalent to the v5-spec "yellow banner" since the slash-
+          // command surface is text-only.
+          const lgPrefix = limitedGuarantee ? "[limited-guarantee] " : "";
           if (pushFailedAfterMerge) {
             status(
-              `Task ${task.id} approved & merged locally as ${pushFailedAfterMerge.sha}, but push failed: ${pushFailedAfterMerge.stderr.split("\n")[0]}. ` +
+              `${lgPrefix}Task ${task.id} approved & merged locally as ${pushFailedAfterMerge.sha}, but push failed: ${pushFailedAfterMerge.stderr.split("\n")[0]}. ` +
                 `Re-push manually with 'git push origin dev'.${cleanupWarn}`,
             );
           } else {
             status(
-              `Task ${task.id} approved${pushed ? " & pushed" : " & merged locally"}: ${mergedSha}${cleanupWarn}`,
+              `${lgPrefix}Task ${task.id} approved${pushed ? " & pushed" : " & merged locally"}: ${mergedSha}${cleanupWarn}`,
             );
           }
           break;
@@ -1053,6 +1199,136 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
         status("Usage: /task list | add <title> | <id> status|assign|done|approve|discard");
       } catch (err) {
         status(`Task error: ${err}`);
+      }
+      break;
+    }
+
+    case "branch-protection": {
+      // LB3 wizard slash-command surface. Subcommands:
+      //   /branch-protection                 — list current state across
+      //                                        repos that have agents
+      //   /branch-protection check           — re-run the check for
+      //                                        the active session's repo
+      //   /branch-protection accept-limited [-- <note>]
+      //                                      — explicitly accept the
+      //                                        limited guarantee for
+      //                                        the active session's repo
+      //   /branch-protection list-acks       — show acked repos
+      try {
+        if (!collabSessionId) {
+          status("Branch-protection commands require a collaborator session.");
+          break;
+        }
+        const sub = cmd.message ?? "";
+
+        // Find the repo root from any agent in the session that has a
+        // worktree. All agents in a single collab session share the
+        // same parent repo root.
+        const sessionAgent = scopedAgents.find((a) => a.worktree);
+        const activeRepoRoot = sessionAgent?.worktree?.repoRoot;
+
+        if (sub === "" || sub === "status") {
+          if (!activeRepoRoot) {
+            status(
+              "No worktree-backed agent in this session — branch-protection " +
+                "applies to repos with active worktrees.",
+            );
+            break;
+          }
+          const ack = store.branchProtectionAcks[activeRepoRoot];
+          if (ack) {
+            status(
+              `Limited guarantee accepted for ${activeRepoRoot} at ${ack.acceptedAt}` +
+                (ack.note ? ` — note: ${ack.note}` : "") +
+                ". Run '/branch-protection check' to re-evaluate.",
+            );
+          } else {
+            status(
+              `No limited-guarantee ack for ${activeRepoRoot}. ` +
+                "Run '/branch-protection check' to verify origin/main protection.",
+            );
+          }
+          break;
+        }
+
+        if (sub === "check") {
+          if (!activeRepoRoot) {
+            status(
+              "No worktree-backed agent in this session — cannot identify " +
+                "a repo to check.",
+            );
+            break;
+          }
+          const state = await checkBranchProtection(activeRepoRoot);
+          if (state === "verified-protected") {
+            status(
+              `Branch protection verified on origin/main for ${activeRepoRoot}. ` +
+                "Approve will run silently.",
+            );
+          } else if (state === "verified-unprotected") {
+            status(
+              `Branch protection NOT enabled on origin/main for ${activeRepoRoot}. ` +
+                "Enable via Settings → Branches, OR run " +
+                "'/branch-protection accept-limited' to proceed with limited guarantee.",
+            );
+          } else {
+            status(
+              `Cannot verify branch protection for ${activeRepoRoot} ` +
+                "(non-GitHub remote, missing 'gh', or auth/network failure). " +
+                "Run '/branch-protection accept-limited [-- <note>]' to proceed.",
+            );
+          }
+          break;
+        }
+
+        const ackMatch = sub.match(/^accept-limited(?:\s+--\s+(.+))?$/s);
+        if (ackMatch) {
+          if (!activeRepoRoot) {
+            status(
+              "No worktree-backed agent in this session — cannot identify " +
+                "a repo to ack.",
+            );
+            break;
+          }
+          const note = ackMatch[1]?.trim();
+          if (store.branchProtectionAcks[activeRepoRoot]) {
+            status(
+              `Limited guarantee already accepted for ${activeRepoRoot}. No change.`,
+            );
+            break;
+          }
+          store.acceptBranchProtectionLimited(activeRepoRoot, note);
+          status(
+            `Limited guarantee accepted for ${activeRepoRoot}` +
+              (note ? ` (note: ${note})` : "") +
+              ". Future Approves will proceed with the [limited-guarantee] prefix.",
+          );
+          break;
+        }
+
+        if (sub === "list-acks") {
+          const acks = store.branchProtectionAcks;
+          const entries = Object.entries(acks);
+          if (entries.length === 0) {
+            status("No limited-guarantee acks recorded.");
+          } else {
+            const lines = [`${entries.length} ack(s):`];
+            for (const [repo, info] of entries) {
+              lines.push(
+                `  ${repo} @ ${info.acceptedAt}` +
+                  (info.note ? ` — ${info.note}` : ""),
+              );
+            }
+            status(lines.join("  "));
+          }
+          break;
+        }
+
+        status(
+          "Usage: /branch-protection [status] | check | accept-limited [-- <note>] | list-acks",
+        );
+      } catch (err) {
+        status(`Branch-protection error: ${err}`);
       }
       break;
     }
