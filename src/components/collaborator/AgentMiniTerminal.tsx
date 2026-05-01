@@ -718,6 +718,43 @@ export function AgentMiniTerminal({
 
       // Kill PTY
       invoke("kill_pty", { sessionId }).catch(() => {});
+
+      // P1 cleanup-on-close (codex2 task-55 Med-#2): if this agent was
+      // running in an isolated worktree, ask the backend whether the
+      // worktree is dirty. Clean → auto-remove (no work to lose). Dirty
+      // → preserve, log a warning. The full Discard/archive flow is P2.
+      // Cleanup is fire-and-forget — don't block the unmount on it.
+      if (worktree) {
+        void (async () => {
+          try {
+            const status = await invoke<{
+              clean: boolean;
+              modified: string[];
+              staged: string[];
+              untrackedNonIgnored: string[];
+            }>("git_worktree_status", { worktreePath: worktree.path });
+            if (status.clean) {
+              await invoke("git_worktree_remove", {
+                repoRoot: worktree.repoRoot,
+                worktreePath: worktree.path,
+                branchName: worktree.branch,
+              });
+            } else {
+              console.warn(
+                `[collab/cleanup] preserving dirty worktree ${worktree.path} ` +
+                  `(modified=${status.modified.length}, staged=${status.staged.length}, ` +
+                  `untracked=${status.untrackedNonIgnored.length}). ` +
+                  "P2 startup janitor / Discard flow will handle.",
+              );
+            }
+          } catch (err) {
+            // Worktree may already be gone (e.g., user manually removed it,
+            // or P2 janitor cleaned up). Don't escalate.
+            console.warn("[collab/cleanup] worktree cleanup failed:", err);
+          }
+        })();
+      }
+
       useCollaboratorStore.getState().removeAgent(sessionId);
 
       // Dispose xterm

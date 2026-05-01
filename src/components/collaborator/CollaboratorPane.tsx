@@ -20,46 +20,82 @@ interface Spawn {
   sessionId: string;
   tool: ToolConfig;
   cwd: string | null;
-  /** True once the initial CWD has been resolved (or failed). */
-  cwdReady: boolean;
-  /** Worktree metadata if the agent was spawned in a git repo (P1 backend
-   *  provisioning). null = either not a git repo, or provisioning failed.
-   *  Threaded into AgentMiniTerminal which forwards it to addAgent so the
-   *  store record carries it for P2's awaiting-approval gate. */
+  /**
+   * Spawn lifecycle:
+   *  - `pending`: provisioning in flight; placeholder shows progress.
+   *  - `ready`: cwd resolved and (if applicable) worktree created;
+   *             AgentMiniTerminal mounts and the PTY launches.
+   *  - `blocked`: in a git repo but worktree provisioning failed —
+   *               PTY does NOT mount; placeholder shows the reason
+   *               and a Cancel button. This is the load-bearing
+   *               fail-closed path that prevents a non-isolated agent
+   *               from running in the shared checkout (codex1 task-53
+   *               H1 / codex2 task-55 High / claude3 task-56).
+   */
+  status: "pending" | "ready" | "blocked";
+  /** Worktree metadata when status === "ready" and cwd is in a git repo.
+   *  null otherwise (no-repo case, or non-git cwd). Threaded into
+   *  AgentMiniTerminal which forwards it to addAgent so the store
+   *  record carries it for P2's awaiting-approval gate. */
   worktree: WorktreeMetadata | null;
-  /** Surface a one-line provisioning message in the spawn placeholder
-   *  (e.g., "Provisioning isolated worktree…", or "missing dev branch"). */
+  /** One-line note for the placeholder UI (success path: nothing or
+   *  "Provisioning isolated worktree…" or stale-base warning;
+   *  blocked path: the actionable error reason). */
   provisioningMessage: string | null;
 }
 
 /**
- * Result of `provisionWorktreeForSpawn`. Exported for unit testing —
- * the closure inside `handleSpawn` consumes this directly.
+ * Result of `provisionWorktreeForSpawn`. Tagged union — the closure
+ * inside `handleSpawn` switches on `outcome` to decide whether to mount
+ * the PTY (`ok`/`no-repo`) or block the spawn entirely (`blocked`).
+ *
+ * `blocked` is the **fail-closed** path required by the v5 L1 invariant
+ * (codex1 task-53 H1, codex2 task-55 High, claude3 task-56): when cwd is
+ * inside a git repo but worktree provisioning fails, the agent must NOT
+ * be spawned in the parent repo, because a non-isolated agent + P2's
+ * `worktree != null` gate condition silently bypasses the approval gate.
  */
-export interface ProvisioningResult {
-  /** The cwd the PTY should actually run in. Falls back to the provided
-   *  `resolvedCwd` if provisioning was skipped or failed. */
-  cwd: string | null;
-  /** The created worktree, or null if not in a git repo / provisioning
-   *  failed. The caller stores this on `SpawnedAgent` for P2 gating. */
-  worktree: WorktreeMetadata | null;
-  /** One-line message for the spawn placeholder UI, or null. */
-  provisioningMessage: string | null;
-  /** Status-line message that should be surfaced to the collab session
-   *  via `setStatus`. null when there's nothing to show. */
-  errorStatus: string | null;
-}
+export type ProvisioningResult =
+  | {
+      outcome: "ok";
+      /** PTY runs INSIDE the worktree. */
+      cwd: string;
+      worktree: WorktreeMetadata;
+      /** One-line note for the spawn placeholder (e.g., stale-base
+       *  warning). null when nothing is worth surfacing. */
+      provisioningMessage: string | null;
+    }
+  | {
+      outcome: "no-repo";
+      /** PTY runs in the resolved cwd (or null = home dir). No worktree
+       *  isolation because the cwd isn't in a git repo at all. */
+      cwd: string | null;
+    }
+  | {
+      outcome: "blocked";
+      /** Reason to show in the placeholder. Concrete (backend error
+       *  string) so the user knows what to fix. */
+      reason: string;
+      /** Optional persistent status-line message. */
+      errorStatus: string | null;
+    };
 
 /**
  * Decide whether `resolvedCwd` is a git repo and, if so, provision a
  * fresh per-agent worktree from `origin/dev`. Pure-ish helper exported
  * for testing: every effect is via the injected `invoke` shim.
  *
- * Failure (e.g., the missing-`dev` case) is non-fatal at the spawn
- * layer — the agent still launches in `resolvedCwd` (no worktree
- * isolation), but P2's awaiting-approval gate keys on `worktree` being
- * non-null, so a non-isolated agent's tasks won't auto-flip. The caller
- * surfaces the failure reason via the status line.
+ * Three outcomes:
+ *  - `ok`: cwd is in a repo and the worktree is provisioned. PTY mounts
+ *          INSIDE the worktree.
+ *  - `no-repo`: cwd is not in a git repo. PTY mounts in cwd (no L1
+ *               isolation, because there's no shared checkout to protect).
+ *  - `blocked`: cwd IS in a git repo but provisioning failed (most
+ *               commonly the missing-`dev` case, OR `git_detect_repo`
+ *               itself errored). The caller MUST NOT mount the PTY
+ *               because doing so would put a non-isolated agent on the
+ *               shared checkout — P2's gate would then silently auto-
+ *               complete its tasks (worktree=null bypass).
  */
 export async function provisionWorktreeForSpawn(args: {
   resolvedCwd: string | null;
@@ -70,24 +106,34 @@ export async function provisionWorktreeForSpawn(args: {
 }): Promise<ProvisioningResult> {
   const inv = args.invokeShim ?? invoke;
   const { resolvedCwd, collabId, sessionId, toolId } = args;
-  const fallback: ProvisioningResult = {
-    cwd: resolvedCwd,
-    worktree: null,
-    provisioningMessage: null,
-    errorStatus: null,
-  };
-  if (!resolvedCwd) return fallback;
+
+  if (!resolvedCwd) {
+    // No active terminal, no cwd to probe → spawn at home dir, no
+    // isolation needed because there's no shared checkout in scope.
+    return { outcome: "no-repo", cwd: null };
+  }
 
   let repo: RepoInfo | null;
   try {
     repo = await inv<RepoInfo | null>("git_detect_repo", { cwd: resolvedCwd });
-  } catch {
-    // git_detect_repo failure is unexpected (it's a local-only probe);
-    // proceed without isolation rather than blocking the spawn.
-    return fallback;
+  } catch (err) {
+    // Probe error inside an arbitrary cwd: we can't tell if it's a git
+    // repo or not. Block to be safe — claude2 Concern 4 + codex2 Med-#3:
+    // "unknown" must not mean "spawn unisolated."
+    console.warn("[collab/spawn] git_detect_repo failed:", err);
+    return {
+      outcome: "blocked",
+      reason: `Could not determine whether ${resolvedCwd} is a git repo: ${String(err)}`,
+      errorStatus: null,
+    };
   }
-  if (!repo) return fallback;
+  if (!repo) {
+    // Definitely not a git repo. Safe to spawn in cwd.
+    return { outcome: "no-repo", cwd: resolvedCwd };
+  }
 
+  // From here on: cwd IS in a git repo. Any failure must block, NOT
+  // fall through to a parent-repo spawn (codex1 H1 / codex2 High).
   try {
     const worktreePath = await inv<string>("compute_worktree_path", {
       collabId,
@@ -102,20 +148,19 @@ export async function provisionWorktreeForSpawn(args: {
       baseRef: "origin/dev",
     });
     return {
+      outcome: "ok",
       cwd: worktree.path,
       worktree,
       provisioningMessage: worktree.baseFresh
         ? null
         : "worktree based on stale local origin/dev (offline fallback)",
-      errorStatus: null,
     };
   } catch (err) {
     const msg = String(err);
     return {
-      cwd: resolvedCwd,
-      worktree: null,
-      provisioningMessage: `worktree provisioning failed: ${msg}`,
-      errorStatus: `Spawn proceeding without worktree isolation. ${msg}`,
+      outcome: "blocked",
+      reason: msg,
+      errorStatus: `Cannot spawn collaborator agent: worktree provisioning failed (${msg}). Configure a non-main base via policy.json or run in a non-git directory.`,
     };
   }
 }
@@ -211,7 +256,7 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
           sessionId,
           tool,
           cwd: null,
-          cwdReady: false,
+          status: "pending",
           worktree: null,
           provisioningMessage: null,
         },
@@ -253,26 +298,67 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
           sessionId,
           toolId: tool.id,
         });
-        if (result.errorStatus) {
-          useCollaboratorStore
-            .getState()
-            .setStatus(result.errorStatus, collabId, "persistent");
-        }
+        if (!mountedRef.current) return;
 
-        if (mountedRef.current) {
-          setSpawns((prev) =>
-            prev.map((s) =>
-              s.sessionId === sessionId
-                ? {
-                    ...s,
-                    cwd: result.cwd,
-                    cwdReady: true,
-                    worktree: result.worktree,
-                    provisioningMessage: result.provisioningMessage,
-                  }
-                : s,
-            ),
-          );
+        // Tagged-union dispatch: each branch sets the spawn status
+        // explicitly. The `blocked` branch is the load-bearing safety
+        // path — placeholder stays without a PTY mount.
+        switch (result.outcome) {
+          case "ok":
+            setSpawns((prev) =>
+              prev.map((s) =>
+                s.sessionId === sessionId
+                  ? {
+                      ...s,
+                      cwd: result.cwd,
+                      status: "ready",
+                      worktree: result.worktree,
+                      provisioningMessage: result.provisioningMessage,
+                    }
+                  : s,
+              ),
+            );
+            break;
+          case "no-repo":
+            setSpawns((prev) =>
+              prev.map((s) =>
+                s.sessionId === sessionId
+                  ? {
+                      ...s,
+                      cwd: result.cwd,
+                      status: "ready",
+                      worktree: null,
+                      provisioningMessage: null,
+                    }
+                  : s,
+              ),
+            );
+            break;
+          case "blocked":
+            // FAIL-CLOSED: PTY does NOT mount. Placeholder shows the
+            // actionable error + Cancel button. User must dismiss the
+            // failed spawn and either fix the underlying issue
+            // (configure a non-main base in policy.json, create a `dev`
+            // branch, or spawn outside the repo) before launching again.
+            if (result.errorStatus) {
+              useCollaboratorStore
+                .getState()
+                .setStatus(result.errorStatus, collabId, "persistent");
+            }
+            setSpawns((prev) =>
+              prev.map((s) =>
+                s.sessionId === sessionId
+                  ? {
+                      ...s,
+                      cwd: null,
+                      status: "blocked",
+                      worktree: null,
+                      provisioningMessage: result.reason,
+                    }
+                  : s,
+              ),
+            );
+            break;
         }
       })();
     },
@@ -349,24 +435,74 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                     : `repeat(${Math.ceil(spawns.length / 2)}, 1fr)`,
               }}
             >
-              {spawns.map((spawn) =>
-                spawn.cwdReady ? (
-                  <AgentMiniTerminal
-                    key={spawn.sessionId}
-                    sessionId={spawn.sessionId}
-                    tool={spawn.tool}
-                    cwd={spawn.cwd}
-                    worktree={spawn.worktree}
-                    onClose={handleClose}
-                  />
-                ) : (
+              {spawns.map((spawn) => {
+                if (spawn.status === "ready") {
+                  return (
+                    <AgentMiniTerminal
+                      key={spawn.sessionId}
+                      sessionId={spawn.sessionId}
+                      tool={spawn.tool}
+                      cwd={spawn.cwd}
+                      worktree={spawn.worktree}
+                      onClose={handleClose}
+                    />
+                  );
+                }
+                // Blocked: fail-closed placeholder — provisioning failed
+                // inside a git repo. Show reason + Cancel; do NOT mount
+                // a PTY. (codex1 H1 / codex2 High / claude3 fail-closed.)
+                if (spawn.status === "blocked") {
+                  return (
+                    <div
+                      key={spawn.sessionId}
+                      className="flex flex-col h-full min-h-0 border rounded-md overflow-hidden border-red-500/40"
+                    >
+                      <div className="flex items-center gap-2 px-2 py-1 bg-surface-light border-b border-surface-lighter text-xs shrink-0">
+                        <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-red-400" />
+                        <span
+                          className={`font-bold ${spawn.tool.colorClass} truncate`}
+                        >
+                          {spawn.tool.label}
+                        </span>
+                        <span className="text-red-300 text-[10px] uppercase tracking-wider">
+                          spawn blocked
+                        </span>
+                        <div className="flex-1" />
+                        <button
+                          className="text-text-dim hover:text-red-400 transition-colors p-0.5 shrink-0"
+                          onClick={() => handleClose(spawn.sessionId)}
+                          title="Cancel this spawn"
+                          aria-label="Cancel blocked spawn"
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                      <div className="flex-1 flex flex-col items-center justify-center text-xs font-mono px-3 py-2 gap-2 text-center">
+                        <p className="text-red-300">
+                          Worktree provisioning failed — agent not started.
+                        </p>
+                        <p className="text-text-dim break-words max-h-24 overflow-y-auto">
+                          {spawn.provisioningMessage}
+                        </p>
+                        <p className="text-text-dim text-[11px]">
+                          Configure a non-main base, create a <code>dev</code>{" "}
+                          branch, or spawn outside this repo.
+                        </p>
+                      </div>
+                    </div>
+                  );
+                }
+                // Pending — provisioning in flight. Existing placeholder.
+                return (
                   <div
                     key={spawn.sessionId}
                     className="flex flex-col h-full min-h-0 border rounded-md overflow-hidden border-surface-lighter"
                   >
                     <div className="flex items-center gap-2 px-2 py-1 bg-surface-light border-b border-surface-lighter text-xs shrink-0">
                       <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-yellow-400 animate-pulse" />
-                      <span className={`font-bold ${spawn.tool.colorClass} truncate`}>
+                      <span
+                        className={`font-bold ${spawn.tool.colorClass} truncate`}
+                      >
                         {spawn.tool.label}
                       </span>
                     </div>
@@ -374,8 +510,8 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                       {spawn.provisioningMessage ?? "Starting..."}
                     </div>
                   </div>
-                ),
-              )}
+                );
+              })}
             </div>
           )}
         </div>

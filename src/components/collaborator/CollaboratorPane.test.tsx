@@ -270,7 +270,7 @@ describe("CollaboratorPane header — collab session id", () => {
 // ---------------------------------------------------------------------------
 
 describe("provisionWorktreeForSpawn (P1 frontend worktree integration)", () => {
-  it("returns a no-isolation result when cwd is null (no active terminal)", async () => {
+  it("returns no-repo when cwd is null (no active terminal)", async () => {
     const inv = vi.fn();
     const result = await Pane.provisionWorktreeForSpawn({
       resolvedCwd: null,
@@ -279,14 +279,15 @@ describe("provisionWorktreeForSpawn (P1 frontend worktree integration)", () => {
       toolId: "claude_code",
       invokeShim: inv as unknown as typeof invoke,
     });
-    expect(result.cwd).toBeNull();
-    expect(result.worktree).toBeNull();
-    expect(result.errorStatus).toBeNull();
+    expect(result.outcome).toBe("no-repo");
+    if (result.outcome === "no-repo") {
+      expect(result.cwd).toBeNull();
+    }
     // No git_* invokes should fire when there's no cwd to probe.
     expect(inv).not.toHaveBeenCalled();
   });
 
-  it("falls through (worktree=null) when cwd is not a git repo", async () => {
+  it("returns no-repo when cwd is not a git repo", async () => {
     const inv = vi.fn(async (cmd: string) => {
       if (cmd === "git_detect_repo") return null;
       return null;
@@ -298,10 +299,10 @@ describe("provisionWorktreeForSpawn (P1 frontend worktree integration)", () => {
       toolId: "claude_code",
       invokeShim: inv as unknown as typeof invoke,
     });
-    expect(result.cwd).toBe("/Users/me/non-git-dir");
-    expect(result.worktree).toBeNull();
-    expect(result.errorStatus).toBeNull();
-    // Only git_detect_repo should have been called — no compute/create.
+    expect(result.outcome).toBe("no-repo");
+    if (result.outcome === "no-repo") {
+      expect(result.cwd).toBe("/Users/me/non-git-dir");
+    }
     expect(inv).toHaveBeenCalledTimes(1);
     expect(inv).toHaveBeenCalledWith("git_detect_repo", {
       cwd: "/Users/me/non-git-dir",
@@ -340,10 +341,12 @@ describe("provisionWorktreeForSpawn (P1 frontend worktree integration)", () => {
       toolId: "claude_code",
       invokeShim: inv as unknown as typeof invoke,
     });
-    expect(result.worktree).toEqual(worktreeMeta);
-    expect(result.cwd).toBe(worktreeMeta.path); // PTY runs INSIDE the worktree
-    expect(result.errorStatus).toBeNull();
-    expect(result.provisioningMessage).toBeNull();
+    expect(result.outcome).toBe("ok");
+    if (result.outcome === "ok") {
+      expect(result.worktree).toEqual(worktreeMeta);
+      expect(result.cwd).toBe(worktreeMeta.path); // PTY runs INSIDE the worktree
+      expect(result.provisioningMessage).toBeNull();
+    }
     // Verify the create call uses origin/dev (D7 fail-fast invariant).
     expect(inv).toHaveBeenCalledWith(
       "git_worktree_create",
@@ -351,10 +354,13 @@ describe("provisionWorktreeForSpawn (P1 frontend worktree integration)", () => {
     );
   });
 
-  it("surfaces the missing-dev error and falls through to non-isolated spawn", async () => {
-    // The most common failure mode — repo lacks origin/dev. The backend
-    // raises a precise error string; the frontend must catch it, set the
-    // status line, and fall through (rather than blocking the spawn).
+  it("BLOCKS the spawn when cwd is in a git repo but provisioning fails (fail-closed L1)", async () => {
+    // Load-bearing regression: codex1 task-53 H1, codex2 task-55 High,
+    // claude3 task-56 — when in a git repo and provisioning fails, we
+    // MUST NOT fall through to a non-isolated spawn in the parent repo.
+    // P2's awaiting-approval gate keys on agent.worktree != null; if the
+    // PTY mounted in the parent checkout with worktree=null, an agent
+    // task would auto-complete past the approval gate.
     const inv = vi.fn(async (cmd: string) => {
       if (cmd === "git_detect_repo")
         return {
@@ -377,11 +383,48 @@ describe("provisionWorktreeForSpawn (P1 frontend worktree integration)", () => {
       toolId: "claude_code",
       invokeShim: inv as unknown as typeof invoke,
     });
-    expect(result.worktree).toBeNull();
-    expect(result.cwd).toBe("/Users/me/fresh-repo"); // PTY proceeds in repo cwd
-    expect(result.errorStatus).toBeTruthy();
-    expect(result.errorStatus).toContain("missing-dev");
-    expect(result.provisioningMessage).toContain("worktree provisioning failed");
+    expect(result.outcome).toBe("blocked");
+    if (result.outcome === "blocked") {
+      // The reason must include the backend's actionable error string so
+      // the user knows what to fix.
+      expect(result.reason).toContain("origin/dev");
+      expect(result.errorStatus).toBeTruthy();
+      // The error status must explicitly mention that the spawn was
+      // blocked, not "proceeding without isolation."
+      expect(result.errorStatus).not.toContain("proceeding");
+      expect(result.errorStatus).toContain("Cannot spawn");
+    }
+  });
+
+  it("BLOCKS the spawn when git_detect_repo fails (unknown != safe-to-spawn)", async () => {
+    // claude2 Concern 4 + codex2 Med-#3: probe failure is "we can't tell
+    // whether this is a git repo." Falling through to non-isolated
+    // spawn would be unsafe if the cwd does turn out to be in a repo.
+    // Block instead.
+    const inv = vi.fn(async (cmd: string) => {
+      if (cmd === "git_detect_repo") {
+        throw new Error("io error: permission denied");
+      }
+      return null;
+    });
+    // Suppress the expected console.warn from the helper.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await Pane.provisionWorktreeForSpawn({
+      resolvedCwd: "/some/dir",
+      collabId: "c",
+      sessionId: "s",
+      toolId: "claude_code",
+      invokeShim: inv as unknown as typeof invoke,
+    });
+    expect(result.outcome).toBe("blocked");
+    if (result.outcome === "blocked") {
+      expect(result.reason).toContain("permission denied");
+    }
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[collab/spawn] git_detect_repo failed:",
+      expect.any(Error),
+    );
+    warnSpy.mockRestore();
   });
 
   it("flags base_fresh=false (offline fallback) in the provisioning message", async () => {
@@ -413,8 +456,10 @@ describe("provisionWorktreeForSpawn (P1 frontend worktree integration)", () => {
       toolId: "claude_code",
       invokeShim: inv as unknown as typeof invoke,
     });
-    expect(result.worktree).toEqual(worktreeMeta);
-    expect(result.provisioningMessage).toContain("stale local origin/dev");
-    expect(result.errorStatus).toBeNull();
+    expect(result.outcome).toBe("ok");
+    if (result.outcome === "ok") {
+      expect(result.worktree).toEqual(worktreeMeta);
+      expect(result.provisioningMessage).toContain("stale local origin/dev");
+    }
   });
 });
