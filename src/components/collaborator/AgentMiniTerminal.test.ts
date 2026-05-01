@@ -8,7 +8,8 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 // We import the helper, not the component — avoids xterm.js/PTY plumbing.
-import { handlePtyExit } from "./AgentMiniTerminal";
+import { handlePtyExit, cleanupWorktreedAgent } from "./AgentMiniTerminal";
+import type { WorktreeMetadata } from "../../types/collaborator";
 import * as Store from "../../stores/collaboratorStore";
 import { useCollaboratorStore } from "../../stores/collaboratorStore";
 
@@ -276,6 +277,202 @@ describe("Phase 1.2 — handlePtyExit (task-31 implementation)", () => {
     await expect(handlerPromise).resolves.toBeUndefined();
     // Agents array remains empty (no zombie agent re-introduced).
     expect(useCollaboratorStore.getState().agents).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------
+  // cleanupWorktreedAgent (round-9 cleanup-helper extracted for testing,
+  // closes codex2 task-79 M2 test-gap + codex1 task-77 H1 ordering bug).
+  // -------------------------------------------------------------------
+
+  describe("cleanupWorktreedAgent (round-9)", () => {
+    const fakeWorktree: WorktreeMetadata = {
+      repoRoot: "/r",
+      path: "/wt",
+      branch: "agent/test-1",
+      baseRef: "origin/dev",
+      baseSha: "abc123",
+      baseFresh: true,
+      createdAtMs: 1,
+    };
+
+    it("ENFORCES kill_pty BEFORE git_diff_summary (codex1 task-77 H1 ordering)", async () => {
+      // The freeze-before-snapshot invariant LB1 enforces in the scanner
+      // must also hold here. A still-running PTY could mutate the
+      // worktree between the kill IPC and the diff if kill weren't
+      // awaited first; mis-classifying the worktree as clean would
+      // silently auto-remove pending work.
+      let nextCallIdx = 0;
+      let killAt: number | null = null;
+      let diffAt: number | null = null;
+      const inv = vi.fn(async (cmd: string) => {
+        const idx = nextCallIdx++;
+        if (cmd === "kill_pty") {
+          killAt = idx;
+          return null;
+        }
+        if (cmd === "git_diff_summary") {
+          diffAt = idx;
+          return {
+            hasChanges: false,
+            committed: [],
+            staged: [],
+            unstaged: [],
+            untracked: [],
+          };
+        }
+        if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+        return null;
+      });
+      const removeAgent = vi.fn();
+      const setAgentStatus = vi.fn();
+      await cleanupWorktreedAgent({
+        sessionId: "pty-1",
+        worktree: fakeWorktree,
+        storeOps: { removeAgent, setAgentStatus },
+        invokeShim: inv as unknown as typeof invoke,
+      });
+      expect(killAt).not.toBeNull();
+      expect(diffAt).not.toBeNull();
+      expect(killAt!).toBeLessThan(diffAt!);
+    });
+
+    it("hasChanges=false → removes worktree + removes agent record", async () => {
+      const inv = vi.fn(async (cmd: string) => {
+        if (cmd === "kill_pty") return null;
+        if (cmd === "git_diff_summary") {
+          return {
+            hasChanges: false,
+            committed: [],
+            staged: [],
+            unstaged: [],
+            untracked: [],
+          };
+        }
+        if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+        return null;
+      });
+      const removeAgent = vi.fn();
+      const setAgentStatus = vi.fn();
+      await cleanupWorktreedAgent({
+        sessionId: "pty-1",
+        worktree: fakeWorktree,
+        storeOps: { removeAgent, setAgentStatus },
+        invokeShim: inv as unknown as typeof invoke,
+      });
+      expect(inv).toHaveBeenCalledWith(
+        "git_worktree_remove",
+        expect.objectContaining({ worktreePath: fakeWorktree.path }),
+      );
+      expect(removeAgent).toHaveBeenCalledWith("pty-1");
+      expect(setAgentStatus).not.toHaveBeenCalled();
+    });
+
+    it("hasChanges=true → preserves worktree, sets agent status to exited", async () => {
+      const inv = vi.fn(async (cmd: string) => {
+        if (cmd === "kill_pty") return null;
+        if (cmd === "git_diff_summary") {
+          return {
+            hasChanges: true,
+            committed: ["src/foo.ts"],
+            staged: [],
+            unstaged: [],
+            untracked: [],
+          };
+        }
+        return null;
+      });
+      const removeAgent = vi.fn();
+      const setAgentStatus = vi.fn();
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await cleanupWorktreedAgent({
+        sessionId: "pty-1",
+        worktree: fakeWorktree,
+        storeOps: { removeAgent, setAgentStatus },
+        invokeShim: inv as unknown as typeof invoke,
+      });
+      // git_worktree_remove must NOT be called.
+      expect(inv).not.toHaveBeenCalledWith(
+        "git_worktree_remove",
+        expect.anything(),
+      );
+      // Record preserved with exited status.
+      expect(setAgentStatus).toHaveBeenCalledWith("pty-1", "exited");
+      expect(removeAgent).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("diff probe failure → preserves agent record defensively (unknown ≠ silent cleanup)", async () => {
+      const inv = vi.fn(async (cmd: string) => {
+        if (cmd === "kill_pty") return null;
+        if (cmd === "git_diff_summary")
+          throw new Error("worktree path missing");
+        return null;
+      });
+      const removeAgent = vi.fn();
+      const setAgentStatus = vi.fn();
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await cleanupWorktreedAgent({
+        sessionId: "pty-1",
+        worktree: fakeWorktree,
+        storeOps: { removeAgent, setAgentStatus },
+        invokeShim: inv as unknown as typeof invoke,
+      });
+      // Probe failure → preserve, don't auto-remove.
+      expect(setAgentStatus).toHaveBeenCalledWith("pty-1", "exited");
+      expect(removeAgent).not.toHaveBeenCalled();
+      // No git_worktree_remove invocation.
+      expect(inv).not.toHaveBeenCalledWith(
+        "git_worktree_remove",
+        expect.anything(),
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("worktree diff probe failed"),
+        expect.any(Error),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("kill_pty failure does NOT abort cleanup — diff still runs (a dead PTY is already frozen)", async () => {
+      const inv = vi.fn(async (cmd: string) => {
+        if (cmd === "kill_pty") throw new Error("PTY already exited");
+        if (cmd === "git_diff_summary") {
+          return {
+            hasChanges: false,
+            committed: [],
+            staged: [],
+            unstaged: [],
+            untracked: [],
+          };
+        }
+        if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+        return null;
+      });
+      const removeAgent = vi.fn();
+      const setAgentStatus = vi.fn();
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      await cleanupWorktreedAgent({
+        sessionId: "pty-1",
+        worktree: fakeWorktree,
+        storeOps: { removeAgent, setAgentStatus },
+        invokeShim: inv as unknown as typeof invoke,
+      });
+      // Diff still ran despite kill failure.
+      expect(inv).toHaveBeenCalledWith(
+        "git_diff_summary",
+        expect.anything(),
+      );
+      // Cleanup proceeded (worktree clean → fully removed).
+      expect(inv).toHaveBeenCalledWith(
+        "git_worktree_remove",
+        expect.anything(),
+      );
+      expect(removeAgent).toHaveBeenCalledWith("pty-1");
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("kill_pty failed"),
+        expect.any(Error),
+      );
+      warnSpy.mockRestore();
+    });
   });
 
   it("keeps mini terminals on the default renderer to avoid idle WebGL blank panes", () => {
