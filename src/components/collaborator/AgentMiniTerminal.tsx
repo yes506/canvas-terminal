@@ -719,31 +719,60 @@ export function AgentMiniTerminal({
       // Kill PTY
       invoke("kill_pty", { sessionId }).catch(() => {});
 
-      // P1 cleanup-on-close (codex2 task-55 Med-#2): if this agent was
-      // running in an isolated worktree, ask the backend whether the
-      // worktree is dirty. Clean → auto-remove (no work to lose). Dirty
-      // → preserve, log a warning. The full Discard/archive flow is P2.
+      // P1 cleanup-on-close (codex2 task-55 Med-#2 + task-59 High-#2,
+      // claude2 task-58 Concern 1, codex1 task-57 C1): if this agent was
+      // running in an isolated worktree, decide whether to auto-remove
+      // based on the FULL diff summary (committed + staged + unstaged +
+      // untracked) — not just `git_worktree_status` (which is uncommitted-
+      // only). A worktree where the agent committed all its work cleanly
+      // would otherwise have status.clean = true and we'd auto-remove,
+      // destroying the diff context P2's Approve UI will need. The fix is
+      // to gate auto-remove on `git_diff_summary.has_changes`.
+      //
       // Cleanup is fire-and-forget — don't block the unmount on it.
       if (worktree) {
         void (async () => {
           try {
-            const status = await invoke<{
-              clean: boolean;
-              modified: string[];
+            const diff = await invoke<{
+              hasChanges: boolean;
+              committed: string[];
               staged: string[];
-              untrackedNonIgnored: string[];
-            }>("git_worktree_status", { worktreePath: worktree.path });
-            if (status.clean) {
-              await invoke("git_worktree_remove", {
+              unstaged: string[];
+              untracked: string[];
+            }>("git_diff_summary", {
+              worktreePath: worktree.path,
+              baseSha: worktree.baseSha,
+            });
+            if (!diff.hasChanges) {
+              // Truly nothing to preserve — committed/staged/unstaged/
+              // untracked all empty. Safe to auto-remove.
+              const outcome = await invoke<
+                | { kind: "fullyRemoved" }
+                | {
+                    kind: "worktreeRemovedBranchPreserved";
+                    branch: string;
+                    reason: string;
+                  }
+              >("git_worktree_remove", {
                 repoRoot: worktree.repoRoot,
                 worktreePath: worktree.path,
                 branchName: worktree.branch,
               });
+              // codex2 task-55 Med + claude2 task-58 Concern 3: surface the
+              // structured outcome instead of silently dropping it. The
+              // backend returns this variant specifically so partial
+              // cleanup is visible.
+              if (outcome.kind === "worktreeRemovedBranchPreserved") {
+                console.warn(
+                  `[collab/cleanup] worktree removed but branch '${outcome.branch}' preserved: ${outcome.reason}. ` +
+                    "P2 startup janitor / Discard flow will reclaim it.",
+                );
+              }
             } else {
               console.warn(
-                `[collab/cleanup] preserving dirty worktree ${worktree.path} ` +
-                  `(modified=${status.modified.length}, staged=${status.staged.length}, ` +
-                  `untracked=${status.untrackedNonIgnored.length}). ` +
+                `[collab/cleanup] preserving worktree ${worktree.path} with unmerged work ` +
+                  `(committed=${diff.committed.length}, staged=${diff.staged.length}, ` +
+                  `unstaged=${diff.unstaged.length}, untracked=${diff.untracked.length}). ` +
                   "P2 startup janitor / Discard flow will handle.",
               );
             }

@@ -160,7 +160,10 @@ export async function provisionWorktreeForSpawn(args: {
     return {
       outcome: "blocked",
       reason: msg,
-      errorStatus: `Cannot spawn collaborator agent: worktree provisioning failed (${msg}). Configure a non-main base via policy.json or run in a non-git directory.`,
+      // claude3 task-60 minor wording fix: don't reference policy.json
+      // because the D7 modal that consumes it isn't shipped in v1.
+      // Point the user at concrete actions they can take right now.
+      errorStatus: `Cannot spawn collaborator agent: worktree provisioning failed (${msg}). Create a \`dev\` branch in this repo (\`git branch dev\`) or spawn outside this repo.`,
     };
   }
 }
