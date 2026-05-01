@@ -379,6 +379,12 @@ export function _resetWriteStateForTests(): void {
   abortedSessions.clear();
   firstSendInflight.clear();
   renamePendingByAgent.clear();
+  // Round-18 codex2 task-110 hygiene note: also reset LB3 module-level
+  // state so persistence + hydration tests don't cross-couple. The
+  // assignments are safe even though the vars are declared later in
+  // the file — function bodies don't read at parse time.
+  branchProtectionAcksWriteChain = Promise.resolve();
+  sessionClears.clear();
 }
 
 /**
@@ -803,6 +809,21 @@ async function readBranchProtectionAcks(): Promise<
  */
 let branchProtectionAcksWriteChain: Promise<void> = Promise.resolve();
 
+/**
+ * Round-18 codex1 task-93 round5 (BLOCKING): explicit-clear tracker
+ * for the symmetric counterpart of round-16's hydration race. When
+ * the user runs `/branch-protection clear-ack` BEFORE hydration's
+ * read resolves, the merge `{...onDisk, ...inMemory}` would silently
+ * resurrect the cleared key (in-memory is empty for that repo, but
+ * onDisk still has it). The merge has no signal that the user EXPLICITLY
+ * cleared the entry — only that in-memory doesn't currently contain it.
+ *
+ * Solution: track every repoRoot the user has explicitly cleared this
+ * boot. Hydration filters those keys out of `onDisk` before merging.
+ * Cleared after `_resetWriteStateForTests` for test isolation.
+ */
+const sessionClears = new Set<string>();
+
 function persistBranchProtectionAcks(): void {
   branchProtectionAcksWriteChain = branchProtectionAcksWriteChain
     .catch(() => {})
@@ -844,29 +865,62 @@ function persistBranchProtectionAcks(): void {
  * promise-chain serialization in `persistBranchProtectionAcks`
  * guarantees this hydration write lands AFTER any user-triggered
  * writes, so the final disk state correctly reflects the union.
+ *
+ * Round-18 (codex1 round5 BLOCKING + claude2 task-109 + claude3
+ * task-111 O3): symmetric clear-during-hydration race. Filter onDisk
+ * against sessionClears BEFORE merging — otherwise an explicit
+ * clear-ack made before hydration resolves would be silently
+ * resurrected when onDisk's stale entry is merged into in-memory.
+ *
+ * Round-18 (claude3 task-111 O1): compute the merge + diff OUTSIDE
+ * the setState updater (Zustand expects pure-function updaters; the
+ * prior in-updater closure mutation worked but was fragile against
+ * future Zustand changes).
  */
 export async function hydrateBranchProtectionAcks(): Promise<void> {
-  const onDisk = await readBranchProtectionAcks();
+  const onDiskRaw = await readBranchProtectionAcks();
+  // Round-18 codex1: drop any onDisk keys the user explicitly cleared
+  // this boot. Without this filter, a clear-ack issued before the
+  // hydration read resolves would be silently undone when the merge
+  // re-introduces the disk's pre-clear state.
+  const onDisk: typeof onDiskRaw = {};
+  for (const [repo, info] of Object.entries(onDiskRaw)) {
+    if (!sessionClears.has(repo)) onDisk[repo] = info;
+  }
+  // Round-18 claude3 O1: compute merge + diff outside setState. Pure
+  // updater stays a single read (returning the new state).
+  const currentInMemory = useCollaboratorStore.getState().branchProtectionAcks;
+  const merged: typeof currentInMemory = {
+    ...onDisk,
+    // In-memory entries (made between mount and hydration resolution)
+    // override disk entries. The user explicitly chose them this
+    // session and they haven't been clobbered yet.
+    ...currentInMemory,
+  };
+  // Detect whether the merge introduced anything not on disk yet.
+  // If so, we need to flush the merged state to disk to recover from
+  // the hydration-window data-loss scenario (claude2 task-106).
+  // Also flush if sessionClears removed entries that disk still had —
+  // disk needs to converge with the user's explicit clear.
   let mergedDifferedFromDisk = false;
-  useCollaboratorStore.setState((s) => {
-    const merged: typeof s.branchProtectionAcks = {
-      ...onDisk,
-      // In-memory entries (made between mount and hydration resolution)
-      // override disk entries. The user explicitly chose them this
-      // session and they haven't been clobbered yet.
-      ...s.branchProtectionAcks,
-    };
-    // Detect whether the merge introduced anything not on disk yet.
-    // If so, we need to flush the merged state to disk to recover from
-    // the hydration-window data-loss scenario (claude2 task-106).
-    for (const repo of Object.keys(merged)) {
-      if (!Object.prototype.hasOwnProperty.call(onDisk, repo)) {
+  for (const repo of Object.keys(merged)) {
+    if (!Object.prototype.hasOwnProperty.call(onDiskRaw, repo)) {
+      mergedDifferedFromDisk = true;
+      break;
+    }
+  }
+  if (!mergedDifferedFromDisk) {
+    // Check the symmetric direction: did sessionClears strip a key that
+    // onDisk still had? If yes, disk is stale (still has the cleared
+    // entry) and needs a write to converge.
+    for (const repo of Object.keys(onDiskRaw)) {
+      if (sessionClears.has(repo)) {
         mergedDifferedFromDisk = true;
         break;
       }
     }
-    return { branchProtectionAcks: merged };
-  });
+  }
+  useCollaboratorStore.setState({ branchProtectionAcks: merged });
   if (mergedDifferedFromDisk) {
     persistBranchProtectionAcks();
   }
@@ -1863,9 +1917,26 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       const { [repoRoot]: _removed, ...rest } = s.branchProtectionAcks;
       return { branchProtectionAcks: rest };
     });
+    // Round-18 codex1 round5 BLOCKING: record the clear in the session-
+    // level set EVEN WHEN didMutate is false. The "no in-memory entry
+    // to clear" path can fire when the user clears a repo whose ack
+    // exists on disk but hasn't been hydrated yet — without this
+    // record, the in-flight hydration would silently resurrect the
+    // ack from disk into the merge result. Recording the explicit
+    // clear lets hydration filter the cleared key out of onDisk and
+    // hydration's symmetric-diff write will then converge disk.
+    sessionClears.add(repoRoot);
     if (didMutate) {
+      // Persist the in-memory mutation. Hydration may also fire a
+      // write later if its sessionClears filter removed onDisk keys;
+      // the chain serialization keeps both writes correct.
       persistBranchProtectionAcks();
     }
+    // No didMutate-false write here: when the entry wasn't in memory,
+    // either (a) it wasn't on disk either (true no-op — no write
+    // needed), or (b) it WAS on disk but hydration hasn't applied yet
+    // — in case (b), hydration's symmetric-diff check sees
+    // sessionClears.has(repo) and fires a converging write itself.
   },
 
   flushPendingMessages: async (sessionId) => {

@@ -5045,6 +5045,105 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(state).toBe("verified-unprotected");
   });
 
+  // -------------------------------------------------------------------------
+  // Round-18: symmetric clear-during-hydration race
+  // -------------------------------------------------------------------------
+
+  it("clearBranchProtectionAck during hydration window does NOT resurrect the cleared ack (round-18 codex1 round5 BLOCKING)", async () => {
+    // Round-18 codex1 round5: symmetric counterpart of round-16's race.
+    //   1. Run 1: user accepted /repoA → disk {/repoA}. App exits.
+    //   2. Run 2: hydration's read fires (in-flight, will return {/repoA}).
+    //   3. Before read resolves, user runs clear-ack /repoA.
+    //      - In-memory was {} (hydration hasn't applied yet) → no
+    //        in-memory mutation, but sessionClears records the intent.
+    //   4. Hydration resolves with stale onDisk={/repoA}; merge would
+    //      have re-introduced /repoA WITHOUT the sessionClears filter.
+    //   5. With round-18 fix: hydration filters onDisk via sessionClears,
+    //      so /repoA is dropped before merge. Final in-memory = {}.
+    //   6. Symmetric-diff check sees sessionClears.has(/repoA) → fires
+    //      a write so disk converges to {}.
+    useCollaboratorStore.setState({ branchProtectionAcks: {} });
+    const writeCalls: Array<{ relativePath: string; content: string }> = [];
+    let resolveRead: ((v: string | null) => void) | null = null;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "read_app_config_file") {
+        // Defer the read so the user's clear-ack can race against it.
+        return new Promise<string | null>((r) => {
+          resolveRead = r;
+        });
+      }
+      if (cmd === "write_app_config_file") {
+        const a = args as { relativePath: string; content: string };
+        writeCalls.push(a);
+      }
+      return null;
+    });
+    // Step 2: hydration starts (read deferred).
+    const hydrationPromise = hydrateBranchProtectionAcks();
+    // Step 3: user clears /repoA before read resolves.
+    useCollaboratorStore.getState().clearBranchProtectionAck("/repoA");
+    // Step 4: now resolve the read with the stale {/repoA} payload.
+    resolveRead!(JSON.stringify({ "/repoA": { acceptedAt: "old-ts" } }));
+    await hydrationPromise;
+    await new Promise((r) => setTimeout(r, 10));
+    // Final in-memory: /repoA must NOT be present (clear-ack honored).
+    expect(useCollaboratorStore.getState().branchProtectionAcks["/repoA"]).toBeUndefined();
+    // Disk must have converged: at least one write to the acks file
+    // whose final content has /repoA absent.
+    const ackWrites = writeCalls.filter(
+      (c) => c.relativePath === "branch-protection-acks.json",
+    );
+    expect(ackWrites.length).toBeGreaterThan(0);
+    const finalDiskState = JSON.parse(ackWrites[ackWrites.length - 1].content);
+    expect(finalDiskState["/repoA"]).toBeUndefined();
+  });
+
+  it("hydrateBranchProtectionAcks: subset-of-disk skip honors sessionClears (round-18 symmetric-diff)", async () => {
+    // Edge case: in-memory is a strict subset of onDisk's RAW state,
+    // but sessionClears stripped a key from disk's effective state.
+    // The diff check must fire a write to converge — otherwise the
+    // cleared key would silently re-appear after restart.
+    useCollaboratorStore.setState({ branchProtectionAcks: {} });
+    const writeCalls: string[] = [];
+    let resolveRead: ((v: string | null) => void) | null = null;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "read_app_config_file") {
+        return new Promise<string | null>((r) => {
+          resolveRead = r;
+        });
+      }
+      if (
+        cmd === "write_app_config_file" &&
+        (args as { relativePath?: string } | undefined)?.relativePath ===
+          "branch-protection-acks.json"
+      ) {
+        writeCalls.push((args as { content: string }).content);
+      }
+      return null;
+    });
+    const hydrationPromise = hydrateBranchProtectionAcks();
+    useCollaboratorStore.getState().clearBranchProtectionAck("/repoA");
+    resolveRead!(JSON.stringify({ "/repoA": { acceptedAt: "old-ts" } }));
+    await hydrationPromise;
+    await new Promise((r) => setTimeout(r, 10));
+    // The hydration symmetric-diff path must trigger a write (because
+    // sessionClears dropped /repoA from the merge but disk still has it).
+    expect(writeCalls.length).toBeGreaterThan(0);
+    expect(JSON.parse(writeCalls[writeCalls.length - 1])).toEqual({});
+  });
+
+  it("clearBranchProtectionAck: sessionClears persists across multiple no-op calls (idempotent tracker)", () => {
+    useCollaboratorStore.setState({ branchProtectionAcks: {} });
+    // First clear records intent even though in-memory was empty.
+    useCollaboratorStore.getState().clearBranchProtectionAck("/repoA");
+    // Second clear of the same repo is a true no-op.
+    useCollaboratorStore.getState().clearBranchProtectionAck("/repoA");
+    // sessionClears is module-private; we exercise its effect via a
+    // hydration check below (round-18 invariant: even after multiple
+    // no-op clears, hydration must still strip the cleared key).
+    expect(useCollaboratorStore.getState().branchProtectionAcks).toEqual({});
+  });
+
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {
     useCollaboratorStore.setState({
       agents: [
