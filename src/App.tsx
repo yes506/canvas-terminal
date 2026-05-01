@@ -6,6 +6,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { useCanvasIntegration } from "./components/canvas/CanvasIntegration";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useCanvasStore } from "./stores/canvasStore";
+import { hydrateBranchProtectionAcks } from "./stores/collaboratorStore";
 import { checkForUpdates } from "./lib/updater";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -21,6 +22,14 @@ export default function App() {
     getVersion().then((version) => {
       getCurrentWindow().setTitle(`Canvas Terminal v${version}`);
     });
+  }, []);
+
+  // LB3 round-15 polish: hydrate the branch-protection ack map from
+  // disk on app start so an explicit accept-limited survives restarts.
+  // Best-effort — failures degrade silently to empty, which just
+  // re-prompts the user on the next /task approve.
+  useEffect(() => {
+    hydrateBranchProtectionAcks().catch(() => {});
   }, []);
 
   // Auto-check for updates ~3s after mount so we don't compete with terminal

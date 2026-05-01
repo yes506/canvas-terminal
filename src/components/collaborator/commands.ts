@@ -262,6 +262,17 @@ function classifyProtectionBody(stdoutBody: string): ProtectionClassification {
   ) {
     return "meaningful";
   }
+  // Direct-push-blocking field #3 (round-15 P5 polish, claude3 O2):
+  // `lock_branch.enabled === true` locks the branch entirely — no
+  // pushes by anyone, including via PR. Rare in practice but valid
+  // protection when present.
+  if (
+    obj.lock_branch != null &&
+    typeof obj.lock_branch === "object" &&
+    (obj.lock_branch as Record<string, unknown>).enabled === true
+  ) {
+    return "meaningful";
+  }
   // Round-14: required_status_checks alone is NOT enough — see the
   // header comment. Falls through to weak-or-empty even when
   // required_status_checks is non-null.
@@ -543,7 +554,7 @@ export function getHelpText(): string {
     "       /task <id> assign @<agent>  /task <id> done [notes]",
     "       /task <id> approve [--push] [-- <message>]   (worktree-backed only)",
     "       /task <id> discard [<reason>]                (worktree-backed only)",
-    "Protection: /branch-protection [status|check|accept-limited [-- <note>]|list-acks]",
+    "Protection: /branch-protection [status|check|accept-limited [-- <note>]|clear-ack [<repo>]|list-acks]",
     "Canvas: /canvas-export [msg]  /canvas-export @agent [msg]  /canvas-import @agent",
     "Memory: /context <text>  /memory list|read|delete|clear",
     "Agents: @claude @codex @gemini @copilot  Indexed: @claude1 @claude2  Or by nickname: @bug-hunter",
@@ -1344,6 +1355,10 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
       //                                        limited guarantee for
       //                                        the active session's repo
       //   /branch-protection list-acks       — show acked repos
+      //   /branch-protection clear-ack [<repoRoot>]
+      //                                      — undo a previous ack
+      //                                        (round-15 polish for
+      //                                        post-protection-enable)
       try {
         if (!collabSessionId) {
           status("Branch-protection commands require a collaborator session.");
@@ -1475,8 +1490,39 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           break;
         }
 
+        // /branch-protection clear-ack [<repoRoot>]
+        // Round-15 polish (claude3 O3): undo a previous accept-limited
+        // for a repo, e.g., after the user has enabled real branch
+        // protection on GitHub. Without this, the persisted ack would
+        // bypass the wizard forever. With no arg, clears the active
+        // session's repo (same fallback as accept-limited).
+        const clearMatch = sub.match(/^clear-ack(?:\s+(.+))?$/);
+        if (clearMatch) {
+          const explicitRepo = clearMatch[1]?.trim();
+          const target = explicitRepo || activeRepoRoot;
+          if (!target) {
+            status(
+              "No worktree-backed agent in this session and no explicit " +
+                "<repoRoot> argument — cannot identify a repo to clear. " +
+                "Usage: /branch-protection clear-ack [<repoRoot>]",
+            );
+            break;
+          }
+          if (!store.branchProtectionAcks[target]) {
+            status(`No limited-guarantee ack to clear for ${target}.`);
+            break;
+          }
+          store.clearBranchProtectionAck(target);
+          status(
+            `Cleared limited-guarantee ack for ${target}. Next /task approve ` +
+              "will re-run the branch-protection wizard.",
+          );
+          break;
+        }
+
         status(
-          "Usage: /branch-protection [status] | check | accept-limited [-- <note>] | list-acks",
+          "Usage: /branch-protection [status] | check | accept-limited [-- <note>] " +
+            "| clear-ack [<repoRoot>] | list-acks",
         );
       } catch (err) {
         status(`Branch-protection error: ${err}`);

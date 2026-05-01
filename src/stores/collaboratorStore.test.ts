@@ -10,6 +10,7 @@ import {
   RECENT_OUTCOME_TTL_MS,
   STATUS_TTL_MS,
   slugify,
+  hydrateBranchProtectionAcks,
 } from "./collaboratorStore";
 import type { CollabTask, SpawnedAgent } from "../types/collaborator";
 import { parseInput, resolveAgent, executeCommand, getHelpText, checkBranchProtection } from "../components/collaborator/commands";
@@ -4641,6 +4642,180 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       fakeInvoke as unknown as typeof invoke,
     );
     expect(state).toBe("unknown");
+  });
+
+  // -------------------------------------------------------------------------
+  // Round-15 polish: persistence + clear-ack + lock_branch support
+  // -------------------------------------------------------------------------
+
+  it("checkBranchProtection: 200 with lock_branch.enabled true → verified-protected (round-15 claude3 O2)", async () => {
+    // GitHub's `lock_branch.enabled === true` field locks the branch
+    // entirely (no pushes by anyone, even via PR). Counts as meaningful
+    // protection per claude3's deferred polish from task-99.
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_status_checks":null,"restrictions":null,"required_pull_request_reviews":null,"lock_branch":{"enabled":true}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-protected");
+  });
+
+  it("checkBranchProtection: 200 with lock_branch.enabled false → verified-unprotected (round-15)", async () => {
+    // lock_branch present but disabled is the default GitHub serves
+    // when no rule is configured. Don't classify as meaningful.
+    const fakeInvoke = vi.fn(async (cmd: string) => {
+      if (cmd === "git_get_remote_url") return "https://github.com/owner/repo.git";
+      if (cmd === "run_gh_api") {
+        return {
+          exitCode: 0,
+          stdout: '{"required_status_checks":null,"restrictions":null,"required_pull_request_reviews":null,"lock_branch":{"enabled":false}}',
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected IPC: ${cmd}`);
+    });
+    const state = await checkBranchProtection(
+      "/r",
+      fakeInvoke as unknown as typeof invoke,
+    );
+    expect(state).toBe("verified-unprotected");
+  });
+
+  it("acceptBranchProtectionLimited: persists the ack map to disk via write_memory_file (round-15)", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    const writeCalls: Array<{ relativePath: string; content: string }> = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "write_memory_file") {
+        writeCalls.push(args as { relativePath: string; content: string });
+      }
+      return null;
+    });
+    useCollaboratorStore.getState().acceptBranchProtectionLimited("/r", "test note");
+    // Allow microtask queue to drain (the persistence is fire-and-forget).
+    await new Promise((r) => setTimeout(r, 5));
+    const persistCall = writeCalls.find(
+      (c) => c.relativePath === "branch-protection-acks.json",
+    );
+    expect(persistCall).toBeDefined();
+    const persisted = JSON.parse(persistCall!.content);
+    expect(persisted["/r"]).toBeDefined();
+    expect(persisted["/r"].note).toBe("test note");
+  });
+
+  it("clearBranchProtectionAck: removes ack and persists empty map", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: true }); // pre-acked at /r
+    const writeCalls: Array<{ relativePath: string; content: string }> = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "write_memory_file") {
+        writeCalls.push(args as { relativePath: string; content: string });
+      }
+      return null;
+    });
+    useCollaboratorStore.getState().clearBranchProtectionAck("/r");
+    await new Promise((r) => setTimeout(r, 5));
+    expect(useCollaboratorStore.getState().branchProtectionAcks["/r"]).toBeUndefined();
+    const persistCall = writeCalls.find(
+      (c) => c.relativePath === "branch-protection-acks.json",
+    );
+    expect(persistCall).toBeDefined();
+    const persisted = JSON.parse(persistCall!.content);
+    expect(persisted["/r"]).toBeUndefined();
+  });
+
+  it("clearBranchProtectionAck: no-op when ack doesn't exist (no persist IPC)", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    const ackPersistCalls: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      // Filter to ack-persistence writes only — task-list and conversation
+      // log writes are unrelated.
+      if (
+        cmd === "write_memory_file" &&
+        (args as { relativePath?: string } | undefined)?.relativePath ===
+          "branch-protection-acks.json"
+      ) {
+        ackPersistCalls.push(cmd);
+      }
+      return null;
+    });
+    useCollaboratorStore.getState().clearBranchProtectionAck("/r");
+    await new Promise((r) => setTimeout(r, 5));
+    // No-op: no ack-file persist write should have fired.
+    expect(ackPersistCalls).toHaveLength(0);
+  });
+
+  it("/branch-protection clear-ack: removes ack for active session's repo", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: true });
+    vi.mocked(invoke).mockImplementation(async () => null);
+    await executeCommand(parseInput("/branch-protection clear-ack"), D14_SESSION);
+    expect(useCollaboratorStore.getState().branchProtectionAcks["/r"]).toBeUndefined();
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("Cleared limited-guarantee ack");
+  });
+
+  it("/branch-protection clear-ack <repoRoot>: clears explicit repo (multi-repo support)", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: true });
+    // Add a second ack for a different repo.
+    useCollaboratorStore.getState().acceptBranchProtectionLimited("/r-other", "other repo");
+    vi.mocked(invoke).mockImplementation(async () => null);
+    await executeCommand(
+      parseInput("/branch-protection clear-ack /r-other"),
+      D14_SESSION,
+    );
+    const acks = useCollaboratorStore.getState().branchProtectionAcks;
+    expect(acks["/r-other"]).toBeUndefined();
+    // Active session's ack is unaffected.
+    expect(acks["/r"]).toBeDefined();
+  });
+
+  it("/branch-protection clear-ack: surfaces no-op message when nothing to clear", async () => {
+    setupAwaitingApprovalTask({ hasResidue: false, ackProtection: false });
+    await executeCommand(parseInput("/branch-protection clear-ack"), D14_SESSION);
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("No limited-guarantee ack to clear");
+  });
+
+  it("hydrateBranchProtectionAcks: loads persisted map from disk on startup", async () => {
+    useCollaboratorStore.setState({ branchProtectionAcks: {} });
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "read_memory_file") {
+        if (
+          (args as { relativePath?: string } | undefined)?.relativePath ===
+          "branch-protection-acks.json"
+        ) {
+          return JSON.stringify({
+            "/persisted-repo": { acceptedAt: "2024-01-01T00:00:00.000Z", note: "persisted" },
+          });
+        }
+      }
+      return null;
+    });
+    await hydrateBranchProtectionAcks();
+    const acks = useCollaboratorStore.getState().branchProtectionAcks;
+    expect(acks["/persisted-repo"]).toBeDefined();
+    expect(acks["/persisted-repo"].note).toBe("persisted");
+  });
+
+  it("hydrateBranchProtectionAcks: degrades to empty when file missing or unparseable", async () => {
+    useCollaboratorStore.setState({
+      branchProtectionAcks: { "/lingering-old": { acceptedAt: "x" } },
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "read_memory_file") return null; // file missing
+      return null;
+    });
+    await hydrateBranchProtectionAcks();
+    // Empty disk replaces in-memory state — disk is the source of truth.
+    expect(useCollaboratorStore.getState().branchProtectionAcks).toEqual({});
   });
 
   it("releaseAgentWorktree: clears worktree on the matching session/handle, no-ops elsewhere", () => {

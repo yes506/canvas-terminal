@@ -753,6 +753,60 @@ function bumpAssignedAt(
   useCollaboratorStore.getState().persistTasks(forSession);
 }
 
+/**
+ * Round-15 polish: file-backed persistence for LB3 ack state. Restarts
+ * shouldn't re-prompt the user for a repo they already explicitly acked.
+ * Storage shape: a single JSON file `branch-protection-acks.json` in the
+ * shared memory dir, mapping `repoRoot → {acceptedAt, note?}`. Best-
+ * effort: read failures default to empty map (the user re-acks once,
+ * which is acceptable degradation), write failures only log.
+ */
+const BRANCH_PROTECTION_ACKS_PATH = "branch-protection-acks.json";
+
+async function readBranchProtectionAcks(): Promise<
+  Record<string, { acceptedAt: string; note?: string }>
+> {
+  try {
+    const content = await invoke<string | null>("read_memory_file", {
+      relativePath: BRANCH_PROTECTION_ACKS_PATH,
+    });
+    if (!content) return {};
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed as Record<string, { acceptedAt: string; note?: string }>;
+  } catch {
+    // File missing / unparseable / IPC error — degrade to empty.
+    return {};
+  }
+}
+
+async function writeBranchProtectionAcks(
+  acks: Record<string, { acceptedAt: string; note?: string }>,
+): Promise<void> {
+  try {
+    await invoke("write_memory_file", {
+      relativePath: BRANCH_PROTECTION_ACKS_PATH,
+      content: JSON.stringify(acks, null, 2),
+    });
+  } catch (err) {
+    // Best-effort; don't block UI on persistence failure.
+    console.warn("[collab/store] failed to persist branch-protection-acks:", err);
+  }
+}
+
+/**
+ * Hydrate `branchProtectionAcks` from disk on store startup. Idempotent:
+ * if already populated (e.g., the in-memory state was written before
+ * hydration completed), the on-disk state takes precedence — that's
+ * the source of truth across restarts. Test code that wants in-memory-
+ * only behavior can skip this by calling `setState({ branchProtectionAcks: {} })`
+ * after construction.
+ */
+export async function hydrateBranchProtectionAcks(): Promise<void> {
+  const acks = await readBranchProtectionAcks();
+  useCollaboratorStore.setState({ branchProtectionAcks: acks });
+}
+
 function ensureSessionMemoryFiles(collabSessionId: string): void {
   const conversationPath = `conversation-${collabSessionId}.md`;
   invoke<string | null>("read_memory_file", {
@@ -921,9 +975,20 @@ interface CollaboratorState {
    * will skip the protection check and prefix `[limited-guarantee]`
    * in their status output.
    *
+   * Round-15 polish: also writes the updated map to disk so the ack
+   * survives app restarts.
+   *
    * No-op when the same repoRoot is already acked (idempotent).
    */
   acceptBranchProtectionLimited: (repoRoot: string, note?: string) => void;
+  /**
+   * LB3 round-15: clear an explicit limited-guarantee ack for a repo.
+   * Used after the user enables real branch protection on GitHub —
+   * subsequent Approves can re-run the wizard and verify the upgrade.
+   *
+   * No-op when the repo isn't acked. Persists the change to disk.
+   */
+  clearBranchProtectionAck: (repoRoot: string) => void;
   /** Flush queued messages for an agent that has become ready. */
   flushPendingMessages: (sessionId: string) => Promise<void>;
   killAllAgents: (forSession?: string) => Promise<void>;
@@ -1702,10 +1767,12 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   },
 
   acceptBranchProtectionLimited: (repoRoot, note) => {
+    let didMutate = false;
     set((s) => {
       // Idempotent: if already acked, leave the original timestamp/note
       // alone (don't shadow the historical first-acceptance metadata).
       if (s.branchProtectionAcks[repoRoot]) return {};
+      didMutate = true;
       return {
         branchProtectionAcks: {
           ...s.branchProtectionAcks,
@@ -1716,6 +1783,24 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         },
       };
     });
+    // Round-15: persist to disk on actual mutation. Fire-and-forget;
+    // best-effort write — failure surfaces as a console.warn only.
+    if (didMutate) {
+      void writeBranchProtectionAcks(get().branchProtectionAcks);
+    }
+  },
+
+  clearBranchProtectionAck: (repoRoot) => {
+    let didMutate = false;
+    set((s) => {
+      if (!s.branchProtectionAcks[repoRoot]) return {};
+      didMutate = true;
+      const { [repoRoot]: _removed, ...rest } = s.branchProtectionAcks;
+      return { branchProtectionAcks: rest };
+    });
+    if (didMutate) {
+      void writeBranchProtectionAcks(get().branchProtectionAcks);
+    }
   },
 
   flushPendingMessages: async (sessionId) => {
