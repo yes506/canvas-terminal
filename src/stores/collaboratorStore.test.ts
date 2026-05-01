@@ -3886,11 +3886,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(status).toContain("Approve only fires for");
   });
 
-  it("/task approve: hookFailed → task transitions to merge-conflict, worktree preserved", async () => {
+  it("/task approve: hookFailed → task transitions to merge-conflict, worktree preserved (round-12 O5: 'pre-unknown' wording fix)", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "git_merge_worktree") {
-        throw { kind: "hookFailed", stage: "commit", stderr: "pre-commit hook rejected" };
+        // Round-12 claude3 O5: backend's classifier always sets
+        // stage: "unknown" for HookFailed (the stage isn't recoverable
+        // from stderr alone). The rendered status MUST fall back to
+        // "pre-commit" (the dominant case), NOT "pre-unknown".
+        throw { kind: "hookFailed", stage: "unknown", stderr: "pre-commit hook rejected" };
       }
       return null;
     });
@@ -3910,6 +3914,10 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     // Lease still held.
     const agent = useCollaboratorStore.getState().agents[0];
     expect(agent.worktree).not.toBeNull();
+    // Round-12 O5: status must NOT contain the awkward "pre-unknown".
+    const statusMsg = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(statusMsg).toContain("pre-commit hook failed");
+    expect(statusMsg).not.toContain("pre-unknown");
   });
 
   it("/task approve: mergeConflict → task transitions to merge-conflict with file list in status", async () => {
@@ -3996,6 +4004,79 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(agent.worktree).toBeNull();
   });
 
+  it("/task approve: after approval-commit succeeds, retry skips approval-commit and reaches merge (round-12 codex1+codex2+claude2 H1)", async () => {
+    // Round-12 H1 (load-bearing): when approval-commit succeeds but the
+    // subsequent merge fails (e.g., targetBranchStale), the retry must
+    // skip the now-redundant approval-commit. Otherwise, the stale
+    // pendingMerge.diffSummary still says "residue exists" → retry
+    // calls git_create_approval_commit against a clean tree → backend's
+    // EmptyCommit short-circuit fires → retry never reaches merge.
+    // Strands the task in approval limbo.
+    const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
+
+    // First Approve attempt: approval-commit succeeds, merge fails.
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_create_approval_commit") {
+        return { commitSha: "ac1", stagedCount: 1 };
+      }
+      if (cmd === "git_merge_worktree") {
+        throw { kind: "targetBranchStale", target: "dev", message: "non-fast-forward" };
+      }
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+
+    // After first attempt: approval-commit DID fire, merge DID fire,
+    // status restored to awaiting-approval (targetBranchStale is
+    // retryable), pendingMerge still set BUT diffSummary should now
+    // show empty staged/unstaged/untracked (residue folded into
+    // committed) so retry won't re-issue approval-commit.
+    let task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("awaiting-approval");
+    expect(task?.pendingMerge).not.toBeNull();
+    expect(task?.pendingMerge?.diffSummary.staged).toEqual([]);
+    expect(task?.pendingMerge?.diffSummary.unstaged).toEqual([]);
+    expect(task?.pendingMerge?.diffSummary.untracked).toEqual([]);
+    // Original residue files (from setupAwaitingApprovalTask: ["b.ts"])
+    // should now be in committed alongside the original committed
+    // files (["a.ts"]).
+    expect(task?.pendingMerge?.diffSummary.committed).toContain("a.ts");
+    expect(task?.pendingMerge?.diffSummary.committed).toContain("b.ts");
+
+    // Second attempt: user has resolved the stale-base issue (git pull),
+    // retries Approve. Mock now succeeds at merge. Approval-commit must
+    // NOT be called again.
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_merge_worktree") return { mergedSha: "abcd", pushed: false };
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      // Defensive: if H1 isn't fixed and approval-commit IS called on a
+      // now-clean tree, the backend would return EmptyCommit. We mock
+      // that variant to simulate backend behavior.
+      if (cmd === "git_create_approval_commit") {
+        throw { kind: "emptyCommit", message: "no working-tree changes to stage" };
+      }
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} approve`), D14_SESSION);
+
+    // H1 fix verified: approval-commit NOT called on retry.
+    const retryGitOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_"));
+    expect(retryGitOrder).not.toContain("git_create_approval_commit");
+    expect(retryGitOrder).toContain("git_merge_worktree");
+    // Task is now completed.
+    task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
+    expect(task?.status).toBe("completed");
+    expect(task?.conclusion).toContain("abcd");
+  });
+
   it("/task approve: approval-commit failure restores awaiting-approval, never proceeds to merge", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
@@ -4061,7 +4142,11 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     expect(task?.status).toBe("pending");
   });
 
-  it("/task discard: surfaces partial-cleanup warnings but still completes the discard transition", async () => {
+  it("/task discard: REFUSES when git_worktree_remove fails (round-12 codex2 H2: lease load-bearing)", async () => {
+    // Round-12 codex2 H2 (load-bearing): if the worktree-remove step fails,
+    // Discard MUST refuse — the source delta still exists on disk and
+    // releasing the lease + marking the task blocked would corrupt the
+    // LB5 lease model. The user must resolve the cleanup error and retry.
     const { taskId } = setupAwaitingApprovalTask();
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "git_worktree_remove") throw "could not lock index";
@@ -4072,10 +4157,44 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     const task = useCollaboratorStore
       .getState()
       .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
-    // Task still ends in `blocked` despite the cleanup warning.
+    // Task status UNCHANGED — discard refused.
+    expect(task?.status).toBe("awaiting-approval");
+    // pendingMerge preserved — caller can retry.
+    expect(task?.pendingMerge).not.toBeNull();
+    // Lease still held — agent.worktree NOT cleared.
+    const agent = useCollaboratorStore.getState().agents[0];
+    expect(agent.worktree).not.toBeNull();
+    // Branch-delete must NOT have fired (we abort before it).
+    const ipcOrder = vi
+      .mocked(invoke)
+      .mock.calls.map((c) => c[0])
+      .filter((c) => typeof c === "string" && c.startsWith("git_"));
+    expect(ipcOrder).not.toContain("git_branch_force_delete");
+    // Status surfaces the actionable error.
+    const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
+    expect(status).toContain("Discard refused");
+    expect(status).toContain("worktree-remove failed");
+  });
+
+  it("/task discard: branch-delete failure AFTER successful worktree-remove is just cleanup debt (warns, completes)", async () => {
+    // Round-12 codex2 H2: branch-delete failure is DIFFERENT from
+    // worktree-remove failure — once the worktree is gone, the load-
+    // bearing artifact is gone too. A leftover branch is cleanup debt
+    // (the user can `git branch -D` manually); the task can still
+    // transition to blocked + release the lease.
+    const { taskId } = setupAwaitingApprovalTask();
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
+      if (cmd === "git_branch_force_delete") throw "branch is checked out elsewhere";
+      return null;
+    });
+    await executeCommand(parseInput(`/task ${taskId} discard`), D14_SESSION);
+    const task = useCollaboratorStore
+      .getState()
+      .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
     expect(task?.status).toBe("blocked");
     const status = useCollaboratorStore.getState().statusMessages[D14_SESSION];
-    expect(status).toContain("warning");
+    expect(status).toContain("branch-delete warning");
   });
 
   it("/task discard: also fires for tasks already in merge-conflict (post-failed-Approve cleanup)", async () => {

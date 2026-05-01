@@ -104,8 +104,15 @@ export function formatGitError(err: unknown): string {
   switch (e.kind) {
     case "emptyCommit":
       return `nothing to commit (${e.message ?? "working tree was already clean"})`;
-    case "hookFailed":
-      return `pre-${e.stage ?? "commit"} hook failed: ${(e.stderr ?? "").split("\n")[0]}`;
+    case "hookFailed": {
+      // Round-12 claude3 O5: backend's from_command_failure classifier
+      // always sets stage: "unknown" for hook failures (the stage isn't
+      // recoverable from stderr alone). Fall back to "commit" — the
+      // dominant case — instead of producing "pre-unknown hook failed".
+      const stage =
+        e.stage && e.stage !== "unknown" ? e.stage : "commit";
+      return `pre-${stage} hook failed: ${(e.stderr ?? "").split("\n")[0]}`;
+    }
     case "mergeConflict": {
       const fileList = (e.files ?? []).slice(0, 5).join(", ");
       const more =
@@ -745,6 +752,13 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           // git_create_approval_commit on a clean tree returns EmptyCommit
           // which we'd then have to special-case (see backend doc on
           // line 845 of git.rs).
+          //
+          // Round-12 codex1+codex2+claude2 H1: after a successful approval-
+          // commit, we MUST mutate pendingMerge.diffSummary so a subsequent
+          // retry (after merge failure) doesn't re-issue the now-redundant
+          // approval-commit against a clean tree (which would short-circuit
+          // to EmptyCommit and never reach the merge step). Fold the residue
+          // into `committed` and zero out the working-tree fields.
           const ds = snapshot.diffSummary;
           const hasResidue =
             ds.staged.length > 0 ||
@@ -752,11 +766,46 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             ds.untracked.length > 0;
           if (hasResidue) {
             try {
-              await invoke("git_create_approval_commit", {
-                worktreePath: snapshot.worktreePath,
-                message,
-                agentHandle: snapshot.agentHandle,
-              });
+              const result = await invoke<{ commitSha: string; stagedCount: number }>(
+                "git_create_approval_commit",
+                {
+                  worktreePath: snapshot.worktreePath,
+                  message,
+                  agentHandle: snapshot.agentHandle,
+                },
+              );
+              // Normalize the snapshot so retries skip approval-commit.
+              // The residue files (staged|unstaged|untracked) are now part
+              // of `committed`; drop duplicates while folding.
+              const newCommitted = Array.from(
+                new Set([
+                  ...ds.committed,
+                  ...ds.staged,
+                  ...ds.unstaged,
+                  ...ds.untracked,
+                ]),
+              );
+              const updatedSnapshot = {
+                ...snapshot,
+                diffSummary: {
+                  committed: newCommitted,
+                  staged: [] as string[],
+                  unstaged: [] as string[],
+                  untracked: [] as string[],
+                },
+              };
+              store.updateTask(
+                task.id,
+                { pendingMerge: updatedSnapshot },
+                collabSessionId,
+              );
+              // Mutate the local snapshot too so the rest of this Approve
+              // run sees the normalized state (cosmetic — the merge step
+              // doesn't read diffSummary, but be consistent).
+              snapshot.diffSummary = updatedSnapshot.diffSummary;
+              // commitSha / stagedCount are informational; the merge step
+              // is what advances the task forward.
+              void result;
             } catch (err) {
               // Structured GitError → surface variant. Restore status
               // to awaiting-approval so the user can fix and retry.
@@ -910,7 +959,17 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           const snapshot = task.pendingMerge;
 
           // Step 1: remove the worktree from disk.
-          let removeWarn = "";
+          //
+          // Round-12 codex2 H2: worktree removal is LOAD-BEARING for
+          // Discard, not "best-effort + partial-cleanup-still-a-Discard"
+          // as the prior round-11 implementation treated it. If the
+          // backend can't remove the worktree (e.g., locked by another
+          // git operation, file-system error), the source delta still
+          // exists on disk and we MUST NOT release the lease or mark
+          // the task `blocked` — that would corrupt the LB5 lease model
+          // and lose the only remaining handle on the orphaned worktree.
+          // Refuse the entire Discard and let the user retry after
+          // resolving the cleanup error.
           try {
             await invoke("git_worktree_remove", {
               repoRoot: snapshot.repoRoot,
@@ -918,20 +977,27 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
               branchName: snapshot.branch,
             });
           } catch (err) {
-            // Continue — discard is destructive; partial cleanup is still
-            // a Discard. Surface in the final status.
-            removeWarn = ` (worktree-remove warning: ${err})`;
+            status(
+              `Discard refused for ${task.id}: worktree-remove failed (${err}). ` +
+                `Resolve the cleanup error and retry — task remains in ${task.status} ` +
+                `with the lease held to keep the orphaned worktree visible.`,
+            );
+            break;
           }
 
           // Step 2: force-delete the branch (Discard explicitly throws
-          // away the work; -d would refuse on unmerged commits).
+          // away the work; -d would refuse on unmerged commits). Branch
+          // deletion failure AFTER successful worktree removal is just
+          // cleanup debt — the load-bearing artifact (the worktree) is
+          // gone, so it's safe to mark the task discarded with a warning.
+          let removeWarn = "";
           try {
             await invoke("git_branch_force_delete", {
               repoRoot: snapshot.repoRoot,
               branchName: snapshot.branch,
             });
           } catch (err) {
-            removeWarn += ` (branch-delete warning: ${err})`;
+            removeWarn = ` (branch-delete warning: ${err})`;
           }
 
           // Step 3: release the lease and mark task blocked. The central
