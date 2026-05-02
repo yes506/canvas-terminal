@@ -2,30 +2,6 @@ mod commands;
 mod dashboard;
 mod state;
 
-/// PR-A test-support seam (F4 from FINAL plan).
-///
-/// `commands::git::worktrees_root` is `pub(crate)` and `mod commands` is
-/// private, so an integration test in `tests/` cannot reach it via
-/// `pub use crate::commands::git::worktrees_root` (re-exporting a
-/// crate-private item from a public module is forbidden — codex3 task-30
-/// caught this in v3.2 review).
-///
-/// Instead, this module exposes a public WRAPPER function whose body is
-/// inside the crate and can therefore call `pub(crate)` items. The
-/// `#[doc(hidden)]` attribute keeps it out of generated API docs; the
-/// `_for_policy_smoke` suffix signals "do not use in production code."
-///
-/// The wrapper deliberately calls `worktrees_root_production`, NOT
-/// `worktrees_root`, so the integration test always exercises the real
-/// `~/.cache/canvas-terminal/worktrees/` path-jail policy regardless of
-/// any test override that might apply in the lib's `#[cfg(test)]` builds.
-#[doc(hidden)]
-pub mod test_support {
-    pub fn worktrees_root_for_policy_smoke() -> Result<std::path::PathBuf, String> {
-        crate::commands::git::worktrees_root_production()
-    }
-}
-
 use std::sync::atomic::Ordering;
 
 use dashboard::DashboardInfo;

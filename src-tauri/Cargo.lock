@@ -346,7 +346,6 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-process",
  "tauri-plugin-updater",
- "tempfile",
  "tokio",
  "tower",
 ]

@@ -128,29 +128,8 @@ pub enum WorktreeRemoveOutcome {
 /// Root for all canvas-terminal-managed worktrees:
 /// `~/.cache/canvas-terminal/worktrees/`. Hardcoded by design — claude2 N2
 /// notes that future custom-root support requires regenerating the wrapper.
-/// A regression test (`tests/policy_jail_smoke.rs`) locks this prefix using
-/// the `test_support` seam in `lib.rs` (which calls
-/// `worktrees_root_production` to bypass the test override).
+/// A regression test (P9) locks this prefix.
 pub(crate) fn worktrees_root() -> Result<PathBuf, String> {
-    // PR-A: under `cargo test`, every Rust test allocates managed paths
-    // under a process-wide TempDir instead of the production root, so
-    // `cargo test` produces zero entries under `~/.cache/canvas-terminal/`.
-    // The `policy_jail_smoke` integration test in `tests/` is built without
-    // `#[cfg(test)]` applied to this lib crate, so it sees the production
-    // path and exercises the real path-jail policy.
-    #[cfg(test)]
-    {
-        return Ok(test_support_internal::worktrees_root_for_test());
-    }
-    #[cfg(not(test))]
-    worktrees_root_production()
-}
-
-/// Production implementation of `worktrees_root()`. Always returns the real
-/// `~/.cache/canvas-terminal/worktrees/` path. Called by `worktrees_root()`
-/// in non-test builds, and by the `test_support` seam in `lib.rs` so the
-/// `policy_jail_smoke` integration test can exercise the production policy.
-pub(crate) fn worktrees_root_production() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     let dir = home
         .join(".cache")
@@ -158,36 +137,6 @@ pub(crate) fn worktrees_root_production() -> Result<PathBuf, String> {
         .join("worktrees");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create worktrees root: {}", e))?;
     Ok(dir)
-}
-
-/// Process-wide `TempDir`-backed override of `worktrees_root()` for unit
-/// tests. Initialized lazily on first call; held in a `OnceLock<TempDir>`
-/// for the lifetime of the test process. Per-test uniqueness comes from
-/// `make_managed_worktree_path`'s timestamp + counter, so all parallel
-/// tests share one root but never collide on a leaf path.
-///
-/// (claude3 task-23 §2.2 proposed thread-local + RAII; rejected in v3 §V1
-/// in favor of process-wide because the timestamp+counter already provides
-/// path uniqueness and a single static avoids per-test bookkeeping.
-/// codex3 task-30 #1 noted that `static TempDir` does not reliably run Drop
-/// at process exit; accepted — the OS temp dir is reaped by `cargo clean`
-/// or by the OS, and CI gate E8 is the verification.)
-#[cfg(test)]
-mod test_support_internal {
-    use std::path::PathBuf;
-    use std::sync::OnceLock;
-    use tempfile::TempDir;
-
-    static TEST_WORKTREES_ROOT: OnceLock<TempDir> = OnceLock::new();
-
-    pub(super) fn worktrees_root_for_test() -> PathBuf {
-        TEST_WORKTREES_ROOT
-            .get_or_init(|| {
-                TempDir::new().expect("failed to create TempDir for test worktrees root")
-            })
-            .path()
-            .to_path_buf()
-    }
 }
 
 /// Run a git subcommand and return stdout as a trimmed string.
@@ -1433,14 +1382,9 @@ mod tests {
 
     /// Allocate a managed-root worktree path (passes the host-side
     /// `validate_managed_worktree_path` check). Tests use this so they
-    /// exercise the same path policy as production callers.
-    ///
-    /// Under `#[cfg(test)]`, `worktrees_root()` redirects to a process-wide
-    /// `OnceLock<TempDir>` (PR-A V1), so paths returned here live under
-    /// `/tmp/.tmp<random>/<collab>/<tool>-<session>` — never under
-    /// `~/.cache/canvas-terminal/worktrees/`. The nanosecond timestamp +
-    /// process-local counter inside `<collab>` keep parallel tests from
-    /// colliding on the same leaf path within the shared TempDir.
+    /// exercise the same path policy as production callers. The path
+    /// includes a nanosecond timestamp + a process-local counter so
+    /// stale dirs from prior failed `cargo test` runs don't collide.
     fn make_managed_worktree_path(label: &str) -> String {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let now = std::time::SystemTime::now()
