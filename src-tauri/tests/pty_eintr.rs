@@ -22,7 +22,8 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, collected: Arc<Mutex<String>>) 
                     Err(e) => e.valid_up_to(),
                 };
                 if valid_up_to > 0 {
-                    let data = unsafe { std::str::from_utf8_unchecked(&pending[..valid_up_to]) };
+                    let data =
+                        unsafe { std::str::from_utf8_unchecked(&pending[..valid_up_to]) };
                     collected.lock().unwrap().push_str(data);
                 }
                 if valid_up_to < pending.len() {
@@ -141,8 +142,14 @@ fn reader_survives_sigwinch_during_output() {
         &output[output.len().saturating_sub(200)..],
     );
     // Verify some of the numbered lines survived
-    assert!(output.contains("line-1"), "Reader missed early output");
-    assert!(output.contains("line-50"), "Reader missed late output");
+    assert!(
+        output.contains("line-1"),
+        "Reader missed early output"
+    );
+    assert!(
+        output.contains("line-50"),
+        "Reader missed late output"
+    );
 }
 
 // ─────────────────────────────────────────────────────────
@@ -184,7 +191,8 @@ fn write_survives_sigwinch() {
 // ─────────────────────────────────────────────────────────
 #[test]
 fn reader_completes_on_normal_exit() {
-    let (master, _child) = open_pty_with_command("echo hello_from_pty; echo goodbye_from_pty");
+    let (master, _child) =
+        open_pty_with_command("echo hello_from_pty; echo goodbye_from_pty");
     let reader = master.try_clone_reader().expect("clone reader");
     let collected = Arc::new(Mutex::new(String::new()));
     let collected_clone = collected.clone();

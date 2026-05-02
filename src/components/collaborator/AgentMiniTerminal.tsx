@@ -16,148 +16,14 @@ import {
 import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture, stripAnsi, registerCapture, unregisterCapture } from "../../lib/agentOutputCapture";
 import { isEnvBootstrapped } from "../../lib/terminalManager";
-import type { ToolConfig, WorktreeMetadata } from "../../types/collaborator";
+import type { ToolConfig } from "../../types/collaborator";
 import { X } from "lucide-react";
 
 interface AgentMiniTerminalProps {
   sessionId: string;
   tool: ToolConfig;
   cwd: string | null;
-  /** Worktree metadata when the spawn was provisioned in a git repo (P1).
-   *  Forwarded to addAgent so the store record carries it for P2's
-   *  awaiting-approval gate; null = no worktree isolation for this agent. */
-  worktree?: WorktreeMetadata | null;
   onClose: (sessionId: string) => void;
-}
-
-/**
- * Cleanup helper for worktree-backed agents — extracted from the
- * AgentMiniTerminal unmount cleanup hook so the decision tree is
- * testable in isolation. Exported for unit testing.
- *
- * Sequence (round-9 ordering fix per codex1 task-77 H1, mirrors LB1's
- * freeze-before-snapshot invariant):
- *
- *   1. kill_pty AWAITED — freezes the worktree so the diff captures a
- *      stable state. Failure is non-fatal (a dead PTY is already
- *      frozen) — log and continue.
- *   2. git_diff_summary — snapshot from the now-frozen worktree.
- *   3. Branch on diff.hasChanges:
- *      - false → git_worktree_remove + removeAgent (truly nothing to
- *        gate)
- *      - true  → setAgentStatus("exited"), preserve worktree+record
- *        (LB1 scan / LB4 helper still find them)
- *   4. On any IPC error: preserve record defensively (unknown state
- *      ≠ silent cleanup).
- *
- * Fire-and-forget by design: React useEffect cleanup is synchronous and
- * cannot await. The caller invokes this with `void cleanupWorktreedAgent
- * (...)` and the helper updates the store eventually.
- */
-export async function cleanupWorktreedAgent(args: {
-  sessionId: string;
-  worktree: WorktreeMetadata;
-  storeOps: {
-    removeAgent: (sessionId: string) => void;
-    setAgentStatus: (
-      sessionId: string,
-      status: "spawning" | "running" | "exited",
-    ) => void;
-  };
-  invokeShim?: typeof invoke;
-}): Promise<void> {
-  const inv = args.invokeShim ?? invoke;
-  const { sessionId, worktree, storeOps } = args;
-
-  // Step 1: kill_pty AWAITED. Frozen worktree before snapshot mirrors
-  // LB1's R2 ordering invariant. Failure is non-fatal because a PTY
-  // that has already exited is already frozen.
-  try {
-    await inv("kill_pty", { sessionId });
-  } catch (err) {
-    console.warn(
-      "[collab/cleanup] kill_pty failed; PTY may already be exited. Continuing with diff snapshot.",
-      err,
-    );
-  }
-
-  // Step 2: snapshot from the (now-frozen) worktree.
-  let diff: {
-    hasChanges: boolean;
-    committed: string[];
-    staged: string[];
-    unstaged: string[];
-    untracked: string[];
-  };
-  try {
-    diff = await inv<{
-      hasChanges: boolean;
-      committed: string[];
-      staged: string[];
-      unstaged: string[];
-      untracked: string[];
-    }>("git_diff_summary", {
-      worktreePath: worktree.path,
-      baseSha: worktree.baseSha,
-    });
-  } catch (err) {
-    // Diff probe failed (e.g., worktree gone, IPC error). Preserve
-    // record defensively — unknown state shouldn't silently cleanup.
-    console.warn(
-      "[collab/cleanup] worktree diff probe failed; preserving agent record defensively:",
-      err,
-    );
-    storeOps.setAgentStatus(sessionId, "exited");
-    return;
-  }
-
-  // Step 3: branch on diff result.
-  if (!diff.hasChanges) {
-    // Truly nothing to preserve. Auto-remove worktree + branch, then
-    // remove the agent record.
-    try {
-      const outcome = await inv<
-        | { kind: "fullyRemoved" }
-        | {
-            kind: "worktreeRemovedBranchPreserved";
-            branch: string;
-            reason: string;
-          }
-      >("git_worktree_remove", {
-        repoRoot: worktree.repoRoot,
-        worktreePath: worktree.path,
-        branchName: worktree.branch,
-      });
-      if (outcome.kind === "worktreeRemovedBranchPreserved") {
-        console.warn(
-          `[collab/cleanup] worktree removed but branch '${outcome.branch}' preserved: ${outcome.reason}. ` +
-            "P2 startup janitor / Discard flow will reclaim it.",
-        );
-      }
-    } catch (err) {
-      // Worktree-remove failed. Don't escalate; preserve record so the
-      // future Discard flow can clean up what's left.
-      console.warn(
-        "[collab/cleanup] git_worktree_remove failed; preserving agent record defensively:",
-        err,
-      );
-      storeOps.setAgentStatus(sessionId, "exited");
-      return;
-    }
-    storeOps.removeAgent(sessionId);
-  } else {
-    // PRESERVE both worktree and agent record. Mark exited so the UI
-    // knows it's no longer interactive, but the record stays in the
-    // store with `worktree` intact. LB1 scan + LB4 isTaskWorktreeBacked
-    // still find it.
-    console.warn(
-      `[collab/cleanup] preserving worktree ${worktree.path} + agent record ` +
-        `(committed=${diff.committed.length}, staged=${diff.staged.length}, ` +
-        `unstaged=${diff.unstaged.length}, untracked=${diff.untracked.length}). ` +
-        "P2 Discard flow will reclaim.",
-    );
-    storeOps.setAgentStatus(sessionId, "exited");
-  }
 }
 
 /**
@@ -211,7 +77,6 @@ export function AgentMiniTerminal({
   sessionId,
   tool,
   cwd,
-  worktree = null,
   onClose,
 }: AgentMiniTerminalProps) {
   const collabSessionId = useCollabSessionId();
@@ -232,7 +97,6 @@ export function AgentMiniTerminal({
   const imeOverlayRef = useRef<HTMLSpanElement | null>(null);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disposed = useRef(false);
-  const initRunRef = useRef(0);
   const [focused, setFocused] = useState(false);
   // Inline-rename state for the header label. `editing === false` shows the
   // <span>; `editing === true` shows an <input value={draft}>. The store action
@@ -243,9 +107,7 @@ export function AgentMiniTerminal({
   const renameInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    const runId = ++initRunRef.current;
     disposed.current = false;
-    const isCurrentRun = () => !disposed.current && initRunRef.current === runId;
 
     const initTerminal = async () => {
       if (!termRef.current || terminalRef.current) return;
@@ -294,12 +156,12 @@ export function AgentMiniTerminal({
           buf.baseY - buf.viewportY <= 2 ||
           document.activeElement === terminal.textarea;
         terminal.write(payload, () => {
-          if (!isCurrentRun()) return;
+          if (disposed.current) return;
           if (shouldFollow) terminal.scrollToBottom();
         });
       };
 
-      if (!isCurrentRun()) {
+      if (disposed.current) {
         terminal.dispose();
         return;
       }
@@ -307,7 +169,6 @@ export function AgentMiniTerminal({
       // ResizeObserver
       const observer = new ResizeObserver(() => {
         if (
-          isCurrentRun() &&
           termRef.current &&
           termRef.current.offsetWidth > 0 &&
           termRef.current.offsetHeight > 0
@@ -335,33 +196,32 @@ export function AgentMiniTerminal({
       registerCapture(sessionId, capture);
 
       // Listen for PTY output
-      const dataUnlisten = await listen<string>(
+      unlistenDataRef.current = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
-          if (isCurrentRun()) {
+          if (!disposed.current) {
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
           }
         },
       );
 
-      if (!isCurrentRun()) {
-        dataUnlisten();
+      if (disposed.current) {
+        unlistenDataRef.current?.();
         observer.disconnect();
         terminal.dispose();
         return;
       }
-      unlistenDataRef.current = dataUnlisten;
 
       // Listen for PTY exit. Logic is delegated to `handlePtyExit` (above)
       // so it can be unit-tested without xterm/PTY plumbing. Tauri's
       // listen() accepts async callbacks and does not block event dispatch
       // on the returned promise — no back-pressure.
-      const exitUnlisten = await listen(
+      unlistenExitRef.current = await listen(
         `pty-exit-${sessionId}`,
         () => {
           void handlePtyExit({
-            disposed: !isCurrentRun(),
+            disposed: disposed.current,
             capture: captureRef.current,
             writeProcessExitedLine: () =>
               writeWithFollowBottom("\r\n\x1b[33m[Process exited]\x1b[0m\r\n"),
@@ -371,19 +231,17 @@ export function AgentMiniTerminal({
         },
       );
 
-      if (!isCurrentRun()) {
+      if (disposed.current) {
         unlistenDataRef.current?.();
-        exitUnlisten();
+        unlistenExitRef.current?.();
         observer.disconnect();
         terminal.dispose();
         return;
       }
-      unlistenExitRef.current = exitUnlisten;
 
       // Spawn the CLI tool — try direct process first, fall back to shell
       const [program, ...programArgs] = tool.command.split(/\s+/);
       let spawnedViaShell = false;
-      let ptyStarted = false;
 
       try {
         await invoke("spawn_process", {
@@ -395,7 +253,6 @@ export function AgentMiniTerminal({
           cols: terminal.cols,
           rows: terminal.rows,
         });
-        ptyStarted = true;
       } catch {
         // Fallback: spawn shell then type the command
         spawnedViaShell = true;
@@ -407,9 +264,8 @@ export function AgentMiniTerminal({
             cwd: cwd ?? null,
             login: !isEnvBootstrapped(),
           });
-          ptyStarted = true;
         } catch (shellErr) {
-          if (isCurrentRun()) {
+          if (!disposed.current) {
             writeWithFollowBottom(
               `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
             );
@@ -418,12 +274,7 @@ export function AgentMiniTerminal({
         }
       }
 
-      if (!isCurrentRun()) {
-        if (ptyStarted) {
-          invoke("kill_pty", { sessionId }).catch(() => {});
-        }
-        return;
-      }
+      if (disposed.current) return;
 
       // Let app-level shortcuts bubble past xterm
       terminal.attachCustomKeyEventHandler((e) => {
@@ -703,7 +554,7 @@ export function AgentMiniTerminal({
 
       // Forward user keystrokes to PTY
       terminal.onData((data) => {
-        if (!isCurrentRun()) return;
+        if (disposed.current) return;
         invoke("write_to_pty", { sessionId, data }).catch(() => {});
         // S2 fix: user typing is explicit "I want to see the prompt" intent.
         // Always snap to bottom on input — prevents the case where the user
@@ -720,24 +571,19 @@ export function AgentMiniTerminal({
       terminal.textarea?.addEventListener("focus", () => {
         setFocused(true);
         requestAnimationFrame(() => {
-          if (isCurrentRun() && document.activeElement === terminal.textarea) {
+          if (!disposed.current && document.activeElement === terminal.textarea) {
             terminal.scrollToBottom();
           }
         });
       });
       terminal.textarea?.addEventListener("blur", () => setFocused(false));
 
-      // If we fell back to shell spawn, replace the shell with the CLI tool
-      // via `exec`. Without `exec`, the CLI runs as a job under zsh, so
-      // kill_pty's SIGHUP (sent to the immediate child = zsh) makes zsh
-      // print "zsh: warning: 1 jobs SIGHUPed" before forwarding the signal
-      // to the CLI. With `exec`, zsh is replaced by the CLI and there is no
-      // wrapper shell to emit that warning when the PTY is torn down.
+      // If we fell back to shell spawn, type the CLI tool command into the shell
       if (spawnedViaShell) {
         try {
           await invoke("write_to_pty", {
             sessionId,
-            data: "exec " + tool.command + "\n",
+            data: tool.command + "\n",
           });
         } catch {
           // Shell may have exited already
@@ -747,19 +593,11 @@ export function AgentMiniTerminal({
       // Register in store as "spawning" — not ready for messages yet.
       // The readiness detector below will set status to "running" and flush
       // any queued messages once the CLI tool's prompt appears.
-      //
-      // `worktree` is forwarded straight through `addAgent`'s spread so the
-      // SpawnedAgent record carries the worktree metadata for the lifetime
-      // of the agent. P2's awaiting-approval gate keys on `agent.worktree`
-      // being non-null to decide whether a `.done.json` arrival flips the
-      // task to `awaiting-approval` (D2 / LB1 freeze) vs straight to
-      // `completed`.
       useCollaboratorStore.getState().addAgent({
         sessionId,
         tool: tool.id,
         status: "spawning",
         collabSessionId,
-        worktree,
       });
 
       // ---- CLI readiness detection ----
@@ -777,7 +615,7 @@ export function AgentMiniTerminal({
       const READY_BUF_MAX = 200;
       // Also use a fallback timer in case prompt pattern isn't matched
       readyTimeoutRef.current = setTimeout(() => {
-        if (!readyDetected && isCurrentRun()) {
+        if (!readyDetected && !disposed.current) {
           readyDetected = true;
           const store = useCollaboratorStore.getState();
           store.setAgentStatus(sessionId, "running");
@@ -803,31 +641,26 @@ export function AgentMiniTerminal({
 
       // Tap into the existing data listener to also check readiness
       const origDataUnlisten = unlistenDataRef.current;
-      const readyDataUnlisten = await listen<string>(
+      unlistenDataRef.current = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
-          if (isCurrentRun()) {
+          if (!disposed.current) {
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
             checkReady(event.payload);
           }
         },
       );
-      if (!isCurrentRun()) {
-        readyDataUnlisten();
-        return;
-      }
-      unlistenDataRef.current = readyDataUnlisten;
       // Unlisten the original listener that was set up before
       origDataUnlisten?.();
 
       // Handle resize
       let resizeTimer: ReturnType<typeof setTimeout> | null = null;
       terminal.onResize(({ cols, rows }) => {
-        if (!isCurrentRun()) return;
+        if (disposed.current) return;
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          if (isCurrentRun()) {
+          if (!disposed.current) {
             invoke("resize_pty", { sessionId, cols, rows }).catch(() => {});
           }
         }, 80);
@@ -837,9 +670,6 @@ export function AgentMiniTerminal({
     initTerminal();
 
     return () => {
-      if (initRunRef.current === runId) {
-        initRunRef.current += 1;
-      }
       if (readyTimeoutRef.current) {
         clearTimeout(readyTimeoutRef.current);
         readyTimeoutRef.current = null;
@@ -873,59 +703,9 @@ export function AgentMiniTerminal({
         imeHandlersRef.current = null;
       }
 
-      // P1+P2 cleanup-on-close (round-8/round-9 fixes from codex1
-      // task-73 H1, codex2 task-75 H1+H2, claude3 task-76 O3, codex1
-      // task-77 H1 — all reviewers convergent: the gate depended on the
-      // live SpawnedAgent record, so closing the pane DURING the polling
-      // window caused .done.json arrivals to fall through the gate.
-      // Fix: the SpawnedAgent record's lifetime now matches the
-      // worktree's lifetime, not the UI tile's lifetime.
-      //
-      // Round-9 ordering fix (codex1 task-77 H1): for worktree-backed
-      // agents, kill_pty is now AWAITED inside the cleanup helper before
-      // git_diff_summary fires — the freeze-before-snapshot invariant
-      // (claude3 task-46 R2). After the LB1 kill-on-.done.json removal,
-      // this terminal-close path is one of the two enforcement sites
-      // (the other is the Approve / Discard handlers in commands.ts).
-      // Without the kill, a still-running PTY could mutate the worktree
-      // between the kill IPC and the diff, mis-classifying it as clean
-      // and triggering silent cleanup.
-      //
-      // The cleanup IS fire-and-forget — React useEffect cleanup is
-      // synchronous and cannot await (claude3 task-80 Issue 1: prior
-      // commit's "synchronous (await)" comment was inaccurate). The
-      // helper runs in the background; when its IPC chain resolves it
-      // updates the store. Subsequent scan ticks (independent 2s timer)
-      // and slash commands see the eventually-consistent state.
-      //
-      // KNOWN LIMITATION (claude2 task-78 Concern 1, claude3 task-80
-      // Issue 2):
-      //   - Pane-close (closing the entire CollaboratorPane) wipes ALL
-      //     records via killAllAgents regardless of preserved-worktree
-      //     state. Tile-close preserves; pane-close doesn't. Orphan
-      //     worktrees on disk are reclaimed by the future startup
-      //     janitor (P5 deferred).
-      //   - For read-only tasks (no source delta), if cleanup-clean-
-      //     remove races with a concurrent scan tick, the scan can fail
-      //     to find the worktree → fail-closed → status `blocked`
-      //     instead of `completed`. Low-probability and recoverable
-      //     (user can /task done after blocked).
-      const store = useCollaboratorStore.getState();
-      if (worktree) {
-        void cleanupWorktreedAgent({
-          sessionId,
-          worktree,
-          storeOps: {
-            removeAgent: store.removeAgent,
-            setAgentStatus: store.setAgentStatus,
-          },
-        });
-      } else {
-        // No worktree → no gate decision depends on PTY state. Fire-and-
-        // forget kill_pty, immediate record removal.
-        invoke("kill_pty", { sessionId }).catch(() => {});
-        store.removeAgent(sessionId);
-      }
+      // Kill PTY
+      invoke("kill_pty", { sessionId }).catch(() => {});
+      useCollaboratorStore.getState().removeAgent(sessionId);
 
       // Dispose xterm
       const term = terminalRef.current;

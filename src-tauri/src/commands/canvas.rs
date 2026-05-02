@@ -1,7 +1,7 @@
-use base64::Engine;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use base64::Engine;
 
 /// Maximum decoded binary file size (50 MB) to prevent memory exhaustion
 const MAX_BINARY_SIZE: usize = 50 * 1024 * 1024;
@@ -24,8 +24,9 @@ fn validate_save_path(path: &str) -> Result<std::path::PathBuf, String> {
         .parent()
         .ok_or_else(|| "Invalid path: no parent directory".to_string())?;
 
-    let canonical_parent = std::fs::canonicalize(parent)
-        .map_err(|e| format!("Cannot resolve parent directory: {}", e))?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
+        format!("Cannot resolve parent directory: {}", e)
+    })?;
 
     if !canonical_parent.starts_with(&home) {
         return Err(format!(
@@ -44,8 +45,9 @@ fn validate_save_path(path: &str) -> Result<std::path::PathBuf, String> {
     if let Ok(meta) = std::fs::symlink_metadata(&full_path) {
         if meta.is_symlink() {
             // Resolve the symlink target and re-check boundary
-            let resolved = std::fs::canonicalize(&full_path)
-                .map_err(|e| format!("Cannot resolve symlink: {}", e))?;
+            let resolved = std::fs::canonicalize(&full_path).map_err(|e| {
+                format!("Cannot resolve symlink: {}", e)
+            })?;
             if !resolved.starts_with(&home) {
                 return Err(format!(
                     "Symlink target is outside home directory: {}",
@@ -61,8 +63,8 @@ fn validate_save_path(path: &str) -> Result<std::path::PathBuf, String> {
 
 fn validate_read_path(path: &str) -> Result<std::path::PathBuf, String> {
     let home = get_home_dir()?;
-    let canonical =
-        std::fs::canonicalize(path).map_err(|e| format!("Cannot resolve path: {}", e))?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("Cannot resolve path: {}", e))?;
 
     if !canonical.starts_with(&home) {
         return Err(format!(
@@ -91,7 +93,8 @@ fn create_file_no_follow(path: &std::path::Path) -> Result<std::fs::File, String
                 return Err("Refused to follow symlink at target path".to_string());
             }
             // Other errors (e.g., O_NOFOLLOW unsupported) — fall back
-            std::fs::File::create(path).map_err(|e2| format!("Failed to create file: {}", e2))
+            std::fs::File::create(path)
+                .map_err(|e2| format!("Failed to create file: {}", e2))
         }
     }
 }
@@ -101,8 +104,7 @@ pub fn save_canvas(path: String, data: String) -> Result<(), String> {
     let safe_path = validate_save_path(&path)?;
     let file = create_file_no_follow(&safe_path)?;
     let mut writer = std::io::BufWriter::new(file);
-    writer
-        .write_all(data.as_bytes())
+    writer.write_all(data.as_bytes())
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -145,8 +147,7 @@ pub fn save_binary_file(path: String, base64_data: String) -> Result<(), String>
     if bytes.len() > MAX_BINARY_SIZE {
         return Err(format!(
             "Decoded payload too large: {} bytes exceeds {} byte limit",
-            bytes.len(),
-            MAX_BINARY_SIZE
+            bytes.len(), MAX_BINARY_SIZE
         ));
     }
 
@@ -174,8 +175,7 @@ pub fn export_snapshot(base64_data: String) -> Result<String, String> {
     if bytes.len() > MAX_BINARY_SIZE {
         return Err(format!(
             "Decoded snapshot too large: {} bytes exceeds {} byte limit",
-            bytes.len(),
-            MAX_BINARY_SIZE
+            bytes.len(), MAX_BINARY_SIZE
         ));
     }
 
@@ -272,10 +272,7 @@ pub fn read_import_file(suffix: Option<String>) -> Result<(String, String), Stri
 /// Remove the snapshot file after the AI tool has read it.
 pub fn cleanup_snapshot() -> Result<(), String> {
     let home = get_home_dir()?;
-    let snapshot_path = home
-        .join(".cache")
-        .join("canvas-terminal")
-        .join("snapshot.png");
+    let snapshot_path = home.join(".cache").join("canvas-terminal").join("snapshot.png");
     if snapshot_path.exists() {
         std::fs::remove_file(&snapshot_path).map_err(|e| e.to_string())?;
     }

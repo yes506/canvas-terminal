@@ -34,12 +34,6 @@ futures = "0.3"
 rand = "0.8"
 hex = "0.4"
 
-# P2 backend: file-lock for git_merge_worktree's concurrent-merge mutex.
-# v5 §3 D8 explicitly requires Rust-side locking, not shell `flock` — macOS
-# doesn't ship `flock(1)` natively, and the lock must survive process
-# crashes (held → owning PID dead → take ownership).
-fs2 = "0.4"
-
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` is the cleanest way to drive an axum Router
 # in unit tests without binding a real TCP port. Test-only — the production
