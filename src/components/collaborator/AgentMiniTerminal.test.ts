@@ -296,8 +296,10 @@ describe("Phase 1.2 — handlePtyExit (task-31 implementation)", () => {
     };
 
     it("ENFORCES kill_pty BEFORE git_diff_summary (codex1 task-77 H1 ordering)", async () => {
-      // The freeze-before-snapshot invariant LB1 enforces in the scanner
-      // must also hold here. A still-running PTY could mutate the
+      // The freeze-before-snapshot invariant (claude3 task-46 R2). After
+      // the LB1 kill-on-.done.json removal, this terminal-close path is
+      // one of the enforcement sites (the others are the Approve and
+      // Discard handlers). A still-running PTY could mutate the
       // worktree between the kill IPC and the diff if kill weren't
       // awaited first; mis-classifying the worktree as clean would
       // silently auto-remove pending work.

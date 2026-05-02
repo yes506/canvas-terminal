@@ -883,10 +883,13 @@ export function AgentMiniTerminal({
       //
       // Round-9 ordering fix (codex1 task-77 H1): for worktree-backed
       // agents, kill_pty is now AWAITED inside the cleanup helper before
-      // git_diff_summary fires — same freeze-before-snapshot invariant
-      // LB1 enforces in the scanner. Without this, a still-running PTY
-      // could mutate the worktree between the kill IPC and the diff,
-      // mis-classifying it as clean and triggering silent cleanup.
+      // git_diff_summary fires — the freeze-before-snapshot invariant
+      // (claude3 task-46 R2). After the LB1 kill-on-.done.json removal,
+      // this terminal-close path is one of the two enforcement sites
+      // (the other is the Approve / Discard handlers in commands.ts).
+      // Without the kill, a still-running PTY could mutate the worktree
+      // between the kill IPC and the diff, mis-classifying it as clean
+      // and triggering silent cleanup.
       //
       // The cleanup IS fire-and-forget — React useEffect cleanup is
       // synchronous and cannot await (claude3 task-80 Issue 1: prior

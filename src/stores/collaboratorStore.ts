@@ -618,9 +618,11 @@ export function formatTaskSummaryForAgent(
   // Round-29 (codex2 task-142 follow-up): use the centralized
   // classifier per claude3 task-139 O3 / round-28's
   // `classifyTaskStatus`. The agent prompt summary should only
-  // include PTY-alive active work — tasks in P2 review/merge states
-  // already have their PTY killed by LB1 design and shouldn't be
-  // surfaced to the agent as "your active work."
+  // include active work — tasks in P2 review/merge states are
+  // waiting on user action (Approve / Discard / conflict resolution)
+  // and shouldn't be surfaced to the agent as "your active work,"
+  // even though the PTY may still be alive after the LB1
+  // kill-on-.done.json removal.
   const active = tasks.filter((t) => isActiveStatus(t.status));
   if (active.length === 0) return "";
 
@@ -729,9 +731,11 @@ function findFreshestActiveTaskForMention(
  * Round-27: pick the freshest NON-TERMINAL task assigned to a given
  * mention. "Non-terminal" = anything except `completed` or `blocked`,
  * covering the full P2 status machine:
- *   - pending, in-progress (active, PTY alive)
- *   - awaiting-approval, approved-merging, merge-conflict (in
- *     P2 review/merge flow, PTY killed by LB1 design)
+ *   - pending, in-progress (active, PTY alive, agent owns the work)
+ *   - awaiting-approval, approved-merging, merge-conflict (in P2
+ *     review/merge flow, PTY may still be alive after the LB1
+ *     kill-on-.done.json removal but the task is waiting on the user
+ *     rather than the agent)
  *
  * Used by the indicator (`getAgentTaskState`) so the agent's mini-
  * terminal label correctly reflects mid-P2-flow tasks. Without this,
@@ -1482,14 +1486,18 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
         //    transition to `blocked` with diagnostic info; the worktree
         //    is preserved for manual inspection.
         //
-        // 3. kill_pty failure is NOT terminal: a dead PTY is already
-        //    frozen, so we still attempt the diff snapshot. Only diff
-        //    failure (which means we cannot determine source delta)
-        //    triggers fail-closed.
-        //
-        // 4. The kill-BEFORE-snapshot ordering invariant (claude3
-        //    task-46 R2) holds: try kill_pty first; whether it succeeds
-        //    or fails, the diff happens after.
+        // 3. The diff captured here is a PREVIEW. The freeze-before-
+        //    snapshot invariant (claude3 task-46 R2) is enforced at the
+        //    Approve / Discard slash command and at terminal-close
+        //    (cleanupWorktreedAgent), NOT here at .done.json arrival.
+        //    Killing the PTY at gate flip would terminate an interactive
+        //    agent the user may still be talking to (typing follow-up
+        //    messages, queuing the next task on the same lease). The
+        //    Approve handler re-runs git_diff_summary on a freshly
+        //    killed PTY before deciding whether to call
+        //    git_create_approval_commit, so a stale preview diff cannot
+        //    cause uncommitted post-.done.json residue to be silently
+        //    dropped during merge.
         //
         // KNOWN LIMITATION (claude3 task-72 O1) — defer to follow-up:
         //   If the user closes the agent's pane within the 2s polling
@@ -1523,27 +1531,11 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
           // Snapshot worktree metadata FIRST — even though removeAgent
           // doesn't fire on PTY exit (only on UI tile dismissal per
           // AgentMiniTerminal's cleanup), capture defensively in case
-          // the SpawnedAgent record changes between PTY exit and snapshot
+          // the SpawnedAgent record changes between scan and snapshot
           // (claude2 task-70 Concern 3 doc correction).
           const wt = agent.worktree;
-          const ptySid = agent.sessionId;
 
-          // Try kill_pty. Failure is non-fatal: a dead PTY is already
-          // frozen, so we proceed to the diff anyway. Successful kill
-          // freezes the worktree explicitly.
-          let killError: unknown = null;
-          try {
-            await invoke("kill_pty", { sessionId: ptySid });
-          } catch (err) {
-            killError = err;
-            // eslint-disable-next-line no-console
-            console.warn(
-              "[collab/scan] kill_pty failed; PTY may already be exited. Continuing with diff snapshot.",
-              err,
-            );
-          }
-
-          // Step: snapshot from the (now-frozen) worktree. Failure HERE
+          // Preview snapshot from the still-live worktree. Failure HERE
           // is fail-CLOSED — without the diff we can't determine source
           // delta and terminalizing as `completed` would silently
           // bypass the gate.
@@ -1586,9 +1578,7 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
           } catch (diffErr) {
             // FAIL-CLOSED: cannot prove there's no source delta. Don't
             // terminalize as completed — that would bypass the gate.
-            const reason = `git_diff_summary failed: ${String(diffErr)}${
-              killError ? ` (after kill_pty also failed: ${String(killError)})` : ""
-            }`;
+            const reason = `git_diff_summary failed: ${String(diffErr)}`;
             // eslint-disable-next-line no-console
             console.warn(
               "[collab/scan] LB1 fail-closed: cannot determine source delta for worktree-backed task; routing to blocked.",

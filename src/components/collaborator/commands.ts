@@ -1303,6 +1303,83 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           );
           status(`Approving task ${task.id}…`);
 
+          // Freeze + re-snapshot before residue check.
+          //
+          // LB1 no longer kills the agent's PTY at .done.json arrival
+          // (so the user can keep talking to the agent on the same
+          // worktree lease). The pendingMerge diff captured at gate
+          // flip is therefore a PREVIEW — the agent may have made
+          // additional commits or working-tree edits between then and
+          // Approve. The freeze-before-snapshot invariant (claude3
+          // task-46 R2) is enforced HERE: kill the PTY, then re-run
+          // git_diff_summary, then mutate pendingMerge.diffSummary so
+          // the residue check below acts on the final state. Without
+          // the re-snapshot, post-.done.json uncommitted edits could
+          // be silently dropped: a clean preview would skip
+          // git_create_approval_commit, and git_merge_worktree only
+          // merges committed work.
+          //
+          // kill_pty failure is non-fatal (PTY may already be exited),
+          // but git_diff_summary failure aborts Approve and rolls the
+          // task back to awaiting-approval — proceeding without a
+          // verified final diff would risk silent data loss.
+          const agent = store.agents.find(
+            (a) =>
+              a.collabSessionId === collabSessionId &&
+              a.handle === snapshot.agentHandle.replace(/^@/, ""),
+          );
+          if (agent?.sessionId) {
+            try {
+              await invoke("kill_pty", { sessionId: agent.sessionId });
+            } catch (err) {
+              console.warn(
+                "[collab/approve] kill_pty failed; PTY may already be exited. Continuing with re-snapshot.",
+                err,
+              );
+            }
+          }
+          let freshDiff: {
+            hasChanges: boolean;
+            committed: string[];
+            staged: string[];
+            unstaged: string[];
+            untracked: string[];
+          };
+          try {
+            freshDiff = await invoke<typeof freshDiff>("git_diff_summary", {
+              worktreePath: snapshot.worktreePath,
+              baseSha: snapshot.baseSha,
+            });
+          } catch (err) {
+            store.updateTask(
+              task.id,
+              { status: "awaiting-approval" },
+              collabSessionId,
+            );
+            status(
+              `Approve refused for ${task.id}: pre-merge diff snapshot failed (${err}). ` +
+                `Retry once the worktree is accessible.`,
+            );
+            break;
+          }
+          const refreshedSnapshot = {
+            ...snapshot,
+            diffSummary: {
+              committed: freshDiff.committed,
+              staged: freshDiff.staged,
+              unstaged: freshDiff.unstaged,
+              untracked: freshDiff.untracked,
+            },
+          };
+          store.updateTask(
+            task.id,
+            { pendingMerge: refreshedSnapshot },
+            collabSessionId,
+          );
+          // Mutate the local snapshot so the rest of this Approve run
+          // sees the refreshed state.
+          snapshot.diffSummary = refreshedSnapshot.diffSummary;
+
           // Step 1: capture uncommitted residue if present. Skip when the
           // diff summary shows committed-only delta — calling
           // git_create_approval_commit on a clean tree returns EmptyCommit
@@ -1524,6 +1601,28 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             break;
           }
           const snapshot = task.pendingMerge;
+
+          // Freeze the worktree before removal. LB1 no longer kills the
+          // PTY at .done.json arrival, so the agent may still be alive
+          // when the user runs Discard. `git worktree remove --force`
+          // can usually evict a busy worktree, but a still-writing
+          // process risks ENOTEMPTY / leftover locks. Kill first;
+          // failure is non-fatal because a dead PTY is already frozen.
+          const discardAgent = store.agents.find(
+            (a) =>
+              a.collabSessionId === collabSessionId &&
+              a.handle === snapshot.agentHandle.replace(/^@/, ""),
+          );
+          if (discardAgent?.sessionId) {
+            try {
+              await invoke("kill_pty", { sessionId: discardAgent.sessionId });
+            } catch (err) {
+              console.warn(
+                "[collab/discard] kill_pty failed; PTY may already be exited. Continuing with worktree removal.",
+                err,
+              );
+            }
+          }
 
           // Step 1: remove the worktree from disk.
           //

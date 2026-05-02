@@ -3540,11 +3540,8 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
     });
     let deleted = false;
     let killPtyCalled = false;
-    let diffSummaryCalledAt: number | null = null;
-    let killPtyCalledAt: number | null = null;
-    let nextCallIdx = 0;
+    let diffSummaryCalled = false;
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
-      const idx = nextCallIdx++;
       if (cmd === "list_memory_files")
         return deleted ? [] : [`${task.id}.done.json`];
       if (cmd === "read_memory_file") return deleted ? null : doneJson;
@@ -3554,11 +3551,10 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
       }
       if (cmd === "kill_pty") {
         killPtyCalled = true;
-        killPtyCalledAt = idx;
         return null;
       }
       if (cmd === "git_diff_summary") {
-        diffSummaryCalledAt = idx;
+        diffSummaryCalled = true;
         return {
           hasChanges: true,
           committed: ["src/foo.ts"],
@@ -3584,13 +3580,14 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
     expect(updated?.pendingMerge?.baseSha).toBe(fakeWorktree.baseSha);
     expect(updated?.pendingMerge?.diffSummary.committed).toEqual(["src/foo.ts"]);
     expect(updated?.pendingMerge?.agentHandle).toBe("@claude1");
-    // Invariant: kill_pty was called.
-    expect(killPtyCalled).toBe(true);
-    // Invariant: kill_pty was called BEFORE git_diff_summary
-    // (claude3 task-46 R2 ordering — frozen worktree before snapshot).
-    expect(killPtyCalledAt).not.toBeNull();
-    expect(diffSummaryCalledAt).not.toBeNull();
-    expect(killPtyCalledAt!).toBeLessThan(diffSummaryCalledAt!);
+    // Invariant (post-LB1-redesign): kill_pty is NOT called at gate
+    // flip — the agent's PTY stays alive so the user can keep talking
+    // to it on the same worktree lease. The freeze-before-snapshot
+    // invariant moves to Approve / Discard / terminal-close paths.
+    expect(killPtyCalled).toBe(false);
+    // The diff was still captured (preview snapshot for the awaiting-
+    // approval UI; Approve will re-snapshot before merging).
+    expect(diffSummaryCalled).toBe(true);
   });
 
   it("auto-completes a worktree-backed task with NO source delta", async () => {
@@ -3685,12 +3682,13 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
     expect(gitDiffCalled).toBe(false);
   });
 
-  it("kill_pty failure does NOT bypass the gate (round-7 codex1+codex2 H1)", async () => {
-    // A dead PTY is already frozen. kill_pty failure must not block the
-    // diff snapshot — we still try git_diff_summary and route based on
-    // its result. If diff shows source delta, flip to awaiting-approval
-    // even though kill_pty failed. PTY-already-exited is the most common
-    // legitimate cause; we shouldn't strand the task OR bypass the gate.
+  it("does NOT call kill_pty at gate flip (post-LB1-redesign)", async () => {
+    // After the LB1 kill-on-.done.json removal, the agent's PTY stays
+    // alive when a worktree-backed task flips to awaiting-approval —
+    // the user can keep talking to it on the same lease, and the
+    // freeze-before-snapshot invariant moves to Approve / Discard /
+    // terminal-close paths. Verify that the scan path itself does not
+    // issue a kill_pty IPC.
     setupAgentWithWorktree();
     const store = useCollaboratorStore.getState();
     const task = store.addTask(
@@ -3703,7 +3701,7 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
       author: "@claude1",
     });
     let deleted = false;
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let killPtyCalled = false;
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "list_memory_files")
         return deleted ? [] : [`${task.id}.done.json`];
@@ -3712,9 +3710,11 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
         deleted = true;
         return null;
       }
-      if (cmd === "kill_pty") throw new Error("PTY already exited");
+      if (cmd === "kill_pty") {
+        killPtyCalled = true;
+        return null;
+      }
       if (cmd === "git_diff_summary") {
-        // PTY was already gone, but diff still works — and shows changes.
         return {
           hasChanges: true,
           committed: ["src/foo.ts"],
@@ -3731,16 +3731,12 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
     const updated = useCollaboratorStore
       .getState()
       .tasksBySession[lb1Session]?.find((t) => t.id === task.id);
-    // The gate engaged successfully despite kill_pty failing.
+    // The gate still engaged.
     expect(updated?.status).toBe("awaiting-approval");
     expect(updated?.pendingMerge).not.toBeNull();
     expect(updated?.pendingMerge?.diffSummary.committed).toEqual(["src/foo.ts"]);
-    // Warn was logged for the kill_pty failure but didn't bypass the gate.
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("kill_pty failed"),
-      expect.any(Error),
-    );
-    warnSpy.mockRestore();
+    // No kill_pty during scan.
+    expect(killPtyCalled).toBe(false);
   });
 
   it("git_diff_summary failure FAILS CLOSED → blocked (round-7 codex1+codex2 H1)", async () => {
@@ -3770,7 +3766,6 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
         deleted = true;
         return null;
       }
-      if (cmd === "kill_pty") return null; // succeeds
       if (cmd === "git_diff_summary")
         throw new Error("worktree path not found");
       return null;
@@ -3823,7 +3818,6 @@ describe("scanForTaskCompletions LB1 awaiting-approval gate (P2)", () => {
         deleted = true;
         return null;
       }
-      if (cmd === "kill_pty") return null;
       if (cmd === "git_diff_summary") {
         return {
           hasChanges: true,
@@ -4044,6 +4038,16 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve: happy path — runs approval-commit + merge + cleanup, releases lease, marks completed", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      // Pre-merge re-snapshot: residue persists (matches setup hasResidue=true).
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: ["b.ts"],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_create_approval_commit") return { commitSha: "deadbeef", stagedCount: 1 };
       if (cmd === "git_merge_worktree") return { mergedSha: "abcd1234", pushed: false };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
@@ -4059,13 +4063,14 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     // Lease released.
     const agent = useCollaboratorStore.getState().agents[0];
     expect(agent.worktree).toBeNull();
-    // Verify all three git IPCs fired in order (filter out persistence
+    // Verify all four git IPCs fired in order (filter out persistence
     // calls like read_memory_file / write_memory_file).
     const gitOrder = vi
       .mocked(invoke)
       .mock.calls.map((c) => c[0])
       .filter((c) => typeof c === "string" && c.startsWith("git_"));
     expect(gitOrder).toEqual([
+      "git_diff_summary",
       "git_create_approval_commit",
       "git_merge_worktree",
       "git_worktree_remove",
@@ -4075,6 +4080,16 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve: skips approval-commit when diffSummary has no working-tree residue", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      // Pre-merge re-snapshot: still committed-only (matches setup).
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") return { mergedSha: "abcd1234", pushed: false };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
       return null;
@@ -4085,7 +4100,11 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       .mock.calls.map((c) => c[0])
       .filter((c) => typeof c === "string" && c.startsWith("git_"));
     // git_create_approval_commit NOT called (committed-only branch).
-    expect(gitOrder).toEqual(["git_merge_worktree", "git_worktree_remove"]);
+    expect(gitOrder).toEqual([
+      "git_diff_summary",
+      "git_merge_worktree",
+      "git_worktree_remove",
+    ]);
     const task = useCollaboratorStore
       .getState()
       .tasksBySession[D14_SESSION]?.find((t) => t.id === taskId);
@@ -4095,6 +4114,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve --push: passes push=true to merge", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") return { mergedSha: "abcd1234", pushed: true };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
       return null;
@@ -4111,6 +4139,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve -- <message>: passes the custom message to approval-commit", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: ["b.ts"],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_create_approval_commit") return { commitSha: "x", stagedCount: 1 };
       if (cmd === "git_merge_worktree") return { mergedSha: "y", pushed: false };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
@@ -4154,6 +4191,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve: hookFailed → task transitions to merge-conflict, worktree preserved (round-12 O5: 'pre-unknown' wording fix)", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") {
         // Round-12 claude3 O5: backend's classifier always sets
         // stage: "unknown" for HookFailed (the stage isn't recoverable
@@ -4188,6 +4234,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve: mergeConflict → task transitions to merge-conflict with file list in status", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") {
         throw { kind: "mergeConflict", branch: "agent/x", files: ["src/a.ts", "src/b.ts"] };
       }
@@ -4206,6 +4261,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve: targetBranchStale → restores awaiting-approval (retryable precondition)", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") {
         throw { kind: "targetBranchStale", target: "dev", message: "non-fast-forward" };
       }
@@ -4224,6 +4288,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve: parentRepoDirty → restores awaiting-approval, surfaces dirty file list", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") {
         throw { kind: "parentRepoDirty", repoRoot: "/r", files: ["docs/x.md"] };
       }
@@ -4242,6 +4315,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve: pushFailedAfterMerge → marks completed but warns (local merge already done)", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: false });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") {
         throw { kind: "pushFailedAfterMerge", mergedSha: "deadbeef", stderr: "remote rejected" };
       }
@@ -4281,6 +4363,16 @@ describe("D14 — /task approve and /task discard slash commands", () => {
 
     // First Approve attempt: approval-commit succeeds, merge fails.
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      // Pre-merge re-snapshot reflects the original residue.
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: ["b.ts"],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_create_approval_commit") {
         return { commitSha: "ac1", stagedCount: 1 };
       }
@@ -4315,6 +4407,18 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     // NOT be called again.
     vi.mocked(invoke).mockClear();
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      // Pre-merge re-snapshot now sees the post-approval-commit state:
+      // residue was folded into the new commit, so the working tree is
+      // clean (committed-only). The retry's residue check must agree.
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts", "b.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") return { mergedSha: "abcd", pushed: false };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
       // Defensive: if H1 isn't fixed and approval-commit IS called on a
@@ -4345,6 +4449,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
   it("/task approve: approval-commit failure restores awaiting-approval, never proceeds to merge", async () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: ["b.ts"],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_create_approval_commit") {
         throw { kind: "hookFailed", stage: "commit", stderr: "lint error" };
       }
@@ -4542,6 +4655,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       if (cmd === "run_gh_api") {
         return { exitCode: 0, stdout: '{"required_pull_request_reviews":{"dismiss_stale_reviews":true}}', stderr: "" };
       }
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") return { mergedSha: "abcd", pushed: false };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
       return null;
@@ -4563,6 +4685,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
       ackProtection: true, // acked, LB3 check should be skipped entirely
     });
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_merge_worktree") return { mergedSha: "abcd", pushed: false };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };
       return null;
@@ -5635,6 +5766,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
     const { taskId } = setupAwaitingApprovalTask({ hasResidue: true });
     let capturedHandle: string | undefined;
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: ["b.ts"],
+          unstaged: [],
+          untracked: [],
+        };
+      }
       if (cmd === "git_create_approval_commit") {
         capturedHandle = (args as { agentHandle: string }).agentHandle;
         return { commitSha: "abc", stagedCount: 1 };
@@ -5891,6 +6031,15 @@ describe("D14 — /task approve and /task discard slash commands", () => {
           };
         }
         return { exitCode: 4, stdout: "", stderr: "Not Found (HTTP 404)" };
+      }
+      if (cmd === "git_diff_summary") {
+        return {
+          hasChanges: true,
+          committed: ["a.ts"],
+          staged: [],
+          unstaged: [],
+          untracked: [],
+        };
       }
       if (cmd === "git_merge_worktree") return { mergedSha: "abc", pushed: false };
       if (cmd === "git_worktree_remove") return { kind: "fullyRemoved" };

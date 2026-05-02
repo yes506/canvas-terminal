@@ -117,10 +117,15 @@ export type RenameResult =
  *                         (b) staged-but-uncommitted changes,
  *                         (c) unstaged changes to tracked files,
  *                         (d) untracked-non-ignored files.
- *                         The agent's PTY is killed at the flip
- *                         (LB1, claude3 task-46 R2 ordering: kill BEFORE
- *                         snapshot). User must Approve / Request Changes
- *                         / Discard.
+ *                         The agent's PTY is left alive at the flip so
+ *                         the user can keep talking to it on the same
+ *                         worktree lease. The freeze-before-snapshot
+ *                         invariant (claude3 task-46 R2) moves to the
+ *                         Approve / Discard handlers and to terminal-
+ *                         close (cleanupWorktreedAgent), each of which
+ *                         calls kill_pty before reading or removing
+ *                         the worktree. User must Approve / Request
+ *                         Changes / Discard.
  *   approved-merging    — orchestrator is mid-merge (transient state
  *                         visible only briefly between Approve click and
  *                         git_merge_worktree completion).
@@ -156,9 +161,14 @@ export type TaskStatus =
  *                       `pending` | `in-progress`. Used by
  *                       sendToAgent / broadcastToAll's refresh
  *                       decision.
- *   - "review-or-merge": agent has finished writing; task is in the
- *                       P2 approval/merge pipeline; PTY killed by
- *                       LB1 design. User action may be required
+ *   - "review-or-merge": agent has finished writing a `.done.json`;
+ *                       task is in the P2 approval/merge pipeline.
+ *                       The PTY may still be alive in this phase —
+ *                       the freeze-before-snapshot kill moved out of
+ *                       LB1 (the scanner) into the Approve / Discard
+ *                       handlers and terminal-close, so the user can
+ *                       keep talking to the agent while the task waits
+ *                       for review. User action may be required
  *                       (`awaiting-approval`, `merge-conflict`) or
  *                       merge is in flight (`approved-merging`).
  *   - "terminal":       task is done — `completed` (success) or
@@ -209,8 +219,12 @@ export function isActiveStatus(s: TaskStatus): boolean {
 /** Worktree-isolation v5 §4 P2.a `pendingMerge` snapshot — captured at
  *  `awaiting-approval` flip, used by the Approve UI to render the diff
  *  and by `git_merge_worktree` to identify the agent branch. Self-
- *  contained per RESID-5: doesn't depend on a live `SpawnedAgent`,
- *  because the agent's PTY is killed at flip (LB1). */
+ *  contained per RESID-5: doesn't depend on a live `SpawnedAgent`, so
+ *  the snapshot survives the agent's eventual PTY exit (which now
+ *  happens at terminal-close / Approve / Discard, not at gate flip).
+ *  The Approve handler re-snapshots `diffSummary` against a freshly
+ *  killed PTY before deciding whether to issue an approval-commit, so
+ *  the field captured here is a PREVIEW for the awaiting-approval UI. */
 export interface PendingMerge {
   /** Branch name (e.g. `agent/claude_code-session-9-…`). */
   branch: string;
@@ -280,9 +294,10 @@ export interface CollabTask {
   /**
    * P2 awaiting-approval snapshot. Set when `status === "awaiting-approval"
    * | "approved-merging" | "merge-conflict"`. Cleared on `completed` /
-   * `blocked` transitions. Self-contained: works after the agent's PTY
-   * has been killed at flip (LB1). null in v1 unless the agent ran in a
-   * worktree.
+   * `blocked` transitions. Self-contained: doesn't depend on a live
+   * `SpawnedAgent`, so the snapshot survives the agent's eventual PTY
+   * exit (which now happens at terminal-close / Approve / Discard, not
+   * at gate flip). null in v1 unless the agent ran in a worktree.
    */
   pendingMerge: PendingMerge | null;
 }
