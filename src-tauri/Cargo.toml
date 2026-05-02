@@ -45,3 +45,13 @@ fs2 = "0.4"
 # in unit tests without binding a real TCP port. Test-only — the production
 # server uses axum::serve directly.
 tower = { version = "0.5", features = ["util"] }
+# PR-A: process-wide TempDir-backed test root override. Every Rust test that
+# allocates managed worktree paths uses this instead of the production
+# `~/.cache/canvas-terminal/worktrees/` root, so `cargo test` produces zero
+# entries under the production root. See git.rs `worktrees_root_for_test`.
+tempfile = "3"
+# PR-A: `dirs::home_dir()` used by tests/policy_jail_smoke.rs to reconstruct
+# the expected production root path independently of the lib's path logic.
+# Integration tests don't transitively get the lib's [dependencies] as
+# direct imports, so this needs to be declared here too.
+dirs = "6"
