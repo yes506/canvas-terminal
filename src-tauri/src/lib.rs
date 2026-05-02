@@ -135,27 +135,9 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::set_settings,
             commands::settings::open_external_url,
-            commands::settings::read_app_config_file,
-            commands::settings::write_app_config_file,
             commands::dashboard::open_dashboard,
             commands::dashboard::get_dashboard_info,
             commands::dashboard::copy_dashboard_url_with_token,
-            // Worktree-isolation policy P1 backend (v5.1 implementation kickoff)
-            commands::git::git_detect_repo,
-            commands::git::git_worktree_create,
-            commands::git::git_worktree_remove,
-            commands::git::git_branch_force_delete,
-            commands::git::git_worktree_list,
-            commands::git::git_worktree_status,
-            commands::git::git_diff_summary,
-            commands::git::compute_worktree_path,
-            // Worktree-isolation policy P2 backend — orchestrator-owned
-            // approval commit + merge with file-lock + structured GitError
-            commands::git::git_create_approval_commit,
-            commands::git::git_merge_worktree,
-            // LB3 branch-protection wizard support
-            commands::git::git_get_remote_url,
-            commands::git::run_gh_api,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

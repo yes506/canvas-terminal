@@ -6,15 +6,9 @@ import type {
   ToolId,
   CollabTask,
   AgentNameRecord,
-  PendingMerge,
   RenameResult,
-  TaskStatus,
 } from "../types/collaborator";
-import {
-  TOOL_CONFIGS,
-  isActiveStatus,
-  isTerminalStatus,
-} from "../types/collaborator";
+import { TOOL_CONFIGS } from "../types/collaborator";
 import { muteCapture } from "../lib/agentOutputCapture";
 import { useTerminalStore } from "./terminalStore";
 
@@ -57,16 +51,6 @@ export interface AgentTaskState {
   taskId?: string;
   taskTitle?: string;
   outcomeKind?: "completed" | "blocked";
-  /**
-   * Round-27: when `kind === "in_progress"`, the task's actual status.
-   * Lets the renderer distinguish the 5 non-terminal statuses
-   * (pending, in-progress, awaiting-approval, approved-merging,
-   * merge-conflict) instead of collapsing them all to a generic
-   * "in progress" — fixes the bug where awaiting-approval /
-   * merge-conflict tasks rendered as "idle" or "exited" because the
-   * indicator couldn't see them.
-   */
-  taskStatus?: TaskStatus;
 }
 
 export const RECENT_OUTCOME_TTL_MS = 5000;
@@ -146,17 +130,24 @@ export function getIndicatorPresentation(
   const liveRole: "status" | "alert" = isBlockedOutcome ? "alert" : "status";
   const liveLevel: "polite" | "assertive" = isBlockedOutcome ? "assertive" : "polite";
 
-  // Step 1 — spawning/pre-registration ALWAYS wins. The PTY isn't
-  // running yet so no task work is happening; whatever state was
-  // captured in `taskState` is stale.
+  if (lifecycle === "exited") {
+    return { color: "bg-gray-500", ringColor: "ring-gray-400/40", pulse: false, ping: false, label: "exited", tone: "text-text-dim", liveRole, liveLevel };
+  }
   if (lifecycle === "spawning" || lifecycle === "pre-registration") {
     return { color: "bg-yellow-400", ringColor: "ring-yellow-300/40", pulse: true, ping: false, label: "starting…", tone: "text-yellow-300", liveRole, liveLevel };
   }
-
-  // Step 2 — completed (recent outcome) wins over `exited`. The
-  // success/blocked flash is informative and the user expects to see
-  // it after a successful Approve (which leaves agent.status='exited'
-  // because LB1 killed the PTY at the awaiting-approval flip).
+  if (taskState.kind === "in_progress") {
+    return {
+      color: "bg-sky-400",
+      ringColor: "ring-sky-300/40",
+      pulse: true,
+      ping: false,
+      label: taskState.taskTitle ? `in progress: ${taskState.taskTitle}` : "in progress",
+      tone: "text-sky-300",
+      liveRole,
+      liveLevel,
+    };
+  }
   if (taskState.kind === "completed") {
     if (isBlockedOutcome) {
       return {
@@ -181,87 +172,6 @@ export function getIndicatorPresentation(
       liveLevel,
     };
   }
-
-  // Step 3 — Round-27: P2 review/merge taskStatus values
-  // (awaiting-approval / approved-merging / merge-conflict) override
-  // the `exited` lifecycle. LB1 kills the PTY by design at the
-  // awaiting-approval flip, so an exited agent with a mid-P2 task
-  // should surface the task state, not "exited".
-  if (taskState.kind === "in_progress") {
-    if (taskState.taskStatus === "awaiting-approval") {
-      return {
-        // Violet: distinct from blue (active work) and emerald
-        // (success). Signals "user action pending."
-        color: "bg-violet-400",
-        ringColor: "ring-violet-300/60",
-        pulse: false,
-        ping: true,
-        label: taskState.taskTitle
-          ? `awaiting approval: ${taskState.taskTitle}`
-          : "awaiting approval",
-        tone: "text-violet-300",
-        liveRole,
-        liveLevel,
-      };
-    }
-    if (taskState.taskStatus === "approved-merging") {
-      return {
-        color: "bg-cyan-400",
-        ringColor: "ring-cyan-300/60",
-        pulse: true,
-        ping: false,
-        label: taskState.taskTitle
-          ? `merging: ${taskState.taskTitle}`
-          : "merging…",
-        tone: "text-cyan-300",
-        liveRole,
-        liveLevel,
-      };
-    }
-    if (taskState.taskStatus === "merge-conflict") {
-      return {
-        // Amber matches the "blocked" outcome treatment — both are
-        // "user action required."
-        color: "bg-amber-500",
-        ringColor: "ring-amber-300/70",
-        pulse: true,
-        ping: true,
-        label: taskState.taskTitle
-          ? `⚠ merge conflict: ${taskState.taskTitle}`
-          : "⚠ merge conflict",
-        tone: "text-amber-300",
-        liveRole: "alert",
-        liveLevel: "assertive",
-      };
-    }
-    // pending / in-progress / undefined fall through — they don't
-    // override `exited`. Step 4 (exited) sees them next.
-  }
-
-  // Step 4 — exited lifecycle. Wins over plain in_progress (no
-  // P2-status override) and over idle. After steps 2+3 already let
-  // completed and P2-review states pre-empt, anything reaching here
-  // with `lifecycle === "exited"` should render gray "exited".
-  if (lifecycle === "exited") {
-    return { color: "bg-gray-500", ringColor: "ring-gray-400/40", pulse: false, ping: false, label: "exited", tone: "text-text-dim", liveRole, liveLevel };
-  }
-
-  // Step 5 — running + in_progress (pending/in-progress taskStatus,
-  // or undefined for back-compat). Standard "active work" blue.
-  if (taskState.kind === "in_progress") {
-    return {
-      color: "bg-sky-400",
-      ringColor: "ring-sky-300/40",
-      pulse: true,
-      ping: false,
-      label: taskState.taskTitle ? `in progress: ${taskState.taskTitle}` : "in progress",
-      tone: "text-sky-300",
-      liveRole,
-      liveLevel,
-    };
-  }
-
-  // Step 6 — running + idle.
   return { color: "bg-green-400/60", ringColor: "ring-green-400/0", pulse: false, ping: false, label: "idle", tone: "text-text-dim", liveRole, liveLevel };
 }
 
@@ -303,15 +213,13 @@ export function getAgentTaskState(
   const recent = recentOutcomesBySession[collabSessionId]?.[handle];
   const recentValid = !!recent && Date.now() - recent.at < RECENT_OUTCOME_TTL_MS;
 
-  // Round-27: use the NON-TERMINAL helper so the indicator can surface
-  // all 5 non-terminal task statuses (pending, in-progress, awaiting-
-  // approval, approved-merging, merge-conflict). The strict
-  // `findFreshestActiveTaskForMention` (used by sendToAgent /
-  // broadcastToAll) only considers pending/in-progress because those
-  // are the states where the PTY is alive and a fresh inject_into_pty
-  // makes sense — but for the indicator label, the user wants to see
-  // the agent's actual current state across the full P2 flow.
-  const found = findFreshestNonTerminalTaskForMention(tasks, mention);
+  // Delegate the "freshest active task" pick to the shared helper so the
+  // selection rule lives in exactly one place. Without this, drift between
+  // the indicator's display logic and `bumpAssignedAt`'s target picker is
+  // exactly the bug @codex3 found in round 5 (oldest-vs-freshest). The
+  // helper also returns the parsed ms so we don't re-parse `assignedAt`
+  // for the freshness gate (claude1 D1 + claude3 D3 from round 7).
+  const found = findFreshestActiveTaskForMention(tasks, mention);
 
   if (found) {
     // "Freshly assigned" = no recent outcome to honor, OR the active task
@@ -322,16 +230,7 @@ export function getAgentTaskState(
     // `assignedAt` is strictly less than `recent.at`.
     const freshAfterOutcome = !recentValid || found.assignedAtMs >= recent!.at;
     if (freshAfterOutcome) {
-      return {
-        kind: "in_progress",
-        taskId: found.task.id,
-        taskTitle: found.task.title,
-        // Round-27: pass the actual status so the renderer can
-        // distinguish pending/in-progress (active work) from
-        // awaiting-approval (review pending) / approved-merging
-        // (merging…) / merge-conflict (needs resolution).
-        taskStatus: found.task.status,
-      };
+      return { kind: "in_progress", taskId: found.task.id, taskTitle: found.task.title };
     }
   }
 
@@ -479,15 +378,6 @@ export function _resetWriteStateForTests(): void {
   abortedSessions.clear();
   firstSendInflight.clear();
   renamePendingByAgent.clear();
-  // Round-18 codex2 task-110 hygiene note: also reset LB3 module-level
-  // state so persistence + hydration tests don't cross-couple. The
-  // assignments are safe even though the vars are declared later in
-  // the file — function bodies don't read at parse time.
-  branchProtectionAcksWriteChain = Promise.resolve();
-  sessionClears.clear();
-  // Round-21 verified-protected cache reset is in commands.ts; tests
-  // call _clearVerifiedProtectedCacheForTests directly to avoid a
-  // circular import.
 }
 
 /**
@@ -615,13 +505,9 @@ export function formatTaskSummaryForAgent(
   recipient: string | null,
   options: { othersCap?: number } = {},
 ): string {
-  // Round-29 (codex2 task-142 follow-up): use the centralized
-  // classifier per claude3 task-139 O3 / round-28's
-  // `classifyTaskStatus`. The agent prompt summary should only
-  // include PTY-alive active work — tasks in P2 review/merge states
-  // already have their PTY killed by LB1 design and shouldn't be
-  // surfaced to the agent as "your active work."
-  const active = tasks.filter((t) => isActiveStatus(t.status));
+  const active = tasks.filter(
+    (t) => t.status === "pending" || t.status === "in-progress",
+  );
   if (active.length === 0) return "";
 
   const mention = recipient ? `@${recipient}` : null;
@@ -687,21 +573,9 @@ function taskFileRelativePath(collabSessionId: string): string {
  * Pick the freshest active (pending/in-progress) task assigned to a given
  * mention — i.e., the one with the largest `assignedAt`. Returns the
  * parsed ms timestamp alongside the task so callers don't re-parse the
- * ISO string (`bumpAssignedAt` callers can ignore it). Single-pass scan,
- * no `.sort()` copy.
- *
- * STRICT pending/in-progress filter — used by sendToAgent and
- * broadcastToAll's auto-create/refresh decision. The strictness is
- * load-bearing: the awaiting-approval / approved-merging /
- * merge-conflict states have a killed PTY (LB1 design), so refreshing
- * via `inject_into_pty` would fail. The lease check at sendToAgent
- * (round-11) handles those non-terminal states by refusing the entire
- * send when a worktree lease is held with no fresh active task.
- *
- * For the INDICATOR (`getAgentTaskState`), use
- * `findFreshestNonTerminalTaskForMention` instead — the indicator
- * needs to surface ALL non-terminal task states, not just the ones
- * where the PTY is alive.
+ * ISO string (`getAgentTaskState` needs `assignedAtMs` for the freshness
+ * gate; `bumpAssignedAt` callers can ignore it). Single-pass scan, no
+ * `.sort()` copy.
  */
 function findFreshestActiveTaskForMention(
   tasks: CollabTask[],
@@ -711,49 +585,7 @@ function findFreshestActiveTaskForMention(
   let freshestMs = -Infinity;
   for (const t of tasks) {
     if (t.assignee !== mention) continue;
-    // Round-28: use the centralized classifier (claude3 task-139 O3).
-    // Adding a new TaskStatus is a single-point edit in
-    // `classifyTaskStatus`; this filter doesn't need to know the
-    // specific status names, just the lifecycle phase.
-    if (!isActiveStatus(t.status)) continue;
-    const ms = new Date(t.assignedAt).getTime();
-    if (ms > freshestMs) {
-      freshest = t;
-      freshestMs = ms;
-    }
-  }
-  return freshest ? { task: freshest, assignedAtMs: freshestMs } : null;
-}
-
-/**
- * Round-27: pick the freshest NON-TERMINAL task assigned to a given
- * mention. "Non-terminal" = anything except `completed` or `blocked`,
- * covering the full P2 status machine:
- *   - pending, in-progress (active, PTY alive)
- *   - awaiting-approval, approved-merging, merge-conflict (in
- *     P2 review/merge flow, PTY killed by LB1 design)
- *
- * Used by the indicator (`getAgentTaskState`) so the agent's mini-
- * terminal label correctly reflects mid-P2-flow tasks. Without this,
- * awaiting-approval / approved-merging / merge-conflict tasks fell
- * through the strict `findFreshestActiveTaskForMention` filter and
- * the indicator showed "idle" (or stale "completed" outcome) when
- * the task was very much alive — the bug shape the user-reported
- * status mismatch surfaced.
- */
-function findFreshestNonTerminalTaskForMention(
-  tasks: CollabTask[],
-  mention: string,
-): { task: CollabTask; assignedAtMs: number } | null {
-  let freshest: CollabTask | null = null;
-  let freshestMs = -Infinity;
-  for (const t of tasks) {
-    if (t.assignee !== mention) continue;
-    // Round-28: use the centralized classifier. Future TaskStatus
-    // additions classified as "terminal" automatically get excluded;
-    // those classified as "active" or "review-or-merge" automatically
-    // get included.
-    if (isTerminalStatus(t.status)) continue;
+    if (t.status !== "pending" && t.status !== "in-progress") continue;
     const ms = new Date(t.assignedAt).getTime();
     if (ms > freshestMs) {
       freshest = t;
@@ -790,62 +622,6 @@ function findFreshestNonTerminalTaskForMention(
  */
 function resolveTaskAuthor(task: CollabTask): string | null {
   return task.completedBy?.trim() || task.assignee?.trim() || null;
-}
-
-/**
- * LB5 lease-based conflict detector (v5 RESID-6 structural gate, hardened
- * by round-10 reviewer feedback codex1 task-81 H1 + codex2 task-83 H1+M1).
- *
- * The "worktree lease" is held by an agent for as long as its
- * SpawnedAgent record has `worktree !== null`. While the lease is held,
- * NO new git-write task may be assigned to the same handle — running
- * two tasks on the same worktree branch would co-mingle their diffs and
- * the per-task approval gate would land work the user never reviewed
- * for either task individually.
- *
- * Rule (lease-based, broader than v4's status-only check):
- *   - Agent has worktree → ANY non-completed task assigned to this
- *     handle is a conflict, INCLUDING `blocked`. Reason: `blocked`
- *     doesn't release the worktree (LB1 fail-closed preserves it for
- *     manual inspection; manual `/task status blocked` is abandonment,
- *     not cleanup).
- *   - Agent has no worktree (or no record) → defense-in-depth fallback:
- *     any task with `pendingMerge !== null` still counts (gate engaged,
- *     state pending review). After round-8 cleanup-on-close, the agent
- *     record should always survive when worktree has work, so this
- *     branch is rare but eliminates a record-loss bypass class.
- *
- * Returns the conflicting task (caller can format error message), or
- * `undefined` if the assignment is safe.
- *
- * `excludeTaskId`: skip this task in the lookup. Used by `updateTask`
- * when reassigning a task — the task being reassigned isn't conflicting
- * with itself.
- */
-export function findWorktreeLeaseConflict(
-  assigneeToken: string,
-  agents: SpawnedAgent[],
-  tasks: CollabTask[],
-  collabSessionId: string,
-  excludeTaskId?: string,
-): CollabTask | undefined {
-  const handle = assigneeToken.replace(/^@/, "");
-  const filtered = excludeTaskId
-    ? tasks.filter((t) => t.id !== excludeTaskId)
-    : tasks;
-  const agent = agents.find(
-    (a) => a.collabSessionId === collabSessionId && a.handle === handle,
-  );
-  if (agent?.worktree) {
-    // Lease held: any non-completed task on this handle conflicts.
-    return filtered.find(
-      (t) => t.assignee === `@${handle}` && t.status !== "completed",
-    );
-  }
-  // Agent record gone or no worktree → fallback to pendingMerge check.
-  return filtered.find(
-    (t) => t.assignee === `@${handle}` && t.pendingMerge !== null,
-  );
 }
 
 /**
@@ -918,173 +694,6 @@ function bumpAssignedAt(
   }));
   // Fire-and-forget persist (matches addTask/updateTask cadence).
   useCollaboratorStore.getState().persistTasks(forSession);
-}
-
-/**
- * Round-15 polish: file-backed persistence for LB3 ack state. Restarts
- * shouldn't re-prompt the user for a repo they already explicitly acked.
- *
- * Storage shape: a single JSON file `branch-protection-acks.json`
- * mapping `repoRoot → {acceptedAt, note?}`.
- *
- * Round-16 (claude2 task-103 critical): the storage location is
- * `app_config_dir()` via the new `read_app_config_file` / `write_app_
- * config_file` Tauri commands — NOT the per-PID memory dir, which
- * gets cleared on every app start by `clear_stale_sessions()`. The
- * memory dir is per-PID-scoped and ephemeral; LB3 acks must be
- * cross-restart durable.
- *
- * Best-effort: read failures default to empty map (the user re-acks
- * once, acceptable degradation); write failures only log.
- */
-const BRANCH_PROTECTION_ACKS_PATH = "branch-protection-acks.json";
-
-async function readBranchProtectionAcks(): Promise<
-  Record<string, { acceptedAt: string; note?: string }>
-> {
-  try {
-    // Round-16 claude2 task-103: target app_config_dir, NOT the per-
-    // PID memory dir which gets cleared on every restart.
-    const content = await invoke<string | null>("read_app_config_file", {
-      relativePath: BRANCH_PROTECTION_ACKS_PATH,
-    });
-    if (!content) return {};
-    const parsed = JSON.parse(content) as unknown;
-    if (!parsed || typeof parsed !== "object") return {};
-    return parsed as Record<string, { acceptedAt: string; note?: string }>;
-  } catch {
-    // File missing / unparseable / IPC error — degrade to empty.
-    return {};
-  }
-}
-
-/**
- * Round-16 codex2 task-104 M1: serialize concurrent writes via a
- * promise chain so out-of-order completion can't resurrect a cleared
- * ack. Each call appends to the chain; the latest in-memory snapshot
- * is captured at write-time, so the final on-disk state always
- * reflects the most recent mutation.
- *
- * Without this, two fire-and-forget writes (e.g., accept then quick
- * clear) could complete in reverse order, leaving stale data on disk.
- */
-let branchProtectionAcksWriteChain: Promise<void> = Promise.resolve();
-
-/**
- * Round-18 codex1 task-93 round5 (BLOCKING): explicit-clear tracker
- * for the symmetric counterpart of round-16's hydration race. When
- * the user runs `/branch-protection clear-ack` BEFORE hydration's
- * read resolves, the merge `{...onDisk, ...inMemory}` would silently
- * resurrect the cleared key (in-memory is empty for that repo, but
- * onDisk still has it). The merge has no signal that the user EXPLICITLY
- * cleared the entry — only that in-memory doesn't currently contain it.
- *
- * Solution: track every repoRoot the user has explicitly cleared this
- * boot. Hydration filters those keys out of `onDisk` before merging.
- * Cleared after `_resetWriteStateForTests` for test isolation.
- */
-const sessionClears = new Set<string>();
-
-function persistBranchProtectionAcks(): void {
-  branchProtectionAcksWriteChain = branchProtectionAcksWriteChain
-    .catch(() => {})
-    .then(async () => {
-      // Snapshot the CURRENT in-memory state at write time, not at
-      // call time. This way the persisted state is always the latest
-      // mutation, regardless of how many writes are queued.
-      const snapshot = useCollaboratorStore.getState().branchProtectionAcks;
-      try {
-        await invoke("write_app_config_file", {
-          relativePath: BRANCH_PROTECTION_ACKS_PATH,
-          content: JSON.stringify(snapshot, null, 2),
-        });
-      } catch (err) {
-        // Best-effort; don't block UI.
-        console.warn(
-          "[collab/store] failed to persist branch-protection-acks:",
-          err,
-        );
-      }
-    });
-}
-
-/**
- * Hydrate `branchProtectionAcks` from disk on store startup.
- *
- * Round-16 (codex2 task-104 M2 + claude3 task-105 O1): MERGE rather
- * than overwrite the in-memory state. If the user accepts a limited
- * guarantee BEFORE hydration resolves (rare but possible during the
- * App.tsx mount window), the in-memory ack must NOT be lost. Disk
- * is the prior-restart source of truth; in-memory accumulates new
- * acks since boot. Final state = union; conflict resolution prefers
- * the in-memory entry (the user's most recent action wins).
- *
- * Round-17 (claude2 task-106): persist the merged state back to disk.
- * Without this, a user-accept that fires between read and merge
- * writes a partial state to disk (only the new ack) and the
- * previously-persisted repos from disk are never re-saved. The
- * promise-chain serialization in `persistBranchProtectionAcks`
- * guarantees this hydration write lands AFTER any user-triggered
- * writes, so the final disk state correctly reflects the union.
- *
- * Round-18 (codex1 round5 BLOCKING + claude2 task-109 + claude3
- * task-111 O3): symmetric clear-during-hydration race. Filter onDisk
- * against sessionClears BEFORE merging — otherwise an explicit
- * clear-ack made before hydration resolves would be silently
- * resurrected when onDisk's stale entry is merged into in-memory.
- *
- * Round-18 (claude3 task-111 O1): compute the merge + diff OUTSIDE
- * the setState updater (Zustand expects pure-function updaters; the
- * prior in-updater closure mutation worked but was fragile against
- * future Zustand changes).
- */
-export async function hydrateBranchProtectionAcks(): Promise<void> {
-  const onDiskRaw = await readBranchProtectionAcks();
-  // Round-18 codex1: drop any onDisk keys the user explicitly cleared
-  // this boot. Without this filter, a clear-ack issued before the
-  // hydration read resolves would be silently undone when the merge
-  // re-introduces the disk's pre-clear state.
-  const onDisk: typeof onDiskRaw = {};
-  for (const [repo, info] of Object.entries(onDiskRaw)) {
-    if (!sessionClears.has(repo)) onDisk[repo] = info;
-  }
-  // Round-18 claude3 O1: compute merge + diff outside setState. Pure
-  // updater stays a single read (returning the new state).
-  const currentInMemory = useCollaboratorStore.getState().branchProtectionAcks;
-  const merged: typeof currentInMemory = {
-    ...onDisk,
-    // In-memory entries (made between mount and hydration resolution)
-    // override disk entries. The user explicitly chose them this
-    // session and they haven't been clobbered yet.
-    ...currentInMemory,
-  };
-  // Detect whether the merge introduced anything not on disk yet.
-  // If so, we need to flush the merged state to disk to recover from
-  // the hydration-window data-loss scenario (claude2 task-106).
-  // Also flush if sessionClears removed entries that disk still had —
-  // disk needs to converge with the user's explicit clear.
-  let mergedDifferedFromDisk = false;
-  for (const repo of Object.keys(merged)) {
-    if (!Object.prototype.hasOwnProperty.call(onDiskRaw, repo)) {
-      mergedDifferedFromDisk = true;
-      break;
-    }
-  }
-  if (!mergedDifferedFromDisk) {
-    // Check the symmetric direction: did sessionClears strip a key that
-    // onDisk still had? If yes, disk is stale (still has the cleared
-    // entry) and needs a write to converge.
-    for (const repo of Object.keys(onDiskRaw)) {
-      if (sessionClears.has(repo)) {
-        mergedDifferedFromDisk = true;
-        break;
-      }
-    }
-  }
-  useCollaboratorStore.setState({ branchProtectionAcks: merged });
-  if (mergedDifferedFromDisk) {
-    persistBranchProtectionAcks();
-  }
 }
 
 function ensureSessionMemoryFiles(collabSessionId: string): void {
@@ -1175,23 +784,6 @@ interface CollaboratorState {
    */
   contextSentByAgent: Record<string, true | "inflight">;
 
-  /**
-   * LB3 branch-protection state, keyed by absolute repoRoot. Set when
-   * the user explicitly accepts the limited guarantee for a repo whose
-   * `origin/main` protection cannot be verified (non-GitHub remote,
-   * missing `gh`, auth/network failure) OR is verified-unprotected and
-   * the user knowingly skips the wizard. When set, every Approve
-   * status message is prefixed with `[limited-guarantee]` (P7 banner
-   * equivalent for the slash-command surface).
-   *
-   * Map shape: `{ [repoRoot]: { acceptedAt, note? } }`. Currently
-   * in-memory only — restart resets the flag, which re-prompts the
-   * user on the next Approve. File-backed persistence is a P5 polish
-   * item; the in-memory shape is sufficient for v1 because the
-   * Approve flow is the only consumer and the prompt is cheap.
-   */
-  branchProtectionAcks: Record<string, { acceptedAt: string; note?: string }>;
-
   // Session lifecycle
   startSession: (id: string) => void;
   /**
@@ -1235,40 +827,6 @@ interface CollaboratorState {
     sessionId: string,
     status: SpawnedAgent["status"],
   ) => void;
-  /**
-   * Release the worktree lease on an agent record, scoped to a session.
-   *
-   * Clears `agent.worktree` for the matching agent. Used by the D14
-   * Approve / Discard flow once the orchestrator has either merged or
-   * removed the worktree — the agent record is then no longer holding
-   * the lease, and a new task can be assigned (LB5 lease-based criteria).
-   *
-   * No-op when no matching agent exists. The caller is responsible for
-   * having already removed the worktree on disk; this only mutates
-   * in-memory state.
-   */
-  releaseAgentWorktree: (handle: string, forSession: string) => void;
-  /**
-   * LB3: persist the user's explicit acceptance of the limited
-   * guarantee for a specific repoRoot. Records the acceptance time
-   * and an optional note. Future Approve calls for the same repoRoot
-   * will skip the protection check and prefix `[limited-guarantee]`
-   * in their status output.
-   *
-   * Round-15 polish: also writes the updated map to disk so the ack
-   * survives app restarts.
-   *
-   * No-op when the same repoRoot is already acked (idempotent).
-   */
-  acceptBranchProtectionLimited: (repoRoot: string, note?: string) => void;
-  /**
-   * LB3 round-15: clear an explicit limited-guarantee ack for a repo.
-   * Used after the user enables real branch protection on GitHub —
-   * subsequent Approves can re-run the wizard and verify the upgrade.
-   *
-   * No-op when the repo isn't acked. Persists the change to disk.
-   */
-  clearBranchProtectionAck: (repoRoot: string) => void;
   /** Flush queued messages for an agent that has become ready. */
   flushPendingMessages: (sessionId: string) => Promise<void>;
   killAllAgents: (forSession?: string) => Promise<void>;
@@ -1314,18 +872,7 @@ interface CollaboratorState {
   }, forSession: string) => CollabTask;
   updateTask: (
     taskId: string,
-    updates: Partial<
-      Pick<
-        CollabTask,
-        | "status"
-        | "assignee"
-        | "reasoning"
-        | "conclusion"
-        | "output"
-        | "completedBy"
-        | "pendingMerge"
-      >
-    >,
+    updates: Partial<Pick<CollabTask, "status" | "assignee" | "reasoning" | "conclusion" | "output" | "completedBy">>,
     forSession: string,
   ) => void;
   getTasks: (forSession: string) => CollabTask[];
@@ -1444,206 +991,21 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
           continue;
         }
 
-        if (!isActiveStatus(task.status)) {
-          // Round-28 (claude3 task-139 O3): centralized classification.
-          // `!isActiveStatus` covers `terminal` (race winner already
-          // terminalized) AND `review-or-merge` (P2 gate already
-          // engaged). Both share the same response: best-effort delete
-          // the signal file; ignore if it's gone.
-          //
-          // The new P2 non-terminal states are handled here too because
-          // a duplicate `.done.json` arriving after the gate flipped
-          // shouldn't reset the task or trigger another flip.
+        if (task.status === "completed" || task.status === "blocked") {
+          // The race winner already terminalized this task. Best-effort
+          // delete so the file doesn't accumulate; ignore if it's gone.
           await invoke("delete_memory_file", { relativePath: relPath }).catch(() => {});
           continue;
         }
 
-        const requestedStatus =
-          data.status === "blocked" ? "blocked" : "completed";
-        const completedBy = data.author ?? data.agent ?? null;
-
-        // ---------------------------------------------------------------
-        // LB1: P2 awaiting-approval gate.
-        //
-        // Routing rules (round-7 fixes from codex1 task-69 H1, codex2
-        // task-71 H1+H2, claude3 task-72):
-        //
-        // 1. Gate by `task.assignee` FIRST, not `data.author`. The
-        //    .done.json `author` field is unauthenticated and a malicious
-        //    or buggy agent could spoof it (e.g., "@some-other-agent")
-        //    to bypass the gate. `task.assignee` is set by the orchestrator
-        //    (slash command / UI) and the worktree was provisioned for
-        //    THAT agent. completedBy stays as audit metadata only.
-        //
-        // 2. Fail CLOSED on diff failure. If we know there's a worktree-
-        //    backed assignee but `git_diff_summary` fails, the system
-        //    cannot prove whether source changed — terminalizing as
-        //    `completed` would silently bypass the approval gate. Instead
-        //    transition to `blocked` with diagnostic info; the worktree
-        //    is preserved for manual inspection.
-        //
-        // 3. kill_pty failure is NOT terminal: a dead PTY is already
-        //    frozen, so we still attempt the diff snapshot. Only diff
-        //    failure (which means we cannot determine source delta)
-        //    triggers fail-closed.
-        //
-        // 4. The kill-BEFORE-snapshot ordering invariant (claude3
-        //    task-46 R2) holds: try kill_pty first; whether it succeeds
-        //    or fails, the diff happens after.
-        //
-        // KNOWN LIMITATION (claude3 task-72 O1) — defer to follow-up:
-        //   If the user closes the agent's pane within the 2s polling
-        //   window after .done.json is written but before the gate
-        //   engages, AgentMiniTerminal cleanup-on-unmount removes the
-        //   SpawnedAgent record. Subsequent scan tick can't find the
-        //   agent's worktree → falls through. Mitigation requires
-        //   integrating LB1 inline into AgentMiniTerminal cleanup OR
-        //   persisting worktree metadata to a sidecar file.
-        // ---------------------------------------------------------------
-        const assigneeHandle = (task.assignee ?? "").replace(/^@/, "");
-        const agent = assigneeHandle
-          ? store.agents.find(
-              (a) =>
-                a.collabSessionId === forSession &&
-                a.handle === assigneeHandle,
-            )
-          : undefined;
-
-        let gateOutcome:
-          | { kind: "no-gate" }
-          | { kind: "approved"; pendingMerge: PendingMerge }
-          | { kind: "no-delta" }
-          | { kind: "fail-closed"; reason: string } = { kind: "no-gate" };
-
-        if (
-          requestedStatus === "completed" &&
-          agent?.worktree &&
-          agent.sessionId
-        ) {
-          // Snapshot worktree metadata FIRST — even though removeAgent
-          // doesn't fire on PTY exit (only on UI tile dismissal per
-          // AgentMiniTerminal's cleanup), capture defensively in case
-          // the SpawnedAgent record changes between PTY exit and snapshot
-          // (claude2 task-70 Concern 3 doc correction).
-          const wt = agent.worktree;
-          const ptySid = agent.sessionId;
-
-          // Try kill_pty. Failure is non-fatal: a dead PTY is already
-          // frozen, so we proceed to the diff anyway. Successful kill
-          // freezes the worktree explicitly.
-          let killError: unknown = null;
-          try {
-            await invoke("kill_pty", { sessionId: ptySid });
-          } catch (err) {
-            killError = err;
-            // eslint-disable-next-line no-console
-            console.warn(
-              "[collab/scan] kill_pty failed; PTY may already be exited. Continuing with diff snapshot.",
-              err,
-            );
-          }
-
-          // Step: snapshot from the (now-frozen) worktree. Failure HERE
-          // is fail-CLOSED — without the diff we can't determine source
-          // delta and terminalizing as `completed` would silently
-          // bypass the gate.
-          try {
-            const diff = await invoke<{
-              hasChanges: boolean;
-              committed: string[];
-              staged: string[];
-              unstaged: string[];
-              untracked: string[];
-            }>("git_diff_summary", {
-              worktreePath: wt.path,
-              baseSha: wt.baseSha,
-            });
-
-            if (diff.hasChanges) {
-              gateOutcome = {
-                kind: "approved",
-                pendingMerge: {
-                  branch: wt.branch,
-                  worktreePath: wt.path,
-                  repoRoot: wt.repoRoot,
-                  baseRef: wt.baseRef,
-                  baseSha: wt.baseSha,
-                  baseFresh: wt.baseFresh,
-                  diffSummary: {
-                    committed: diff.committed,
-                    staged: diff.staged,
-                    unstaged: diff.unstaged,
-                    untracked: diff.untracked,
-                  },
-                  agentHandle: `@${assigneeHandle}`,
-                },
-              };
-            } else {
-              // Worktree-backed agent but no source delta (e.g., read-
-              // only investigation). Safe to auto-complete.
-              gateOutcome = { kind: "no-delta" };
-            }
-          } catch (diffErr) {
-            // FAIL-CLOSED: cannot prove there's no source delta. Don't
-            // terminalize as completed — that would bypass the gate.
-            const reason = `git_diff_summary failed: ${String(diffErr)}${
-              killError ? ` (after kill_pty also failed: ${String(killError)})` : ""
-            }`;
-            // eslint-disable-next-line no-console
-            console.warn(
-              "[collab/scan] LB1 fail-closed: cannot determine source delta for worktree-backed task; routing to blocked.",
-              diffErr,
-            );
-            gateOutcome = { kind: "fail-closed", reason };
-          }
-        }
-
-        if (gateOutcome.kind === "approved") {
-          store.updateTask(
-            task.id,
-            {
-              status: "awaiting-approval",
-              reasoning: data.reasoning ?? null,
-              conclusion: data.conclusion ?? null,
-              output: data.output ?? null,
-              completedBy,
-              pendingMerge: gateOutcome.pendingMerge,
-            },
-            forSession,
-          );
-        } else if (gateOutcome.kind === "fail-closed") {
-          // Worktree-backed task whose diff snapshot failed. Preserve
-          // the worktree (no removal) so the user can inspect manually.
-          // Mark as blocked with the underlying error in conclusion so
-          // the failure is user-visible (not silently dropped).
-          store.updateTask(
-            task.id,
-            {
-              status: "blocked",
-              reasoning:
-                "LB1 gate could not determine source delta; preserving worktree for manual inspection.",
-              conclusion: gateOutcome.reason,
-              output: data.output ?? null,
-              completedBy,
-            },
-            forSession,
-          );
-        } else {
-          // no-gate (no agent / no worktree / non-completed status)
-          // OR no-delta (worktree-backed but read-only). Direct
-          // terminalization is correct in both cases.
-          store.updateTask(
-            task.id,
-            {
-              status: requestedStatus as CollabTask["status"],
-              reasoning: data.reasoning ?? null,
-              conclusion: data.conclusion ?? null,
-              output: data.output ?? null,
-              completedBy,
-            },
-            forSession,
-          );
-        }
+        const status = data.status === "blocked" ? "blocked" : "completed";
+        store.updateTask(task.id, {
+          status: status as CollabTask["status"],
+          reasoning: data.reasoning ?? null,
+          conclusion: data.conclusion ?? null,
+          output: data.output ?? null,
+          completedBy: data.author ?? data.agent ?? null,
+        }, forSession);
 
         // Delete the signal file after processing
         await invoke("delete_memory_file", { relativePath: relPath });
@@ -1809,7 +1171,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   pendingMessagesByAgent: {},
   recentOutcomesBySession: {},
   contextSentByAgent: {},
-  branchProtectionAcks: {},
 
   // -- Session lifecycle --------------------------------------------------
 
@@ -2030,80 +1391,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     }));
   },
 
-  releaseAgentWorktree: (handle, forSession) => {
-    // Strip leading @ defensively — callers may pass either form.
-    const normalized = handle.replace(/^@/, "");
-    set((s) => ({
-      agents: s.agents.map((a) =>
-        a.collabSessionId === forSession && a.handle === normalized
-          ? { ...a, worktree: null }
-          : a,
-      ),
-    }));
-  },
-
-  acceptBranchProtectionLimited: (repoRoot, note) => {
-    let didMutate = false;
-    set((s) => {
-      // Idempotent: if already acked, leave the original timestamp/note
-      // alone (don't shadow the historical first-acceptance metadata).
-      if (s.branchProtectionAcks[repoRoot]) return {};
-      didMutate = true;
-      return {
-        branchProtectionAcks: {
-          ...s.branchProtectionAcks,
-          [repoRoot]: {
-            acceptedAt: new Date().toISOString(),
-            ...(note ? { note } : {}),
-          },
-        },
-      };
-    });
-    // Round-19 P5 (claude2 task-112 Concern 1 + claude3 task-114 O3
-    // convergent): if the user clear-acked this repo earlier in the
-    // same session, the sessionClears tracker still has it. Without
-    // this delete, hydration would filter the new accept out of
-    // onDisk on a subsequent re-hydration, causing a redundant write
-    // on every restart-after-re-accept. Cheap fix: clear the
-    // tracker on accept so the slate is clean.
-    sessionClears.delete(repoRoot);
-    // Round-15: persist to disk on actual mutation. Fire-and-forget;
-    // best-effort write — failure surfaces as a console.warn only.
-    if (didMutate) {
-      persistBranchProtectionAcks();
-    }
-  },
-
-  clearBranchProtectionAck: (repoRoot) => {
-    let didMutate = false;
-    set((s) => {
-      if (!s.branchProtectionAcks[repoRoot]) return {};
-      didMutate = true;
-      const { [repoRoot]: _removed, ...rest } = s.branchProtectionAcks;
-      return { branchProtectionAcks: rest };
-    });
-    // Round-18 codex1 round5 BLOCKING: record the clear in the session-
-    // level set EVEN WHEN didMutate is false. The "no in-memory entry
-    // to clear" path can fire when the user clears a repo whose ack
-    // exists on disk but hasn't been hydrated yet — without this
-    // record, the in-flight hydration would silently resurrect the
-    // ack from disk into the merge result. Recording the explicit
-    // clear lets hydration filter the cleared key out of onDisk and
-    // hydration's symmetric-diff write will then converge disk.
-    sessionClears.add(repoRoot);
-    if (didMutate) {
-      // Persist the in-memory mutation. Hydration may also fire a
-      // write later if its sessionClears filter removed onDisk keys;
-      // the chain serialization keeps both writes correct.
-      persistBranchProtectionAcks();
-    }
-    // No didMutate-false write here: when the entry wasn't in memory,
-    // either (a) it wasn't on disk either (true no-op — no write
-    // needed), or (b) it WAS on disk but hydration hasn't applied yet
-    // — in case (b), hydration's symmetric-diff check sees
-    // sessionClears.has(repo) and fires a converging write itself.
-  },
-
   flushPendingMessages: async (sessionId) => {
     const queue = get().pendingMessagesByAgent[sessionId];
     if (!queue || queue.length === 0) return;
@@ -2223,41 +1510,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
           get().setStatus("Agent starting up, message queued...", agentCollabId);
         }
         return;
-      }
-
-      // LB5 lease check (round-11 codex2 task-87 H1): the structural
-      // gate at addTask refuses ledger writes, but PTY injection still
-      // proceeded — agent could receive fresh work in the same held
-      // worktree, just under a no-assignee task. Refuse the ENTIRE send
-      // operation when the assignee's lease is held AND there's no
-      // active task to refresh (i.e., we'd otherwise auto-create).
-      //
-      // We deliberately allow the send when an active pending/in-progress
-      // task exists, even if the agent has a held worktree from prior
-      // work — that send refreshes assignedAt on an already-assigned task,
-      // not a new assignment. The user's intent is to drive the existing
-      // task forward, which is correct.
-      if (agentCollabId && agent) {
-        const existing = tasksBySession[agentCollabId] ?? [];
-        const found = findFreshestActiveTaskForMention(existing, `@${mention}`);
-        if (!found) {
-          // No active task to refresh → would auto-create. Check for lease.
-          const conflict = findWorktreeLeaseConflict(
-            `@${mention}`,
-            get().agents,
-            existing,
-            agentCollabId,
-          );
-          if (conflict) {
-            get().setStatus(
-              `Cannot send to @${mention} — worktree lease still held by task ${conflict.id} (status: ${conflict.status}). ` +
-                `Approve, discard, or finish that task first.`,
-              agentCollabId,
-              "persistent",
-            );
-            return;
-          }
-        }
       }
 
       // Auto-create a task if none exist for this session, OR refresh the
@@ -2382,53 +1634,10 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   broadcastToAll: async (content, forSession) => {
     const { agents, tasksBySession } = get();
     const sid = forSession ?? null;
-    const allTargets = sid ? agents.filter((a) => a.collabSessionId === sid) : agents;
-    if (allTargets.length === 0) {
+    const targetAgents = sid ? agents.filter((a) => a.collabSessionId === sid) : agents;
+    if (targetAgents.length === 0) {
       if (sid) get().setStatus("No agents running. Launch a tool first.", sid);
       return;
-    }
-    // LB5 lease check (round-11 codex2 task-87 H1): per-agent, refuse the
-    // broadcast for any agent whose worktree lease is held AND has no
-    // active task to refresh. Skipping vs aborting the whole broadcast is
-    // less disruptive — partial fan-out is allowed; the user gets a status
-    // line listing skipped agents.
-    let targetAgents = allTargets;
-    const skippedHandles: string[] = [];
-    if (sid) {
-      const existing = tasksBySession[sid] ?? [];
-      targetAgents = allTargets.filter((agent) => {
-        const mention = `@${agent.handle}`;
-        const found = findFreshestActiveTaskForMention(existing, mention);
-        if (found) return true; // has active task → refresh path, no auto-create
-        const conflict = findWorktreeLeaseConflict(
-          mention,
-          allTargets,
-          existing,
-          sid,
-        );
-        if (conflict) {
-          skippedHandles.push(agent.handle);
-          return false;
-        }
-        return true;
-      });
-      if (targetAgents.length === 0) {
-        // Nothing to send — every agent had a held lease. Surface the
-        // skip status before returning early.
-        if (skippedHandles.length > 0) {
-          get().setStatus(
-            `Skipped ${skippedHandles.length} agent(s) with held worktree leases: ${skippedHandles
-              .map((h) => "@" + h)
-              .join(", ")}. Approve, discard, or finish their pending tasks first.`,
-            sid,
-            "persistent",
-          );
-        }
-        return;
-      }
-      // Skip status is deferred until after the broadcast completes (see
-      // the final setStatus block) so it isn't overwritten by the
-      // "Broadcast sent to N agent(s)" transient.
     }
     // Auto-create tasks for each agent if none exist; otherwise refresh
     // the assignedAt of the existing active task so the indicator promotes
@@ -2530,21 +1739,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       }
     }
     if (sid) {
-      // Round-11: combine the broadcast acknowledgement with the LB5
-      // skip notice when both are relevant. The base "Broadcast sent to
-      // N" message is transient; appending "; skipped …" preserves the
-      // skip information without losing the acknowledgement.
-      let msg = `Broadcast sent to ${sent} agent${sent !== 1 ? "s" : ""}`;
-      if (skippedHandles.length > 0) {
-        msg += `; skipped ${skippedHandles.length} with held worktree leases: ${skippedHandles
-          .map((h) => "@" + h)
-          .join(", ")}. Approve, discard, or finish their pending tasks first.`;
-      }
-      get().setStatus(
-        msg,
-        sid,
-        skippedHandles.length > 0 ? "persistent" : "transient",
-      );
+      get().setStatus(`Broadcast sent to ${sent} agent${sent !== 1 ? "s" : ""}`, sid);
     }
   },
 
@@ -2629,32 +1824,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   // -- Task management ----------------------------------------------------
 
   addTask: (opts, forSession) => {
-    // LB5 structural gate (round-10 placement fix per claude3 task-84 O1
-    // + codex2 task-83 H1: helper here in the store mutator catches all
-    // assignment paths — slash commands, sendToAgent auto-create,
-    // broadcastToAll auto-create, future UI buttons. Lease-based per
-    // codex1 task-81 H1: blocked doesn't release the worktree).
-    let effectiveAssignee = opts.assignee ?? null;
-    if (effectiveAssignee) {
-      const state = get();
-      const sessionTasks = state.tasksBySession[forSession] ?? [];
-      const conflict = findWorktreeLeaseConflict(
-        effectiveAssignee,
-        state.agents,
-        sessionTasks,
-        forSession,
-      );
-      if (conflict) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[collab/store] LB5: refused to assign new task to ${effectiveAssignee} ` +
-            `— worktree lease still held by task ${conflict.id} (status: ${conflict.status}). ` +
-            "Task created without an assignee.",
-        );
-        effectiveAssignee = null;
-      }
-    }
-
     taskCounter++;
     const now = new Date().toISOString();
     const task: CollabTask = {
@@ -2663,7 +1832,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       objective: opts.objective,
       context: opts.context ?? "",
       deliverables: opts.deliverables ?? [],
-      assignee: effectiveAssignee,
+      assignee: opts.assignee ?? null,
       dependencies: opts.dependencies ?? [],
       status: "pending",
       reasoning: null,
@@ -2676,10 +1845,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // updateTask({ assignee }) refreshes this so the in-frame freshness
       // gate sees the re-assignment as fresh work.
       assignedAt: now,
-      // P2 awaiting-approval snapshot — populated when scanForTaskCompletions
-      // flips a worktree-touching task to `awaiting-approval` (LB1, next
-      // commit). Default null at creation.
-      pendingMerge: null,
     };
     set((s) => ({
       tasksBySession: {
@@ -2718,12 +1883,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     //   3. The diff against `prevTask.assignee` skips no-op same-assignee
     //      writes that share the partial with other field updates.
     const assigneeProvided = Object.prototype.hasOwnProperty.call(updates, "assignee");
-    // Round-11 codex2 task-87 M1: declare as `let` so the LB5 structural
-    // gate can reset this to false if it drops the assignee field. Without
-    // the reset, a refused reassignment would still bump assignedAt —
-    // contradicting the surrounding rule that no-op assignee changes
-    // shouldn't refresh the freshness timestamp.
-    let reassigned =
+    const reassigned =
       assigneeProvided
       && updates.assignee !== undefined
       && prevTask !== undefined
@@ -2741,94 +1901,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     const cleanUpdates = Object.fromEntries(
       Object.entries(updates).filter(([, v]) => v !== undefined),
     ) as typeof updates;
-
-    // LB5 structural gate (round-10 placement fix per claude3 task-84 O1).
-    // If the update would change the assignee to a handle whose worktree
-    // lease is still held by another task, drop the assignee field
-    // silently and warn. Caller-side slash-command checks fire FIRST
-    // with a nicer message; this is the structural backstop for
-    // programmatic / future-UI callers (also closes codex2 task-83 H1
-    // for sendToAgent's bumpAssignedAt path which doesn't change
-    // assignees but ensures any direct updateTask({assignee}) bypass
-    // is also caught).
-    if (
-      cleanUpdates.assignee !== null &&
-      cleanUpdates.assignee !== undefined &&
-      prevTask &&
-      cleanUpdates.assignee !== prevTask.assignee
-    ) {
-      const sessionTasks = get().tasksBySession[forSession] ?? [];
-      const conflict = findWorktreeLeaseConflict(
-        cleanUpdates.assignee as string,
-        get().agents,
-        sessionTasks,
-        forSession,
-        taskId,
-      );
-      if (conflict) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[collab/store] LB5: refused to reassign task ${taskId} to ${cleanUpdates.assignee} ` +
-            `— worktree lease still held by task ${conflict.id} (status: ${conflict.status}). ` +
-            "Assignee update dropped.",
-        );
-        delete (cleanUpdates as { assignee?: string | null }).assignee;
-        // codex2 task-87 M1: also clear the reassigned flag so assignedAt
-        // doesn't bump for a refused reassignment. A no-op assignee change
-        // (which is what this becomes after the drop) shouldn't refresh
-        // the freshness timestamp.
-        reassigned = false;
-      }
-    }
-
-    // codex2 task-67 H1: enforce pendingMerge terminal cleanup centrally,
-    // not at every caller. Without this guard, a legacy callsite that
-    // does `updateTask(id, { status: "completed" })` without explicitly
-    // setting `pendingMerge: null` would leave stale merge metadata on
-    // the terminal task once LB1 starts populating pendingMerge.
-    //
-    // Rule:
-    //   - status transitioning to `completed` or `blocked` → force
-    //     `pendingMerge: null` unless the caller explicitly opted in
-    //     to keep it (no current callsites need that).
-    //   - status transitioning to a P2 non-terminal (`awaiting-approval`
-    //     | `approved-merging` | `merge-conflict`) → caller MUST supply
-    //     `pendingMerge` in the same updates batch. We can't hard-fail
-    //     in production (would break legacy paths under construction)
-    //     but we log a dev-mode warning so the next commit (LB1 wiring)
-    //     surfaces any forgotten snapshots.
-    if (cleanUpdates.status !== undefined && isTerminalStatus(cleanUpdates.status)) {
-      // Round-28: use the centralized classifier. Caller may set
-      // pendingMerge to anything (including the previous value); we
-      // override to null. The clean-updates spread happens BEFORE
-      // this so the override wins.
-      (cleanUpdates as { pendingMerge: PendingMerge | null }).pendingMerge = null;
-    } else if (
-      cleanUpdates.status === "awaiting-approval" ||
-      cleanUpdates.status === "approved-merging" ||
-      cleanUpdates.status === "merge-conflict"
-    ) {
-      const merging = cleanUpdates as { pendingMerge?: PendingMerge | null };
-      const willHaveSnapshot =
-        merging.pendingMerge !== undefined && merging.pendingMerge !== null;
-      // If the caller didn't supply a fresh snapshot AND the existing
-      // task doesn't already have one, we'd flip into the awaiting-
-      // approval state with no merge metadata — a real lifecycle bug.
-      // Best-effort warning until LB1 lands; can be promoted to a hard
-      // assertion once the gate is wired.
-      if (!willHaveSnapshot) {
-        const existing = (get().tasksBySession[forSession] ?? []).find(
-          (t) => t.id === taskId,
-        );
-        if (!existing?.pendingMerge) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[collab/store] updateTask ${taskId} → ${cleanUpdates.status} without pendingMerge snapshot ` +
-              `(codex2 task-67 H1: every P2 non-terminal transition should carry a fresh PendingMerge).`,
-          );
-        }
-      }
-    }
 
     set((s) => ({
       tasksBySession: {
@@ -2848,8 +1920,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     const task = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
     if (task) {
       // Append a structured task report when status changes to a terminal state
-      // Round-28: use the centralized classifier (claude3 task-139 O3).
-      const isTerminal = isTerminalStatus(task.status);
+      const isTerminal = task.status === "completed" || task.status === "blocked";
       const statusChanged = task.status !== prevStatus;
       if (isTerminal && statusChanged) {
         // Decorate the resolved author handle with its current nickname,

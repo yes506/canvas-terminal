@@ -14,34 +14,6 @@ export const TOOL_CONFIGS: ToolConfig[] = [
   { id: "copilot_cli", label: "Copilot CLI", command: "copilot", colorClass: "text-emerald-400" },
 ];
 
-// ---------------------------------------------------------------------------
-// Worktree-isolation policy types (P1 backend mirrors).
-// Match `commands::git::*` Rust outputs (serde camelCase). The frontend
-// treats these as opaque metadata; the backend owns the validation.
-// ---------------------------------------------------------------------------
-
-/** Output of `git_detect_repo` — local-refs-only repo snapshot. */
-export interface RepoInfo {
-  root: string;
-  currentBranch: string | null;
-  hasOriginDev: boolean;
-  hasLocalDev: boolean;
-}
-
-/** Output of `git_worktree_create`. Stored on `SpawnedAgent` so approval
- *  works even after the agent is killed (kill-PTY-at-flip in P2). */
-export interface WorktreeMetadata {
-  repoRoot: string;
-  path: string;
-  branch: string;
-  baseRef: string;
-  baseSha: string;
-  /** false signals offline fallback; the approval UI surfaces this as
-   *  a "stale base" warning (codex2 #2). */
-  baseFresh: boolean;
-  createdAtMs: number;
-}
-
 /** Raw spawn facts passed by AgentMiniTerminal to addAgent(). Identity fields are computed by the store. */
 export interface SpawnedAgentInit {
   sessionId: string;
@@ -49,11 +21,6 @@ export interface SpawnedAgentInit {
   status: "spawning" | "running" | "exited";
   /** Which collaborator pane owns this agent. */
   collabSessionId: string;
-  /** Worktree metadata if the agent was spawned in a git repo (P1).
-   *  null means either the spawn cwd was not a git repo, or worktree
-   *  provisioning failed. P2's awaiting-approval gate is keyed on this
-   *  field being non-null. */
-  worktree?: WorktreeMetadata | null;
 }
 
 /** One entry per name change. Append-only; index 0 is the system-set birth name. */
@@ -103,142 +70,7 @@ export type RenameResult =
 // Structured Task
 // ---------------------------------------------------------------------------
 
-/**
- * Task lifecycle states. The five non-terminal states (`pending`,
- * `in-progress`, `awaiting-approval`, `approved-merging`, `merge-conflict`)
- * carry distinct semantics:
- *
- *   pending             — created, may or may not be assigned
- *   in-progress         — agent is actively working
- *   awaiting-approval   — P2 gate: agent wrote .done.json AND the task
- *                         produced a "source delta" in its worktree.
- *                         Source delta = D2 broadened scope: any of
- *                         (a) committed changes against baseSha,
- *                         (b) staged-but-uncommitted changes,
- *                         (c) unstaged changes to tracked files,
- *                         (d) untracked-non-ignored files.
- *                         The agent's PTY is killed at the flip
- *                         (LB1, claude3 task-46 R2 ordering: kill BEFORE
- *                         snapshot). User must Approve / Request Changes
- *                         / Discard.
- *   approved-merging    — orchestrator is mid-merge (transient state
- *                         visible only briefly between Approve click and
- *                         git_merge_worktree completion).
- *   merge-conflict      — orchestrator's merge surfaced a git conflict
- *                         (LB6 GitError::MergeConflict). Worktree is
- *                         preserved; user resolves manually or Discards.
- *
- * Two terminal states:
- *   completed           — task done (either no git delta + auto-completed,
- *                         OR Approved & merged successfully)
- *   blocked             — explicit Discard or unrecoverable failure
- *                         (P2 gate didn't engage and won't auto-retry)
- */
-export type TaskStatus =
-  | "pending"
-  | "in-progress"
-  | "awaiting-approval"
-  | "approved-merging"
-  | "merge-conflict"
-  | "completed"
-  | "blocked";
-
-/**
- * Round-28 (claude3 task-139 O3): classify a `TaskStatus` by its
- * position in the task lifecycle. Centralizing the classification
- * here means adding a new status to `TaskStatus` is a single-point
- * edit — TypeScript's exhaustiveness check on the switch below
- * forces every consumer to handle the new state.
- *
- * Phases:
- *   - "active":         agent is actively working; PTY alive; can
- *                       receive `inject_into_pty`. Currently
- *                       `pending` | `in-progress`. Used by
- *                       sendToAgent / broadcastToAll's refresh
- *                       decision.
- *   - "review-or-merge": agent has finished writing; task is in the
- *                       P2 approval/merge pipeline; PTY killed by
- *                       LB1 design. User action may be required
- *                       (`awaiting-approval`, `merge-conflict`) or
- *                       merge is in flight (`approved-merging`).
- *   - "terminal":       task is done — `completed` (success) or
- *                       `blocked` (abandoned).
- *
- * The bug fixed in round-27 (status mismatch) was rooted in
- * inconsistent status classification across consumers. The
- * predicates below replace inline `=== "completed" || === "blocked"`
- * checks at every call site so the same drift can't recur.
- */
-export type TaskLifecyclePhase = "active" | "review-or-merge" | "terminal";
-
-export function classifyTaskStatus(status: TaskStatus): TaskLifecyclePhase {
-  switch (status) {
-    case "pending":
-    case "in-progress":
-      return "active";
-    case "awaiting-approval":
-    case "approved-merging":
-    case "merge-conflict":
-      return "review-or-merge";
-    case "completed":
-    case "blocked":
-      return "terminal";
-    default: {
-      // Round-29 (codex1 task-140 #4 + claude3 task-143 O1): explicit
-      // `assertNever`-style exhaustiveness. TypeScript's flow analysis
-      // would already flag a non-returning function under `strict`,
-      // but assigning the variable to `never` produces an immediate,
-      // localized type error at the unhandled case — making the
-      // exhaustiveness contract visible at the switch itself rather
-      // than as a "Not all code paths return" error elsewhere.
-      const _exhaustive: never = status;
-      return _exhaustive;
-    }
-  }
-}
-
-/** Convenience: true iff status is a terminal state (completed/blocked). */
-export function isTerminalStatus(s: TaskStatus): boolean {
-  return classifyTaskStatus(s) === "terminal";
-}
-/** Convenience: true iff status is active (pending/in-progress; PTY alive). */
-export function isActiveStatus(s: TaskStatus): boolean {
-  return classifyTaskStatus(s) === "active";
-}
-
-/** Worktree-isolation v5 §4 P2.a `pendingMerge` snapshot — captured at
- *  `awaiting-approval` flip, used by the Approve UI to render the diff
- *  and by `git_merge_worktree` to identify the agent branch. Self-
- *  contained per RESID-5: doesn't depend on a live `SpawnedAgent`,
- *  because the agent's PTY is killed at flip (LB1). */
-export interface PendingMerge {
-  /** Branch name (e.g. `agent/claude_code-session-9-…`). */
-  branch: string;
-  /** Absolute path to the agent's worktree. */
-  worktreePath: string;
-  /** Repo root the worktree belongs to (needed by `git_merge_worktree`
-   *  even after the SpawnedAgent record is gone). */
-  repoRoot: string;
-  /** Base ref the worktree was created from (always `origin/dev` in v1). */
-  baseRef: string;
-  /** Base SHA — the commit the worktree branched from. */
-  baseSha: string;
-  /** False signals offline fallback at provisioning time; surfaced as a
-   *  "stale base" warning in the Approve UI (codex2 #2). */
-  baseFresh: boolean;
-  /** Diff summary captured at flip time. Tracks all four classes per D2
-   *  broadened scope: tracked-modified, staged, unstaged, untracked-non-
-   *  ignored. Approve UI renders the diff from this. */
-  diffSummary: {
-    committed: string[];
-    staged: string[];
-    unstaged: string[];
-    untracked: string[];
-  };
-  /** Agent handle preserved for traceability after the agent's
-   *  SpawnedAgent record is gone (POLISH-5). */
-  agentHandle: string;
-}
+export type TaskStatus = "pending" | "in-progress" | "completed" | "blocked";
 
 export interface CollabTask {
   /** Unique task id, e.g. "task-1-1713100000000" */
@@ -277,12 +109,4 @@ export interface CollabTask {
    * highlight even when the task was originally created long before.
    */
   assignedAt: string;
-  /**
-   * P2 awaiting-approval snapshot. Set when `status === "awaiting-approval"
-   * | "approved-merging" | "merge-conflict"`. Cleared on `completed` /
-   * `blocked` transitions. Self-contained: works after the agent's PTY
-   * has been killed at flip (LB1). null in v1 unless the agent ran in a
-   * worktree.
-   */
-  pendingMerge: PendingMerge | null;
 }

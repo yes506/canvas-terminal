@@ -305,7 +305,10 @@ struct SnapshotEntry {
 #[serde(tag = "status")]
 enum SnapshotResponse {
     #[serde(rename = "alive")]
-    Alive { pid: u32, files: Vec<SnapshotEntry> },
+    Alive {
+        pid: u32,
+        files: Vec<SnapshotEntry>,
+    },
     #[serde(rename = "ended")]
     Ended,
 }
@@ -817,7 +820,10 @@ mod tests {
         state.session_alive.store(false, Ordering::SeqCst);
         let app = build_router(state);
         let resp = app
-            .oneshot(req_authed("/api/sessions/current/snapshot", "test-token"))
+            .oneshot(req_authed(
+                "/api/sessions/current/snapshot",
+                "test-token",
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
