@@ -120,7 +120,13 @@ export function AgentMiniTerminal({
         fontFamily:
           "'JetBrainsMono Nerd Font Mono', 'Noto Sans Mono CJK KR', 'D2Coding', 'JetBrains Mono', Menlo, monospace",
         fontSize: Math.max(fontSize - 2, 9),
-        lineHeight: 1.15,
+        // Match the main terminal's lineHeight (terminalManager.ts:187).
+        // The previous 1.15 was tuned for vertical compactness in small panes
+        // but left zero air between rows, so html2canvas screenshots showed
+        // glyph descenders bleeding into the next row whenever the cloned
+        // DOM lost xterm's runtime row-clip stylesheet. 1.2 matches the
+        // main terminal and the +0.05 is not visually perceptible.
+        lineHeight: 1.2,
         cursorBlink: true,
         cursorStyle: "bar",
         scrollback: 5000,

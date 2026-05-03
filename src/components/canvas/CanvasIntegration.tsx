@@ -56,8 +56,11 @@ export function useCanvasIntegration() {
         const cy = (fabricCanvas.getHeight() / 2 - vpt[5]) / zoom;
 
         const img = new fabric.Image(imgEl, {
-          left: cx,
-          top: cy,
+          // Integer-snap so the bitmap doesn't fall on a half-pixel boundary,
+          // which causes a mild bilinear pass on every render and amplifies
+          // monospace-text aliasing in subsequent exports.
+          left: Math.round(cx),
+          top: Math.round(cy),
           originX: "center",
           originY: "center",
         });
