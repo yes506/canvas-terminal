@@ -806,7 +806,7 @@ export function AgentMiniTerminal({
   const indicator = getIndicatorPresentation(lifecycle, taskState);
 
   return (
-    <div className={`flex flex-col h-full min-h-0 border rounded-md overflow-hidden ${focused ? "border-accent" : "border-surface-lighter"}`}>
+    <div className={`flex flex-col h-full min-h-[220px] border rounded-md overflow-hidden ${focused ? "border-accent" : "border-surface-lighter"}`}>
       {/* Agent header */}
       <div className="flex items-center gap-2 px-2 py-1 bg-surface-light border-b border-surface-lighter text-xs shrink-0">
         {/* Status light — `ping` halo flags a fresh outcome (completed/blocked).

@@ -193,12 +193,18 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
             <div
               className="grid gap-2 h-full"
               style={{
+                // `minmax(0, 1fr)` columns prevent a child's intrinsic min-width
+                // from growing the column beyond the grid's bounds.
+                // `gridAutoRows: minmax(220px, 1fr)` enforces a usable floor for
+                // each tile so xterm's fitAddon can't size the PTY below the
+                // ~10–13 row threshold where Claude/Codex TUIs draw their
+                // header/transcript/prompt/footer regions on top of each other.
+                // The parent already has `overflow-auto`, so the pane scrolls
+                // when many agents push the grid past viewport height instead
+                // of squeezing tiles below the floor.
                 gridTemplateColumns:
-                  spawns.length === 1 ? "1fr" : "repeat(2, 1fr)",
-                gridTemplateRows:
-                  spawns.length <= 2
-                    ? "1fr"
-                    : `repeat(${Math.ceil(spawns.length / 2)}, 1fr)`,
+                  spawns.length === 1 ? "1fr" : "repeat(2, minmax(0, 1fr))",
+                gridAutoRows: "minmax(220px, 1fr)",
               }}
             >
               {spawns.map((spawn) =>
@@ -213,7 +219,7 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                 ) : (
                   <div
                     key={spawn.sessionId}
-                    className="flex flex-col h-full min-h-0 border rounded-md overflow-hidden border-surface-lighter"
+                    className="flex flex-col h-full min-h-[220px] border rounded-md overflow-hidden border-surface-lighter"
                   >
                     <div className="flex items-center gap-2 px-2 py-1 bg-surface-light border-b border-surface-lighter text-xs shrink-0">
                       <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-yellow-400 animate-pulse" />
