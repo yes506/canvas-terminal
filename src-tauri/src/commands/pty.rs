@@ -75,6 +75,53 @@ fn start_reader_thread(
     })
 }
 
+/// Build the baseline env-pairs (without writing to a CommandBuilder).
+/// Shared by spawn_process and `commands::worktree::start_worktree_agent`
+/// so worktree-backed agents inherit the same TERM/LANG/HOME baseline
+/// as legacy direct-spawned agents (F7 — codex1 M1).
+pub(crate) fn baseline_env_pairs() -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = vec![
+        ("TERM".into(), "xterm-256color".into()),
+        ("LANG".into(), "en_US.UTF-8".into()),
+        ("LC_ALL".into(), "en_US.UTF-8".into()),
+        ("LC_CTYPE".into(), "en_US.UTF-8".into()),
+        ("GIT_TERMINAL_PROMPT".into(), "1".into()),
+        ("SSH_ASKPASS".into(), "".into()),
+        ("GIT_ASKPASS".into(), "".into()),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        v.push(("HOME".into(), home));
+    }
+    v
+}
+
+/// Snapshot the cached login-shell env (skipping baseline keys).
+/// Used by `commands::worktree::start_worktree_agent` to give
+/// worktree-backed agents the same environment as direct-spawned ones.
+pub(crate) fn cached_env_pairs(state: &State<'_, AppState>) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = Vec::new();
+    if let Ok(cached) = state.cached_env.lock() {
+        if let Some(ref env_map) = *cached {
+            for (key, val) in env_map {
+                if !BASELINE_ENV_KEYS.contains(&key.as_str()) {
+                    v.push((key.clone(), val.clone()));
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Resolve a program against the cached PATH (or the process PATH as
+/// fallback). Pub-crate so worktree-backed agent spawn can use the
+/// same resolution logic as legacy spawn_process.
+pub(crate) fn resolve_program_pub(
+    program: &str,
+    state: &State<'_, AppState>,
+) -> Result<String, String> {
+    resolve_program(program, state)
+}
+
 /// Apply baseline env vars to a CommandBuilder — shared by spawn_shell and spawn_process.
 fn apply_baseline_env(cmd: &mut CommandBuilder) {
     cmd.env("TERM", "xterm-256color");

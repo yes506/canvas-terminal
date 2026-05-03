@@ -1,6 +1,7 @@
 mod commands;
 mod dashboard;
 mod state;
+pub mod worktree;
 
 use std::sync::atomic::Ordering;
 
@@ -87,10 +88,119 @@ pub fn run() {
         .manage(AppState::new())
         .manage(DashboardInfo::new())
         .setup(|app| {
+            // E24 — structured logging via `tracing`. Subscriber reads
+            // RUST_LOG env (e.g. RUST_LOG=worktree=info). Idempotent —
+            // try_init only succeeds the first time; subsequent calls
+            // (e.g. test harnesses) are silently no-op. Replaces the
+            // ad-hoc eprintln! pattern in heartbeat/monitor/drainer.
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| {
+                            tracing_subscriber::EnvFilter::new("warn,worktree=info")
+                        }),
+                )
+                .try_init();
+
             let menu = build_menu(app)?;
             app.set_menu(menu)?;
             // Remove only stale session directories from dead processes.
             let _ = commands::memory::clear_stale_sessions();
+
+            // F7 (Phase 2 verifier round): wire the worktree reaper
+            // into the Tauri runtime. Without this, the reaper module
+            // is well-tested but never runs in production. The reaper
+            // is started ONLY when a managed root is configured (env
+            // var or default user-config path); otherwise the worktree
+            // subsystem is dormant per spec §6.1 lazy-acquisition.
+            if let Some(root) = worktree::config::resolve_managed_root() {
+                if worktree::managed_root::ensure_layout(&root).is_ok() {
+                    // B12 — multi-process restart recovery: any lease in
+                    // Working/Ready from a prior run has no live supervisor
+                    // in this process. Transition them to Draining so the
+                    // reaper picks them up immediately on first sweep.
+                    let recovery_report = worktree::recovery::adopt_orphan_leases(&root);
+                    if recovery_report.adopted > 0 {
+                        tracing::info!(
+                            target: "worktree::recovery",
+                            adopted = recovery_report.adopted,
+                            "adopted orphan lease(s) → Draining"
+                        );
+                    }
+                    if !recovery_report.failures.is_empty() {
+                        tracing::warn!(
+                            target: "worktree::recovery",
+                            failures = ?recovery_report.failures,
+                            "some orphan leases could not be adopted"
+                        );
+                    }
+                    let reaper = std::sync::Arc::new(
+                        worktree::reaper::Reaper::new(root.clone()),
+                    );
+                    let drainer_root = root.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let mut tick = tokio::time::interval(
+                            std::time::Duration::from_secs(15),
+                        );
+                        loop {
+                            tick.tick().await;
+                            // Sweep result is best-effort; errors are
+                            // logged via tracing.
+                            if let Err(e) = reaper.sweep() {
+                                tracing::warn!(
+                                    target: "worktree::reaper",
+                                    error = %e,
+                                    "reaper sweep failed"
+                                );
+                            }
+                        }
+                    });
+
+                    // **H3 fix per codex2 #1**: production drainer
+                    // sweep loop. Without this, leases in `Draining`
+                    // (set by Supervisor monitor on agent exit, by
+                    // recovery on Tauri restart, or by the reaper on
+                    // wedged/dead claim) never get processed unless
+                    // the UI explicitly calls `release_worktree`. Now
+                    // a periodic tick runs `Drainer::sweep_draining`
+                    // alongside the reaper.
+                    tauri::async_runtime::spawn(async move {
+                        let drainer = worktree::drainer::Drainer::new(drainer_root);
+                        let mut tick = tokio::time::interval(
+                            std::time::Duration::from_secs(15),
+                        );
+                        loop {
+                            tick.tick().await;
+                            match drainer.sweep_draining() {
+                                Ok(report) => {
+                                    if !report.failures.is_empty() {
+                                        tracing::warn!(
+                                            target: "worktree::drainer",
+                                            processed = report.processed,
+                                            failures = ?report.failures,
+                                            "sweep_draining had per-lease failures"
+                                        );
+                                    } else if report.processed > 0 {
+                                        tracing::info!(
+                                            target: "worktree::drainer",
+                                            processed = report.processed,
+                                            "sweep_draining completed"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "worktree::drainer",
+                                        error = %e,
+                                        "sweep_draining errored"
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -138,6 +248,24 @@ pub fn run() {
             commands::dashboard::open_dashboard,
             commands::dashboard::get_dashboard_info,
             commands::dashboard::copy_dashboard_url_with_token,
+            commands::worktree::query_registry,
+            commands::worktree::query_lease_by_agent_id,
+            commands::worktree::provision_worktree,
+            commands::worktree::query_agent_lease,
+            commands::worktree::release_worktree,
+            commands::worktree::force_close_worktree,
+            commands::worktree::retry_preserve,
+            commands::worktree::discard_artifact,
+            commands::worktree::start_worktree_agent,
+            commands::worktree::bulk_close_worktrees,
+            commands::worktree::query_audit_log,
+            commands::worktree::query_reaper_metrics,
+            commands::worktree::query_supervisor_registry,
+            commands::worktree::queue_merge,
+            commands::worktree::query_merge_state,
+            commands::worktree::approve_merge,
+            commands::worktree::abort_merge,
+            commands::worktree::retry_merge,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

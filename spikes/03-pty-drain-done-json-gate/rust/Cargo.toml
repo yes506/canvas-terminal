@@ -1,0 +1,11 @@
+[package]
+name = "spike-03-pty-drain-done-json"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+portable-pty = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"

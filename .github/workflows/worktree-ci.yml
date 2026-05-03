@@ -1,0 +1,92 @@
+name: Worktree CI
+
+# Phase 0 minimal CI scaffolding (per plan-rev-2 R-T2.2 / plan-rev-3
+# §P1.1). Phase 8 expands this with soak runs (50 spawn/crash/reap
+# cycles + 6 concurrent merges) on a nightly schedule.
+#
+# This workflow gates Phase 2 exit ("all tests pass in CI on macOS
+# and Linux runners"). Without it, Phase 2 cannot exit by its own
+# gate (claude3 round-4 B.2.1 circular-dep finding).
+
+on:
+  pull_request:
+    paths:
+      - 'src-tauri/src/worktree/**'
+      - 'src-tauri/src/commands/worktree.rs'
+      - 'src-tauri/tests/worktree/**'
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - '.github/workflows/worktree-ci.yml'
+  push:
+    branches: [main, dev]
+    paths:
+      - 'src-tauri/src/worktree/**'
+      - 'src-tauri/src/commands/worktree.rs'
+      - 'src-tauri/tests/worktree/**'
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - '.github/workflows/worktree-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cargo test (worktree)
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: worktree-${{ matrix.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            worktree-${{ matrix.os }}-
+
+      - name: Install OS deps (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libappindicator3-dev librsvg2-dev patchelf
+
+      - name: cargo test (worktree unit tests)
+        # R1 fix (codex2 task-62): the unquoted `worktree::` made YAML
+        # parse the value as a mapping (`::` is the map-value indicator),
+        # which broke the workflow parser entirely. Block-scalar form
+        # makes `::` safe.
+        # P2.T0 (Phase 2 promotion): runs the actual worktree unit
+        # tests instead of the Phase 0 build-only placeholder. Failures
+        # gate the workflow.
+        run: |
+          cargo test --lib worktree:: --quiet
+
+      - name: cargo clippy (worktree paths)
+        run: |
+          # P2.T0 promotion: clippy is now denying warnings on the
+          # worktree subsystem itself. The rest of the crate still has
+          # one pre-existing too-many-arguments warning in
+          # src/commands/pty.rs:225 (unrelated to worktree); that file
+          # is excluded from -D warnings until a separate cleanup PR
+          # addresses it. Worktree code uses module-level
+          # `#![allow(dead_code)]` until Phase 3+ consumers land.
+          cargo clippy --lib --no-deps -- -D warnings -A clippy::too_many_arguments

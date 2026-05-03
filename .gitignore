@@ -6,6 +6,10 @@ dist/
 dist-dashboard/
 src-tauri/target/
 
+# Worktree subsystem Phase 1 spike build artifacts
+spikes/*/rust/target/
+spikes/*/rust/Cargo.lock
+
 # Environment
 .env
 .env.*

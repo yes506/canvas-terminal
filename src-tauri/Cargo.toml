@@ -34,8 +34,38 @@ futures = "0.3"
 rand = "0.8"
 hex = "0.4"
 
+# Worktree subsystem (Phase 2 foundation per final-implementation-plan §3a).
+# fs2: cross-platform flock for orchestrator + per-worktree lockfiles.
+# nix: process-group signals (killpg) and setsid for agent provisioning.
+fs2 = "0.4"
+nix = { version = "0.27", features = ["signal", "process"] }
+# Phase 5 D17: secret detector per spec §4.3 — explicit regex shapes
+# (AKIA[0-9A-Z]{16}, GitHub PAT 36-char tail, AWS secret 40-char b64,
+# Slack tokens, PEM private-key headers).
+regex = "1"
+# Phase 5 E24: structured logging. Replaces ad-hoc eprintln! in
+# heartbeat/monitor/drainer/reaper. Subscriber configured via
+# RUST_LOG env var; defaults to compile-time targets only when
+# unset.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` is the cleanest way to drive an axum Router
 # in unit tests without binding a real TCP port. Test-only — the production
 # server uses axum::serve directly.
 tower = { version = "0.5", features = ["util"] }
+
+# Worktree subsystem test deps.
+tempfile = "3"
+proptest = "1"
+# H9 — serialize tests that touch process-wide singletons
+# (audit_log VecDeque, supervisor_registry HashMap, env vars).
+# Without this, parallel test runs racily intermix entries from
+# different tests, causing flaky assertions on log/registry order
+# and content. Per claude2 I1.
+serial_test = "3"
+# Phase 4 T2.1 fix per claude2 Q1 + claude3 Issue 1: tokio test-util
+# enables `#[tokio::test(start_paused = true)]` so heartbeat tick
+# behavior can be tested with virtual time instead of real sleeps.
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }

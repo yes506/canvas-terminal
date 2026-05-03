@@ -1,0 +1,12 @@
+[package]
+name = "spike-05-orchestrator-crash"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Throwaway spike per plan-rev-2 §3 / spec.md §11 spike #5.
+# Not part of the canvas-terminal main workspace; runs standalone via
+# `cargo run --manifest-path rust/Cargo.toml` from the spike directory.
+
+[dependencies]
+tempfile = "3"

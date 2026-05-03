@@ -85,6 +85,12 @@ export function AgentMiniTerminal({
   const fitAddonRef = useRef<FitAddon | null>(null);
   const unlistenDataRef = useRef<UnlistenFn | null>(null);
   const unlistenExitRef = useRef<UnlistenFn | null>(null);
+  // A3 — track the worktree agent_id (if worktree mode was active for
+  // this terminal) so we can call release_worktree on cleanup. The
+  // supervisor's force_close path is reached via force_close_worktree
+  // when the user explicitly asks to terminate; release_worktree
+  // covers the normal "agent finished" close.
+  const worktreeAgentIdRef = useRef<string | null>(null);
   const observerRef = useRef<ResizeObserver | null>(null);
   const imeHandlersRef = useRef<{
     el: HTMLTextAreaElement;
@@ -105,6 +111,42 @@ export function AgentMiniTerminal({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+  // E20+E23 — half-state chip for PreserveFailed / GcError. Polls the
+  // worktree lease while it exists; null when the agent has no
+  // worktree lease (legacy spawn path).
+  const [leaseSnapshot, setLeaseSnapshot] = useState<{
+    state_kind: string;
+    state_reason: string | null;
+    gc_retries: number | null;
+  } | null>(null);
+
+  // E20+E23 — poll the worktree lease snapshot every 2s while the
+  // agent is mounted. Sets `leaseSnapshot` so the half-state chip
+  // re-renders when the lease enters PreserveFailed or GcError.
+  // No-op for non-worktree agents (worktreeAgentIdRef.current === null).
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      const id = worktreeAgentIdRef.current;
+      if (!id) return;
+      invoke("query_agent_lease", { agentId: id })
+        .then((snap) => {
+          if (cancelled) return;
+          if (snap == null) {
+            setLeaseSnapshot(null);
+          } else {
+            setLeaseSnapshot(snap as typeof leaseSnapshot);
+          }
+        })
+        .catch(() => {});
+    };
+    const handle = setInterval(tick, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     disposed.current = false;
@@ -239,38 +281,116 @@ export function AgentMiniTerminal({
         return;
       }
 
-      // Spawn the CLI tool — try direct process first, fall back to shell
+      // Spawn the CLI tool — try direct process first, fall back to shell.
+      //
+      // **A3 — worktree-backed agent mode** (Phase 4.5/5 production
+      // wiring per claude2/codex2/codex3 convergence): when localStorage
+      // flag `worktree-mode-enabled` is `"true"` AND the cwd is set
+      // (worktree provisioning needs a repo root), we route through
+      // provision_worktree → start_worktree_agent. The supervisor then
+      // owns the lease lifecycle (heartbeat, monitor, force_close) and
+      // the existing PTY IPC commands (write_to_pty / resize_pty /
+      // kill_pty) keep working unchanged because start_worktree_agent
+      // wires the master/writer/reader into AppState::sessions.
       const [program, ...programArgs] = tool.command.split(/\s+/);
       let spawnedViaShell = false;
+      const worktreeEnabled =
+        cwd != null &&
+        typeof window !== "undefined" &&
+        window.localStorage?.getItem("worktree-mode-enabled") === "true";
 
-      try {
-        await invoke("spawn_process", {
-          sessionId,
-          program,
-          args: programArgs.length > 0 ? programArgs : null,
-          extraEnv: null,
-          cwd: cwd ?? null,
-          cols: terminal.cols,
-          rows: terminal.rows,
-        });
-      } catch {
-        // Fallback: spawn shell then type the command
-        spawnedViaShell = true;
+      // **F3 fix per codex1/codex2/codex3 P0 convergence**: when
+      // worktree mode is enabled, fail CLOSED on any boot error.
+      // Falling back to legacy spawn_process after `provision_worktree`
+      // succeeded (but `start_worktree_agent` failed) would (a) leak
+      // the provisioned worktree+lease+lock state and (b) run an
+      // UNSUPERVISED agent in the original repo — exactly the
+      // isolation breach worktree mode is designed to prevent.
+      //
+      // Recovery: if provisioning succeeded, call force_close_worktree
+      // to clean up the orphaned lease before bailing out.
+      if (worktreeEnabled) {
+        let provisionedAgentId: string | null = null;
         try {
-          await invoke("spawn_shell", {
-            sessionId,
-            cols: terminal.cols,
-            rows: terminal.rows,
-            cwd: cwd ?? null,
-            login: !isEnvBootstrapped(),
+          const provisioned = (await invoke("provision_worktree", {
+            request: {
+              session_id: sessionId,
+              task_id: `agent-${sessionId}`,
+              repo_root: cwd,
+              parent_agent_id: null,
+              base_ref: null,
+              heartbeat_timeout_secs: null,
+            },
+          })) as { agent_id: string; worktree_path: string };
+          provisionedAgentId = provisioned.agent_id;
+          worktreeAgentIdRef.current = provisioned.agent_id;
+          await invoke("start_worktree_agent", {
+            request: {
+              agent_id: provisioned.agent_id,
+              session_id: sessionId,
+              program,
+              args: programArgs.length > 0 ? programArgs : null,
+              cols: terminal.cols,
+              rows: terminal.rows,
+              env: null,
+            },
           });
-        } catch (shellErr) {
+        } catch (e) {
+          // Cleanup any orphaned provisioned lease before surfacing
+          // the error. Backend's force_close_worktree is idempotent
+          // and tolerates "no live supervisor" (drainer-only path).
+          if (provisionedAgentId) {
+            try {
+              await invoke("force_close_worktree", { agentId: provisionedAgentId });
+            } catch (cleanupErr) {
+              console.warn(
+                "force_close_worktree cleanup after boot failure also failed:",
+                cleanupErr,
+              );
+            }
+            worktreeAgentIdRef.current = null;
+          }
           if (!disposed.current) {
             writeWithFollowBottom(
-              `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
+              `\r\n\x1b[31m[Worktree-mode boot failed: ${String(
+                e,
+              )}]\x1b[0m\r\n` +
+                `\r\n\x1b[33m[Worktree mode is fail-closed — disable ` +
+                `localStorage["worktree-mode-enabled"] to spawn directly.]\x1b[0m\r\n`,
             );
           }
           return;
+        }
+      } else {
+        try {
+          await invoke("spawn_process", {
+            sessionId,
+            program,
+            args: programArgs.length > 0 ? programArgs : null,
+            extraEnv: null,
+            cwd: cwd ?? null,
+            cols: terminal.cols,
+            rows: terminal.rows,
+          });
+        } catch {
+          // Fallback: spawn shell then type the command
+          spawnedViaShell = true;
+          try {
+            await invoke("spawn_shell", {
+              sessionId,
+              cols: terminal.cols,
+              rows: terminal.rows,
+              cwd: cwd ?? null,
+              login: !isEnvBootstrapped(),
+            });
+          } catch (shellErr) {
+            if (!disposed.current) {
+              writeWithFollowBottom(
+                `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
+              );
+            }
+            return;
+          }
         }
       }
 
@@ -703,9 +823,57 @@ export function AgentMiniTerminal({
         imeHandlersRef.current = null;
       }
 
-      // Kill PTY
-      invoke("kill_pty", { sessionId }).catch(() => {});
-      useCollaboratorStore.getState().removeAgent(sessionId);
+      // **F2 fix per codex1/codex2/codex3 P0 convergence + K2 fix per
+      // codex1 B2 (rev-6 verification)**: for worktree-backed sessions,
+      // kill_pty does NOT terminate the agent — SupervisorChildShim::kill
+      // is a no-op. The real PG is owned by the Supervisor, so user-close
+      // MUST go through force_close_worktree.
+      //
+      // K2: previously we always tore down the UI even if force_close
+      // failed. The backend intentionally keeps the supervisor registered
+      // for retry on kill failure, but the user got no failure surface.
+      // Now we surface the error on the terminal so the user can see
+      // it and decide whether to forcibly remove the session anyway
+      // (close X again with the chip showing the failure).
+      if (worktreeAgentIdRef.current) {
+        const agentId = worktreeAgentIdRef.current;
+        worktreeAgentIdRef.current = null;
+        invoke("force_close_worktree", { agentId })
+          .then(() => {
+            // Successful supervised close — proceed with normal teardown
+            invoke("kill_pty", { sessionId }).catch(() => {});
+            useCollaboratorStore.getState().removeAgent(sessionId);
+          })
+          .catch((err) => {
+            // K2: surface the failure. Restore the agent_id ref so a
+            // retry close (user clicks X again) tries again with the
+            // supervisor still registered.
+            worktreeAgentIdRef.current = agentId;
+            console.warn("force_close_worktree failed on close:", err);
+            // Write to terminal via the ref (writeWithFollowBottom is
+            // closure-scoped to initTerminal; from cleanup we touch
+            // the terminal directly).
+            try {
+              const term = terminalRef.current;
+              if (term && !disposed.current) {
+                term.write(
+                  `\r\n\x1b[31m[Close failed: ${String(err)}]\x1b[0m\r\n` +
+                    `\x1b[33m[Click X again to retry, or use the half-state ` +
+                    `chip's discard action to forcibly remove.]\x1b[0m\r\n`,
+                );
+              }
+            } catch {
+              // term.write may throw if terminal disposed mid-call;
+              // intentionally swallow — the console.warn above is the
+              // signal of last resort.
+            }
+            // Don't tear down the UI — leave the agent visible so the
+            // user can retry or use discard_artifact from the chip.
+          });
+      } else {
+        invoke("kill_pty", { sessionId }).catch(() => {});
+        useCollaboratorStore.getState().removeAgent(sessionId);
+      }
 
       // Dispose xterm
       const term = terminalRef.current;
@@ -882,6 +1050,28 @@ export function AgentMiniTerminal({
         >
           {indicator.label}
         </span>
+        {/* E20+E23 — half-state chip with retry/discard for worktree
+            leases that landed in PreserveFailed or GcError. */}
+        {leaseSnapshot &&
+          (leaseSnapshot.state_kind === "preserve_failed" ||
+            leaseSnapshot.state_kind === "gc_error") && (
+            <WorktreeHalfStateChip
+              snapshot={leaseSnapshot}
+              agentId={worktreeAgentIdRef.current ?? ""}
+              onChange={() => {
+                // Trigger immediate re-poll after retry/discard so the
+                // chip reflects the new state without waiting for the
+                // 2-second tick.
+                if (worktreeAgentIdRef.current) {
+                  invoke("query_agent_lease", {
+                    agentId: worktreeAgentIdRef.current,
+                  })
+                    .then((snap) => setLeaseSnapshot((snap as typeof leaseSnapshot) ?? null))
+                    .catch(() => {});
+                }
+              }}
+            />
+          )}
         <button
           className="text-text-dim hover:text-red-400 transition-colors p-0.5 shrink-0"
           onClick={() => onClose(sessionId)}
@@ -893,5 +1083,71 @@ export function AgentMiniTerminal({
       {/* xterm container */}
       <div ref={termRef} className="flex-1 min-h-0 bg-surface" />
     </div>
+  );
+}
+
+/// E20+E23 — compact half-state chip rendered in the agent header
+/// when the worktree lease is in PreserveFailed or GcError.
+/// Surfaces the reason (truncated) and offers Retry / Discard buttons.
+function WorktreeHalfStateChip({
+  snapshot,
+  agentId,
+  onChange,
+}: {
+  snapshot: { state_kind: string; state_reason: string | null; gc_retries: number | null };
+  agentId: string;
+  onChange: () => void;
+}) {
+  const isPreserveFailed = snapshot.state_kind === "preserve_failed";
+  const tone = isPreserveFailed
+    ? "bg-amber-900/40 text-amber-300 border-amber-700/40"
+    : "bg-rose-900/40 text-rose-300 border-rose-700/40";
+  const label = isPreserveFailed
+    ? "preserve failed"
+    : `gc error${snapshot.gc_retries != null ? ` (×${snapshot.gc_retries})` : ""}`;
+
+  const handleRetry = () => {
+    if (!agentId) return;
+    invoke("retry_preserve", { agentId })
+      .then(onChange)
+      .catch((e) => console.warn("retry_preserve failed:", e));
+  };
+  const handleDiscard = () => {
+    if (!agentId) return;
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm(
+        "Discard preserved artifact? This is irreversible — the quarantine snapshot will be deleted.",
+      )
+    ) {
+      return;
+    }
+    invoke("discard_artifact", { agentId })
+      .then(onChange)
+      .catch((e) => console.warn("discard_artifact failed:", e));
+  };
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] border rounded ${tone}`}
+      title={snapshot.state_reason ?? label}
+    >
+      <span className="font-medium">{label}</span>
+      <button
+        className="hover:underline focus:underline"
+        onClick={handleRetry}
+        title="Retry preservation"
+      >
+        retry
+      </button>
+      <span aria-hidden>·</span>
+      <button
+        className="hover:underline focus:underline"
+        onClick={handleDiscard}
+        title="Discard artifact (irreversible)"
+      >
+        discard
+      </button>
+    </span>
   );
 }

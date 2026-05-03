@@ -1,0 +1,9 @@
+[package]
+name = "spike-01-darwin-flock"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fs2 = "0.4"
+tempfile = "3"

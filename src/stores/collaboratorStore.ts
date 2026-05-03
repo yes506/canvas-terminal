@@ -1411,6 +1411,40 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     const { agents } = get();
     const sid = forSession;
     const toKill = sid ? agents.filter((a) => a.collabSessionId === sid) : agents;
+    // **H4 fix per codex1 B1**: for worktree-backed sessions, route
+    // teardown through bulk_close_worktrees (which calls
+    // force_close_worktree per agent — kills the supervised PG via
+    // Supervisor BEFORE drainer). kill_pty is a no-op for worktree-
+    // backed sessions (SupervisorChildShim::kill is a no-op), so
+    // calling kill_pty alone leaks the agent process.
+    //
+    // **K6 fix per claude2 J5 + codex1 B1**: surface partial failures
+    // from BulkCloseReport so dev tools and operators see when a
+    // teardown leaked supervisors. Previously the catch was silent.
+    if (sid) {
+      try {
+        const report = (await invoke("bulk_close_worktrees", { sessionId: sid })) as {
+          closed: number;
+          failures: Array<[string, string]>;
+        };
+        if (report?.failures?.length > 0) {
+          console.warn(
+            `[killAllAgents] bulk_close_worktrees partial failure for session ${sid}:`,
+            `${report.closed} closed, ${report.failures.length} failed:`,
+            report.failures,
+          );
+        }
+      } catch (err) {
+        // Worktree mode may not be enabled, or the managed root may
+        // not be configured — fall through to legacy kill_pty path
+        // for backward compatibility. Log so a real backend error
+        // (vs. config absence) is visible in dev tools.
+        console.warn(
+          `[killAllAgents] bulk_close_worktrees failed for session ${sid} (will fall through to legacy kill_pty):`,
+          err,
+        );
+      }
+    }
     for (const agent of toKill) {
       try {
         await invoke("kill_pty", { sessionId: agent.sessionId });
