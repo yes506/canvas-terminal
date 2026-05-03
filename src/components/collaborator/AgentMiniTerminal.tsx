@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { invoke } from "@tauri-apps/api/core";
@@ -15,9 +15,14 @@ import {
 } from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture, stripAnsi, registerCapture, unregisterCapture } from "../../lib/agentOutputCapture";
+import { createFsdLineTap } from "../../lib/fsdLineTap";
 import { isEnvBootstrapped } from "../../lib/terminalManager";
 import type { ToolConfig } from "../../types/collaborator";
 import { X } from "lucide-react";
+import { FsdToggle } from "./FsdToggle";
+import { FsdRunChip } from "./FsdRunChip";
+import { SwarmDrawer } from "./SwarmDrawer";
+import type { DispatchResponse } from "../../types/fsd";
 
 interface AgentMiniTerminalProps {
   sessionId: string;
@@ -92,6 +97,8 @@ export function AgentMiniTerminal({
     onFocus: () => void;
   } | null>(null);
   const captureRef = useRef<ReturnType<typeof createOutputCapture> | null>(null);
+  const fsdTapRef = useRef<ReturnType<typeof createFsdLineTap> | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const docKeyDownRef = useRef<((e: KeyboardEvent) => void) | null>(null);
   const docInputRef = useRef<((e: Event) => void) | null>(null);
   const imeOverlayRef = useRef<HTMLSpanElement | null>(null);
@@ -105,6 +112,38 @@ export function AgentMiniTerminal({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+
+  /**
+   * Inject text into the leader PTY with echo suppression.
+   *
+   * Defaults to TARGETED echo suppression (`expectEcho`) — bracketed-paste
+   * echoes the same text back, so the tap matches and silently consumes only
+   * that text. A real leader-emitted `##FSD done` immediately after still
+   * flows through.
+   *
+   * Per @codex3 task-59 P1/P2: blanket mute risks dropping real leader
+   * commands emitted within the mute window. Use it only as an opt-in
+   * fallback when targeted echo suppression isn't reliable enough on the
+   * current CLI (Phase 0 spike's `EchoFidelity` scenario decides per-CLI).
+   */
+  const injectFsdLeaderText = useCallback(
+    (text: string, opts?: { fallbackBlanketMuteMs?: number }) => {
+      // Targeted echo suppression — DEFAULT. The tap matches the exact
+      // injected text within a 1200ms window and consumes the echo.
+      fsdTapRef.current?.expectEcho(text, 1200);
+      // Blanket mute is opt-in: only enabled when a CLI is known (per Phase
+      // 0 EchoFidelity outcome) to mangle bracketed-paste echo such that
+      // expectEcho can't match. When set, blanket-drops EVERYTHING for the
+      // window — risk is dropping a real leader command emitted quickly.
+      if (opts?.fallbackBlanketMuteMs && opts.fallbackBlanketMuteMs > 0) {
+        fsdTapRef.current?.enableBlanketMute(opts.fallbackBlanketMuteMs);
+      }
+      invoke("inject_into_pty", { sessionId, text, tool: tool.id }).catch((err) => {
+        console.warn("[FSD] inject_into_pty failed:", err);
+      });
+    },
+    [sessionId, tool.id],
+  );
 
   useEffect(() => {
     disposed.current = false;
@@ -201,12 +240,82 @@ export function AgentMiniTerminal({
       captureRef.current = capture;
       registerCapture(sessionId, capture);
 
+      // FSD line tap — parses `##FSD` lines from PTY output and dispatches
+      // them to the orchestrator via fsd_dispatch_command. Lives in the SAME
+      // listener path as `capture.feed` (per @codex2 task-17 §1) — sequence:
+      // writeWithFollowBottom → fsdTap.feed → capture.feed → checkReady.
+      const fsdTap = createFsdLineTap({
+        sessionId,
+        onCommand: (result) => {
+          if (result.kind === "ok") {
+            invoke<DispatchResponse>("fsd_dispatch_command", {
+              leaderSessionId: sessionId,
+              cmd: result.cmd,
+            })
+              .then((resp) => {
+                if (!resp.message || resp.next_action === "ack") return;
+                injectFsdLeaderText(
+                  [
+                    "[FSD ORCHESTRATOR RESPONSE]",
+                    `result: ${resp.result}`,
+                    `next_action: ${resp.next_action}`,
+                    `strikes: ${resp.strike_count}`,
+                    resp.message,
+                  ].join("\n"),
+                );
+              })
+              .catch((err) => {
+              console.warn("[FSD] dispatch_command failed:", err);
+              });
+          } else if (result.kind === "malformed") {
+            console.debug("[FSD] malformed line:", result.reason);
+            // Report to backend so the canonical Rust strike counter
+            // increments. Per @codex2 task-50 P1 / @codex3 task-52 P1 /
+            // @claude3 task-58 §5.2 — frontend's optimistic count is for UI
+            // responsiveness; orchestrator owns the authoritative count and
+            // can force-block at STRIKES_PER_TURN.
+            invoke<{ result: string; strike_count: number; message: string }>(
+              "fsd_report_malformed",
+              {
+                leaderSessionId: sessionId,
+                runId: null,
+                reason: result.reason,
+              },
+            )
+              .then((resp) => {
+                injectFsdLeaderText(
+                  [
+                    "[FSD MALFORMED COMMAND]",
+                    `result: ${resp.result}`,
+                    `strikes: ${resp.strike_count}`,
+                    result.reason,
+                    "Emit exactly one valid JSON object on a line prefixed by ##FSD.",
+                  ].join("\n"),
+                );
+              })
+              .catch((err) => {
+                console.warn("[FSD] fsd_report_malformed failed:", err);
+                // Fall back to local-only reminder if backend reachable.
+                injectFsdLeaderText(
+                  [
+                    "[FSD MALFORMED COMMAND]",
+                    result.reason,
+                    "Emit exactly one valid JSON object on a line prefixed by ##FSD.",
+                  ].join("\n"),
+                );
+              });
+          }
+        },
+      });
+      fsdTapRef.current = fsdTap;
+
       // Listen for PTY output
       unlistenDataRef.current = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
           if (!disposed.current) {
             writeWithFollowBottom(event.payload);
+            fsdTap.feed(event.payload);
             capture.feed(event.payload);
           }
         },
@@ -652,6 +761,7 @@ export function AgentMiniTerminal({
         (event) => {
           if (!disposed.current) {
             writeWithFollowBottom(event.payload);
+            fsdTap.feed(event.payload); // FSD tap also wired in the replacement listener
             capture.feed(event.payload);
             checkReady(event.payload);
           }
@@ -686,6 +796,9 @@ export function AgentMiniTerminal({
       captureRef.current?.dispose();
       captureRef.current = null;
       unregisterCapture(sessionId);
+      // FSD tap cleanup
+      fsdTapRef.current?.dispose();
+      fsdTapRef.current = null;
       unlistenDataRef.current?.();
       unlistenExitRef.current?.();
       observerRef.current?.disconnect();
@@ -759,6 +872,76 @@ export function AgentMiniTerminal({
       }
     });
   }, []);
+
+  // FSD event subscriptions — backend emits these per leader handle.
+  // Updates the store so the UI chip + drawer reflect run progress.
+  const agentForFsd = useCollaboratorStore((s) =>
+    s.agents.find((a) => a.sessionId === sessionId),
+  );
+  useEffect(() => {
+    if (!agentForFsd?.handle) return;
+    const handle = agentForFsd.handle;
+    const unlistenStart = listen<{ run_id: string; run_nonce: string; max_turns: number }>(
+      `fsd-run-start-${handle}`,
+      (e) => {
+        useCollaboratorStore.getState().applyFsdRunStart(sessionId, e.payload);
+        injectFsdLeaderText(
+          [
+            "[FSD RUN STARTED]",
+            `run_id: ${e.payload.run_id}`,
+            `run_nonce: ${e.payload.run_nonce}`,
+            `max_turns: ${e.payload.max_turns}`,
+            "Use this run_nonce as rn for every dispatch, done, or blocked command in this run.",
+          ].join("\n"),
+        );
+      },
+    );
+    const unlistenReport = listen<{ run_id: string; turn: number; report: string }>(
+      `fsd-iteration-report-${handle}`,
+      (e) => {
+        // Use targeted echo suppression only (no blanket mute) per @codex3
+        // task-59 P1 — blanket mute risks dropping a real `##FSD done` the
+        // leader emits within 2s of receiving the report. expectEcho matches
+        // the exact injected text and only consumes that.
+        injectFsdLeaderText(
+          [
+            "[FSD ITERATION REPORT]",
+            `run_id: ${e.payload.run_id}`,
+            `turn: ${e.payload.turn}`,
+            "",
+            e.payload.report,
+          ].join("\n"),
+        );
+      },
+    );
+    // fsd-task-start makes the SwarmDrawer chip appear immediately when the
+    // task is dispatched (per @claude2 task-49 §3.1) — without this the
+    // drawer was empty until tasks completed.
+    const unlistenTaskStart = listen<{ run_id: string; turn: number; task_id: string; tool: string; role_hint?: string | null }>(
+      `fsd-task-start-${handle}`,
+      (e) => useCollaboratorStore.getState().applyFsdTaskStart(sessionId, e.payload),
+    );
+    const unlistenDone = listen<{
+      run_id: string; turn: number; task_id: string;
+      tool?: string; role_hint?: string | null;
+      kind: string; wallclock_ms: number;
+      exit_code?: number | null; last_line?: string;
+    }>(
+      `fsd-task-done-${handle}`,
+      (e) => useCollaboratorStore.getState().applyFsdTaskDone(sessionId, e.payload),
+    );
+    const unlistenEnd = listen<{ run_id: string; status: string }>(
+      `fsd-run-end-${handle}`,
+      (e) => useCollaboratorStore.getState().applyFsdRunEnd(sessionId, e.payload),
+    );
+    return () => {
+      unlistenStart.then((u) => u()).catch(() => {});
+      unlistenReport.then((u) => u()).catch(() => {});
+      unlistenTaskStart.then((u) => u()).catch(() => {});
+      unlistenDone.then((u) => u()).catch(() => {});
+      unlistenEnd.then((u) => u()).catch(() => {});
+    };
+  }, [sessionId, agentForFsd?.handle, injectFsdLeaderText]);
 
   const agent = useCollaboratorStore((s) =>
     s.agents.find((a) => a.sessionId === sessionId),
@@ -888,6 +1071,21 @@ export function AgentMiniTerminal({
         >
           {indicator.label}
         </span>
+        {/* FSD: run-status chip + tier toggle (plan v5 §6.1). Off / Pilot are
+            functional in Phase 1; x1/x2/x3 are disabled until Phase 2. */}
+        {agent && agent.handle && (
+          <>
+            <FsdRunChip
+              leaderSessionId={sessionId}
+              onClick={() => setDrawerOpen((v) => !v)}
+            />
+            <FsdToggle
+              leaderSessionId={sessionId}
+              leaderHandle={agent.handle}
+              disabled={isExited || isSpawning || isPreRegistration}
+            />
+          </>
+        )}
         <button
           className="text-text-dim hover:text-red-400 transition-colors p-0.5 shrink-0"
           onClick={() => onClose(sessionId)}
@@ -898,6 +1096,8 @@ export function AgentMiniTerminal({
       </div>
       {/* xterm container */}
       <div ref={termRef} className="flex-1 min-h-0 bg-surface" />
+      {/* FSD swarm drawer — collapsed by default, opens via FsdRunChip click. */}
+      <SwarmDrawer leaderSessionId={sessionId} open={drawerOpen} />
     </div>
   );
 }

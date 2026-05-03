@@ -6,6 +6,16 @@ use std::path::PathBuf;
 const MAX_MEMORY_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 pub(crate) fn get_memory_root() -> Result<PathBuf, String> {
+    // Test/CI override: if CANVAS_TERMINAL_MEMORY_ROOT is set in the env,
+    // use that path instead of ~/.cache/canvas-terminal/collab-memory/.
+    // Production never sets this; tests and CI point it at a tempdir so
+    // they don't pollute the user's real cache. (Per @claude3 task-43 §5.2.)
+    if let Ok(override_path) = std::env::var("CANVAS_TERMINAL_MEMORY_ROOT") {
+        let dir = PathBuf::from(override_path);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create memory root override: {}", e))?;
+        return Ok(dir);
+    }
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     let dir = home
         .join(".cache")

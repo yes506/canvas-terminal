@@ -22,6 +22,7 @@ export interface ParsedCommand {
     | "memory"
     | "task"
     | "rename"
+    | "fsd-cancel"
     | "unknown";
   target?: string;
   message?: string;
@@ -34,6 +35,13 @@ export function parseInput(input: string): ParsedCommand {
   if (trimmed === "/status") return { type: "status", raw: trimmed };
   if (trimmed === "/clear") return { type: "clear", raw: trimmed };
   if (trimmed === "/help") return { type: "help", raw: trimmed };
+  // /fsd-cancel — cancel any in-flight FSD run for the focused leader.
+  // Optional target: /fsd-cancel @<handle>; defaults to all FSD-active leaders
+  // in the current pane.
+  const fsdCancelMatch = trimmed.match(/^\/fsd-cancel(?:\s+@(\S+))?$/);
+  if (fsdCancelMatch) {
+    return { type: "fsd-cancel", target: fsdCancelMatch[1], raw: trimmed };
+  }
 
   // Canvas export: require explicit @target to distinguish agent handle from prompt message.
   // Branch 1: /canvas-export @target [message] → groups 1,2
@@ -217,6 +225,33 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
 
     case "help": {
       status(getHelpText());
+      break;
+    }
+
+    case "fsd-cancel": {
+      // Cancel FSD runs for the targeted leader (or all FSD-active leaders
+      // in this pane if no @target). Per plan v5 §6.4 / §8 Q7.
+      const fsdMap = useCollaboratorStore.getState().fsdByLeaderSessionId;
+      const targets = Object.values(fsdMap).filter((s) => {
+        if (!scopedAgents.some((a) => a.sessionId === s.leaderSessionId)) return false;
+        if (cmd.target && s.leaderHandle !== cmd.target) return false;
+        return s.activeRunId != null;
+      });
+      if (targets.length === 0) {
+        status("No active FSD runs to cancel.");
+        break;
+      }
+      let cancelled = 0;
+      for (const t of targets) {
+        if (t.activeRunId == null) continue;
+        try {
+          const ok = await invoke<boolean>("fsd_cancel_run", { runId: t.activeRunId });
+          if (ok) cancelled += 1;
+        } catch (e) {
+          console.warn("fsd_cancel_run failed:", e);
+        }
+      }
+      status(`Cancelled ${cancelled} FSD run${cancelled === 1 ? "" : "s"}.`);
       break;
     }
 

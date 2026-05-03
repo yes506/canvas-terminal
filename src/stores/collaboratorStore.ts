@@ -11,6 +11,7 @@ import type {
 import { TOOL_CONFIGS } from "../types/collaborator";
 import { muteCapture } from "../lib/agentOutputCapture";
 import { useTerminalStore } from "./terminalStore";
+import type { FsdLeaderState, FsdSetTierResponse, FsdTier, RunStatus } from "../types/fsd";
 
 // ---------------------------------------------------------------------------
 // Per-agent task outcome — drives the in-frame status light + message that
@@ -784,6 +785,55 @@ interface CollaboratorState {
    */
   contextSentByAgent: Record<string, true | "inflight">;
 
+  // FSD orchestration state (plan v5 §6.1)
+  /** Per-leader FSD activation state, keyed by `leaderSessionId`. */
+  fsdByLeaderSessionId: Record<string, FsdLeaderState>;
+  /**
+   * Per-agent flag: when set, the next message MUST re-inject the full
+   * TASK_PROTOCOL header so the leader (re)learns the FSD grammar after a
+   * toggle off→on cycle. Cleared by `prependContextHeader` after delivery.
+   * (Plan v5 §4.5 / §5.5 / item A.)
+   */
+  fsdProtocolPendingByAgent: Record<string, true>;
+
+  // FSD actions
+  setFsdTier: (
+    leaderSessionId: string,
+    leaderHandle: string,
+    tier: FsdTier,
+    resp: FsdSetTierResponse,
+  ) => void;
+  /** Apply a backend `fsd-run-start-{handle}` event payload. */
+  applyFsdRunStart: (
+    leaderSessionId: string,
+    payload: { run_id: string; run_nonce: string; max_turns: number },
+  ) => void;
+  /** Apply a backend `fsd-task-start-{handle}` event payload. */
+  applyFsdTaskStart: (
+    leaderSessionId: string,
+    payload: { run_id: string; turn: number; task_id: string; tool: string; role_hint?: string | null },
+  ) => void;
+  /** Apply a backend `fsd-task-done-{handle}` event payload (enriched). */
+  applyFsdTaskDone: (
+    leaderSessionId: string,
+    payload: {
+      run_id: string;
+      turn: number;
+      task_id: string;
+      tool?: string;
+      role_hint?: string | null;
+      kind: string;
+      wallclock_ms: number;
+      exit_code?: number | null;
+      last_line?: string;
+    },
+  ) => void;
+  /** Apply a backend `fsd-run-end-{handle}` event payload. */
+  applyFsdRunEnd: (
+    leaderSessionId: string,
+    payload: { run_id: string; status: string },
+  ) => void;
+
   // Session lifecycle
   startSession: (id: string) => void;
   /**
@@ -1074,8 +1124,75 @@ async function prependContextHeader(
   const taskSummary = formatTaskSummaryForAgent(tasks, agentIdentity ?? null);
   if (taskSummary) parts.push(taskSummary);
 
+  // Inject FSD orchestration protocol if this leader has FSD enabled
+  // (per plan v5 §6.1 / TASK_PROTOCOL extension).
+  const fsdBlock = buildFsdProtocolBlockForAgent(agentIdentity);
+  if (fsdBlock) {
+    parts.push(fsdBlock);
+    // Mark the protocol-pending flag as delivered. We can't access the store
+    // directly here without a circular dep, so the caller (sendToAgent) is
+    // responsible for clearing fsdProtocolPendingByAgent after a successful
+    // first-or-re-injection send.
+  }
+
   parts.push(text);
   return parts.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// FSD orchestration protocol block (plan v5 §3 grammar + §5.4 escape).
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the `[FSD ACTIVE]` instruction block that teaches the leader CLI
+ * the `##FSD {json}` grammar. Returns null if the leader (identified by
+ * `agentIdentity`) has FSD off or there's no live FSD state.
+ *
+ * Examples in the block use the `# #FSD` escape (single hash + space + #FSD)
+ * per plan v5 §5.4 — the parser regex `^\s*##FSD\s+...` cannot match this,
+ * so an echo of the example never self-triggers a dispatch. The active
+ * `<SESSION_NONCE>` and `<RUN_NONCE>` placeholders are also defended by the
+ * §5.2 discriminator's "drop literal placeholder" branch.
+ */
+function buildFsdProtocolBlockForAgent(agentIdentity?: string | null): string | null {
+  if (!agentIdentity) return null;
+  // Look up the leader's FSD state by handle.
+  const state = useCollaboratorStore.getState();
+  const leader = state.agents.find((a) => a.handle === agentIdentity);
+  if (!leader) return null;
+  const fsd = state.fsdByLeaderSessionId[leader.sessionId];
+  if (!fsd || fsd.tier === "off") return null;
+
+  return [
+    "## FSD ACTIVE",
+    "",
+    "You are operating in Full-Self Driving mode. You are the orchestrator: decompose",
+    "the user's request into tasks, dispatch each to a headless assistant of your",
+    "choice, evaluate results, and decide when the loop is complete.",
+    "",
+    "Emit single-line JSON commands prefixed with `##FSD ` (two hashes, no space",
+    "between them). Real commands look like:",
+    "    `# #FSD {\"v\":1,\"cmd_id\":\"<uuid>\",\"sn\":\"<SESSION_NONCE>\",\"rn\":\"<RUN_NONCE>\",...}`",
+    "    (replace the space between # and # with no space; replace placeholders",
+    "    with the live values below.)",
+    "",
+    "Live nonces for this session:",
+    `  SESSION_NONCE: ${fsd.sessionNonce}`,
+    `  RUN_NONCE:     <issued by orchestrator on each plan; see response>`,
+    "",
+    "Verbs (v=1):",
+    '  plan     {goal, success_criteria[], max_turns}     — start a run',
+    '  dispatch {turn, tasks: [{task_id, tool, prompt, ...}]}  — assign work',
+    '  done     {summary, evidence[]}                     — terminate (success)',
+    '  blocked  {reason, missing_capability?, ...}        — terminate (no progress)',
+    "",
+    "Tools available (Phase 1 Pilot): claude_code, codex_cli, gemini_cli, copilot_cli.",
+    "Caps: max_turns=4 (negotiable up to 16), max_tasks_per_dispatch=4,",
+    "max_prompt_bytes=8KB per task, wallclock=120s per task / 600s per run.",
+    "",
+    "After each dispatch, you'll receive an iteration_report from the orchestrator.",
+    "DO NOT wrap `##FSD` lines in markdown code fences. Emit them on their own line.",
+  ].join("\n");
 }
 
 /**
@@ -1155,6 +1272,28 @@ async function buildSlimHeader(
       `over full Read of shared tasks/conversation files]`,
     );
   }
+
+  // Per plan v5 §4.5 / §5.5: re-inject FSD protocol if the toggle was just
+  // flipped on (or off-on cycled). prependContextHeader handles the first-
+  // send case; this slim path handles every subsequent send AFTER toggle.
+  if (agentIdentity) {
+    const pendingMap = useCollaboratorStore.getState().fsdProtocolPendingByAgent;
+    const leader = useCollaboratorStore.getState().agents
+      .find((a) => a.handle === agentIdentity);
+    if (leader && pendingMap[leader.sessionId]) {
+      const fsdBlock = buildFsdProtocolBlockForAgent(agentIdentity);
+      if (fsdBlock) {
+        parts.push(fsdBlock);
+        // Clear the pending flag — protocol delivered.
+        useCollaboratorStore.setState((s) => {
+          const next = { ...s.fsdProtocolPendingByAgent };
+          delete next[leader.sessionId];
+          return { fsdProtocolPendingByAgent: next };
+        });
+      }
+    }
+  }
+
   parts.push(text);
   return parts.join("\n");
 }
@@ -1171,6 +1310,162 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   pendingMessagesByAgent: {},
   recentOutcomesBySession: {},
   contextSentByAgent: {},
+  fsdByLeaderSessionId: {},
+  fsdProtocolPendingByAgent: {},
+
+  // -- FSD orchestration --------------------------------------------------
+
+  setFsdTier: (leaderSessionId, leaderHandle, tier, resp) => {
+    set((s) => {
+      const next: Record<string, FsdLeaderState> = { ...s.fsdByLeaderSessionId };
+      const nextPending: Record<string, true> = { ...s.fsdProtocolPendingByAgent };
+      const prev = next[leaderSessionId]?.tier ?? "off";
+      if (tier === "off") {
+        // Toggle off — clear leader state AND the protocol-pending flag so a
+        // subsequent re-toggle correctly re-injects the FSD header.
+        // (Plan v5 §5.5 / item K bug fix.)
+        delete next[leaderSessionId];
+        delete nextPending[leaderSessionId];
+      } else {
+        next[leaderSessionId] = {
+          leaderSessionId,
+          leaderHandle,
+          tier,
+          activeRunId: null,
+          sessionNonce: resp.session_nonce,
+          runNonce: null,
+          strikeCount: 0,
+          emissionMode: resp.emission_mode,
+          tasks: [],
+          status: null,
+          turn: 0,
+        };
+        // 0 → >0: leader needs the FSD header injected on next send.
+        if (prev === "off") {
+          nextPending[leaderSessionId] = true;
+        }
+      }
+      return { fsdByLeaderSessionId: next, fsdProtocolPendingByAgent: nextPending };
+    });
+  },
+
+  applyFsdRunStart: (leaderSessionId, payload) => {
+    set((s) => {
+      const cur = s.fsdByLeaderSessionId[leaderSessionId];
+      if (cur == null) return s;
+      return {
+        fsdByLeaderSessionId: {
+          ...s.fsdByLeaderSessionId,
+          [leaderSessionId]: {
+            ...cur,
+            activeRunId: payload.run_id,
+            runNonce: payload.run_nonce,
+            tasks: [],
+            status: "running" as RunStatus,
+            turn: 0,
+            strikeCount: 0,
+          },
+        },
+      };
+    });
+  },
+
+  applyFsdTaskStart: (leaderSessionId, payload) => {
+    set((s) => {
+      const cur = s.fsdByLeaderSessionId[leaderSessionId];
+      if (cur == null || cur.activeRunId !== payload.run_id) return s;
+      const idx = cur.tasks.findIndex((t) => t.taskId === payload.task_id);
+      const taskUpdate = {
+        taskId: payload.task_id,
+        tool: payload.tool,
+        roleHint: payload.role_hint ?? undefined,
+        status: "running" as const,
+        lastLine: null,
+        startedAt: new Date().toISOString(),
+        finishedAt: null,
+        exitCode: null,
+        wallclockMs: 0,
+      };
+      const nextTasks = idx >= 0
+        ? cur.tasks.map((t, i) => (i === idx ? { ...t, ...taskUpdate } : t))
+        : [...cur.tasks, taskUpdate];
+      return {
+        fsdByLeaderSessionId: {
+          ...s.fsdByLeaderSessionId,
+          [leaderSessionId]: {
+            ...cur,
+            tasks: nextTasks,
+            turn: Math.max(cur.turn, payload.turn),
+          },
+        },
+      };
+    });
+  },
+
+  applyFsdTaskDone: (leaderSessionId, payload) => {
+    set((s) => {
+      const cur = s.fsdByLeaderSessionId[leaderSessionId];
+      if (cur == null || cur.activeRunId !== payload.run_id) return s;
+      const idx = cur.tasks.findIndex((t) => t.taskId === payload.task_id);
+      // Use enriched payload: prefer real tool/exit_code/last_line over
+      // synthesized values when available (per @claude2 task-49 §3.2).
+      const tool = payload.tool ?? (idx >= 0 ? cur.tasks[idx].tool : "?");
+      const roleHint = payload.role_hint ?? (idx >= 0 ? cur.tasks[idx].roleHint : undefined);
+      const exitCode = payload.exit_code ?? (payload.kind === "ok" ? 0 : 1);
+      const lastLine = payload.last_line && payload.last_line.length > 0
+        ? payload.last_line
+        : (payload.kind === "ok" ? "completed" : payload.kind);
+      const status = (payload.kind === "ok" ? "done" : "errored") as "done" | "errored";
+      const taskUpdate = {
+        taskId: payload.task_id,
+        tool,
+        roleHint,
+        status,
+        lastLine,
+        startedAt: idx >= 0 ? cur.tasks[idx].startedAt : null,
+        finishedAt: new Date().toISOString(),
+        exitCode,
+        wallclockMs: payload.wallclock_ms,
+      };
+      const nextTasks = idx >= 0
+        ? cur.tasks.map((t, i) => (i === idx ? { ...t, ...taskUpdate } : t))
+        : [...cur.tasks, taskUpdate];
+      return {
+        fsdByLeaderSessionId: {
+          ...s.fsdByLeaderSessionId,
+          [leaderSessionId]: {
+            ...cur,
+            tasks: nextTasks,
+            turn: Math.max(cur.turn, payload.turn),
+          },
+        },
+      };
+    });
+  },
+
+  applyFsdRunEnd: (leaderSessionId, payload) => {
+    set((s) => {
+      const cur = s.fsdByLeaderSessionId[leaderSessionId];
+      if (cur == null || cur.activeRunId !== payload.run_id) return s;
+      // Per @codex3 task-59 residual: clear activeRunId + runNonce so a
+      // subsequent toggle/plan starts fresh. Status persists for the chip
+      // tone (done/blocked/cancelled/cap_tripped/interrupted) until the
+      // next run begins. tasks remain visible in the drawer for post-run
+      // inspection until activeRunId reappears.
+      return {
+        fsdByLeaderSessionId: {
+          ...s.fsdByLeaderSessionId,
+          [leaderSessionId]: {
+            ...cur,
+            status: payload.status as RunStatus,
+            activeRunId: null,
+            runNonce: null,
+            strikeCount: 0,
+          },
+        },
+      };
+    });
+  },
 
   // -- Session lifecycle --------------------------------------------------
 

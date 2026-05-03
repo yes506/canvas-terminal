@@ -1,5 +1,6 @@
 mod commands;
 mod dashboard;
+mod fsd;
 mod state;
 
 use std::sync::atomic::Ordering;
@@ -90,7 +91,17 @@ pub fn run() {
             let menu = build_menu(app)?;
             app.set_menu(menu)?;
             // Remove only stale session directories from dead processes.
+            // IMPORTANT order: this runs FIRST and only matches `session-<pid>`
+            // dirs (verified plan v5 §1.2), so `fsd-runs/` is preserved.
             let _ = commands::memory::clear_stale_sessions();
+            // Then mark any in-flight FSD runs from a dead process as
+            // interrupted (R15 catches both dead-PID and stale-heartbeat).
+            // Run on a background tokio task so app setup isn't blocked.
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = fsd::recovery::recover_runs().await {
+                    eprintln!("FSD recovery failed: {}", e);
+                }
+            });
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -138,6 +149,12 @@ pub fn run() {
             commands::dashboard::open_dashboard,
             commands::dashboard::get_dashboard_info,
             commands::dashboard::copy_dashboard_url_with_token,
+            commands::fsd::fsd_set_tier,
+            commands::fsd::fsd_dispatch_command,
+            commands::fsd::fsd_query_run,
+            commands::fsd::fsd_cancel_run,
+            commands::fsd::fsd_recover_runs,
+            commands::fsd::fsd_report_malformed,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
