@@ -163,15 +163,38 @@ export function DrawingBoard() {
     useCanvasStore.getState().setViewportPan(vpt[4], vpt[5]);
   };
 
-  const addImageToCanvas = (dataUrl: string) => {
+  // Insertion path for full-window/canvas screenshots. Preserves the source
+  // bitmap at full resolution and only display-scales via Fabric's scaleX/
+  // scaleY. Why this matters: monospace terminal text rows are ~10–11 CSS px
+  // tall; a destructive `scaleToWidth(400)` bilinearly aliases adjacent rows
+  // together, and the subsequent `multiplier=dpr` export upsamples those
+  // collisions instead of recovering them. Display-scaling keeps the full-res
+  // source so the export samples from the original pixels. `objectCaching:
+  // false` prevents Fabric from pre-baking a low-res cached bitmap on first
+  // render. Integer-snap left/top avoids a mild bilinear pass from sub-pixel
+  // placement.
+  //
+  // `sourceScale` is the device-pixels-per-CSS-pixel factor that produced the
+  // source bitmap — must match the `scale`/`multiplier` used at capture. Pass
+  // `dpr` for `exportCanvasToDataUrl` (multiplier=dpr) and `dpr*2` for the
+  // fullwindow `html2canvas(scale: dpr*2)` path. Without this, the helper
+  // would compute the source's CSS width incorrectly for higher-density
+  // captures and clamp/scale the displayed image to the wrong size.
+  const addCapturedScreenshotToCanvas = (dataUrl: string, sourceScale: number) => {
     if (!fabricCanvas) return;
     const imgEl = new Image();
     imgEl.onload = () => {
-      const img = new fabric.Image(imgEl, { left: 50, top: 50 });
-      // Scale down to fit within 400px wide
-      const maxW = 400;
-      if (img.width && img.width > maxW) {
-        img.scaleToWidth(maxW);
+      const naturalCssW = imgEl.naturalWidth / sourceScale;
+      const displayW = Math.min(naturalCssW, 900);
+      const img = new fabric.Image(imgEl, {
+        left: 50,
+        top: 50,
+        objectCaching: false,
+      });
+      if (img.width && img.width > 0) {
+        const s = displayW / img.width;
+        img.scaleX = s;
+        img.scaleY = s;
       }
       fabricCanvas.add(img);
       fabricCanvas.setActiveObject(img);
@@ -187,7 +210,10 @@ export function DrawingBoard() {
 
     try {
       const dataUrl = exportCanvasToDataUrl(fabricCanvas);
-      addImageToCanvas(dataUrl);
+      // exportCanvasToDataUrl already produces a full-resolution bitmap
+      // (multiplier=dpr); preserve that source via the screenshot path
+      // instead of re-downscaling it through scaleToWidth(400).
+      addCapturedScreenshotToCanvas(dataUrl, window.devicePixelRatio);
     } catch (err) {
       console.error("Canvas capture failed:", err);
     } finally {
@@ -203,16 +229,62 @@ export function DrawingBoard() {
       const appRoot = document.querySelector<HTMLElement>("#root");
       if (!appRoot) return;
 
+      // Wait for web fonts (e.g. JetBrainsMono Nerd Font Mono) so the cloned
+      // DOM html2canvas builds doesn't fall back to a system font with
+      // different metrics. xterm's DomRenderer measures `cellHeight` from
+      // the loaded font; a fallback in the clone breaks the row clip
+      // invariant and produces visually-collided rows in the screenshot.
+      if (document.fonts?.ready) {
+        try { await document.fonts.ready; } catch { /* fonts API absent */ }
+      }
+
       // html2canvas natively clones canvas elements via drawImage().
       // For WebGL canvases (xterm.js), this requires preserveDrawingBuffer=true
       // on the WebGL addon — see useTerminal.ts where it's enabled.
+      //
+      // scale: dpr*2 — gives downstream Fabric resampling enough source
+      // pixels per text row that monospaced rows stay distinct after the
+      // export's bilinear pass.
+      //
+      // onclone — re-asserts row geometry that xterm.js v5 DomRenderer sets
+      // at runtime (overflow:hidden + per-row height + span inline-block).
+      // xterm appends those rules in a <style> under `_screenElement`
+      // (NOT <head>); html2canvas v1 commonly drops scoped stylesheets,
+      // which lets cloned glyphs overflow their row slot and visually
+      // collide with neighbours. We re-apply the invariants in <head> so
+      // the clip survives the clone.
       const screenshot = await html2canvas(appRoot, {
         backgroundColor: null,
-        scale: window.devicePixelRatio,
+        scale: window.devicePixelRatio * 2,
         useCORS: true,
+        onclone: (doc) => {
+          // `contain: layout paint` (NOT `contain: strict`): we intentionally
+          // omit the `size` containment aspect because that requires the
+          // element to declare an explicit size, otherwise it collapses to
+          // 0×0. xterm v5 does inline `height: <px>` on each row at runtime
+          // so `contain: strict` would work today, but a future xterm refactor
+          // (e.g. flexbox-based rows) could remove the inline height and
+          // produce blank captures. `layout paint` gets us the paint-bleed
+          // isolation we need without the size-collapse risk.
+          const styleEl = doc.createElement("style");
+          styleEl.textContent = `
+            .xterm-rows > div {
+              overflow: hidden !important;
+              contain: layout paint;
+            }
+            .xterm-rows span {
+              display: inline-block !important;
+              height: 100% !important;
+              vertical-align: top !important;
+            }
+          `;
+          doc.head.appendChild(styleEl);
+        },
       });
       const dataUrl = screenshot.toDataURL("image/png");
-      addImageToCanvas(dataUrl);
+      // Match the `scale: dpr*2` used by html2canvas above so the helper
+      // computes the source's CSS width correctly.
+      addCapturedScreenshotToCanvas(dataUrl, window.devicePixelRatio * 2);
     } catch (err) {
       console.error("Full window capture failed:", err);
     } finally {

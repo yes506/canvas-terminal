@@ -120,7 +120,13 @@ export function AgentMiniTerminal({
         fontFamily:
           "'JetBrainsMono Nerd Font Mono', 'Noto Sans Mono CJK KR', 'D2Coding', 'JetBrains Mono', Menlo, monospace",
         fontSize: Math.max(fontSize - 2, 9),
-        lineHeight: 1.15,
+        // Match the main terminal's lineHeight (terminalManager.ts:187).
+        // The previous 1.15 was tuned for vertical compactness in small panes
+        // but left zero air between rows, so html2canvas screenshots showed
+        // glyph descenders bleeding into the next row whenever the cloned
+        // DOM lost xterm's runtime row-clip stylesheet. 1.2 matches the
+        // main terminal and the +0.05 is not visually perceptible.
+        lineHeight: 1.2,
         cursorBlink: true,
         cursorStyle: "bar",
         scrollback: 5000,
@@ -800,7 +806,7 @@ export function AgentMiniTerminal({
   const indicator = getIndicatorPresentation(lifecycle, taskState);
 
   return (
-    <div className={`flex flex-col h-full min-h-0 border rounded-md overflow-hidden ${focused ? "border-accent" : "border-surface-lighter"}`}>
+    <div className={`flex flex-col h-full min-h-[220px] border rounded-md overflow-hidden ${focused ? "border-accent" : "border-surface-lighter"}`}>
       {/* Agent header */}
       <div className="flex items-center gap-2 px-2 py-1 bg-surface-light border-b border-surface-lighter text-xs shrink-0">
         {/* Status light — `ping` halo flags a fresh outcome (completed/blocked).
