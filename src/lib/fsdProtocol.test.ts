@@ -28,6 +28,11 @@ describe("parseFsdLine — happy path", () => {
     expect(r.kind).toBe("ok");
   });
 
+  it("parses the current bootstrap plan shape with an empty rn", () => {
+    const r = parseFsdLine(planLine({ rn: "" }));
+    expect(r.kind).toBe("ok");
+  });
+
   it("parses a dispatch with one task", () => {
     const r = parseFsdLine(`##FSD ${JSON.stringify({
       v: 1, cmd_id: "c2", sn: SN, rn: RN, run_id: "r1",
@@ -96,6 +101,19 @@ describe("parseFsdLine — malformed", () => {
   it("rejects bad JSON", () => {
     const r = parseFsdLine("##FSD {not valid json");
     expect(r.kind).toBe("malformed");
+  });
+
+  it("rejects the stale prompt shape that used cmd instead of type", () => {
+    const r = parseFsdLine(`##FSD ${JSON.stringify({
+      v: 1,
+      cmd_id: "c1",
+      sn: SN,
+      rn: "",
+      run_id: "r1",
+      cmd: "plan",
+      goal: "x",
+    })}`);
+    expect(r).toEqual({ kind: "malformed", reason: "missing field: type" });
   });
 
   it("rejects when missing required field cmd_id", () => {

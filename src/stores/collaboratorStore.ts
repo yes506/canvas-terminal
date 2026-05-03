@@ -1151,8 +1151,11 @@ async function prependContextHeader(
  * Examples in the block use the `# #FSD` escape (single hash + space + #FSD)
  * per plan v5 §5.4 — the parser regex `^\s*##FSD\s+...` cannot match this,
  * so an echo of the example never self-triggers a dispatch. The active
- * `<SESSION_NONCE>` and `<RUN_NONCE>` placeholders are also defended by the
- * §5.2 discriminator's "drop literal placeholder" branch.
+ * `<SESSION_NONCE>` placeholder is also defended by the §5.2 discriminator's
+ * "drop literal placeholder" branch (see `classifyMismatch` in fsdProtocol.ts).
+ * The plan envelope intentionally uses `rn:""` instead of an `<RUN_NONCE>`
+ * placeholder — `handle_plan` ignores `rn` and the orchestrator returns the
+ * real `run_nonce` via the `[FSD RUN STARTED]` injection that follows.
  */
 function buildFsdProtocolBlockForAgent(agentIdentity?: string | null): string | null {
   if (!agentIdentity) return null;
@@ -1172,19 +1175,19 @@ function buildFsdProtocolBlockForAgent(agentIdentity?: string | null): string | 
     "",
     "Emit single-line JSON commands prefixed with `##FSD ` (two hashes, no space",
     "between them). Real commands look like:",
-    "    `# #FSD {\"v\":1,\"cmd_id\":\"<uuid>\",\"sn\":\"<SESSION_NONCE>\",\"rn\":\"<RUN_NONCE>\",...}`",
+    "    `# #FSD {\"v\":1,\"cmd_id\":\"<uuid>\",\"sn\":\"<SESSION_NONCE>\",\"rn\":\"\",\"run_id\":\"<run_uuid>\",\"type\":\"plan\",\"goal\":\"...\",\"success_criteria\":[],\"max_turns\":4}`",
     "    (replace the space between # and # with no space; replace placeholders",
     "    with the live values below.)",
     "",
     "Live nonces for this session:",
     `  SESSION_NONCE: ${fsd.sessionNonce}`,
-    `  RUN_NONCE:     <issued by orchestrator on each plan; see response>`,
+    "  RUN_NONCE:     use an empty string for plan; after plan is accepted, use the run_nonce from [FSD RUN STARTED].",
     "",
     "Verbs (v=1):",
-    '  plan     {goal, success_criteria[], max_turns}     — start a run',
-    '  dispatch {turn, tasks: [{task_id, tool, prompt, ...}]}  — assign work',
-    '  done     {summary, evidence[]}                     — terminate (success)',
-    '  blocked  {reason, missing_capability?, ...}        — terminate (no progress)',
+    '  plan     type="plan" with cmd_id, sn, rn="", run_id, goal, success_criteria[], max_turns',
+    '  dispatch type="dispatch" with cmd_id, sn, rn, run_id, turn, tasks: [{task_id, tool, instance_idx, prompt, ...}]',
+    '  done     type="done" with cmd_id, sn, rn, run_id, summary, evidence[]',
+    '  blocked  type="blocked" with cmd_id, sn, rn, run_id, reason, missing_capability?',
     "",
     "Tools available (Phase 1 Pilot): claude_code, codex_cli, gemini_cli, copilot_cli.",
     "Caps: max_turns=4 (negotiable up to 16), max_tasks_per_dispatch=4,",
