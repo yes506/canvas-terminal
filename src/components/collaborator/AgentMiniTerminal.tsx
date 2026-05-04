@@ -16,13 +16,14 @@ import {
 import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture, stripAnsi, registerCapture, unregisterCapture } from "../../lib/agentOutputCapture";
 import { createFsdLineTap } from "../../lib/fsdLineTap";
+import type { ParseResult } from "../../lib/fsdProtocol";
 import { isEnvBootstrapped } from "../../lib/terminalManager";
 import type { ToolConfig } from "../../types/collaborator";
 import { X } from "lucide-react";
 import { FsdToggle } from "./FsdToggle";
 import { FsdRunChip } from "./FsdRunChip";
 import { SwarmDrawer } from "./SwarmDrawer";
-import type { DispatchResponse } from "../../types/fsd";
+import type { DispatchResponse, FsdCommand, FsdLeaderState } from "../../types/fsd";
 
 interface AgentMiniTerminalProps {
   sessionId: string;
@@ -72,6 +73,134 @@ export async function handlePtyExit(opts: {
     }
   }
   useCollaboratorStore.getState().setAgentStatus(opts.sessionId, "exited");
+}
+
+/**
+ * Sanitize leader-supplied text before re-injecting it into the leader's PTY.
+ *
+ * The orchestrator may echo a leader's malformed `##FSD …` line back through
+ * `[FSD MALFORMED COMMAND]` / `[FSD ORCHESTRATOR RESPONSE]` / `[FSD ITERATION
+ * REPORT]` blocks. The leader's own line tap is NOT gated against re-parsing
+ * self-injected text (only non-leaders are gated), so a verbatim `##FSD`
+ * substring in the inject can re-trigger the parser and start a strike loop.
+ *
+ * Replacing `##FSD` with `# #FSD` (the documented §5.4 escape) breaks the
+ * line-tap regex without changing the semantic content the leader sees.
+ */
+export function sanitizeFsd(s: string | null | undefined): string {
+  return (s ?? "").replace(/##FSD\b/g, "# #FSD");
+}
+
+/**
+ * Parser-isolation predicate for the FSD line tap.
+ *
+ * The tap is per-mini-terminal but must only PARSE PTY output for sessions
+ * that are currently FSD leaders. Without this gate, every mini-terminal —
+ * including non-leader Codex/Gemini followers — runs the `##FSD ...` regex
+ * over its own PTY echo. That created a side channel where:
+ *   - typed user text containing `##FSD` got dispatched as malformed,
+ *   - and `[FSD MALFORMED COMMAND]` got injected back into the agent's PTY.
+ *
+ * The earlier IPC-side guard (`if tier === "off" return`) inside the
+ * onCommand callback only short-circuits the dispatch — it does NOT stop
+ * the parser. This predicate gates `feed()` itself, so non-leaders never
+ * accumulate a partial-line buffer or invoke the parser at all.
+ *
+ * Returns true only when this session has an active FSD leader registration
+ * with a non-`off` tier.
+ */
+export function shouldFeedFsdTap(
+  fsdByLeaderSessionId: Record<string, FsdLeaderState>,
+  sessionId: string,
+): boolean {
+  const fsd = fsdByLeaderSessionId[sessionId];
+  return fsd != null && fsd.tier !== "off";
+}
+
+export function buildFallbackFsdPlanCommand(
+  leaderSessionId: string,
+  collabSessionId: string | null,
+): FsdCommand | null {
+  const state = useCollaboratorStore.getState();
+  const fsd = state.fsdByLeaderSessionId[leaderSessionId];
+  if (!fsd || fsd.tier === "off" || fsd.activeRunId != null) return null;
+  const leader = state.agents.find((a) => a.sessionId === leaderSessionId);
+  if (!leader) return null;
+  const tasks = collabSessionId ? (state.tasksBySession[collabSessionId] ?? []) : [];
+  const task = tasks
+    .filter((t) =>
+      t.assignee === `@${leader.handle}` &&
+      (t.status === "pending" || t.status === "in-progress"))
+    .sort((a, b) => new Date(b.assignedAt).getTime() - new Date(a.assignedAt).getTime())[0];
+  // Phase 3.3 (claude2/claude3 review): if no actionable task exists, return
+  // null and let the strike+remind path fire instead of synthesizing a vague
+  // "Complete the current user request via FSD" run. A vague run starts but
+  // can't be usefully steered — the leader has no concrete goal and no
+  // success criteria to evaluate against — so it burns turns and tokens for
+  // no product value. Better to surface the malformed shorthand to the user
+  // (via the orchestrator's strike message) and let them either author a
+  // proper plan or assign a task first.
+  const goal = task?.objective || task?.title;
+  if (!goal) return null;
+  const randomId = () =>
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return {
+    v: 1,
+    cmd_id: randomId(),
+    sn: fsd.sessionNonce,
+    rn: "",
+    run_id: randomId(),
+    type: "plan",
+    goal,
+    success_criteria: [
+      "Dispatch at least one assistant task unless the goal is already complete.",
+      "Synthesize assistant results before writing the collaborator completion report.",
+    ],
+    max_turns: 4,
+  };
+}
+
+/**
+ * Pure routing decision for a parsed `##FSD` line — extracted so the
+ * dispatch logic in `AgentMiniTerminal`'s line-tap callback can be unit
+ * tested without mounting xterm or mocking IPC.
+ *
+ * Maps a `(ParseResult, fallbackPlan)` pair to one of four discrete
+ * actions the line tap takes:
+ *  - `dispatch-cmd` — leader emitted a well-formed command; forward to
+ *    `fsd_dispatch_command` IPC.
+ *  - `dispatch-fallback` — leader shorthand'd `##FSD plan` and we have
+ *    enough state to synthesize a recovery plan; dispatch that.
+ *  - `local-reminder` — leader shorthand'd `##FSD plan` but no actionable
+ *    task is assigned; inject a local `[FSD MALFORMED COMMAND]` with
+ *    recovery guidance and SKIP the backend strike (no run to attribute
+ *    to). Closes the no-task feedback hole codex2 task-40 P1 raised.
+ *  - `report-strike` — any other malformed line; report to the canonical
+ *    Rust strike counter via `fsd_report_malformed`.
+ *  - `ignore` — `kind: "skip"` (not an `##FSD` line at all).
+ */
+export type FsdRouteAction =
+  | { kind: "dispatch-cmd"; cmd: FsdCommand }
+  | { kind: "dispatch-fallback"; cmd: FsdCommand }
+  | { kind: "local-reminder"; reason: string }
+  | { kind: "report-strike"; reason: string }
+  | { kind: "ignore" };
+
+export function routeFsdParseResult(
+  result: ParseResult,
+  fallbackPlan: FsdCommand | null,
+): FsdRouteAction {
+  if (result.kind === "ok") return { kind: "dispatch-cmd", cmd: result.cmd };
+  if (result.kind === "skip") return { kind: "ignore" };
+  // result.kind === "malformed"
+  if (result.code === "shorthand-plan") {
+    if (fallbackPlan) return { kind: "dispatch-fallback", cmd: fallbackPlan };
+    // No fallback synthesizable → local reminder, NOT a backend strike.
+    return { kind: "local-reminder", reason: result.reason };
+  }
+  return { kind: "report-strike", reason: result.reason };
 }
 
 /**
@@ -247,12 +376,19 @@ export function AgentMiniTerminal({
       const fsdTap = createFsdLineTap({
         sessionId,
         onCommand: (result) => {
+          const fsdState = useCollaboratorStore.getState().fsdByLeaderSessionId[sessionId];
+          if (!fsdState || fsdState.tier === "off") return;
           if (result.kind === "ok") {
             invoke<DispatchResponse>("fsd_dispatch_command", {
               leaderSessionId: sessionId,
               cmd: result.cmd,
             })
               .then((resp) => {
+                // Toggle-off race guard: if FSD was disabled while the dispatch
+                // was in flight, drop the response — injecting it now would
+                // surprise the user (no longer the leader's expected mode).
+                const cur = useCollaboratorStore.getState().fsdByLeaderSessionId[sessionId];
+                if (!cur || cur.tier === "off") return;
                 if (!resp.message || resp.next_action === "ack") return;
                 injectFsdLeaderText(
                   [
@@ -260,7 +396,7 @@ export function AgentMiniTerminal({
                     `result: ${resp.result}`,
                     `next_action: ${resp.next_action}`,
                     `strikes: ${resp.strike_count}`,
-                    resp.message,
+                    sanitizeFsd(resp.message),
                   ].join("\n"),
                 );
               })
@@ -268,7 +404,73 @@ export function AgentMiniTerminal({
               console.warn("[FSD] dispatch_command failed:", err);
               });
           } else if (result.kind === "malformed") {
-            console.debug("[FSD] malformed line:", result.reason);
+            console.debug("[FSD] malformed line:", result.code, result.reason);
+            // Recovery synthesis ONLY for shorthand `##FSD plan` — the other
+            // shorthand verbs (dispatch/done/blocked) need live run context
+            // (task list, summary, reason) that the harness cannot fabricate;
+            // they fall through to strike+remind with a clearer message.
+            const fallbackPlan = result.code === "shorthand-plan"
+              ? buildFallbackFsdPlanCommand(sessionId, collabSessionId)
+              : null;
+            // No-task fallback hole (codex2 task-40 P1): when the leader
+            // emitted `##FSD plan` shorthand BUT no actionable task exists,
+            // `buildFallbackFsdPlanCommand` returns null. The next backend
+            // call to `fsd_report_malformed(runId: null)` returns
+            // `out_of_scope` (no active run), and the `.then()` branch below
+            // suppresses the inject for `out_of_scope` — so the leader sees
+            // nothing. Inject a local reminder here that explains the gap and
+            // tells the leader how to recover (full JSON plan or assign a
+            // task first). Skip the backend call entirely — there's no run to
+            // attribute a strike to, and the local reminder is the actionable
+            // signal the leader needs.
+            if (result.code === "shorthand-plan" && !fallbackPlan) {
+              injectFsdLeaderText(
+                [
+                  "[FSD MALFORMED COMMAND]",
+                  sanitizeFsd(result.reason),
+                  "No actionable collaborator task is currently assigned to you,",
+                  "so the harness cannot synthesize a fallback plan from your",
+                  "shorthand. Either emit a full JSON plan command — `##FSD",
+                  "{\"v\":1,\"type\":\"plan\",\"goal\":\"…\",…}` — or have a task",
+                  "assigned (`/task add … @<your-handle>`) before retrying.",
+                ].join("\n"),
+              );
+              return;
+            }
+            if (fallbackPlan) {
+              invoke<DispatchResponse>("fsd_dispatch_command", {
+                leaderSessionId: sessionId,
+                cmd: fallbackPlan,
+              })
+                .then((resp) => {
+                  // Toggle-off race guard (same reasoning as the ok-branch above).
+                  const cur = useCollaboratorStore.getState().fsdByLeaderSessionId[sessionId];
+                  if (!cur || cur.tier === "off") return;
+                  if (resp.result === "accepted" || resp.next_action === "ack") {
+                    injectFsdLeaderText(
+                      [
+                        "[FSD SHORTHAND PLAN RECOVERED]",
+                        "Your `##FSD plan` shorthand was converted into a valid JSON plan.",
+                        "Continue only with JSON `dispatch`, `done`, or `blocked` commands.",
+                      ].join("\n"),
+                    );
+                    return;
+                  }
+                  injectFsdLeaderText(
+                    [
+                      "[FSD ORCHESTRATOR RESPONSE]",
+                      `result: ${resp.result}`,
+                      `next_action: ${resp.next_action}`,
+                      `strikes: ${resp.strike_count}`,
+                      sanitizeFsd(resp.message ?? "fallback plan was not accepted"),
+                    ].join("\n"),
+                  );
+                })
+                .catch((err) => {
+                  console.warn("[FSD] fallback plan dispatch failed:", err);
+                });
+              return;
+            }
             // Report to backend so the canonical Rust strike counter
             // increments. Per @codex2 task-50 P1 / @codex3 task-52 P1 /
             // @claude3 task-58 §5.2 — frontend's optimistic count is for UI
@@ -283,24 +485,37 @@ export function AgentMiniTerminal({
               },
             )
               .then((resp) => {
+                // Toggle-off race guard: if FSD was disabled mid-flight, don't
+                // resurface a malformed-line reminder for an inactive leader.
+                const cur = useCollaboratorStore.getState().fsdByLeaderSessionId[sessionId];
+                if (!cur || cur.tier === "off") return;
+                if (resp.result === "out_of_scope") return;
                 injectFsdLeaderText(
                   [
                     "[FSD MALFORMED COMMAND]",
                     `result: ${resp.result}`,
                     `strikes: ${resp.strike_count}`,
-                    result.reason,
+                    sanitizeFsd(result.reason),
                     "Emit exactly one valid JSON object on a line prefixed by ##FSD.",
+                    "Do not emit shorthand such as `##FSD plan`; the line must start with `##FSD {`.",
                   ].join("\n"),
                 );
               })
               .catch((err) => {
                 console.warn("[FSD] fsd_report_malformed failed:", err);
-                // Fall back to local-only reminder if backend reachable.
+                // Same toggle-off race guard as the success branch (codex1
+                // task-38 finding 4): if FSD was disabled while the backend
+                // call was in flight, don't surface a reminder for an
+                // inactive leader on the local-fallback path either.
+                const cur = useCollaboratorStore.getState().fsdByLeaderSessionId[sessionId];
+                if (!cur || cur.tier === "off") return;
+                // Fall back to local-only reminder if backend unreachable.
                 injectFsdLeaderText(
                   [
                     "[FSD MALFORMED COMMAND]",
-                    result.reason,
+                    sanitizeFsd(result.reason),
                     "Emit exactly one valid JSON object on a line prefixed by ##FSD.",
+                    "Do not emit shorthand such as `##FSD plan`; the line must start with `##FSD {`.",
                   ].join("\n"),
                 );
               });
@@ -310,12 +525,18 @@ export function AgentMiniTerminal({
       fsdTapRef.current = fsdTap;
 
       // Listen for PTY output
+      const feedFsdTap = (payload: string) => {
+        const state = useCollaboratorStore.getState();
+        if (shouldFeedFsdTap(state.fsdByLeaderSessionId, sessionId)) {
+          fsdTap.feed(payload);
+        }
+      };
       unlistenDataRef.current = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
           if (!disposed.current) {
             writeWithFollowBottom(event.payload);
-            fsdTap.feed(event.payload);
+            feedFsdTap(event.payload);
             capture.feed(event.payload);
           }
         },
@@ -761,7 +982,7 @@ export function AgentMiniTerminal({
         (event) => {
           if (!disposed.current) {
             writeWithFollowBottom(event.payload);
-            fsdTap.feed(event.payload); // FSD tap also wired in the replacement listener
+            feedFsdTap(event.payload); // FSD tap also wired in the replacement listener
             capture.feed(event.payload);
             checkReady(event.payload);
           }
@@ -845,6 +1066,20 @@ export function AgentMiniTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, tool.command, collabSessionId]);
 
+  // Parser isolation: clear the FSD line tap's internal buffer when this
+  // session stops being an FSD leader. Pairs with the `shouldFeedFsdTap`
+  // gate inside the data listener — together they guarantee non-leader
+  // mini-terminals neither parse incoming PTY chunks nor retain stale
+  // partial-line state from a previous active period.
+  const fsdTier = useCollaboratorStore(
+    (s) => s.fsdByLeaderSessionId[sessionId]?.tier,
+  );
+  useEffect(() => {
+    if (fsdTier == null || fsdTier === "off") {
+      fsdTapRef.current?.dispose();
+    }
+  }, [fsdTier]);
+
   // React to theme changes
   useEffect(() => {
     return useTerminalStore.subscribe((state, prev) => {
@@ -909,7 +1144,7 @@ export function AgentMiniTerminal({
             `run_id: ${e.payload.run_id}`,
             `turn: ${e.payload.turn}`,
             "",
-            e.payload.report,
+            sanitizeFsd(e.payload.report),
           ].join("\n"),
         );
       },

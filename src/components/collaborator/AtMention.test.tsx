@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { AtMention, filterMentionEntries } from "./AtMention";
+import { InputPrompt } from "./InputPrompt";
 import { CollabSessionContext } from "./CollabSessionContext";
 import { useCollaboratorStore } from "../../stores/collaboratorStore";
 import { TOOL_CONFIGS, type SpawnedAgent } from "../../types/collaborator";
@@ -231,5 +232,56 @@ describe("AtMention component", () => {
       .filter((e): e is Extract<typeof e, { kind: "agent" }> => e.kind === "agent")
       .map((e) => e.handle);
     expect(handles).toEqual(expect.arrayContaining(["claude1", "claude2"]));
+  });
+});
+
+describe("InputPrompt target selector", () => {
+  it("opens the target selector with an inline @mention preselected instead of sending immediately", () => {
+    const { paneA } = freshPanes();
+    spawn(paneA, "claude_code", "s1");
+    spawn(paneA, "codex_cli", "s2");
+    const sendToAgent = vi.fn(async () => undefined);
+    useCollaboratorStore.setState({ sendToAgent });
+
+    render(
+      <CollabSessionContext.Provider value={paneA}>
+        <InputPrompt />
+      </CollabSessionContext.Provider>,
+    );
+
+    const input = screen.getByPlaceholderText(/\/help/);
+    fireEvent.change(input, { target: { value: "please verify this @claude1 " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(sendToAgent).not.toHaveBeenCalled();
+    expect(screen.getAllByText((_, el) => el?.textContent?.includes("Send to:") ?? false).length)
+      .toBeGreaterThan(0);
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+
+  it("does not submit the target selector on Shift+Enter", () => {
+    const { paneA } = freshPanes();
+    spawn(paneA, "claude_code", "s1");
+    spawn(paneA, "codex_cli", "s2");
+    const sendToAgent = vi.fn(async () => undefined);
+    useCollaboratorStore.setState({ sendToAgent });
+
+    render(
+      <CollabSessionContext.Provider value={paneA}>
+        <InputPrompt />
+      </CollabSessionContext.Provider>,
+    );
+
+    const input = screen.getByPlaceholderText(/\/help/);
+    fireEvent.change(input, { target: { value: "bare message" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getAllByText((_, el) => el?.textContent?.includes("Send to:") ?? false).length)
+      .toBeGreaterThan(0);
+
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+
+    expect(sendToAgent).not.toHaveBeenCalled();
+    expect(screen.getAllByText((_, el) => el?.textContent?.includes("Send to:") ?? false).length)
+      .toBeGreaterThan(0);
   });
 });

@@ -38,17 +38,20 @@ pub fn fsd_set_tier(
     // Phase 1 hard cap: only Pilot (tier == 1) is supported.
     if tier > 1 {
         return Err(format!(
-            "tier {} not supported in Phase 1 (only Off=0 and Pilot=1; x1/x2/x3 = Phase 2+)",
+            "tier {} not supported in Phase 1 (only Off=0 and Auto-Pilot=1; x1/x2/x3 = Phase 2+)",
             tier
         ));
     }
     let session_nonce = generate_8hex();
-    leaders.insert(leader_handle.clone(), FsdLeaderRuntime {
-        leader_handle: leader_handle.clone(),
-        leader_session_id,
-        session_nonce: session_nonce.clone(),
-        tier,
-    });
+    leaders.insert(
+        leader_handle.clone(),
+        FsdLeaderRuntime {
+            leader_handle: leader_handle.clone(),
+            leader_session_id,
+            session_nonce: session_nonce.clone(),
+            tier,
+        },
+    );
     Ok(FsdSetTierResponse {
         session_nonce,
         // Phase 1 default: prompt-eng path. MCP coexistence path (plan v5 §4.4)
@@ -83,10 +86,15 @@ pub fn fsd_query_run(run_id: String) -> Result<Option<serde_json::Value>, String
     }
     if let Ok(leaders) = std::fs::read_dir(&fsd_root) {
         for leader in leaders.flatten() {
-            let manifest = leader.path().join("runs").join(&run_id).join("manifest.json");
+            let manifest = leader
+                .path()
+                .join("runs")
+                .join(&run_id)
+                .join("manifest.json");
             if manifest.exists() {
                 let raw = std::fs::read_to_string(&manifest).map_err(|e| e.to_string())?;
-                let val: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                let val: serde_json::Value =
+                    serde_json::from_str(&raw).map_err(|e| e.to_string())?;
                 return Ok(Some(val));
             }
         }
@@ -161,7 +169,11 @@ pub fn fsd_report_malformed(
         }));
     };
     let (count, force_blocked) = crate::fsd::orchestrator::record_strike_for_test(
-        &app, &state, &run_id, &leader_handle, &reason,
+        &app,
+        &state,
+        &run_id,
+        &leader_handle,
+        &reason,
     );
     Ok(serde_json::json!({
         "result": if force_blocked { "force_blocked" } else { "remind" },

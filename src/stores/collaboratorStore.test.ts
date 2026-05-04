@@ -5,6 +5,7 @@ import {
   getIndicatorPresentation,
   scanForTaskCompletions,
   formatTaskSummaryForAgent,
+  clearFsdProtocolPendingForSession,
   _resetWriteStateForTests,
   _isRenamePendingForTests,
   RECENT_OUTCOME_TTL_MS,
@@ -35,6 +36,8 @@ function resetStores() {
     logEntriesBySession: {},
     recentOutcomesBySession: {},
     contextSentByAgent: {},
+    fsdByLeaderSessionId: {},
+    fsdProtocolPendingByAgent: {},
     pendingMessagesByAgent: {},
     agents: [],
   });
@@ -824,6 +827,141 @@ describe("task-45 — scanForTaskCompletions in-loop re-read (real integration)"
   });
 });
 
+// Phase 2.8: scanForTaskCompletions must NOT see FSD per-task done.json
+// files. The FSD orchestrator writes to fsd-runs/{leader}/runs/{run_id}/
+// turns/{turn}/tasks/{task_id}/done.json — visible to list_memory_files's
+// recursive walk. If the collaborator scanner picked them up it could (a)
+// prefix-match against collaborator task IDs and corrupt their state, or
+// (b) orphan-delete them after 24h, racing FSD retention. Filter at the
+// scanner is the defense.
+describe("Phase 2.8 — scanForTaskCompletions ignores fsd-runs/ subtree", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetStores();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.mocked(invoke).mockImplementation(async () => null);
+  });
+
+  it("never reads or deletes a done.json under fsd-runs/", async () => {
+    // Stage the SAME `task_id` in both a collaborator file AND under fsd-runs/.
+    // If the filter is missing, the FSD file would either re-terminalize the
+    // collaborator task (read_memory_file → updateTask) or get orphan-deleted.
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask(
+      { objective: "x", title: "y", assignee: "@claude1" },
+      SESSION,
+    );
+    const collabPath = `${task.id}.done.json`;
+    const fsdPath = `fsd-runs/claude1/runs/r-1/turns/1/tasks/${task.id}/done.json`;
+
+    const reads: string[] = [];
+    const deletes: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return [collabPath, fsdPath];
+      if (cmd === "read_memory_file") {
+        reads.push((args as { relativePath: string }).relativePath);
+        return JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+      }
+      if (cmd === "delete_memory_file") {
+        deletes.push((args as { relativePath: string }).relativePath);
+        return null;
+      }
+      return null;
+    });
+
+    await scanForTaskCompletions(SESSION);
+
+    // The collab file IS read and (after terminal transition) deleted.
+    expect(reads).toContain(collabPath);
+    expect(deletes).toContain(collabPath);
+
+    // The FSD file is NEVER read and NEVER deleted by this scanner.
+    expect(reads).not.toContain(fsdPath);
+    expect(deletes).not.toContain(fsdPath);
+  });
+});
+
+// claude2 task-51 R6 + codex3 task-48: direct lifecycle tests for the
+// fsdProtocolPendingByAgent paired-invariant pattern. The flag indicates
+// the next inject_into_pty MUST embed the FSD ACTIVE block; only
+// clearFsdProtocolPendingForSession may clear it, and only after the IPC
+// succeeds. If the IPC throws, the flag persists for retry.
+describe("Phase 2.4 — fsdProtocolPendingByAgent paired-invariant lifecycle", () => {
+  beforeEach(() => {
+    resetStores();
+  });
+
+  it("clearFsdProtocolPendingForSession: removes the flag for the targeted session", () => {
+    useCollaboratorStore.setState({
+      fsdProtocolPendingByAgent: { "session-A": true, "session-B": true },
+    });
+    clearFsdProtocolPendingForSession("session-A");
+    const map = useCollaboratorStore.getState().fsdProtocolPendingByAgent;
+    expect(map).not.toHaveProperty("session-A");
+    expect(map).toHaveProperty("session-B");
+    expect(map["session-B"]).toBe(true);
+  });
+
+  it("clearFsdProtocolPendingForSession: no-op when the flag is absent (defensive)", () => {
+    useCollaboratorStore.setState({
+      fsdProtocolPendingByAgent: { "session-A": true },
+    });
+    const before = useCollaboratorStore.getState();
+    clearFsdProtocolPendingForSession("session-other");
+    const after = useCollaboratorStore.getState();
+    // Reference equality: state was not mutated for an absent key.
+    expect(after.fsdProtocolPendingByAgent).toBe(before.fsdProtocolPendingByAgent);
+  });
+
+  it("setFsdTier off→pilot SETS the pending flag; pilot→off CLEARS it (toggle cycle)", () => {
+    const store = useCollaboratorStore.getState();
+    // Toggle ON: 0→1. The setFsdTier action sets pending.
+    store.setFsdTier("session-A", "claude1", "pilot", {
+      session_nonce: "abc12345",
+      emission_mode: "prompt_lines",
+    });
+    expect(useCollaboratorStore.getState().fsdProtocolPendingByAgent["session-A"]).toBe(true);
+
+    // Simulate the inject succeeded → caller clears the flag.
+    clearFsdProtocolPendingForSession("session-A");
+    expect(useCollaboratorStore.getState().fsdProtocolPendingByAgent["session-A"]).toBeUndefined();
+
+    // Toggle OFF: 1→0. The setFsdTier action also drops any leftover pending
+    // (defense-in-depth — the flag should already be cleared, but a
+    // post-failure persist scenario could leave it set).
+    useCollaboratorStore.setState((s) => ({
+      fsdProtocolPendingByAgent: { ...s.fsdProtocolPendingByAgent, "session-A": true },
+    }));
+    store.setFsdTier("session-A", "claude1", "off", {
+      session_nonce: "",
+      emission_mode: "unavailable",
+    });
+    expect(useCollaboratorStore.getState().fsdProtocolPendingByAgent["session-A"]).toBeUndefined();
+
+    // Toggle ON again: pending is set fresh.
+    store.setFsdTier("session-A", "claude1", "pilot", {
+      session_nonce: "fresh1234",
+      emission_mode: "prompt_lines",
+    });
+    expect(useCollaboratorStore.getState().fsdProtocolPendingByAgent["session-A"]).toBe(true);
+  });
+
+  it("clear is idempotent — calling twice has no side effect", () => {
+    useCollaboratorStore.setState({ fsdProtocolPendingByAgent: { "session-A": true } });
+    clearFsdProtocolPendingForSession("session-A");
+    expect(useCollaboratorStore.getState().fsdProtocolPendingByAgent).not.toHaveProperty(
+      "session-A",
+    );
+    // Second call must not throw and must keep the absent state.
+    expect(() => clearFsdProtocolPendingForSession("session-A")).not.toThrow();
+    expect(useCollaboratorStore.getState().fsdProtocolPendingByAgent).not.toHaveProperty(
+      "session-A",
+    );
+  });
+});
+
 // task-45: regression for codex3 D1 — bumpAssignedAt picks freshest active
 // task, not the first array match. Ensures fresh sends bump the same task
 // the indicator surfaces as in_progress.
@@ -1254,6 +1392,25 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
     expect(calls[0]).toContain("hello");
   });
 
+  it("FSD pilot first send gives the leader a mandatory plan kickoff", async () => {
+    const store = useCollaboratorStore.getState();
+    store.setFsdTier("pty-1", "claude1", "pilot", {
+      session_nonce: "abcdef01",
+      emission_mode: "prompt_lines",
+    });
+
+    await store.sendToAgent("pty-1", "solve through the swarm");
+
+    const calls = injectCalls();
+    expect(calls.length).toBe(1);
+    expect(calls[0]).toContain("## FSD ACTIVE");
+    expect(calls[0]).toContain("Your first response MUST be exactly one JSON object line");
+    expect(calls[0]).toContain("containing `\"type\":\"plan\"`");
+    expect(calls[0]).toContain("Never emit shorthand");
+    expect(calls[0]).toContain("do not answer directly");
+    expect(calls[0]).toContain("SESSION_NONCE: abcdef01");
+  });
+
   it("second send omits TASK_PROTOCOL but keeps active-task summary + breadcrumb", async () => {
     const store = useCollaboratorStore.getState();
     await store.sendToAgent("pty-1", "first");
@@ -1266,6 +1423,25 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
     expect(calls[1]).toContain("Your active tasks");   // formatTaskSummaryForAgent
     expect(calls[1]).toContain("Protocol reminder");   // breadcrumb
     expect(calls[1]).toContain("second");
+  });
+
+  it("enabling FSD after the first send reinjects the mandatory plan kickoff in the slim path", async () => {
+    const store = useCollaboratorStore.getState();
+    await store.sendToAgent("pty-1", "first");
+    store.setFsdTier("pty-1", "claude1", "pilot", {
+      session_nonce: "1234abcd",
+      emission_mode: "prompt_lines",
+    });
+
+    await store.sendToAgent("pty-1", "second");
+
+    const calls = injectCalls();
+    expect(calls.length).toBe(2);
+    expect(calls[1]).not.toContain("Agent Task Protocol");
+    expect(calls[1]).toContain("## FSD ACTIVE");
+    expect(calls[1]).toContain("Your first response MUST be exactly one JSON object line");
+    expect(calls[1]).toContain("Never emit shorthand");
+    expect(calls[1]).toContain("SESSION_NONCE: 1234abcd");
   });
 
   it("flag flips to true on successful first inject", async () => {

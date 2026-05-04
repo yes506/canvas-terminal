@@ -216,7 +216,12 @@ impl<'a> TaskPath<'a> {
         validate_id_component("leader_handle", leader_handle)?;
         validate_id_component("run_id", run_id)?;
         validate_id_component("task_id", task_id)?;
-        Ok(Self { leader_handle, run_id, turn, task_id })
+        Ok(Self {
+            leader_handle,
+            run_id,
+            turn,
+            task_id,
+        })
     }
 
     fn dir(&self) -> String {
@@ -258,10 +263,12 @@ fn validate_id_component(field: &str, value: &str) -> Result<(), String> {
     for (i, ch) in value.chars().enumerate() {
         match ch {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' => continue,
-            _ => return Err(format!(
-                "{}: invalid character {:?} at position {} (allowed: A-Z a-z 0-9 . _ -)",
-                field, ch, i
-            )),
+            _ => {
+                return Err(format!(
+                    "{}: invalid character {:?} at position {} (allowed: A-Z a-z 0-9 . _ -)",
+                    field, ch, i
+                ))
+            }
         }
     }
     Ok(())
@@ -518,8 +525,8 @@ mod tests {
 
         // Check 2: lib.rs's invoke_handler! does not name the FSD claim
         // helper. Same comment-skip discipline.
-        let lib_src = std::fs::read_to_string(format!("{}/src/lib.rs", manifest))
-            .expect("lib.rs readable");
+        let lib_src =
+            std::fs::read_to_string(format!("{}/src/lib.rs", manifest)).expect("lib.rs readable");
         let fn_name = concat!("claim_memo", "ry_file"); // avoid literal self-match
         for (lineno, line) in lib_src.lines().enumerate() {
             let trimmed = line.trim_start();

@@ -245,7 +245,12 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: FsdCommand = serde_json::from_str(&json).unwrap();
         match parsed {
-            FsdCommand::Plan { env, goal, max_turns, .. } => {
+            FsdCommand::Plan {
+                env,
+                goal,
+                max_turns,
+                ..
+            } => {
                 assert_eq!(env.cmd_id, "abc");
                 assert_eq!(goal, "list files");
                 assert_eq!(max_turns, 3);
@@ -290,7 +295,12 @@ mod tests {
         }"#;
         let cmd: FsdCommand = serde_json::from_str(json).unwrap();
         match cmd {
-            FsdCommand::Blocked { reason, missing_capability, needed_user_input, .. } => {
+            FsdCommand::Blocked {
+                reason,
+                missing_capability,
+                needed_user_input,
+                ..
+            } => {
                 assert_eq!(reason, "auth-missing");
                 assert_eq!(missing_capability.as_deref(), Some("gemini-cli"));
                 assert_eq!(needed_user_input, None);

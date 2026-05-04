@@ -789,10 +789,17 @@ interface CollaboratorState {
   /** Per-leader FSD activation state, keyed by `leaderSessionId`. */
   fsdByLeaderSessionId: Record<string, FsdLeaderState>;
   /**
-   * Per-agent flag: when set, the next message MUST re-inject the full
-   * TASK_PROTOCOL header so the leader (re)learns the FSD grammar after a
-   * toggle off→on cycle. Cleared by `prependContextHeader` after delivery.
-   * (Plan v5 §4.5 / §5.5 / item A.)
+   * Per-agent flag: when set, the next message MUST re-inject the FSD
+   * ACTIVE block so the leader (re)learns the `##FSD {json}` grammar after
+   * a toggle off→on cycle. Both header builders (`prependContextHeader` for
+   * the first send, `buildSlimHeader` for subsequent sends) embed the block
+   * when this flag is set. Neither builder clears the flag — only
+   * `clearFsdProtocolPendingForSession`, called from the IPC success path
+   * in `sendToAgent` and `broadcastToAll`, may clear it. If
+   * `inject_into_pty` throws, the flag persists and the next send retries.
+   * Same paired-invariant pattern as `contextSentByAgent` and
+   * `renamePendingByAgent`. (Plan v5 §4.5 / §5.5 / item A; round-2 lifecycle
+   * fix per codex3 task-42 finding 1.)
    */
   fsdProtocolPendingByAgent: Record<string, true>;
 
@@ -971,7 +978,17 @@ const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
 export async function scanForTaskCompletions(forSession: string): Promise<void> {
   try {
     const files = await invoke<string[]>("list_memory_files");
-    const doneFiles = files.filter((f) => f.endsWith(".done.json"));
+    // Filter out FSD per-task done.json files at
+    // `fsd-runs/{leader}/runs/{run_id}/turns/{turn}/tasks/{task_id}/done.json`.
+    // Those belong to the FSD orchestrator's own retention policy; if the
+    // collaborator scanner picks them up it can prefix-match against
+    // collaborator task IDs (corrupting their state) or orphan-delete them
+    // after 24h, racing the orchestrator. Symmetric to the parser-isolation
+    // fix in AgentMiniTerminal.tsx — both keep the mini-agent surface
+    // separated from the FSD subtree.
+    const doneFiles = files.filter(
+      (f) => f.endsWith(".done.json") && !f.startsWith("fsd-runs/"),
+    );
     if (doneFiles.length === 0) return;
 
     const store = useCollaboratorStore.getState();
@@ -1169,9 +1186,13 @@ function buildFsdProtocolBlockForAgent(agentIdentity?: string | null): string | 
   return [
     "## FSD ACTIVE",
     "",
-    "You are operating in Full-Self Driving mode. You are the orchestrator: decompose",
-    "the user's request into tasks, dispatch each to a headless assistant of your",
-    "choice, evaluate results, and decide when the loop is complete.",
+    "You are operating in Full-Self Driving mode. For the user's request in this",
+    "message, do not answer directly and do not complete the collaborator task",
+    "yet. Your first response MUST be exactly one JSON object line beginning",
+    "with `##FSD {` and containing `\"type\":\"plan\"`. Never emit shorthand",
+    "text such as `##FSD plan`. After the orchestrator replies with",
+    "[FSD RUN STARTED], continue with JSON `dispatch`, then finish with JSON",
+    "`done` or JSON `blocked`.",
     "",
     "Emit single-line JSON commands prefixed with `##FSD ` (two hashes, no space",
     "between them). Real commands look like:",
@@ -1189,11 +1210,13 @@ function buildFsdProtocolBlockForAgent(agentIdentity?: string | null): string | 
     '  done     type="done" with cmd_id, sn, rn, run_id, summary, evidence[]',
     '  blocked  type="blocked" with cmd_id, sn, rn, run_id, reason, missing_capability?',
     "",
-    "Tools available (Phase 1 Pilot): claude_code, codex_cli, gemini_cli, copilot_cli.",
+    "Tools available (Phase 1 Auto-Pilot): claude_code, codex_cli, gemini_cli, copilot_cli.",
     "Caps: max_turns=4 (negotiable up to 16), max_tasks_per_dispatch=4,",
     "max_prompt_bytes=8KB per task, wallclock=120s per task / 600s per run.",
     "",
     "After each dispatch, you'll receive an iteration_report from the orchestrator.",
+    "When you emit `done` or `blocked`, then write the collaborator .done.json",
+    "for your assigned task using the FSD outcome.",
     "DO NOT wrap `##FSD` lines in markdown code fences. Emit them on their own line.",
   ].join("\n");
 }
@@ -1279,6 +1302,14 @@ async function buildSlimHeader(
   // Per plan v5 §4.5 / §5.5: re-inject FSD protocol if the toggle was just
   // flipped on (or off-on cycled). prependContextHeader handles the first-
   // send case; this slim path handles every subsequent send AFTER toggle.
+  //
+  // codex3 task-42 finding 1: do NOT clear `fsdProtocolPendingByAgent` here.
+  // Clearing the flag while building the text means a subsequent failed
+  // `inject_into_pty` would lose the retry signal — the next send would skip
+  // the protocol block, and the leader would never see the FSD instructions.
+  // The caller (sendToAgent / broadcastToAll) clears the flag AFTER the
+  // inject_into_pty IPC succeeds — same paired-invariant pattern as
+  // contextSentByAgent / renamePendingByAgent.
   if (agentIdentity) {
     const pendingMap = useCollaboratorStore.getState().fsdProtocolPendingByAgent;
     const leader = useCollaboratorStore.getState().agents
@@ -1287,18 +1318,34 @@ async function buildSlimHeader(
       const fsdBlock = buildFsdProtocolBlockForAgent(agentIdentity);
       if (fsdBlock) {
         parts.push(fsdBlock);
-        // Clear the pending flag — protocol delivered.
-        useCollaboratorStore.setState((s) => {
-          const next = { ...s.fsdProtocolPendingByAgent };
-          delete next[leader.sessionId];
-          return { fsdProtocolPendingByAgent: next };
-        });
       }
     }
   }
 
   parts.push(text);
   return parts.join("\n");
+}
+
+/**
+ * Clear the FSD-protocol-pending flag for a leader's session, paired with a
+ * SUCCESSFUL `inject_into_pty` whose payload included the FSD ACTIVE block.
+ *
+ * Both header builders (`prependContextHeader` for the first send,
+ * `buildSlimHeader` for subsequent sends) embed the FSD block when the leader's
+ * pending flag is set. They intentionally do NOT clear the flag — only the
+ * caller after IPC success can be sure the leader actually received the
+ * instructions. If injection fails, the flag persists and the next send
+ * retries.
+ *
+ * Safe to call when the leader has no pending flag (no-op).
+ */
+export function clearFsdProtocolPendingForSession(sessionId: string): void {
+  useCollaboratorStore.setState((s) => {
+    if (!s.fsdProtocolPendingByAgent[sessionId]) return s;
+    const next = { ...s.fsdProtocolPendingByAgent };
+    delete next[sessionId];
+    return { fsdProtocolPendingByAgent: next };
+  });
 }
 
 export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
@@ -1880,15 +1927,17 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
             muteCapture(sessionId, 1500);
             await invoke("inject_into_pty", { sessionId, text, tool });
             // PAIRED INVARIANT: contextSentByAgent[sessionId] := true AND
-            // renamePendingByAgent.delete(sessionId) must happen together.
-            // Both writes invalidate the "rename-since-last-emit" claim. If you
-            // move one, move the other — splitting them silently regresses the
-            // slim-header design (the leak forces every subsequent send into
-            // the full header for no reason).
+            // renamePendingByAgent.delete(sessionId) AND
+            // fsdProtocolPendingByAgent[sessionId] cleared must happen together
+            // post-inject success. The full header includes the FSD ACTIVE
+            // block when the pending flag is set; clearing it pairs the same
+            // way as contextSentByAgent — splitting it silently regresses the
+            // FSD re-inject path (codex3 task-42 finding 1).
             set((s) => ({
               contextSentByAgent: { ...s.contextSentByAgent, [sessionId]: true },
             }));
             renamePendingByAgent.delete(sessionId);
+            clearFsdProtocolPendingForSession(sessionId);
           } catch (err) {
             // Roll back so the next sender retries with a full header.
             set((s) => {
@@ -1910,6 +1959,10 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         const text = await buildSlimHeader(content, agentCollabId, sessionTasks, mention, nickname);
         muteCapture(sessionId, 1500);
         await invoke("inject_into_pty", { sessionId, text, tool });
+        // Pair with successful inject: clear FSD-protocol-pending so the next
+        // send skips the re-inject. If invoke threw, the flag persists and
+        // the next send retries the protocol block (codex3 task-42 finding 1).
+        clearFsdProtocolPendingForSession(sessionId);
       }
       // ── End first-send gating ─────────────────────────────────────
 
@@ -2005,13 +2058,13 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
               const text = await prependContextHeader(content, sid, sessionTasks, identity, identityNickname);
               muteCapture(aSid, 1500);
               await invoke("inject_into_pty", { sessionId: aSid, text, tool: agent.tool });
-              // PAIRED INVARIANT: see sendToAgent's matching comment. Both
-              // writes invalidate the "rename-since-last-emit" claim and must
-              // move together if either is moved.
+              // PAIRED INVARIANT: see sendToAgent's matching comment. All
+              // three flags must clear together post-inject success.
               set((s) => ({
                 contextSentByAgent: { ...s.contextSentByAgent, [aSid]: true },
               }));
               renamePendingByAgent.delete(aSid);
+              clearFsdProtocolPendingForSession(aSid);
             } catch (err) {
               set((s) => {
                 const { [aSid]: _, ...rest } = s.contextSentByAgent;
@@ -2030,6 +2083,8 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
           const text = await buildSlimHeader(content, sid, sessionTasks, identity, identityNickname);
           muteCapture(aSid, 1500);
           await invoke("inject_into_pty", { sessionId: aSid, text, tool: agent.tool });
+          // Pair with successful inject — same invariant as sendToAgent.
+          clearFsdProtocolPendingForSession(aSid);
         }
         sent++;
       } catch {

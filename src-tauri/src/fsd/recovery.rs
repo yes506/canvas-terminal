@@ -157,23 +157,33 @@ fn iso_to_epoch_secs(iso: &str) -> Option<u64> {
     let hour: u64 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
     let min: u64 = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
     let sec: u64 = std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?;
-    if month < 1 || month > 12 || day < 1 || day > 31 { return None; }
+    if month < 1 || month > 12 || day < 1 || day > 31 {
+        return None;
+    }
     // days_from_civil — inverse of orchestrator::epoch_to_iso.
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
     let yoe = (y - era * 400) as u64;
-    let m = if month > 2 { (month - 3) as u64 } else { (month + 9) as u64 };
+    let m = if month > 2 {
+        (month - 3) as u64
+    } else {
+        (month + 9) as u64
+    };
     let doy = (153 * m + 2) / 5 + (day as u64) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = (era as i64) * 146_097 + (doe as i64) - 719_468;
-    if days < 0 { return None; }
+    if days < 0 {
+        return None;
+    }
     let secs = (days as u64) * 86_400 + hour * 3600 + min * 60 + sec;
     Some(secs)
 }
 
 fn now_iso() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     crate::fsd::orchestrator::epoch_to_iso(secs)
 }
 
@@ -208,7 +218,10 @@ fn apply_retention(manifests: &[(std::path::PathBuf, RunManifest)]) -> usize {
     // Sort by started_at descending (most recent first).
     terminal.sort_by(|a, b| b.1.started_at.cmp(&a.1.started_at));
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut deleted = 0;
     for (i, (path, m)) in terminal.iter().enumerate() {
         let in_count_window = i < RETAIN_LATEST_N;
@@ -283,8 +296,9 @@ mod tests {
         assert!(report.interrupted >= 1);
 
         let updated_raw = std::fs::read_to_string(
-            root.join(format!("fsd-runs/{}/runs/r-stale/manifest.json", leader))
-        ).unwrap();
+            root.join(format!("fsd-runs/{}/runs/r-stale/manifest.json", leader)),
+        )
+        .unwrap();
         let updated: RunManifest = serde_json::from_str(&updated_raw).unwrap();
         assert_eq!(updated.status, RunStatus::Interrupted);
 
@@ -310,10 +324,15 @@ mod tests {
         let _ = recover_runs_in_root(&root).await.unwrap();
 
         let updated_raw = std::fs::read_to_string(
-            root.join(format!("fsd-runs/{}/runs/r-alive/manifest.json", leader))
-        ).unwrap();
+            root.join(format!("fsd-runs/{}/runs/r-alive/manifest.json", leader)),
+        )
+        .unwrap();
         let updated: RunManifest = serde_json::from_str(&updated_raw).unwrap();
-        assert_eq!(updated.status, RunStatus::Running, "alive+fresh-heartbeat run must not be touched");
+        assert_eq!(
+            updated.status,
+            RunStatus::Running,
+            "alive+fresh-heartbeat run must not be touched"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -324,7 +343,11 @@ mod tests {
         let root = per_test_root("wedged");
         let leader = "test_leader_wedge";
         // Simulate a heartbeat from 90 seconds ago (> HEARTBEAT_TIMEOUT_SECS = 60).
-        let old_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 90;
+        let old_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 90;
         let m = RunManifest {
             run_id: "r-wedged".into(),
             leader_handle: leader.into(),
@@ -341,10 +364,15 @@ mod tests {
         assert!(report.interrupted >= 1);
 
         let updated_raw = std::fs::read_to_string(
-            root.join(format!("fsd-runs/{}/runs/r-wedged/manifest.json", leader))
-        ).unwrap();
+            root.join(format!("fsd-runs/{}/runs/r-wedged/manifest.json", leader)),
+        )
+        .unwrap();
         let updated: RunManifest = serde_json::from_str(&updated_raw).unwrap();
-        assert_eq!(updated.status, RunStatus::Interrupted, "stale-heartbeat should be marked interrupted");
+        assert_eq!(
+            updated.status,
+            RunStatus::Interrupted,
+            "stale-heartbeat should be marked interrupted"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -19,6 +19,8 @@ interface PendingMessage {
   message: string;
   /** When set, wraps the selected target into a command instead of plain send. */
   commandPrefix?: string;
+  /** Optional rows to pre-check when opening the selector. */
+  initialCheckedIds?: string[];
 }
 
 function targetHandle(agent: SpawnedAgent): string {
@@ -28,6 +30,13 @@ function targetHandle(agent: SpawnedAgent): string {
 export function InputPrompt() {
   const collabSessionId = useCollabSessionId();
   const [value, setValue] = useState("");
+  // Tracked cursor position. Reading `inputRef.current?.selectionStart` in the
+  // render body was fragile: on focus loss or stale renders, selectionStart
+  // snaps to value.length, which makes extractMentionQuery walk backward from
+  // the end and silently dismiss the @-mention dropdown. Updating this state
+  // from onSelect/onKeyUp/onClick keeps the mention/file pickers stable across
+  // re-renders that don't actually move the textarea cursor.
+  const [cursorPos, setCursorPos] = useState(0);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [fileIndex, setFileIndex] = useState(0);
   const [fileEntryCount, setFileEntryCount] = useState(0);
@@ -54,7 +63,6 @@ export function InputPrompt() {
   }, [pendingInput, setPendingInput, collabSessionId]);
 
   // Compute mention and file-completion state
-  const cursorPos = inputRef.current?.selectionStart ?? value.length;
   const fileQuery = extractFileQuery(value, cursorPos);
   const mention = fileQuery ? null : extractMentionQuery(value, cursorPos);
   const showFile = fileQuery !== null;
@@ -106,7 +114,7 @@ export function InputPrompt() {
   // must not survive into the next time the selector opens.
   useEffect(() => {
     setSelectorIndex(0);
-    setCheckedIds(new Set());
+    setCheckedIds(new Set(pending?.initialCheckedIds ?? []));
   }, [pending]);
 
   // Auto-focus on mount
@@ -312,7 +320,7 @@ export function InputPrompt() {
         return;
       }
       const inlineTarget = resolveSingleInlineMention(cmd.message!, agents);
-      if (inlineTarget) {
+      if (inlineTarget && agents.length === 1) {
         await useCollaboratorStore.getState().sendToAgent(inlineTarget.sessionId, cmd.message!);
         return;
       }
@@ -322,7 +330,10 @@ export function InputPrompt() {
         return;
       }
       // Multiple agents — show target selector
-      setPending({ message: cmd.message! });
+      setPending({
+        message: cmd.message!,
+        initialCheckedIds: inlineTarget ? [inlineTarget.sessionId] : undefined,
+      });
       return;
     }
 
@@ -389,7 +400,11 @@ export function InputPrompt() {
           if (opt) toggleChecked(opt.agent?.sessionId ?? "all");
           return;
         }
-        if (e.key === "Enter" || e.key === "Tab") {
+        if (e.key === "Enter" && e.shiftKey) {
+          e.preventDefault();
+          return;
+        }
+        if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
           e.preventDefault();
           // If the user has explicitly checked rows, send to those.
           // Otherwise fall back to the cursor row (single-target fast path
@@ -471,6 +486,16 @@ export function InputPrompt() {
         if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
           e.preventDefault();
           const entries = filterMentionEntries(mention?.query ?? "", agents);
+          if (e.key === "Enter") {
+            const q = (mention?.query ?? "").toLowerCase();
+            const exactEntry = entries.find((entry) =>
+              entry.kind === "all" ? q === "all" : entry.handle.toLowerCase() === q,
+            );
+            if (exactEntry) {
+              handleSubmit();
+              return;
+            }
+          }
           const entry = entries[mentionIndex];
           if (entry) {
             insertMention(entry.kind === "all" ? "all" : entry.handle);
@@ -615,8 +640,20 @@ export function InputPrompt() {
         <textarea
           ref={inputRef}
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setCursorPos(e.target.selectionStart ?? e.target.value.length);
+          }}
           onKeyDown={handleKeyDown}
+          onKeyUp={(e) =>
+            setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length)
+          }
+          onClick={(e) =>
+            setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length)
+          }
+          onSelect={(e) =>
+            setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length)
+          }
           className="flex-1 bg-transparent text-text outline-none placeholder-text-dim resize-none leading-7"
           style={{ height: textareaHeight }}
           placeholder={

@@ -157,7 +157,11 @@ mod tests {
             .expect("child should exit within 5s")
             .expect("wait succeeded");
 
-        assert!(!status.success(), "expected non-success exit, got {:?}", status);
+        assert!(
+            !status.success(),
+            "expected non-success exit, got {:?}",
+            status
+        );
     }
 
     /// ESRCH idempotency — killing a group whose leader is already gone
@@ -166,7 +170,11 @@ mod tests {
     async fn kill_process_group_idempotent_on_dead_pid() {
         // PID 999999 is essentially guaranteed not to exist on a fresh test run.
         let result = kill_process_group(999999).await;
-        assert!(result.is_ok(), "ESRCH must be treated as success, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "ESRCH must be treated as success, got {:?}",
+            result
+        );
     }
 
     /// Safety regression: never signal a shared process group. The current

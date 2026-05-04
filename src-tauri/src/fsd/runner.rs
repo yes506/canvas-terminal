@@ -49,10 +49,16 @@ pub trait AssistantRunner: Send + Sync {
     /// to disk under `output_dir`, and return the outcome. Honors
     /// `spec.wallclock_ms_cap`. On cancel (via `cancel_rx`), kills the
     /// child's process group via `process_group::kill_process_group`.
+    ///
+    /// `cwd` is the leader's project root, looked up by the orchestrator from
+    /// `state.sessions[leader_session_id].cwd`. Threaded here (Phase 2.9) so
+    /// helpers resolve relative paths in the leader's prompt against the
+    /// project root, not the Tauri app bundle's working directory.
     fn run<'a>(
         &'a self,
         spec: TaskSpec,
         output_dir_rel: String,
+        cwd: Option<std::path::PathBuf>,
         cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RunOutcome> + Send + 'a>>;
 }
@@ -65,152 +71,164 @@ impl AssistantRunner for HeadlessStdioRunner {
         &'a self,
         spec: TaskSpec,
         output_dir_rel: String,
+        cwd: Option<std::path::PathBuf>,
         mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RunOutcome> + Send + 'a>> {
         Box::pin(async move {
-        let started = Instant::now();
-        let tool_command = match build_command(&spec) {
-            Some(command) => command,
-            None => {
+            let started = Instant::now();
+            let tool_command = match build_command(&spec) {
+                Some(command) => command,
+                None => {
+                    return RunOutcome {
+                        exit_code: None,
+                        wallclock_ms: started.elapsed().as_millis() as u64,
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        kind: "spawn_error",
+                        error: Some(format!("unknown tool: {}", spec.tool)),
+                    };
+                }
+            };
+
+            let output_dir = match get_memory_root() {
+                Ok(root) => root.join(&output_dir_rel),
+                Err(e) => {
+                    return RunOutcome {
+                        exit_code: None,
+                        wallclock_ms: started.elapsed().as_millis() as u64,
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        kind: "io_error",
+                        error: Some(format!("memory root: {}", e)),
+                    }
+                }
+            };
+            if let Err(e) = std::fs::create_dir_all(&output_dir) {
                 return RunOutcome {
                     exit_code: None,
                     wallclock_ms: started.elapsed().as_millis() as u64,
                     stdout_bytes: 0,
                     stderr_bytes: 0,
-                    kind: "spawn_error",
-                    error: Some(format!("unknown tool: {}", spec.tool)),
+                    kind: "io_error",
+                    error: Some(format!("create output dir: {}", e)),
                 };
             }
-        };
 
-        let output_dir = match get_memory_root() {
-            Ok(root) => root.join(&output_dir_rel),
-            Err(e) => return RunOutcome {
-                exit_code: None,
-                wallclock_ms: started.elapsed().as_millis() as u64,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                kind: "io_error",
-                error: Some(format!("memory root: {}", e)),
-            },
-        };
-        if let Err(e) = std::fs::create_dir_all(&output_dir) {
-            return RunOutcome {
-                exit_code: None,
-                wallclock_ms: started.elapsed().as_millis() as u64,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                kind: "io_error",
-                error: Some(format!("create output dir: {}", e)),
-            };
-        }
-
-        let mut cmd = Command::new(&tool_command.program);
-        cmd.args(&tool_command.args);
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        let mut cmd = spawn_in_new_session(cmd);
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return RunOutcome {
-                exit_code: None,
-                wallclock_ms: started.elapsed().as_millis() as u64,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                kind: "spawn_error",
-                error: Some(format!("spawn {}: {}", spec.tool, e)),
-            },
-        };
-        let pid = child.id().map(|p| p as i32).unwrap_or(0);
-
-        // Write the prompt to stdin and close the pipe so stdin-driven CLIs
-        // exit when done. Copilot's current CLI uses `-p <prompt>` instead.
-        if tool_command.stdin_prompt {
-            if let Some(stdin) = child.stdin.take() {
-                let prompt = spec.prompt.clone();
-                tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-                    let mut stdin = stdin;
-                    let _ = stdin.write_all(prompt.as_bytes()).await;
-                    let _ = stdin.shutdown().await;
-                });
+            let mut cmd = Command::new(&tool_command.program);
+            cmd.args(&tool_command.args);
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            // Phase 2.9: inherit the leader's project root if known. Without this,
+            // helpers run against the Tauri app's bundle path (e.g. `/Applications/
+            // Canvas Terminal.app/Contents/MacOS/`), which silently breaks any
+            // prompt referring to relative file paths.
+            if let Some(ref dir) = cwd {
+                cmd.current_dir(dir);
             }
-        } else {
-            drop(child.stdin.take());
-        }
+            let mut cmd = spawn_in_new_session(cmd);
 
-        // Concurrent: read stdout, read stderr, wait for exit, watch cancel,
-        // honor wallclock timeout.
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdout_path = output_dir.join("result.stdout");
-        let stderr_path = output_dir.join("result.stderr");
-        let stdout_task = tokio::spawn(read_to_capped_file(stdout, stdout_path));
-        let stderr_task = tokio::spawn(read_to_capped_file(stderr, stderr_path));
-
-        let timeout = std::time::Duration::from_millis(spec.wallclock_ms_cap);
-        let result = tokio::select! {
-            biased;
-            _ = &mut cancel_rx => {
-                let _ = kill_process_group(pid).await;
-                let _ = child.wait().await;
-                RunOutcomeKind::Cancelled
-            }
-            r = tokio::time::timeout(timeout, child.wait()) => {
-                match r {
-                    Ok(Ok(status)) => RunOutcomeKind::Exited(status.code()),
-                    Ok(Err(e)) => RunOutcomeKind::IoError(e.to_string()),
-                    Err(_) => {
-                        let _ = kill_process_group(pid).await;
-                        let _ = child.wait().await;
-                        RunOutcomeKind::Timeout
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    return RunOutcome {
+                        exit_code: None,
+                        wallclock_ms: started.elapsed().as_millis() as u64,
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        kind: "spawn_error",
+                        error: Some(format!("spawn {}: {}", spec.tool, e)),
                     }
                 }
+            };
+            let pid = child.id().map(|p| p as i32).unwrap_or(0);
+
+            // Write the prompt to stdin and close the pipe so stdin-driven CLIs
+            // exit when done. Copilot's current CLI uses `-p <prompt>` instead.
+            if tool_command.stdin_prompt {
+                if let Some(stdin) = child.stdin.take() {
+                    let prompt = spec.prompt.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt;
+                        let mut stdin = stdin;
+                        let _ = stdin.write_all(prompt.as_bytes()).await;
+                        let _ = stdin.shutdown().await;
+                    });
+                }
+            } else {
+                drop(child.stdin.take());
             }
-        };
 
-        // Drain reader tasks (with their own short timeout — they should
-        // wrap up immediately after stdin is closed and the child exits).
-        let stdout_bytes = stdout_task.await.unwrap_or(0);
-        let stderr_bytes = stderr_task.await.unwrap_or(0);
+            // Concurrent: read stdout, read stderr, wait for exit, watch cancel,
+            // honor wallclock timeout.
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let stdout_path = output_dir.join("result.stdout");
+            let stderr_path = output_dir.join("result.stderr");
+            let stdout_task = tokio::spawn(read_to_capped_file(stdout, stdout_path));
+            let stderr_task = tokio::spawn(read_to_capped_file(stderr, stderr_path));
 
-        let wallclock_ms = started.elapsed().as_millis() as u64;
-        match result {
-            RunOutcomeKind::Exited(code) => RunOutcome {
-                exit_code: code,
-                wallclock_ms,
-                stdout_bytes,
-                stderr_bytes,
-                kind: "ok",
-                error: None,
-            },
-            RunOutcomeKind::Timeout => RunOutcome {
-                exit_code: None,
-                wallclock_ms,
-                stdout_bytes,
-                stderr_bytes,
-                kind: "timeout",
-                error: Some(format!("wallclock {}ms exceeded", spec.wallclock_ms_cap)),
-            },
-            RunOutcomeKind::Cancelled => RunOutcome {
-                exit_code: None,
-                wallclock_ms,
-                stdout_bytes,
-                stderr_bytes,
-                kind: "killed",
-                error: Some("cancelled by orchestrator".into()),
-            },
-            RunOutcomeKind::IoError(e) => RunOutcome {
-                exit_code: None,
-                wallclock_ms,
-                stdout_bytes,
-                stderr_bytes,
-                kind: "io_error",
-                error: Some(e),
-            },
-        }
+            let timeout = std::time::Duration::from_millis(spec.wallclock_ms_cap);
+            let result = tokio::select! {
+                biased;
+                _ = &mut cancel_rx => {
+                    let _ = kill_process_group(pid).await;
+                    let _ = child.wait().await;
+                    RunOutcomeKind::Cancelled
+                }
+                r = tokio::time::timeout(timeout, child.wait()) => {
+                    match r {
+                        Ok(Ok(status)) => RunOutcomeKind::Exited(status.code()),
+                        Ok(Err(e)) => RunOutcomeKind::IoError(e.to_string()),
+                        Err(_) => {
+                            let _ = kill_process_group(pid).await;
+                            let _ = child.wait().await;
+                            RunOutcomeKind::Timeout
+                        }
+                    }
+                }
+            };
+
+            // Drain reader tasks (with their own short timeout — they should
+            // wrap up immediately after stdin is closed and the child exits).
+            let stdout_bytes = stdout_task.await.unwrap_or(0);
+            let stderr_bytes = stderr_task.await.unwrap_or(0);
+
+            let wallclock_ms = started.elapsed().as_millis() as u64;
+            match result {
+                RunOutcomeKind::Exited(code) => RunOutcome {
+                    exit_code: code,
+                    wallclock_ms,
+                    stdout_bytes,
+                    stderr_bytes,
+                    kind: "ok",
+                    error: None,
+                },
+                RunOutcomeKind::Timeout => RunOutcome {
+                    exit_code: None,
+                    wallclock_ms,
+                    stdout_bytes,
+                    stderr_bytes,
+                    kind: "timeout",
+                    error: Some(format!("wallclock {}ms exceeded", spec.wallclock_ms_cap)),
+                },
+                RunOutcomeKind::Cancelled => RunOutcome {
+                    exit_code: None,
+                    wallclock_ms,
+                    stdout_bytes,
+                    stderr_bytes,
+                    kind: "killed",
+                    error: Some("cancelled by orchestrator".into()),
+                },
+                RunOutcomeKind::IoError(e) => RunOutcome {
+                    exit_code: None,
+                    wallclock_ms,
+                    stdout_bytes,
+                    stderr_bytes,
+                    kind: "io_error",
+                    error: Some(e),
+                },
+            }
         }) // close Box::pin(async move { ... })
     }
 }

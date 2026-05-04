@@ -1,6 +1,7 @@
 use portable_pty::{Child, MasterPty};
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
@@ -12,6 +13,15 @@ pub struct PtySession {
     pub writer: Box<dyn Write + Send>,
     pub reader_thread: Option<JoinHandle<()>>,
     pub master: Box<dyn MasterPty + Send>,
+    /// Initial working directory the PTY child was spawned in. Captured at
+    /// `spawn_shell` / `spawn_process` time. Used by the FSD orchestrator to
+    /// thread the leader's project root into headless helper invocations
+    /// (Phase 2.9) — without this, helpers inherit the Tauri app's bundle
+    /// path (`/Applications/.../MacOS/`) and fail to resolve relative paths
+    /// in the leader's prompts. Doesn't reflect post-spawn `cd` inside the
+    /// shell; for that, the live PID-based `get_pty_cwd` Tauri command is
+    /// available.
+    pub cwd: Option<PathBuf>,
 }
 
 impl Drop for PtySession {

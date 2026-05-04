@@ -10,9 +10,17 @@ interface FsdToggleProps {
 }
 
 /**
- * 5-segment toggle: `Off · Pilot · x1 · x2 · x3`. Phase 1 ships only `Off`
- * and `Pilot` as functional; x1/x2/x3 are rendered disabled with a tooltip
- * "available in Phase 2" per plan v5 §6.1 / @claude2 task-16 §2.3.
+ * Auto-Pilot toggle — single switch (ON / OFF).
+ *
+ * Phase 1 ships only `off` and `pilot`. The user-facing label is "Auto-Pilot"
+ * (the `pilot` wire identifier and `tier=1` numeric encoding stay unchanged
+ * in the FsdTier union, the Rust enum, and the IPC). The previous 5-segment
+ * radiogroup `Off · Pilot · x1 · x2 · x3` was replaced with a single switch
+ * so the OFF state is the toggle's off state rather than a sibling segment.
+ *
+ * Defensive: any non-`off` tier reads as enabled, so persisted x1/x2/x3 state
+ * (Phase 2+) doesn't visually lie. Click toggles strictly between `off` and
+ * `pilot`. Phase 2 will reintroduce a tier picker beside this switch.
  */
 export function FsdToggle({ leaderSessionId, leaderHandle, disabled }: FsdToggleProps) {
   const fsdState = useCollaboratorStore(
@@ -23,70 +31,52 @@ export function FsdToggle({ leaderSessionId, leaderHandle, disabled }: FsdToggle
   const collabSessionId = useCollaboratorStore.getState().agents
     .find((a) => a.sessionId === leaderSessionId)?.collabSessionId ?? "";
   const current: FsdTier = fsdState?.tier ?? "off";
+  const enabled = current !== "off";
 
-  async function onChange(next: FsdTier) {
-    if (next === current) return;
-    if (next !== "off" && next !== "pilot") {
-      setStatus(`FSD ${next} is Phase 2 — toggle limited to Off/Pilot in Phase 1.`,
-        collabSessionId, "transient");
-      return;
-    }
+  async function onToggle() {
+    if (disabled) return;
+    const next: FsdTier = enabled ? "off" : "pilot";
     const tierNum = next === "off" ? 0 : 1;
     try {
       const resp = await invoke<FsdSetTierResponse>("fsd_set_tier", {
         leaderSessionId, leaderHandle, tier: tierNum,
       });
       setFsdTier(leaderSessionId, leaderHandle, next, resp);
-      setStatus(`FSD ${next} for ${leaderHandle}`, collabSessionId, "transient");
+      setStatus(
+        `FSD Auto-Pilot ${next === "pilot" ? "on" : "off"} for @${leaderHandle}`,
+        collabSessionId,
+        "transient",
+      );
     } catch (e) {
-      setStatus(`FSD set_tier failed: ${e}`, collabSessionId, "persistent");
+      setStatus(`FSD Auto-Pilot toggle failed: ${e}`, collabSessionId, "persistent");
     }
   }
 
-  const segments: { value: FsdTier; label: string; phase1: boolean }[] = [
-    { value: "off", label: "Off", phase1: true },
-    { value: "pilot", label: "Pilot", phase1: true },
-    { value: "x1", label: "x1", phase1: false },
-    { value: "x2", label: "x2", phase1: false },
-    { value: "x3", label: "x3", phase1: false },
-  ];
-
   return (
-    <div
-      role="radiogroup"
-      aria-label="FSD tier"
-      className="inline-flex items-center text-[10px] font-mono border border-surface-lighter rounded overflow-hidden shrink-0"
-      title="Full-Self Driving — leader orchestrates a pool of headless assistants"
+    <button
+      type="button"
+      role="switch"
+      aria-checked={enabled}
+      aria-label="Auto-Pilot toggle"
+      onClick={onToggle}
+      disabled={disabled}
+      title={
+        disabled
+          ? "Auto-Pilot — waiting for the agent to be ready"
+          : enabled
+            ? "Click to turn Auto-Pilot off"
+            : "Click to turn Auto-Pilot on — leader orchestrates a pool of headless assistants"
+      }
+      className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono border rounded transition-colors shrink-0 ${
+        disabled
+          ? "border-surface-lighter text-text-dim/50 cursor-not-allowed"
+          : enabled
+            ? "border-accent bg-accent text-surface font-bold hover:bg-accent/90"
+            : "border-surface-lighter text-text-dim hover:bg-surface-lighter hover:text-text"
+      }`}
     >
-      {segments.map((seg) => {
-        const active = current === seg.value;
-        const isDisabled = disabled || !seg.phase1;
-        const tooltip = !seg.phase1
-          ? `${seg.label} available in Phase 2`
-          : seg.value === "off"
-            ? "Disable FSD"
-            : "Enable Pilot — single-CLI orchestration loop";
-        return (
-          <button
-            key={seg.value}
-            role="radio"
-            aria-checked={active}
-            type="button"
-            onClick={() => onChange(seg.value)}
-            disabled={isDisabled}
-            className={`px-1.5 py-0.5 transition-colors ${
-              active
-                ? "bg-accent text-surface font-bold"
-                : isDisabled
-                  ? "text-text-dim/50 cursor-not-allowed"
-                  : "text-text-dim hover:bg-surface-lighter hover:text-text"
-            }`}
-            title={tooltip}
-          >
-            {seg.label}
-          </button>
-        );
-      })}
-    </div>
+      <span aria-hidden="true">{enabled ? "●" : "○"}</span>
+      <span>Auto-Pilot {enabled ? "ON" : "OFF"}</span>
+    </button>
   );
 }

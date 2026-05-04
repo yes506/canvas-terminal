@@ -126,7 +126,7 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
     if (pendingFsdLine != null) {
       pendingFsdLine += line.trimStart();
       if (pendingFsdLine.length > PENDING_FSD_BYTES_CAP) {
-        opts.onCommand({ kind: "malformed", reason: "FSD command exceeded partial-line cap" });
+        opts.onCommand({ kind: "malformed", code: "json-parse", reason: "FSD command exceeded partial-line cap" });
         pendingFsdLine = null;
         return;
       }

@@ -11,7 +11,7 @@
 use crate::commands::memory::get_memory_root;
 use crate::fsd::runner::{AssistantRunner, HeadlessStdioRunner};
 use crate::fsd::schema::{
-    FsdCommand, FsdEnvelope, RunManifest, RunStatus, SCHEMA_VERSION, TaskDone, TaskSpec,
+    FsdCommand, FsdEnvelope, RunManifest, RunStatus, TaskDone, TaskSpec, SCHEMA_VERSION,
 };
 use crate::fsd::storage::TaskPath;
 use crate::state::{AppState, FsdRunHandle};
@@ -31,11 +31,11 @@ pub const MAX_PROMPT_BYTES: usize = 8 * 1024;
 /// Hard ceiling on whole-run wallclock — heartbeat loop force-cancels the run
 /// when exceeded, regardless of leader activity. Per plan v5 §6.3 R2.
 pub const WALLCLOCK_MS_PER_RUN: u64 = 600_000;
-/// Phase-2+ tunable — strike count before the orchestrator force-blocks the
-/// run after repeated malformed emissions. Phase 1 ships without per-strike
-/// counting (frontend + backend each maintain optimistic counts; canonical
-/// enforcement in Phase 2 will use this constant).
-#[allow(dead_code)]
+/// Strike count before the orchestrator force-blocks the run after repeated
+/// malformed emissions. Canonical here per plan v5 §5.6 — the frontend keeps
+/// an optimistic count for UI responsiveness, but `record_strike` /
+/// `apply_strike_top` enforce this ceiling and emit `force_blocked` once it
+/// trips.
 pub const STRIKES_PER_TURN: u32 = 3;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const ITERATION_REPORT_BYTES_CAP: usize = 16 * 1024;
@@ -48,9 +48,9 @@ pub const PER_TASK_STDOUT_TRUNCATE_BYTES: usize = 2048;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
-    Planning,         // awaiting first plan
-    Dispatching,      // tasks running
-    AwaitingLeader,   // iteration_report injected; waiting for leader's next FSD line
+    Planning,       // awaiting first plan
+    Dispatching,    // tasks running
+    AwaitingLeader, // iteration_report injected; waiting for leader's next FSD line
     Done,
     Blocked,
     Cancelled,
@@ -98,9 +98,9 @@ pub struct DispatchResponse {
 /// cap-tripped (anything beyond).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CapTripState {
-    Normal,         // turn < max_turns — run normally
-    FinalTurn,      // turn == max_turns — run normally but warn in iteration_report
-    SynthesisPass,  // turn == max_turns + 1 — inject synthesis prompt, no real spawn
+    Normal,        // turn < max_turns — run normally
+    FinalTurn,     // turn == max_turns — run normally but warn in iteration_report
+    SynthesisPass, // turn == max_turns + 1 — inject synthesis prompt, no real spawn
 }
 
 /// Real ISO-8601 timestamp at second resolution (UTC).
@@ -135,7 +135,11 @@ pub(crate) fn epoch_to_iso(secs: u64) -> String {
     // civil_from_days: convert days since 1970-01-01 to (year, month, day).
     // Adapted from https://howardhinnant.github.io/date_algorithms.html
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u64; // [0, 146_096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe as i64 + era * 400;
@@ -145,7 +149,10 @@ pub(crate) fn epoch_to_iso(secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
 
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hour, min, sec)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, hour, min, sec
+    )
 }
 
 // ---- Top-level entry ---------------------------------------------------------
@@ -170,7 +177,10 @@ pub async fn handle_command(
             result: DispatchResult::OutOfScope,
             strike_count: 0,
             next_action: NextAction::Terminal,
-            message: Some(format!("no active FSD leader for session {}", leader_session_id)),
+            message: Some(format!(
+                "no active FSD leader for session {}",
+                leader_session_id
+            )),
         });
     };
 
@@ -184,17 +194,68 @@ pub async fn handle_command(
     };
 
     let response = match cmd {
-        FsdCommand::Plan { env, goal, success_criteria, max_turns } => {
-            handle_plan(app.clone(), state.clone(), leader_handle.clone(), leader_runtime, env, goal, success_criteria, max_turns).await
+        FsdCommand::Plan {
+            env,
+            goal,
+            success_criteria,
+            max_turns,
+        } => {
+            handle_plan(
+                app.clone(),
+                state.clone(),
+                leader_handle.clone(),
+                leader_runtime,
+                env,
+                goal,
+                success_criteria,
+                max_turns,
+            )
+            .await
         }
         FsdCommand::Dispatch { env, turn, tasks } => {
-            handle_dispatch(app.clone(), state.clone(), leader_handle.clone(), env, turn, tasks).await
+            handle_dispatch(
+                app.clone(),
+                state.clone(),
+                leader_handle.clone(),
+                env,
+                turn,
+                tasks,
+            )
+            .await
         }
-        FsdCommand::Done { env, summary, evidence } => {
-            handle_done(app.clone(), state.clone(), leader_handle.clone(), env, summary, evidence).await
+        FsdCommand::Done {
+            env,
+            summary,
+            evidence,
+        } => {
+            handle_done(
+                app.clone(),
+                state.clone(),
+                leader_handle.clone(),
+                env,
+                summary,
+                evidence,
+            )
+            .await
         }
-        FsdCommand::Blocked { env, reason, missing_capability, needed_user_input, last_cmd_id } => {
-            handle_blocked(app.clone(), state.clone(), leader_handle.clone(), env, reason, missing_capability, needed_user_input, last_cmd_id).await
+        FsdCommand::Blocked {
+            env,
+            reason,
+            missing_capability,
+            needed_user_input,
+            last_cmd_id,
+        } => {
+            handle_blocked(
+                app.clone(),
+                state.clone(),
+                leader_handle.clone(),
+                env,
+                reason,
+                missing_capability,
+                needed_user_input,
+                last_cmd_id,
+            )
+            .await
         }
     };
 
@@ -204,7 +265,13 @@ pub async fn handle_command(
     // - other      → record_strike; force-blocks the run at STRIKES_PER_TURN
     // The response always carries the live strike_count for the UI.
     match response {
-        Ok(resp) => Ok(apply_strike_top(&app, &state, &leader_handle, &run_id_for_strike, resp)),
+        Ok(resp) => Ok(apply_strike_top(
+            &app,
+            &state,
+            &leader_handle,
+            &run_id_for_strike,
+            resp,
+        )),
         Err(e) => Err(e),
     }
 }
@@ -315,11 +382,16 @@ async fn handle_plan(
             message: Some(format!("manifest write failed: {}", e)),
         });
     }
-    let _ = write_run_file(&leader_handle, &run_id, "plan.json", serde_json::json!({
-        "goal": goal,
-        "success_criteria": success_criteria,
-        "max_turns": clamped_max_turns,
-    }));
+    let _ = write_run_file(
+        &leader_handle,
+        &run_id,
+        "plan.json",
+        serde_json::json!({
+            "goal": goal,
+            "success_criteria": success_criteria,
+            "max_turns": clamped_max_turns,
+        }),
+    );
 
     // Register run handle for cancellation. `task_cancel_txs` starts empty
     // and is populated as `handle_dispatch` spawns assistants; `cancel_run`
@@ -330,16 +402,19 @@ async fn handle_plan(
         let mut seen = std::collections::HashSet::new();
         // Pre-insert the plan's own cmd_id so a duplicate plan is also rejected.
         seen.insert(env.cmd_id.clone());
-        runs.insert(run_id.clone(), FsdRunHandle {
-            leader_handle: leader_handle.clone(),
-            run_id: run_id.clone(),
-            cancel_tx: Some(cancel_tx),
-            task_cancel_txs: std::collections::HashMap::new(),
-            max_turns: clamped_max_turns,
-            current_turn: 0,
-            seen_cmd_ids: seen,
-            consecutive_strikes: 0,
-        });
+        runs.insert(
+            run_id.clone(),
+            FsdRunHandle {
+                leader_handle: leader_handle.clone(),
+                run_id: run_id.clone(),
+                cancel_tx: Some(cancel_tx),
+                task_cancel_txs: std::collections::HashMap::new(),
+                max_turns: clamped_max_turns,
+                current_turn: 0,
+                seen_cmd_ids: seen,
+                consecutive_strikes: 0,
+            },
+        );
     }
 
     // Launch heartbeat task — writes manifest.last_heartbeat_at every 10s
@@ -355,11 +430,14 @@ async fn handle_plan(
     ));
 
     // Emit event so UI can show the new run.
-    let _ = app.emit(&format!("fsd-run-start-{}", leader_handle), serde_json::json!({
-        "run_id": run_id,
-        "run_nonce": run_nonce,
-        "max_turns": clamped_max_turns,
-    }));
+    let _ = app.emit(
+        &format!("fsd-run-start-{}", leader_handle),
+        serde_json::json!({
+            "run_id": run_id,
+            "run_nonce": run_nonce,
+            "max_turns": clamped_max_turns,
+        }),
+    );
 
     Ok(DispatchResponse {
         result: DispatchResult::Accepted,
@@ -395,7 +473,8 @@ async fn handle_dispatch(
             next_action: NextAction::Remind,
             message: Some(format!(
                 "tasks ({}) exceeds MAX_TASKS_PER_DISPATCH ({})",
-                tasks.len(), MAX_TASKS_PER_DISPATCH
+                tasks.len(),
+                MAX_TASKS_PER_DISPATCH
             )),
         });
     }
@@ -407,7 +486,9 @@ async fn handle_dispatch(
                 next_action: NextAction::Remind,
                 message: Some(format!(
                     "task {} prompt ({} bytes) exceeds MAX_PROMPT_BYTES ({})",
-                    t.task_id, t.prompt.len(), MAX_PROMPT_BYTES
+                    t.task_id,
+                    t.prompt.len(),
+                    MAX_PROMPT_BYTES
                 )),
             });
         }
@@ -433,7 +514,10 @@ async fn handle_dispatch(
     // would race overlapping turns. Only allow dispatch from Running or
     // AwaitingLeader (post-iteration_report). `done`/`blocked` may interrupt
     // a Dispatching state — that's the leader explicitly aborting.
-    if !matches!(manifest.status, RunStatus::Running | RunStatus::AwaitingLeader) {
+    if !matches!(
+        manifest.status,
+        RunStatus::Running | RunStatus::AwaitingLeader
+    ) {
         return Ok(DispatchResponse {
             result: DispatchResult::OutOfScope,
             strike_count: 0,
@@ -516,7 +600,8 @@ async fn handle_dispatch(
     if cap_trip_state == CapTripState::SynthesisPass {
         let synthesis_report = build_synthesis_pass_report(&leader_handle, &env.run_id, turn);
         let _ = write_run_file_text(
-            &leader_handle, &env.run_id,
+            &leader_handle,
+            &env.run_id,
             &format!("turns/{}/synthesis_pass.md", turn),
             &synthesis_report,
         );
@@ -542,10 +627,34 @@ async fn handle_dispatch(
 
     // Persist the dispatch.
     let _ = write_run_file(
-        &leader_handle, &env.run_id,
+        &leader_handle,
+        &env.run_id,
         &format!("turns/{}/dispatch.json", turn),
         serde_json::json!({"tasks": tasks}),
     );
+
+    // Phase 2.9: look up the leader's project root once, before the spawn
+    // loop. We thread this into every helper invocation so they resolve
+    // relative paths in the leader's prompt against the project root rather
+    // than the Tauri app bundle. The lookup chain is:
+    //   leader_handle → fsd_leaders[handle].leader_session_id → sessions[id].cwd
+    // Both lookups are best-effort: if either fails (leader deregistered, PTY
+    // already exited), helpers fall back to inheriting the parent's cwd —
+    // same as before the fix, no regression.
+    let leader_cwd: Option<std::path::PathBuf> = {
+        let leader_session_id = state
+            .fsd_leaders
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&leader_handle).map(|r| r.leader_session_id.clone()));
+        leader_session_id.and_then(|sid| {
+            state
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|s| s.get(&sid).and_then(|p| p.cwd.clone()))
+        })
+    };
 
     // Spawn each task in parallel. Per plan v5 §6.4, register each task's
     // cancel_tx into the run's FsdRunHandle so /fsd-cancel can fan out and
@@ -554,7 +663,11 @@ async fn handle_dispatch(
     for spec in &tasks {
         let task_path = TaskPath::try_new(&leader_handle, &env.run_id, turn, &spec.task_id)
             .map_err(|e| format!("validated task_id became invalid: {}", e))?;
-        let output_dir_rel = task_path.pending().rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+        let output_dir_rel = task_path
+            .pending()
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default();
         // The runner is now passed into run_and_record_one_task by reference;
         // we construct a fresh HeadlessStdioRunner inside the call (zero-sized).
 
@@ -583,7 +696,9 @@ async fn handle_dispatch(
         {
             let mut runs = state.fsd_runs.lock().map_err(|e| e.to_string())?;
             if let Some(run_handle) = runs.get_mut(&env.run_id) {
-                run_handle.task_cancel_txs.insert(spec.task_id.clone(), task_cancel_tx);
+                run_handle
+                    .task_cancel_txs
+                    .insert(spec.task_id.clone(), task_cancel_tx);
                 run_handle.current_turn = turn;
             }
         }
@@ -601,6 +716,7 @@ async fn handle_dispatch(
             }),
         );
 
+        let cwd_clone = leader_cwd.clone();
         handles.push(tokio::spawn(async move {
             // Production calls run_and_record_one_task — the SAME helper that
             // the integration test calls with FakeAssistantRunner. Per
@@ -617,6 +733,7 @@ async fn handle_dispatch(
                 role_hint_clone.clone(),
                 spec_clamped,
                 output_dir_rel,
+                cwd_clone,
                 task_cancel_rx,
                 Some(&runs_for_cleanup),
                 Some(&app_clone),
@@ -668,7 +785,8 @@ async fn handle_dispatch(
         report = warning + &report;
     }
     let _ = write_run_file_text(
-        &leader_handle, &env.run_id,
+        &leader_handle,
+        &env.run_id,
         &format!("turns/{}/iteration_report.md", turn),
         &report,
     );
@@ -702,7 +820,9 @@ async fn handle_done(
     }
     let cancelled_tasks = remove_run_and_cancel(&state, &env.run_id);
     let _ = write_run_file(
-        &leader_handle, &env.run_id, "final.json",
+        &leader_handle,
+        &env.run_id,
+        "final.json",
         serde_json::json!({
             "status": "done",
             "summary": summary,
@@ -712,8 +832,10 @@ async fn handle_done(
         }),
     );
     update_manifest_status(&leader_handle, &env.run_id, RunStatus::Done);
-    let _ = app.emit(&format!("fsd-run-end-{}", leader_handle),
-        serde_json::json!({"run_id": env.run_id, "status": "done"}));
+    let _ = app.emit(
+        &format!("fsd-run-end-{}", leader_handle),
+        serde_json::json!({"run_id": env.run_id, "status": "done"}),
+    );
     Ok(DispatchResponse {
         result: DispatchResult::Accepted,
         strike_count: 0,
@@ -741,7 +863,9 @@ async fn handle_blocked(
     }
     let cancelled_tasks = remove_run_and_cancel(&state, &env.run_id);
     let _ = write_run_file(
-        &leader_handle, &env.run_id, "final.json",
+        &leader_handle,
+        &env.run_id,
+        "final.json",
         serde_json::json!({
             "status": "blocked",
             "reason": reason,
@@ -753,8 +877,10 @@ async fn handle_blocked(
         }),
     );
     update_manifest_status(&leader_handle, &env.run_id, RunStatus::Blocked);
-    let _ = app.emit(&format!("fsd-run-end-{}", leader_handle),
-        serde_json::json!({"run_id": env.run_id, "status": "blocked"}));
+    let _ = app.emit(
+        &format!("fsd-run-end-{}", leader_handle),
+        serde_json::json!({"run_id": env.run_id, "status": "blocked"}),
+    );
     Ok(DispatchResponse {
         result: DispatchResult::Accepted,
         strike_count: 0,
@@ -791,7 +917,9 @@ pub fn cancel_run(
         }
         update_manifest_status(&handle.leader_handle, run_id, RunStatus::Cancelled);
         let _ = write_run_file(
-            &handle.leader_handle, run_id, "final.json",
+            &handle.leader_handle,
+            run_id,
+            "final.json",
             serde_json::json!({
                 "status": "cancelled",
                 "ended_at": now_iso(),
@@ -818,14 +946,22 @@ async fn read_stdout_last_line(
     turn: u32,
     task_id: &str,
 ) -> String {
-    let Ok(root) = get_memory_root() else { return String::new() };
+    let Ok(root) = get_memory_root() else {
+        return String::new();
+    };
     let path = root.join(format!(
         "fsd-runs/{}/runs/{}/turns/{}/tasks/{}/result.stdout",
         leader_handle, run_id, turn, task_id
     ));
-    let Ok(content) = tokio::fs::read_to_string(&path).await else { return String::new() };
+    let Ok(content) = tokio::fs::read_to_string(&path).await else {
+        return String::new();
+    };
     // Take the last non-empty line, trimmed to 200 chars.
-    let last = content.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let last = content
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
     let stripped = last.trim();
     stripped.chars().take(200).collect()
 }
@@ -964,11 +1100,14 @@ pub(crate) async fn run_and_record_one_task<R: AssistantRunner + ?Sized>(
     role_hint: Option<String>,
     spec: TaskSpec,
     output_dir_rel: String,
+    cwd: Option<std::path::PathBuf>,
     cancel_rx: oneshot::Receiver<()>,
-    runs: Option<&std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FsdRunHandle>>>>,
+    runs: Option<
+        &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FsdRunHandle>>>,
+    >,
     app: Option<&AppHandle>,
 ) -> TaskDone {
-    let outcome = runner.run(spec, output_dir_rel, cancel_rx).await;
+    let outcome = runner.run(spec, output_dir_rel, cwd, cancel_rx).await;
 
     // Remove the cancel sender now that the task is done — keeps
     // /fsd-cancel's "cancelled_tasks" count accurate (only counts genuinely
@@ -999,7 +1138,8 @@ pub(crate) async fn run_and_record_one_task<R: AssistantRunner + ?Sized>(
         error: outcome.error.clone(),
     };
     let _ = write_run_file(
-        leader_handle, run_id,
+        leader_handle,
+        run_id,
         &format!("turns/{}/tasks/{}/done.json", turn, task_id),
         serde_json::to_value(&done).unwrap_or(serde_json::Value::Null),
     );
@@ -1062,7 +1202,9 @@ fn record_strike(
             Ok(g) => g,
             Err(_) => return (0, false),
         };
-        let Some(handle) = runs.get_mut(run_id) else { return (0, false) };
+        let Some(handle) = runs.get_mut(run_id) else {
+            return (0, false);
+        };
         handle.consecutive_strikes += 1;
         let count = handle.consecutive_strikes;
         if count >= STRIKES_PER_TURN {
@@ -1078,15 +1220,23 @@ fn record_strike(
                 Err(_) => return (strike_count, true),
             };
             if let Some(mut handle) = runs.remove(run_id) {
-                if let Some(tx) = handle.cancel_tx.take() { let _ = tx.send(()); }
+                if let Some(tx) = handle.cancel_tx.take() {
+                    let _ = tx.send(());
+                }
                 let n = handle.task_cancel_txs.len();
-                for (_tid, tx) in handle.task_cancel_txs.drain() { let _ = tx.send(()); }
+                for (_tid, tx) in handle.task_cancel_txs.drain() {
+                    let _ = tx.send(());
+                }
                 n
-            } else { 0 }
+            } else {
+                0
+            }
         };
         update_manifest_status(leader_handle, run_id, RunStatus::Blocked);
         let _ = write_run_file(
-            leader_handle, run_id, "final.json",
+            leader_handle,
+            run_id,
+            "final.json",
             serde_json::json!({
                 "status": "blocked",
                 "reason": format!("strike_threshold_reached (last reason: {})", reason),
@@ -1133,7 +1283,10 @@ fn apply_strike(
         // Duplicate is a no-op (idempotent ack), not a real failure — don't strike.
         return resp;
     }
-    let reason = resp.message.clone().unwrap_or_else(|| format!("{:?}", resp.result));
+    let reason = resp
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("{:?}", resp.result));
     let (count, force_blocked) = record_strike(app, state, run_id, leader_handle, &reason);
     resp.strike_count = count;
     if force_blocked {
@@ -1194,12 +1347,14 @@ fn check_cmd_id_seen_in(
 ) -> Result<(), DispatchResponse> {
     let runs = match runs.lock() {
         Ok(g) => g,
-        Err(e) => return Err(DispatchResponse {
-            result: DispatchResult::OutOfScope,
-            strike_count: 0,
-            next_action: NextAction::Terminal,
-            message: Some(format!("fsd_runs lock poisoned: {}", e)),
-        }),
+        Err(e) => {
+            return Err(DispatchResponse {
+                result: DispatchResult::OutOfScope,
+                strike_count: 0,
+                next_action: NextAction::Terminal,
+                message: Some(format!("fsd_runs lock poisoned: {}", e)),
+            })
+        }
     };
     let Some(run_handle) = runs.get(run_id) else {
         return Ok(()); // unknown run is handled downstream by validate_run_command
@@ -1209,7 +1364,10 @@ fn check_cmd_id_seen_in(
             result: DispatchResult::Duplicate,
             strike_count: run_handle.consecutive_strikes,
             next_action: NextAction::Ack,
-            message: Some(format!("cmd_id {} already processed for run {}", cmd_id, run_id)),
+            message: Some(format!(
+                "cmd_id {} already processed for run {}",
+                cmd_id, run_id
+            )),
         });
     }
     Ok(())
@@ -1218,11 +1376,7 @@ fn check_cmd_id_seen_in(
 /// Insert `(run_id, cmd_id)` into the run's seen set. Caller must have
 /// already verified via `check_cmd_id_seen` that the cmd_id is new and
 /// passed all other validation. Idempotent — re-insertion is harmless.
-fn record_cmd_id(
-    state: &State<'_, AppState>,
-    run_id: &str,
-    cmd_id: &str,
-) {
+fn record_cmd_id(state: &State<'_, AppState>, run_id: &str, cmd_id: &str) {
     if let Ok(mut runs) = state.fsd_runs.lock() {
         if let Some(run_handle) = runs.get_mut(run_id) {
             run_handle.seen_cmd_ids.insert(cmd_id.to_string());
@@ -1242,12 +1396,14 @@ fn check_and_record_cmd_id(
 ) -> Result<(), DispatchResponse> {
     let mut runs = match state.fsd_runs.lock() {
         Ok(g) => g,
-        Err(e) => return Err(DispatchResponse {
-            result: DispatchResult::OutOfScope,
-            strike_count: 0,
-            next_action: NextAction::Terminal,
-            message: Some(format!("fsd_runs lock poisoned: {}", e)),
-        }),
+        Err(e) => {
+            return Err(DispatchResponse {
+                result: DispatchResult::OutOfScope,
+                strike_count: 0,
+                next_action: NextAction::Terminal,
+                message: Some(format!("fsd_runs lock poisoned: {}", e)),
+            })
+        }
     };
     let Some(run_handle) = runs.get_mut(run_id) else {
         return Err(DispatchResponse {
@@ -1262,13 +1418,19 @@ fn check_and_record_cmd_id(
             result: DispatchResult::Duplicate,
             strike_count: 0,
             next_action: NextAction::Ack,
-            message: Some(format!("cmd_id {} already processed for run {}", cmd_id, run_id)),
+            message: Some(format!(
+                "cmd_id {} already processed for run {}",
+                cmd_id, run_id
+            )),
         });
     }
     Ok(())
 }
 
-fn validate_run_command(leader_handle: &str, env: &FsdEnvelope) -> Result<RunManifest, DispatchResponse> {
+fn validate_run_command(
+    leader_handle: &str,
+    env: &FsdEnvelope,
+) -> Result<RunManifest, DispatchResponse> {
     if env.v != SCHEMA_VERSION {
         return Err(DispatchResponse {
             result: DispatchResult::Malformed,
@@ -1277,18 +1439,22 @@ fn validate_run_command(leader_handle: &str, env: &FsdEnvelope) -> Result<RunMan
             message: Some(format!("schema v{} unsupported", env.v)),
         });
     }
-    let manifest = read_manifest_for_run(leader_handle, &env.run_id).map_err(|e| DispatchResponse {
-        result: DispatchResult::UnknownRun,
-        strike_count: 0,
-        next_action: NextAction::Remind,
-        message: Some(e),
-    })?;
+    let manifest =
+        read_manifest_for_run(leader_handle, &env.run_id).map_err(|e| DispatchResponse {
+            result: DispatchResult::UnknownRun,
+            strike_count: 0,
+            next_action: NextAction::Remind,
+            message: Some(e),
+        })?;
     if !manifest.status.is_active() {
         return Err(DispatchResponse {
             result: DispatchResult::OutOfScope,
             strike_count: 0,
             next_action: NextAction::Terminal,
-            message: Some(format!("run {} is already terminal: {:?}", env.run_id, manifest.status)),
+            message: Some(format!(
+                "run {} is already terminal: {:?}",
+                env.run_id, manifest.status
+            )),
         });
     }
     if env.sn != manifest.session_nonce || env.rn != manifest.run_nonce {
@@ -1341,12 +1507,18 @@ fn write_run_file(
     json: serde_json::Value,
 ) -> Result<(), String> {
     let root = get_memory_root()?;
-    let abs = root.join(format!("fsd-runs/{}/runs/{}/{}", leader_handle, run_id, rel));
+    let abs = root.join(format!(
+        "fsd-runs/{}/runs/{}/{}",
+        leader_handle, run_id, rel
+    ));
     if let Some(p) = abs.parent() {
         std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&abs, serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &abs,
+        serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1357,7 +1529,10 @@ fn write_run_file_text(
     text: &str,
 ) -> Result<(), String> {
     let root = get_memory_root()?;
-    let abs = root.join(format!("fsd-runs/{}/runs/{}/{}", leader_handle, run_id, rel));
+    let abs = root.join(format!(
+        "fsd-runs/{}/runs/{}/{}",
+        leader_handle, run_id, rel
+    ));
     if let Some(p) = abs.parent() {
         std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
     }
@@ -1367,7 +1542,12 @@ fn write_run_file_text(
 
 // ---- iteration_report --------------------------------------------------------
 
-fn build_iteration_report(leader_handle: &str, run_id: &str, turn: u32, results: &[TaskDone]) -> String {
+fn build_iteration_report(
+    leader_handle: &str,
+    run_id: &str,
+    turn: u32,
+    results: &[TaskDone],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("# FSD turn {} report\n\n", turn));
     let total = results.len();
@@ -1380,15 +1560,26 @@ fn build_iteration_report(leader_handle: &str, run_id: &str, turn: u32, results:
             Some(code) => format!("✗ exit {}", code),
             None => format!("⚠ {}", r.error.clone().unwrap_or_default()),
         };
-        out.push_str(&format!("- {} ({}ms, {} bytes)\n", status, r.wallclock_ms, r.stdout_bytes));
+        out.push_str(&format!(
+            "- {} ({}ms, {} bytes)\n",
+            status, r.wallclock_ms, r.stdout_bytes
+        ));
 
         // Inline up to PER_TASK_STDOUT_TRUNCATE_BYTES of stdout.
         if let Ok(stream) = get_memory_root()
-            .map(|root| root.join(format!("fsd-runs/{}/runs/{}/{}", leader_handle, run_id, r.stdout_path)))
+            .map(|root| {
+                root.join(format!(
+                    "fsd-runs/{}/runs/{}/{}",
+                    leader_handle, run_id, r.stdout_path
+                ))
+            })
             .and_then(|path| std::fs::read_to_string(path).map_err(|e| e.to_string()))
         {
             // Path heuristic above is approximate — include defensively even if read fails.
-            let truncated: String = stream.chars().take(PER_TASK_STDOUT_TRUNCATE_BYTES).collect();
+            let truncated: String = stream
+                .chars()
+                .take(PER_TASK_STDOUT_TRUNCATE_BYTES)
+                .collect();
             out.push_str(&format!("\n```\n{}\n```\n\n", truncated));
         } else {
             out.push_str(&format!("\n_(stdout: see {})_\n\n", r.stdout_path));
@@ -1486,8 +1677,11 @@ mod tests {
             });
         }
         let report = build_iteration_report("leader", "r1", 1, &tasks);
-        assert!(report.len() <= ITERATION_REPORT_BYTES_CAP + 100,
-            "report {}b exceeded cap+slack", report.len());
+        assert!(
+            report.len() <= ITERATION_REPORT_BYTES_CAP + 100,
+            "report {}b exceeded cap+slack",
+            report.len()
+        );
         assert!(report.contains("# FSD turn 1 report"));
     }
 
@@ -1620,6 +1814,95 @@ mod tests {
         assert!(report.len() < ITERATION_REPORT_BYTES_CAP);
     }
 
+    /// Phase 2.9: the runner trait now accepts `cwd: Option<PathBuf>` and
+    /// callers (orchestrator + tests) thread it through unchanged. This test
+    /// is the unit-level invariant that the cwd argument round-trips: a
+    /// runner that captures the value sees exactly what we passed in. Closes
+    /// claude3 task-41 / codex1 task-38 test-gap finding for cwd plumbing.
+    #[tokio::test]
+    async fn runner_receives_orchestrator_cwd_argument() {
+        use crate::fsd::runner::{AssistantRunner, RunOutcome};
+        use crate::fsd::schema::TaskSpec;
+        use std::sync::{Arc, Mutex};
+
+        // Test runner that captures the cwd argument it was called with.
+        struct CapturingRunner {
+            captured: Arc<Mutex<Option<Option<std::path::PathBuf>>>>,
+        }
+        impl AssistantRunner for CapturingRunner {
+            fn run<'a>(
+                &'a self,
+                _spec: TaskSpec,
+                _output_dir_rel: String,
+                cwd: Option<std::path::PathBuf>,
+                _cancel_rx: tokio::sync::oneshot::Receiver<()>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RunOutcome> + Send + 'a>>
+            {
+                let captured = self.captured.clone();
+                Box::pin(async move {
+                    *captured.lock().unwrap() = Some(cwd);
+                    RunOutcome {
+                        exit_code: Some(0),
+                        wallclock_ms: 1,
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        kind: "ok",
+                        error: None,
+                    }
+                })
+            }
+        }
+
+        // Case 1: cwd = Some(/tmp).
+        let captured = Arc::new(Mutex::new(None));
+        let runner = CapturingRunner {
+            captured: captured.clone(),
+        };
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cwd = Some(std::path::PathBuf::from("/tmp"));
+        let _ = runner
+            .run(
+                TaskSpec {
+                    task_id: "t".into(),
+                    tool: "claude_code".into(),
+                    instance_idx: 1,
+                    role_hint: None,
+                    prompt: "p".into(),
+                    context_refs: vec![],
+                    wallclock_ms_cap: 1000,
+                },
+                "out".into(),
+                cwd.clone(),
+                rx,
+            )
+            .await;
+        assert_eq!(*captured.lock().unwrap(), Some(cwd));
+
+        // Case 2: cwd = None (no leader cwd available).
+        let captured2 = Arc::new(Mutex::new(None));
+        let runner2 = CapturingRunner {
+            captured: captured2.clone(),
+        };
+        let (_tx2, rx2) = tokio::sync::oneshot::channel::<()>();
+        let _ = runner2
+            .run(
+                TaskSpec {
+                    task_id: "t".into(),
+                    tool: "claude_code".into(),
+                    instance_idx: 1,
+                    role_hint: None,
+                    prompt: "p".into(),
+                    context_refs: vec![],
+                    wallclock_ms_cap: 1000,
+                },
+                "out".into(),
+                None,
+                rx2,
+            )
+            .await;
+        assert_eq!(*captured2.lock().unwrap(), Some(None));
+    }
+
     #[test]
     fn cap_trip_state_classification() {
         // Pure helper-style assertions on the enum variants used by handle_dispatch.
@@ -1726,7 +2009,11 @@ mod tests {
                 assert_eq!(resp.result, DispatchResult::Duplicate);
                 assert_eq!(resp.next_action, NextAction::Ack);
                 assert_eq!(resp.strike_count, 2, "must surface live strike count");
-                assert!(resp.message.as_deref().unwrap_or("").contains("dispatch-cmd-already-seen"));
+                assert!(resp
+                    .message
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("dispatch-cmd-already-seen"));
                 assert!(resp.message.as_deref().unwrap_or("").contains("run-active"));
             }
             Ok(()) => panic!("expected Duplicate, got Ok"),
@@ -1734,11 +2021,19 @@ mod tests {
 
         // Case 2: new cmd_id → Ok (caller continues to next validation).
         let result = check_cmd_id_seen_in(&registry, "run-active", "dispatch-cmd-fresh");
-        assert!(result.is_ok(), "fresh cmd_id must return Ok, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "fresh cmd_id must return Ok, got {:?}",
+            result
+        );
 
         // Case 3: unknown run_id → Ok (defer to validate_run_command downstream).
         let result = check_cmd_id_seen_in(&registry, "run-nonexistent", "any-cmd-id");
-        assert!(result.is_ok(), "unknown run must return Ok, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "unknown run must return Ok, got {:?}",
+            result
+        );
     }
 
     /// Per @codex3 task-90 P2 — round-13: invoke the **actual production
@@ -1765,8 +2060,10 @@ mod tests {
             let _ = std::fs::create_dir_all(&test_root);
             #[allow(unused_unsafe)]
             unsafe {
-                std::env::set_var("CANVAS_TERMINAL_MEMORY_ROOT",
-                    test_root.to_string_lossy().as_ref());
+                std::env::set_var(
+                    "CANVAS_TERMINAL_MEMORY_ROOT",
+                    test_root.to_string_lossy().as_ref(),
+                );
             }
         }
 
@@ -1776,6 +2073,7 @@ mod tests {
                 &'a self,
                 spec: TaskSpec,
                 output_dir_rel: String,
+                _cwd: Option<std::path::PathBuf>,
                 _cancel_rx: oneshot::Receiver<()>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RunOutcome> + Send + 'a>>
             {
@@ -1799,9 +2097,14 @@ mod tests {
             }
         }
 
-        let leader = format!("h13_test_{}_{}",
+        let leader = format!(
+            "h13_test_{}_{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
         let run_id = "run-h13";
         let task_id = "t-1-helper";
 
@@ -1827,7 +2130,11 @@ mod tests {
 
         // Construct paths via TaskPath::try_new (production code does this).
         let task_path = TaskPath::try_new(&leader, run_id, 1, task_id).unwrap();
-        let output_dir_rel = task_path.pending().rsplit_once('/').map(|(d, _)| d.to_string()).unwrap();
+        let output_dir_rel = task_path
+            .pending()
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap();
 
         let spec = TaskSpec {
             task_id: task_id.into(),
@@ -1840,7 +2147,13 @@ mod tests {
         };
 
         // Verify the cancel sender is registered before the call.
-        assert!(runs.lock().unwrap().get(run_id).unwrap().task_cancel_txs.contains_key(task_id));
+        assert!(runs
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .unwrap()
+            .task_cancel_txs
+            .contains_key(task_id));
 
         // Call the SAME helper that handle_dispatch's spawn closure calls.
         // No AppHandle (test passes None), runs is provided so cleanup runs.
@@ -1854,10 +2167,12 @@ mod tests {
             Some("test-role".into()),
             spec,
             output_dir_rel,
+            None, // no leader cwd in this test (Phase 2.9 param)
             task_cancel_rx,
             Some(&runs),
             None, // no AppHandle in test
-        ).await;
+        )
+        .await;
 
         // Verify TaskDone shape and side effects.
         assert_eq!(done.task_id, task_id);
@@ -1865,21 +2180,34 @@ mod tests {
         assert_eq!(done.tool, "claude_code");
 
         // Verify cancel sender was REMOVED post-completion (cleanup invariant).
-        let still_registered = runs.lock().unwrap().get(run_id).unwrap()
-            .task_cancel_txs.contains_key(task_id);
-        assert!(!still_registered, "production helper must remove completed task's cancel sender");
+        let still_registered = runs
+            .lock()
+            .unwrap()
+            .get(run_id)
+            .unwrap()
+            .task_cancel_txs
+            .contains_key(task_id);
+        assert!(
+            !still_registered,
+            "production helper must remove completed task's cancel sender"
+        );
 
         // Verify done.json written to disk.
         let root = get_memory_root().unwrap();
         let done_path = root.join(format!(
-            "fsd-runs/{}/runs/{}/turns/1/tasks/{}/done.json", leader, run_id, task_id
+            "fsd-runs/{}/runs/{}/turns/1/tasks/{}/done.json",
+            leader, run_id, task_id
         ));
-        assert!(done_path.exists(), "done.json must be written by the helper");
+        assert!(
+            done_path.exists(),
+            "done.json must be written by the helper"
+        );
 
         // Verify the stdout file FakeAssistantRunner created is readable by
         // read_stdout_last_line (production helper calls it for last_line preview).
         let stdout_path = root.join(format!(
-            "fsd-runs/{}/runs/{}/turns/1/tasks/{}/result.stdout", leader, run_id, task_id
+            "fsd-runs/{}/runs/{}/turns/1/tasks/{}/result.stdout",
+            leader, run_id, task_id
         ));
         assert!(stdout_path.exists());
         let content = std::fs::read_to_string(&stdout_path).unwrap();
@@ -1929,6 +2257,7 @@ mod tests {
                 &'a self,
                 spec: TaskSpec,
                 output_dir_rel: String,
+                _cwd: Option<std::path::PathBuf>,
                 _cancel_rx: oneshot::Receiver<()>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RunOutcome> + Send + 'a>>
             {
@@ -1940,7 +2269,10 @@ mod tests {
                         if let Some(parent) = stdout_path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        let _ = std::fs::write(&stdout_path, format!("FAKE OUTPUT for {}", spec.task_id));
+                        let _ = std::fs::write(
+                            &stdout_path,
+                            format!("FAKE OUTPUT for {}", spec.task_id),
+                        );
                     }
                     RunOutcome {
                         exit_code: Some(0),
@@ -1955,9 +2287,14 @@ mod tests {
         }
 
         // ---- Phase 1: simulate `plan` accepted ----
-        let leader = format!("integ_test_{}_{}", std::process::id(),
+        let leader = format!(
+            "integ_test_{}_{}",
+            std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
         let run_id = "run-integ";
         let session_nonce = "abcdef01";
         let run_nonce = "01234567";
@@ -2023,10 +2360,15 @@ mod tests {
             wallclock_ms_cap: 60_000,
         };
         let task_path = TaskPath::try_new(&leader, run_id, turn, &task_spec.task_id).unwrap();
-        let output_dir_rel = task_path.pending().rsplit_once('/')
-            .map(|(d, _)| d.to_string()).unwrap_or_default();
+        let output_dir_rel = task_path
+            .pending()
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default();
         let (_t_cancel_tx, t_cancel_rx) = oneshot::channel::<()>();
-        let outcome = runner.run(task_spec.clone(), output_dir_rel, t_cancel_rx).await;
+        let outcome = runner
+            .run(task_spec.clone(), output_dir_rel, None, t_cancel_rx)
+            .await;
         assert_eq!(outcome.exit_code, Some(0));
         assert_eq!(outcome.kind, "ok");
 
@@ -2045,7 +2387,8 @@ mod tests {
             error: outcome.error.clone(),
         };
         let _ = write_run_file(
-            &leader, run_id,
+            &leader,
+            run_id,
             &format!("turns/{}/tasks/{}/done.json", turn, task_spec.task_id),
             serde_json::to_value(&task_done).unwrap(),
         );
@@ -2055,9 +2398,13 @@ mod tests {
         assert!(report.contains("FSD turn 1 report"));
         assert!(report.contains("t-1-a"));
         assert!(report.contains("✓ ok"));
-        assert!(report.contains("FAKE OUTPUT"), "iteration_report must inline FakeAssistantRunner stdout");
+        assert!(
+            report.contains("FAKE OUTPUT"),
+            "iteration_report must inline FakeAssistantRunner stdout"
+        );
         let _ = write_run_file_text(
-            &leader, run_id,
+            &leader,
+            run_id,
             &format!("turns/{}/iteration_report.md", turn),
             &report,
         );
@@ -2067,7 +2414,9 @@ mod tests {
 
         // ---- Phase 5: simulate `done` ----
         let _ = write_run_file(
-            &leader, run_id, "final.json",
+            &leader,
+            run_id,
+            "final.json",
             serde_json::json!({
                 "status": "done",
                 "summary": "integration test complete",
@@ -2080,19 +2429,23 @@ mod tests {
         // ---- Verify: manifest status is now Done; iteration_report on disk ----
         let root = get_memory_root().unwrap();
         let final_manifest_raw = std::fs::read_to_string(
-            root.join(format!("fsd-runs/{}/runs/{}/manifest.json", leader, run_id))
-        ).unwrap();
+            root.join(format!("fsd-runs/{}/runs/{}/manifest.json", leader, run_id)),
+        )
+        .unwrap();
         let final_manifest: RunManifest = serde_json::from_str(&final_manifest_raw).unwrap();
         assert_eq!(final_manifest.status, RunStatus::Done);
 
-        let report_on_disk = std::fs::read_to_string(
-            root.join(format!("fsd-runs/{}/runs/{}/turns/1/iteration_report.md", leader, run_id))
-        ).unwrap();
+        let report_on_disk = std::fs::read_to_string(root.join(format!(
+            "fsd-runs/{}/runs/{}/turns/1/iteration_report.md",
+            leader, run_id
+        )))
+        .unwrap();
         assert!(report_on_disk.contains("FAKE OUTPUT"));
 
         let final_json_raw = std::fs::read_to_string(
-            root.join(format!("fsd-runs/{}/runs/{}/final.json", leader, run_id))
-        ).unwrap();
+            root.join(format!("fsd-runs/{}/runs/{}/final.json", leader, run_id)),
+        )
+        .unwrap();
         let final_json: serde_json::Value = serde_json::from_str(&final_json_raw).unwrap();
         assert_eq!(final_json["status"], "done");
 

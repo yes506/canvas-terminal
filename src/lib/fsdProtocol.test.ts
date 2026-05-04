@@ -113,14 +113,14 @@ describe("parseFsdLine — malformed", () => {
       cmd: "plan",
       goal: "x",
     })}`);
-    expect(r).toEqual({ kind: "malformed", reason: "missing field: type" });
+    expect(r).toEqual({ kind: "malformed", code: "shape", reason: "missing field: type" });
   });
 
   it("rejects when missing required field cmd_id", () => {
     const r = parseFsdLine(`##FSD ${JSON.stringify({
       v: 1, sn: SN, rn: RN, run_id: "r1", type: "plan", goal: "x",
     })}`);
-    expect(r).toEqual({ kind: "malformed", reason: "missing field: cmd_id" });
+    expect(r).toEqual({ kind: "malformed", code: "shape", reason: "missing field: cmd_id" });
   });
 
   it("rejects unknown verb", () => {
@@ -180,6 +180,58 @@ describe("parseFsdLine — malformed", () => {
   it("rejects non-object payload", () => {
     const r = parseFsdLine(`##FSD [1,2,3]`);
     expect(r.kind).toBe("malformed");
+  });
+});
+
+describe("parseFsdLine — typed shorthand classification (Phase 2.1)", () => {
+  it("classifies bare `##FSD plan` as shorthand-plan (recoverable)", () => {
+    const r = parseFsdLine("##FSD plan");
+    expect(r.kind).toBe("malformed");
+    if (r.kind === "malformed") {
+      expect(r.code).toBe("shorthand-plan");
+      expect(r.reason).toContain("requires a JSON object");
+    }
+  });
+
+  it("classifies `##FSD dispatch` as shorthand-other (NOT recoverable)", () => {
+    const r = parseFsdLine("##FSD dispatch");
+    expect(r.kind).toBe("malformed");
+    if (r.kind === "malformed") expect(r.code).toBe("shorthand-other");
+  });
+
+  it("classifies `##FSD done` as shorthand-other", () => {
+    const r = parseFsdLine("##FSD done");
+    expect(r.kind).toBe("malformed");
+    if (r.kind === "malformed") expect(r.code).toBe("shorthand-other");
+  });
+
+  it("classifies `##FSD blocked` as shorthand-other", () => {
+    const r = parseFsdLine("##FSD blocked");
+    expect(r.kind).toBe("malformed");
+    if (r.kind === "malformed") expect(r.code).toBe("shorthand-other");
+  });
+
+  it("does NOT match shorthand when JSON follows the verb (the regular path applies)", () => {
+    // `##FSD plan {...}` is the proper full form, NOT a shorthand. Must reach
+    // the JSON-parse branch and fail with code "json-parse" because `plan {` is
+    // unparseable JSON. (The parser's full-form is `##FSD {"type":"plan", …}`.)
+    const r = parseFsdLine("##FSD plan {}");
+    expect(r.kind).toBe("malformed");
+    if (r.kind === "malformed") expect(r.code).toBe("json-parse");
+  });
+
+  it("classifies bad JSON as json-parse (not shorthand-*)", () => {
+    const r = parseFsdLine("##FSD {not valid json");
+    expect(r.kind).toBe("malformed");
+    if (r.kind === "malformed") expect(r.code).toBe("json-parse");
+  });
+
+  it("classifies missing-field-type as shape", () => {
+    const r = parseFsdLine(`##FSD ${JSON.stringify({
+      v: 1, cmd_id: "c1", sn: SN, rn: "", run_id: "r1", goal: "x",
+    })}`);
+    expect(r.kind).toBe("malformed");
+    if (r.kind === "malformed") expect(r.code).toBe("shape");
   });
 });
 

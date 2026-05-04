@@ -21,3 +21,6 @@ src-tauri/target/
 # Logs
 *.log
 npm-debug.log*
+
+# Local research / spike workspaces (not part of the committed code)
+spikes/
