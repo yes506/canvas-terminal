@@ -5,7 +5,7 @@ import {
   agentDisplayName,
 } from "../../stores/collaboratorStore";
 import { useCollabSessionId } from "./CollabSessionContext";
-import { parseInput, executeCommand } from "./commands";
+import { parseInput, executeCommand, resolveSingleInlineMention } from "./commands";
 import { AtMention, extractMentionQuery, filterMentionEntries } from "./AtMention";
 import { FileCompletion, escapeShellPath, extractFileQuery } from "./FileCompletion";
 import type { SpawnedAgent } from "../../types/collaborator";
@@ -309,6 +309,11 @@ export function InputPrompt() {
     if (cmd.type === "needs-target") {
       if (agents.length === 0) {
         useCollaboratorStore.getState().setStatus("No agents running.", collabSessionId);
+        return;
+      }
+      const inlineTarget = resolveSingleInlineMention(cmd.message!, agents);
+      if (inlineTarget) {
+        await useCollaboratorStore.getState().sendToAgent(inlineTarget.sessionId, cmd.message!);
         return;
       }
       if (agents.length === 1) {

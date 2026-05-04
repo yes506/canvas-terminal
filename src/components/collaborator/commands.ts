@@ -166,12 +166,32 @@ export function resolveAgent(
   return agents.find((a) => a.sessionId === target) ?? null;
 }
 
+export function resolveSingleInlineMention(
+  message: string,
+  agents: SpawnedAgent[],
+): SpawnedAgent | null {
+  const tokens = new Set<string>();
+  const mentionRe = /(^|[\s([{"])@(\S+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = mentionRe.exec(message)) !== null) {
+    const token = match[2].replace(/[),.;:!?]+$/g, "");
+    if (token.length > 0 && token.toLowerCase() !== "all") {
+      tokens.add(token);
+    }
+  }
+  if (tokens.size !== 1) return null;
+
+  const [token] = Array.from(tokens);
+  return resolveAgent(token, agents);
+}
+
 export function getHelpText(): string {
   return [
     "Type directly in each agent terminal. This prompt is for commands & targeted messages.",
     "",
     "Commands:",
     "  @<agent> <msg>    Send message to specific agent",
+    "  <msg> @<agent>    Send message to the single mentioned agent",
     "  @all <msg>        Broadcast to all agents",
     "  <bare text>       Shows target selector before sending",
     "  /status           Show running agents",

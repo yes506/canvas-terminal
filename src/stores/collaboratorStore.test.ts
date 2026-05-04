@@ -12,7 +12,7 @@ import {
   slugify,
 } from "./collaboratorStore";
 import type { CollabTask, SpawnedAgent } from "../types/collaborator";
-import { parseInput, resolveAgent, executeCommand, getHelpText } from "../components/collaborator/commands";
+import { parseInput, resolveAgent, resolveSingleInlineMention, executeCommand, getHelpText } from "../components/collaborator/commands";
 import { useTerminalStore } from "./terminalStore";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -2230,6 +2230,31 @@ describe("resolveAgent — nickname-aware resolution (codex1/2/3 round-7)", () =
     agents[0].status = "exited";
     expect(resolveAgent("claude-code-1", agents)).toBeNull();
   });
+
+  it("routes bare text with one inline @handle to that agent", () => {
+    const agents = buildAgents();
+    const target = resolveSingleInlineMention(
+      "I sent a prompt to @claude1, check what went wrong.",
+      agents,
+    );
+    expect(target?.sessionId).toBe("pty-A");
+  });
+
+  it("routes inline @handle wrapped in opening punctuation", () => {
+    const agents = buildAgents();
+    const target = resolveSingleInlineMention("Please verify (@claude1).", agents);
+    expect(target?.sessionId).toBe("pty-A");
+  });
+
+  it("does not infer a target when inline mentions are ambiguous", () => {
+    const agents = buildAgents();
+    expect(resolveSingleInlineMention("Compare @claude1 and @codex1", agents)).toBeNull();
+  });
+
+  it("does not infer a target for unresolved inline mentions", () => {
+    const agents = buildAgents();
+    expect(resolveSingleInlineMention("Please ask @ghost about this", agents)).toBeNull();
+  });
 });
 
 describe("parseInput — /rename slash command (codex1+codex2 round-7)", () => {
@@ -2638,5 +2663,3 @@ describe("Copilot CLI roster registration", () => {
     expect(getHelpText()).toMatch(/@copilot\b/);
   });
 });
-
-
