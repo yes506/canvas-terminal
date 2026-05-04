@@ -50,10 +50,34 @@ describe("createFsdLineTap", () => {
     expect(received[0].kind).toBe("ok");
   });
 
-  it("handles bare \\r line endings", () => {
+  it("does not treat bare \\r as a complete command line", () => {
     tap.feed(`##FSD ${planJson()}\r`);
+    expect(received).toHaveLength(0);
+    tap.feed("\n");
     expect(received).toHaveLength(1);
     expect(received[0].kind).toBe("ok");
+  });
+
+  it("collapses PTY carriage-return redraws before parsing", () => {
+    tap.feed(`##FSD {"v":1,"cmd_id":"c1","sn":"${SN}","rn":"${RN}","run_id":"r1","t\r`);
+    expect(received).toHaveLength(0);
+    tap.feed(`##FSD ${planJson()}\r\n`);
+    expect(received).toHaveLength(1);
+    expect(received[0].kind).toBe("ok");
+  });
+
+  it("reassembles hard-wrapped FSD JSON before parsing", () => {
+    tap.feed(`##FSD {"v":1,"cmd_id":"c1","sn":"${SN}","rn":"${RN}","run_id":"r1","t\n`);
+    expect(received).toHaveLength(0);
+    tap.feed(`ype":"plan","goal":"x"}\n`);
+    expect(received).toHaveLength(1);
+    expect(received[0].kind).toBe("ok");
+  });
+
+  it("still reports non-incomplete malformed FSD JSON", () => {
+    tap.feed("##FSD {bad json\n");
+    expect(received).toHaveLength(1);
+    expect(received[0].kind).toBe("malformed");
   });
 
   it("handles multiple lines in one feed", () => {
@@ -80,8 +104,10 @@ describe("createFsdLineTap", () => {
     expect(received).toHaveLength(0);
   });
 
-  it("flags malformed FSD lines (so the strike protocol fires)", () => {
-    tap.feed("##FSD {bad json\n");
+  it("flags incomplete FSD lines if continuation becomes malformed", () => {
+    tap.feed("##FSD {\"v\":1,\"cmd_id\":\"c1\n");
+    expect(received).toHaveLength(0);
+    tap.feed("\",bad}\n");
     expect(received).toHaveLength(1);
     expect(received[0].kind).toBe("malformed");
   });

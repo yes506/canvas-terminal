@@ -6,7 +6,9 @@
  * not lines, so we accumulate a per-session string buffer until we see `\n`.
  *
  * Defenses:
- *  - Per-session string buffer (handles `\n`, `\r\n`, bare `\r`)
+ *  - Per-session string buffer (handles `\n` and `\r\n`)
+ *  - PTY carriage-return redraw collapse before parsing
+ *  - Hard-wrap reassembly for incomplete `##FSD` JSON
  *  - ANSI strip BEFORE regex (per plan v5 §1.5)
  *  - 64 KB partial-line cap (DoS guard, per plan v5 §3 rule 4)
  *  - `expectEcho(text, ms)` targeted echo suppressor (per plan v5 §5.1)
@@ -17,6 +19,7 @@ import { stripAnsi } from "./agentOutputCapture";
 import { parseFsdLine, ParseResult } from "./fsdProtocol";
 
 const PARTIAL_LINE_BYTES_CAP = 64 * 1024;
+const PENDING_FSD_BYTES_CAP = 64 * 1024;
 const ECHO_WINDOW_DEFAULT_MS = 800;
 const ECHO_FIDELITY_THRESHOLD = 0.8;
 
@@ -56,6 +59,8 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
   let echoExpect: { text: string; expiresAt: number } | null = null;
   /** Blanket-mute window end (set by enableBlanketMute fallback). */
   let blanketMuteUntil = 0;
+  /** Incomplete `##FSD` JSON split by hard-wrapped PTY output. */
+  let pendingFsdLine: string | null = null;
 
   const echoWindow = opts.echoWindowMs ?? ECHO_WINDOW_DEFAULT_MS;
   void opts.sessionId; // sessionId is held by the caller for event scoping
@@ -64,12 +69,12 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
     let idx = nextLineBoundary(buffer);
     while (idx >= 0) {
       const rawLine = buffer.substring(0, idx);
-      // Skip the line terminator (handles \r\n, \n, \r).
-      let next = idx + 1;
-      if (buffer[idx] === "\r" && buffer[idx + 1] === "\n") next = idx + 2;
+      // Skip the line terminator. Lines are finalized only on LF; a CR just
+      // before LF is part of CRLF and will be trimmed by normalizePtyLine.
+      const next = idx + 1;
       buffer = buffer.substring(next);
 
-      const stripped = stripAnsi(rawLine);
+      const stripped = stripAnsi(normalizePtyLine(rawLine));
       if (stripped.length === 0) {
         idx = nextLineBoundary(buffer);
         continue;
@@ -87,10 +92,7 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
         continue;
       }
 
-      const result = parseFsdLine(stripped);
-      if (result.kind !== "skip") {
-        opts.onCommand(result);
-      }
+      processProtocolLine(stripped);
 
       idx = nextLineBoundary(buffer);
     }
@@ -120,6 +122,42 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
     return false;
   }
 
+  function processProtocolLine(line: string): void {
+    if (pendingFsdLine != null) {
+      pendingFsdLine += line.trimStart();
+      if (pendingFsdLine.length > PENDING_FSD_BYTES_CAP) {
+        opts.onCommand({ kind: "malformed", reason: "FSD command exceeded partial-line cap" });
+        pendingFsdLine = null;
+        return;
+      }
+
+      const pendingResult = parseFsdLine(pendingFsdLine);
+      if (pendingResult.kind === "ok") {
+        pendingFsdLine = null;
+        opts.onCommand(pendingResult);
+        return;
+      }
+      if (pendingResult.kind === "malformed" && isIncompleteJson(pendingResult.reason)) {
+        return;
+      }
+
+      pendingFsdLine = null;
+      if (pendingResult.kind !== "skip") {
+        opts.onCommand(pendingResult);
+      }
+      return;
+    }
+
+    const result = parseFsdLine(line);
+    if (result.kind === "malformed" && isIncompleteJson(result.reason)) {
+      pendingFsdLine = line;
+      return;
+    }
+    if (result.kind !== "skip") {
+      opts.onCommand(result);
+    }
+  }
+
   return {
     feed(payload: string): void {
       buffer += payload;
@@ -141,19 +179,39 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
     },
     dispose(): void {
       buffer = "";
+      pendingFsdLine = null;
       echoExpect = null;
       blanketMuteUntil = 0;
     },
   };
 }
 
-/** Returns index of the first \n or \r in buffer, or -1 if none. */
+/**
+ * Returns index of the next completed line.
+ *
+ * PTY output from full-screen CLIs often uses bare carriage returns to redraw
+ * the same visual row while streaming. Treating those CRs as line boundaries
+ * turns a partially redrawn `##FSD` JSON command into a malformed command.
+ */
 function nextLineBoundary(buf: string): number {
-  for (let i = 0; i < buf.length; i++) {
-    const c = buf[i];
-    if (c === "\n" || c === "\r") return i;
-  }
-  return -1;
+  return buf.indexOf("\n");
+}
+
+/**
+ * Collapse carriage-return redraw frames to the final visible row.
+ *
+ * Example: `##FSD {"t\r##FSD {"type":"plan"}\r\n` should parse the final
+ * redrawn row, not report the first partial frame as malformed.
+ */
+function normalizePtyLine(rawLine: string): string {
+  const withoutCrlf = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+  const lastCarriageReturn = withoutCrlf.lastIndexOf("\r");
+  if (lastCarriageReturn < 0) return withoutCrlf;
+  return withoutCrlf.slice(lastCarriageReturn + 1);
+}
+
+function isIncompleteJson(reason: string): boolean {
+  return reason.includes("Unterminated string") || reason.includes("Unexpected end of JSON input");
 }
 
 /** Phase-0 outcome: if `EchoFidelity` < this, fall back to blanket mute. */
