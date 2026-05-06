@@ -74,7 +74,7 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
       const next = idx + 1;
       buffer = buffer.substring(next);
 
-      const stripped = stripAnsi(normalizePtyLine(rawLine));
+      const stripped = extractFsdCandidate(rawLine);
       if (stripped.length === 0) {
         idx = nextLineBoundary(buffer);
         continue;
@@ -96,6 +96,8 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
 
       idx = nextLineBoundary(buffer);
     }
+
+    processUnterminatedFsdCandidate();
 
     // Truncate runaway partial lines — DoS guard.
     if (buffer.length > PARTIAL_LINE_BYTES_CAP) {
@@ -158,6 +160,27 @@ export function createFsdLineTap(opts: CreateFsdLineTapOptions): FsdLineTap {
     }
   }
 
+  function processUnterminatedFsdCandidate(): void {
+    if (pendingFsdLine != null || buffer.length === 0) return;
+
+    const stripped = extractFsdCandidate(buffer);
+    if (stripped.length === 0) return;
+    if (consumeEcho(stripped)) {
+      buffer = "";
+      return;
+    }
+    if (Date.now() < blanketMuteUntil) {
+      buffer = "";
+      return;
+    }
+
+    const result = parseFsdLine(stripped);
+    if (result.kind === "ok") {
+      buffer = "";
+      opts.onCommand(result);
+    }
+  }
+
   return {
     feed(payload: string): void {
       buffer += payload;
@@ -208,6 +231,32 @@ function normalizePtyLine(rawLine: string): string {
   const lastCarriageReturn = withoutCrlf.lastIndexOf("\r");
   if (lastCarriageReturn < 0) return withoutCrlf;
   return withoutCrlf.slice(lastCarriageReturn + 1);
+}
+
+/**
+ * Extract the FSD candidate from a raw PTY line, with redraw-rescue.
+ *
+ * Default: take the post-last-CR segment (visually-final row). But if that
+ * segment isn't a valid `##FSD` ok command and an earlier CR-frame IS,
+ * prefer the latest valid FSD frame. This rescues a complete `##FSD`
+ * command that gets visually overwritten by a status-bar redraw emitted
+ * in the same chunk — e.g. `##FSD {valid}\r<status>` would otherwise
+ * drop the FSD content because `lastIndexOf("\r")` returns `<status>`.
+ *
+ * Walks newest-to-oldest to honor redraw semantics: latest valid FSD wins.
+ */
+function extractFsdCandidate(rawLine: string): string {
+  const lastSegment = stripAnsi(normalizePtyLine(rawLine));
+  if (!rawLine.includes("##FSD")) return lastSegment;
+  if (parseFsdLine(lastSegment).kind === "ok") return lastSegment;
+
+  const trimmed = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+  const segments = trimmed.split("\r");
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const candidate = stripAnsi(segments[i]);
+    if (parseFsdLine(candidate).kind === "ok") return candidate;
+  }
+  return lastSegment;
 }
 
 function isIncompleteJson(reason: string): boolean {

@@ -50,10 +50,24 @@ describe("createFsdLineTap", () => {
     expect(received[0].kind).toBe("ok");
   });
 
-  it("does not treat bare \\r as a complete command line", () => {
+  it("parses a complete FSD command before a trailing bare \\r is followed by LF", () => {
     tap.feed(`##FSD ${planJson()}\r`);
-    expect(received).toHaveLength(0);
+    expect(received).toHaveLength(1);
+    expect(received[0].kind).toBe("ok");
     tap.feed("\n");
+    expect(received).toHaveLength(1);
+  });
+
+  it("parses a complete FSD command even when the CLI omits the trailing newline", () => {
+    tap.feed(`##FSD ${planJson()}`);
+    expect(received).toHaveLength(1);
+    expect(received[0].kind).toBe("ok");
+  });
+
+  it("does not prematurely report incomplete unterminated FSD JSON", () => {
+    tap.feed(`##FSD {"v":1,"cmd_id":"c1","sn":"${SN}`);
+    expect(received).toHaveLength(0);
+    tap.feed(`","rn":"${RN}","run_id":"r1","type":"plan","goal":"x"}`);
     expect(received).toHaveLength(1);
     expect(received[0].kind).toBe("ok");
   });
@@ -64,6 +78,32 @@ describe("createFsdLineTap", () => {
     tap.feed(`##FSD ${planJson()}\r\n`);
     expect(received).toHaveLength(1);
     expect(received[0].kind).toBe("ok");
+  });
+
+  it("rescues a complete FSD command overwritten by a CR status redraw (no trailing LF)", () => {
+    // Leader emits a complete ##FSD command, then carriage-returns to redraw
+    // a status bar in the same chunk without a trailing LF. Without the
+    // FSD-aware redraw rescue, normalizePtyLine would return only the post-CR
+    // status text, and the FSD command would be silently dropped.
+    tap.feed(`##FSD ${planJson()}\rstatus_bar_redraw`);
+    expect(received).toHaveLength(1);
+    expect(received[0].kind).toBe("ok");
+  });
+
+  it("rescues a complete FSD command overwritten by a CR status redraw (with trailing LF)", () => {
+    tap.feed(`##FSD ${planJson()}\rstatus_bar_redraw\n`);
+    expect(received).toHaveLength(1);
+    expect(received[0].kind).toBe("ok");
+  });
+
+  it("prefers the latest valid FSD frame when multiple appear across CR redraws", () => {
+    // Two complete FSD commands in one rendered line separated by CR — last wins.
+    tap.feed(`##FSD ${planJson("-A")}\r##FSD ${planJson("-B")}\n`);
+    expect(received).toHaveLength(1);
+    expect(received[0].kind).toBe("ok");
+    if (received[0].kind === "ok" && received[0].cmd.type === "plan") {
+      expect(received[0].cmd.goal).toBe("x-B");
+    }
   });
 
   it("reassembles hard-wrapped FSD JSON before parsing", () => {

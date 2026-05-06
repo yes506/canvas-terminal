@@ -126,6 +126,14 @@ fn default_max_turns() -> u32 {
     crate::fsd::orchestrator::MAX_TURNS_DEFAULT
 }
 
+/// Generate a fresh 8-hex `agent_id` (PR-PreC). Used as the
+/// `#[serde(default)]` for `TaskSpec.agent_id` so in-flight TaskSpec
+/// JSON from a leader pre-dating the schema migration deserializes
+/// successfully — claude4 task-29 §3.4 + plan v6 §2.7.
+fn generate_agent_id() -> String {
+    crate::fsd::orchestrator::generate_8hex()
+}
+
 /// One assistant's task within a `dispatch`. The leader authors the prompt;
 /// the harness only validates schema and bounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +155,28 @@ pub(crate) struct TaskSpec {
     /// Per-task wallclock cap. Clamped server-side.
     #[serde(default = "default_task_wallclock_ms")]
     pub wallclock_ms_cap: u64,
+
+    // ---- PR-PreC additions (plan v6 §2.13) -----------------------------
+    /// Stable per-agent identity for inter-agent messaging and inbox
+    /// addressing. 8-hex; auto-generated server-side if missing from the
+    /// leader's TaskSpec (backward compat). Plan v6 §2.7 + claude4 task-29
+    /// §3.4 (`#[serde(default)]` to avoid breaking in-flight dispatch JSON).
+    #[serde(default = "generate_agent_id")]
+    pub agent_id: String,
+
+    // ---- Phase C additions (plan v6 §2.13 / §C.1) ----------------------
+    /// Optional: when set, this task's stdout result is brokered into
+    /// the originating agent's inbox by the orchestrator (response routing).
+    /// `None` means a leader-direct task with no agent-to-agent linkage.
+    /// Plan v6 §2.9.
+    #[serde(default)]
+    pub from_agent_id: Option<String>,
+    /// Optional: when set, the pending message in `inbox/agent-<to_agent_id>/`
+    /// is drained at spawn time and prepended to this task's prompt.
+    /// Validated by the orchestrator against `current_dispatch_groups`
+    /// before dispatch is accepted. Plan v6 §2.10.
+    #[serde(default)]
+    pub to_agent_id: Option<String>,
 }
 
 fn default_task_wallclock_ms() -> u64 {

@@ -424,6 +424,11 @@ async fn handle_plan(
     tokio::spawn(heartbeat_loop(
         app.clone(),
         state.fsd_runs.clone(),
+        // Round-10 reflection per codex1 task-1 + claude3 task-4 §(b):
+        // pass the dispatch-group registry through so the cap-trip path
+        // inside the heartbeat can clear its run's entry on terminal
+        // transition (mirrors handle_done/cancel_run).
+        state.current_dispatch_groups.clone(),
         leader_handle_for_hb,
         run_id_for_hb,
         cancel_rx,
@@ -543,6 +548,106 @@ async fn handle_dispatch(
         }
     }
 
+    // PR-PreC: validate `to_agent_id` AND `from_agent_id` against the
+    // current run's dispatch group. A leader may only address agents that
+    // the orchestrator spawned in the CURRENT or prior turn of this run
+    // (per plan v6 §2.10). Empty group = no inter-agent messaging yet;
+    // allow only None.
+    //
+    // Round-7 reflection (codex2 task-75 P2 + codex3 task-77 P1):
+    // `from_agent_id` MUST also be validated — without this, a leader can
+    // synthesize a `from_agent_id="<arbitrary>"` and the response broker
+    // would write to that arbitrary agent's inbox, polluting unrelated
+    // run/turn agent inbox namespaces. Same authorization rule as
+    // `to_agent_id`.
+    //
+    // Also validate `agent_id` shape (8-hex) for every task — codex2 P2.
+    //
+    // Round-10 reflection per codex3 task-5: also reject duplicate
+    // `agent_id` values within a single dispatch. PR-PreC's authorization
+    // model assumes (run_id, agent_id) is unique within a turn —
+    // duplicates would mean two concurrent task spawns share a single
+    // inbox lane, breaking the writer-monopoly invariant for response
+    // routing and producing nondeterministic prompt augmentation.
+    if let Some(dup) = find_duplicate_agent_id(&tasks) {
+        return Ok(DispatchResponse {
+            result: DispatchResult::Malformed,
+            strike_count: 0,
+            next_action: NextAction::Remind,
+            message: Some(format!(
+                "duplicate agent_id {} within single dispatch (each task must have a unique agent_id)",
+                dup
+            )),
+        });
+    }
+    {
+        let groups = state.current_dispatch_groups.lock().map_err(|e| e.to_string())?;
+        let known_agents: std::collections::HashSet<String> = groups
+            .get(&env.run_id)
+            .map(|by_turn| {
+                by_turn
+                    .values()
+                    .flat_map(|s| s.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for spec in &tasks {
+            // Validate `agent_id` 8-hex shape (per PR-PreC contract).
+            if let Err(e) = crate::fsd::inbox::validate_id_hex(
+                &spec.agent_id,
+                crate::fsd::inbox::AGENT_ID_HEX_WIDTH,
+            ) {
+                return Ok(DispatchResponse {
+                    result: DispatchResult::Malformed,
+                    strike_count: 0,
+                    next_action: NextAction::Remind,
+                    message: Some(format!("agent_id invalid: {}", e)),
+                });
+            }
+            if let Some(target) = &spec.to_agent_id {
+                if !known_agents.contains(target) {
+                    return Ok(DispatchResponse {
+                        result: DispatchResult::OutOfScope,
+                        strike_count: 0,
+                        next_action: NextAction::Remind,
+                        message: Some(format!(
+                            "to_agent_id {} not in current_dispatch_groups for run {} \
+                             (must be a previously-spawned agent_id)",
+                            target, env.run_id
+                        )),
+                    });
+                }
+            }
+            if let Some(requester) = &spec.from_agent_id {
+                // `from_agent_id` must also be a known agent in this run —
+                // closes the broker-injection vector codex2 P2 + codex3 P1.
+                if let Err(e) = crate::fsd::inbox::validate_id_hex(
+                    requester,
+                    crate::fsd::inbox::AGENT_ID_HEX_WIDTH,
+                ) {
+                    return Ok(DispatchResponse {
+                        result: DispatchResult::Malformed,
+                        strike_count: 0,
+                        next_action: NextAction::Remind,
+                        message: Some(format!("from_agent_id invalid: {}", e)),
+                    });
+                }
+                if !known_agents.contains(requester) {
+                    return Ok(DispatchResponse {
+                        result: DispatchResult::OutOfScope,
+                        strike_count: 0,
+                        next_action: NextAction::Remind,
+                        message: Some(format!(
+                            "from_agent_id {} not in current_dispatch_groups for run {} \
+                             (broker would write to unauthorized inbox)",
+                            requester, env.run_id
+                        )),
+                    });
+                }
+            }
+        }
+    }
+
     // Enforce max_turns from the registered FsdRunHandle (per plan v5 §6.3 +
     // §5.4 + claude3 task-51 §4.3). When the leader dispatches AT max_turns,
     // it's their last real turn; AT max_turns+1, they get a synthesis-pass
@@ -573,6 +678,12 @@ async fn handle_dispatch(
                     ),
                 }),
             );
+            // Round-10 reflection per codex1 task-1 + claude3 task-4 §(b):
+            // mirror handle_done's PR-PreC dispatch-group clear so the
+            // cap-trip terminal path doesn't leak an orphan group entry.
+            if let Ok(mut groups) = state.current_dispatch_groups.lock() {
+                groups.remove(&env.run_id);
+            }
             cleanup_run(&state, &env.run_id);
             let _ = app.emit(
                 &format!("fsd-run-end-{}", leader_handle),
@@ -659,6 +770,21 @@ async fn handle_dispatch(
     // Spawn each task in parallel. Per plan v5 §6.4, register each task's
     // cancel_tx into the run's FsdRunHandle so /fsd-cancel can fan out and
     // kill in-flight assistants via process_group::kill_process_group.
+    // PR-PreC: register every task's `agent_id` in `current_dispatch_groups`
+    // BEFORE spawning so future turns of this run can address these agents
+    // via `to_agent_id`. Plan v6 §2.8 keys by (run_id, turn).
+    {
+        let mut groups = state
+            .current_dispatch_groups
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let by_turn = groups.entry(env.run_id.clone()).or_default();
+        let turn_set = by_turn.entry(turn).or_default();
+        for spec in &tasks {
+            turn_set.insert(spec.agent_id.clone());
+        }
+    }
+
     let mut handles = Vec::new();
     for spec in &tasks {
         let task_path = TaskPath::try_new(&leader_handle, &env.run_id, turn, &spec.task_id)
@@ -687,6 +813,12 @@ async fn handle_dispatch(
         // Clone the runs registry Arc so the spawned task can remove its
         // cancel sender on completion (closes @codex2 task-57 P2 stale-Vec leak).
         let runs_for_cleanup = state.fsd_runs.clone();
+
+        // Round-7 reflection (claude4 task-78 §3.2): clone Arc<AtomicU64>
+        // for the Phase C response broker so it can stamp seq_global from
+        // the orchestrator's authoritative counter across the spawned task
+        // boundary (preserves writer-monopoly invariant from plan v6 §2.3).
+        let seq_global_clone = state.seq_global.clone();
 
         let (task_cancel_tx, task_cancel_rx) = oneshot::channel::<()>();
         // Register the cancel sender keyed by task_id so cancel_run() can
@@ -737,6 +869,7 @@ async fn handle_dispatch(
                 task_cancel_rx,
                 Some(&runs_for_cleanup),
                 Some(&app_clone),
+                Some(&seq_global_clone),
             )
             .await
         }));
@@ -790,10 +923,106 @@ async fn handle_dispatch(
         &format!("turns/{}/iteration_report.md", turn),
         &report,
     );
-    update_manifest_status(&leader_handle, &env.run_id, RunStatus::AwaitingLeader);
+    // Round-10 reflection per claude2 task-2 §1: use a conditional
+    // transition so a concurrent done/blocked/cancel that already set
+    // a terminal status is not clobbered by AwaitingLeader. If the
+    // transition is rejected (manifest no longer Dispatching) we
+    // also skip emitting `inject_iteration_report` to suppress the
+    // phantom event the original disk-re-read race could produce.
+    //
+    // Round-11 reflection per codex1+claude2+codex2 (3/5 reviewers):
+    // `try_transition_manifest_status` is a non-atomic disk
+    // read-then-write, so a `done`/`blocked`/`cancel`/`heartbeat
+    // cap-trip` interleaving between its read and write can still
+    // clobber the terminal status with `AwaitingLeader` (manifest
+    // ends terminal regardless because the terminal handler then
+    // overwrites it on its own update_manifest_status, but the
+    // phantom event would still fire). The belt-and-braces
+    // `state.fsd_runs` checks below cut this race further.
+    //
+    // Round-12 nuance per claude3 task-16: the leading-edge
+    // invariant — "terminal handler removes from `fsd_runs`
+    // BEFORE its manifest write" — holds for `handle_done`,
+    // `handle_blocked`, `cancel_run`, and `heartbeat_loop`'s
+    // cap-trip path (each calls `remove_run_and_cancel` /
+    // `runs.remove` strictly before `update_manifest_status`).
+    // The cap-trip branch INSIDE `handle_dispatch` itself
+    // (orchestrator.rs:644+) reverses this — it writes
+    // `RunStatus::CapTripped` BEFORE calling `cleanup_run` —
+    // but that path is harmless here because `CapTripped` fails
+    // the `prior == Dispatching` precondition in
+    // `try_transition_manifest_status` independently of the
+    // `fsd_runs` check. So both belt-and-braces guards AND the
+    // CAS catch the cap-trip-vs-dispatch-finish race; we don't
+    // need the leading-edge invariant for that handler.
+    //
+    // We check both pre-transition and pre-emit so the
+    // phantom-event surface is reduced to a microsecond window
+    // between the post-transition check and the actual emit. A
+    // truly atomic fix would need flock or rename-CAS — deferred
+    // pending empirical macOS/Linux flock semantics verification
+    // (Obsidian observation 2026-05-02).
+    let run_alive_pre = state
+        .fsd_runs
+        .lock()
+        .ok()
+        .map(|r| r.contains_key(&env.run_id))
+        .unwrap_or(false);
+    if !run_alive_pre {
+        return Ok(DispatchResponse {
+            result: DispatchResult::Accepted,
+            strike_count: 0,
+            next_action: NextAction::Terminal,
+            message: Some(format!(
+                "turn {} completed but run already removed from in-memory registry; iteration_report skipped",
+                turn
+            )),
+        });
+    }
+    let transitioned = try_transition_manifest_status(
+        &leader_handle,
+        &env.run_id,
+        RunStatus::AwaitingLeader,
+        |prior| prior == RunStatus::Dispatching,
+    );
+    if transitioned.is_none() {
+        return Ok(DispatchResponse {
+            result: DispatchResult::Accepted,
+            strike_count: 0,
+            next_action: NextAction::Terminal,
+            message: Some(format!(
+                "turn {} completed but run terminated concurrently; iteration_report skipped",
+                turn
+            )),
+        });
+    }
+    // Post-transition belt-and-braces: a concurrent terminal handler
+    // may have removed the run between our pre-check and our manifest
+    // write. If so, suppress the emit. The terminal handler will
+    // overwrite our just-written AwaitingLeader on its own
+    // update_manifest_status call — manifest converges to terminal
+    // even though we briefly wrote AwaitingLeader.
+    let run_alive_post = state
+        .fsd_runs
+        .lock()
+        .ok()
+        .map(|r| r.contains_key(&env.run_id))
+        .unwrap_or(false);
+    if !run_alive_post {
+        return Ok(DispatchResponse {
+            result: DispatchResult::Accepted,
+            strike_count: 0,
+            next_action: NextAction::Terminal,
+            message: Some(format!(
+                "turn {} transitioned to AwaitingLeader but run removed concurrently; iteration_report skipped",
+                turn
+            )),
+        });
+    }
 
     // Inject into leader PTY via existing inject_into_pty.
-    inject_iteration_report(&app, &leader_handle, &env.run_id, turn, &report).await;
+    // PR-4: also writes a shadow-audit copy to the inbox subsystem.
+    inject_iteration_report(&app, &state, &leader_handle, &env.run_id, turn, &report).await;
 
     Ok(DispatchResponse {
         result: DispatchResult::Accepted,
@@ -817,6 +1046,10 @@ async fn handle_done(
     // Idempotency: reject duplicate (run_id, cmd_id) before any side effects.
     if let Err(resp) = check_and_record_cmd_id(&state, &env.run_id, &env.cmd_id) {
         return Ok(resp);
+    }
+    // PR-PreC: clear this run's dispatch group registry on terminal state.
+    if let Ok(mut groups) = state.current_dispatch_groups.lock() {
+        groups.remove(&env.run_id);
     }
     let cancelled_tasks = remove_run_and_cancel(&state, &env.run_id);
     let _ = write_run_file(
@@ -861,6 +1094,10 @@ async fn handle_blocked(
     if let Err(resp) = check_and_record_cmd_id(&state, &env.run_id, &env.cmd_id) {
         return Ok(resp);
     }
+    // PR-PreC: clear this run's dispatch group registry on terminal state.
+    if let Ok(mut groups) = state.current_dispatch_groups.lock() {
+        groups.remove(&env.run_id);
+    }
     let cancelled_tasks = remove_run_and_cancel(&state, &env.run_id);
     let _ = write_run_file(
         &leader_handle,
@@ -904,6 +1141,14 @@ pub fn cancel_run(
         runs.remove(run_id)
     };
     if let Some(mut handle) = removed {
+        // Round-10 reflection per codex1 task-1 + claude3 task-4 §(b):
+        // PR-PreC dispatch-group registry is cleared on `done`/`blocked`
+        // but was not cleared on cancel/cap-trip — leaving an orphan
+        // in-memory entry until app restart. Mirror handle_done's clear
+        // here so the asymmetry is closed.
+        if let Ok(mut groups) = state.current_dispatch_groups.lock() {
+            groups.remove(run_id);
+        }
         // Stop heartbeat task.
         if let Some(tx) = handle.cancel_tx.take() {
             let _ = tx.send(());
@@ -996,6 +1241,13 @@ fn remove_run_and_cancel(state: &State<'_, AppState>, run_id: &str) -> usize {
 async fn heartbeat_loop(
     app: AppHandle,
     runs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FsdRunHandle>>>,
+    // Round-10 reflection per codex1 task-1 + claude3 task-4 §(b): clear
+    // PR-PreC dispatch-group registry on cap-trip terminal transition.
+    dispatch_groups: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::collections::HashMap<u32, std::collections::HashSet<String>>>,
+        >,
+    >,
     leader_handle: String,
     run_id: String,
     mut cancel_rx: oneshot::Receiver<()>,
@@ -1027,6 +1279,9 @@ async fn heartbeat_loop(
                     } else {
                         0
                     };
+                    if let Ok(mut groups) = dispatch_groups.lock() {
+                        groups.remove(&run_id);
+                    }
                     update_manifest_status(&leader_handle, &run_id, RunStatus::CapTripped);
                     let _ = write_run_file(
                         &leader_handle, &run_id, "final.json",
@@ -1106,7 +1361,17 @@ pub(crate) async fn run_and_record_one_task<R: AssistantRunner + ?Sized>(
         &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, FsdRunHandle>>>,
     >,
     app: Option<&AppHandle>,
+    // Round-7 reflection (claude4 task-78 §3.2): orchestrator's
+    // authoritative seq counter for the Phase C broker. None during tests
+    // that don't exercise broker (broker only fires when from_agent_id is
+    // set). Threaded through here to preserve writer-monopoly globality.
+    seq_global: Option<&std::sync::atomic::AtomicU64>,
 ) -> TaskDone {
+    // Phase C: capture `from_agent_id` before `spec` is moved into the
+    // runner — needed after the task completes to broker the response
+    // back into the requester's inbox. Plan v6 §2.9 / §C.2.
+    let from_agent_id_for_broker = spec.from_agent_id.clone();
+    let task_agent_id_for_broker = spec.agent_id.clone();
     let outcome = runner.run(spec, output_dir_rel, cwd, cancel_rx).await;
 
     // Remove the cancel sender now that the task is done — keeps
@@ -1162,7 +1427,95 @@ pub(crate) async fn run_and_record_one_task<R: AssistantRunner + ?Sized>(
             }),
         );
     }
+
+    // Phase C broker: if this task carried `from_agent_id`, write a
+    // synthesized `AgentMessage` envelope into the requester's inbox so
+    // the leader sees the response in its next turn. Plan v6 §2.9 + §C.2.
+    // Best-effort; broker failure is logged but not fatal — the result
+    // is still on disk under turns/<turn>/tasks/<task_id>/result.stdout.
+    //
+    // Round-7 reflection (claude4 task-78 §3.2): use the orchestrator's
+    // authoritative `seq_global` for global ordering. If not provided
+    // (test path), skip the broker — tests don't exercise inter-agent
+    // messaging.
+    if let Some(requester) = from_agent_id_for_broker {
+        if let (Some(_app), Some(seq)) = (app, seq_global) {
+            broker_response_to_requester(
+                seq,
+                leader_handle,
+                run_id,
+                turn,
+                task_id,
+                &task_agent_id_for_broker,
+                &requester,
+                &last_line,
+            );
+        }
+    }
     done
+}
+
+/// Phase C response-broker. Writes an `AgentMessage` envelope to the
+/// requester's inbox with the responding agent's stdout last-line as the
+/// content. Best-effort: errors logged, never propagated.
+///
+/// The orchestrator brokers because non-leader agents are NOT authorized
+/// to write to other inboxes directly (preserves writer-monopoly invariant
+/// from plan v6 §2.3 authorization rules). The orchestrator's authority
+/// is implicit (`SenderKind::Orchestrator`).
+///
+/// Round-7 reflection (claude4 task-78 §3.2): takes `&AtomicU64` directly
+/// so it can use the orchestrator's authoritative `state.seq_global` for
+/// global ordering. Earlier first-cut allocated an ephemeral counter
+/// initialized from wall-clock; that violated the writer-monopoly invariant
+/// because concurrent broker calls within the same millisecond could stamp
+/// duplicate seq values. Now globally monotonic.
+fn broker_response_to_requester(
+    seq_global: &std::sync::atomic::AtomicU64,
+    leader_handle: &str,
+    run_id: &str,
+    turn: u32,
+    task_id: &str,
+    responder_agent_id: &str,
+    requester_agent_id: &str,
+    response_summary: &str,
+) {
+    use crate::fsd::inbox::{InboxMessagePartial, InboxScope, InboxState, MessageKind, SenderKind};
+
+    let scope = InboxScope::Agent {
+        agent_id: requester_agent_id.to_string(),
+    };
+    let partial = InboxMessagePartial {
+        message_id: crate::fsd::inbox::generate_message_id_pub(),
+        sender_id: format!("agent-{}", responder_agent_id),
+        sender_kind: SenderKind::Orchestrator,
+        target_id: format!("agent-{}", requester_agent_id),
+        kind: MessageKind::AgentMessage,
+        content: format!(
+            "[Response from agent {} for task {} (turn {} of run {} on leader {})]\n{}",
+            responder_agent_id, task_id, turn, run_id, leader_handle, response_summary
+        ),
+        created_at_ms: crate::fsd::inbox::now_ms_pub(),
+        run_id: Some(run_id.to_string()),
+        task_id: Some(task_id.to_string()),
+        turn: None, // AgentMessage kind rejects turn per envelope invariant
+        source_cmd_id: None,
+        sn: None,
+        rn: None,
+        attempt: 1,
+    };
+    if let Err(e) = crate::fsd::storage::write_inbox_payload_atomic(
+        &scope,
+        &partial,
+        InboxState::Pending,
+        seq_global,
+    ) {
+        eprintln!(
+            "fsd: Phase C broker write_inbox_payload_atomic({} → {}) failed: {} \
+             (response is still on disk at turns/{}/tasks/{}/result.stdout)",
+            responder_agent_id, requester_agent_id, e, turn, task_id
+        );
+    }
 }
 
 /// Public alias of `record_strike` for external callers (e.g. the
@@ -1484,6 +1837,51 @@ fn update_manifest_status(leader_handle: &str, run_id: &str, status: RunStatus) 
     })();
 }
 
+/// Transition manifest status only if the prior status passes
+/// `precondition`. Returns `Some(prior)` if the write happened,
+/// `None` if the precondition rejected the write or any IO failed.
+///
+/// Round-10 reflection per claude2 task-2 §1: closes the manifest-status
+/// race window where `handle_dispatch`'s post-tasks `awaiting_leader`
+/// write could clobber a concurrent `handle_done`/`handle_blocked`/
+/// `cancel_run` terminal write. The remaining read→write window is
+/// intra-function (no async, no event emit) so the race is reduced
+/// from "process-wide" to "single small read+write".
+///
+/// **Round-11 known limitation** (codex1+claude2+codex2 converged): the
+/// helper is NOT disk-atomic. There is no flock or rename-CAS, so two
+/// threads can both pass `precondition` then both write. Last-write
+/// wins on disk; the only path that writes a non-terminal status is
+/// `handle_dispatch`'s `AwaitingLeader` transition, while terminal
+/// writers (`done`/`blocked`/`cancel`/`cap-trip`) write through
+/// `update_manifest_status`. So the residual race is `Done` →
+/// `AwaitingLeader` (clobber) → `Done` again (terminal handler
+/// re-overwrites). **Manifest converges to terminal correctly**;
+/// `final.json` is the source of truth. The `state.fsd_runs`
+/// belt-and-braces checks at the dispatch site further suppress the
+/// phantom `inject_iteration_report` emit. A truly atomic fix would
+/// need `flock` or rename-CAS — deferred pending empirical macOS/Linux
+/// flock semantics verification (Obsidian observation 2026-05-02).
+fn try_transition_manifest_status(
+    leader_handle: &str,
+    run_id: &str,
+    new_status: RunStatus,
+    precondition: impl Fn(RunStatus) -> bool,
+) -> Option<RunStatus> {
+    let root = get_memory_root().ok()?;
+    let abs = root.join(manifest_rel_path(leader_handle, run_id));
+    let raw = std::fs::read_to_string(&abs).ok()?;
+    let mut m: RunManifest = serde_json::from_str(&raw).ok()?;
+    let prior = m.status;
+    if !precondition(prior) {
+        return None;
+    }
+    m.status = new_status;
+    let json = serde_json::to_string_pretty(&m).ok()?;
+    std::fs::write(&abs, json).ok()?;
+    Some(prior)
+}
+
 fn update_manifest_heartbeat(leader_handle: &str, run_id: &str) {
     let _ = (|| -> Result<(), String> {
         let root = get_memory_root()?;
@@ -1498,6 +1896,26 @@ fn update_manifest_heartbeat(leader_handle: &str, run_id: &str) {
         std::fs::write(&abs, json).map_err(|e| e.to_string())?;
         Ok(())
     })();
+}
+
+/// Returns the first duplicate `agent_id` across the dispatch's task
+/// specs, or `None` if every spec carries a unique agent_id.
+///
+/// Round-10 reflection per codex3 task-5: PR-PreC's authorization model
+/// assumes `(run_id, agent_id)` is unique within a turn — duplicates
+/// would mean two concurrent task spawns share a single inbox lane,
+/// breaking the writer-monopoly invariant for response routing
+/// (`from_agent_id`) and producing nondeterministic prompt
+/// augmentation (`to_agent_id`'s drain would fan-in to two callers).
+fn find_duplicate_agent_id(tasks: &[TaskSpec]) -> Option<&str> {
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(tasks.len());
+    for spec in tasks {
+        if !seen.insert(spec.agent_id.as_str()) {
+            return Some(spec.agent_id.as_str());
+        }
+    }
+    None
 }
 
 fn write_run_file(
@@ -1620,22 +2038,91 @@ fn build_synthesis_pass_report(leader_handle: &str, run_id: &str, turn: u32) -> 
 
 async fn inject_iteration_report(
     app: &AppHandle,
+    state: &State<'_, AppState>,
     leader_handle: &str,
     run_id: &str,
     turn: u32,
     report: &str,
 ) {
-    // Emit-only path: the frontend listener on `fsd-iteration-report-{handle}`
-    // calls inject_into_pty with leader-tool-aware newline handling. Backend
-    // intentionally stays decoupled from ToolConfig.
-    let _ = app.emit(
-        &format!("fsd-iteration-report-{}", leader_handle),
-        serde_json::json!({
-            "run_id": run_id,
-            "turn": turn,
-            "report": report,
-        }),
-    );
+    // Plan v6 Phase B: feature-flagged delivery. When
+    // `settings.fsd_inbox_delivery == true`, write to
+    // `inbox/leader-<handle>/.pending/` and notify the LeaderInboxPoller.
+    // The poller picks it up and emits `fsd-inbox-leader-message-<handle>`.
+    // When `false` (default), use the existing direct `app.emit` path.
+    let phase_b_enabled = match crate::commands::settings::get_settings(app.clone()) {
+        Ok(s) => s.fsd_inbox_delivery,
+        Err(_) => false,
+    };
+
+    if phase_b_enabled {
+        // Phase B path: inbox-driven delivery via the LeaderInboxPoller.
+        match crate::fsd::inbox::write_iteration_report_pending(
+            &*state.seq_global,
+            leader_handle,
+            run_id,
+            turn,
+            report,
+        ) {
+            Ok(_filename) => {
+                // Notify the matching LeaderInboxPoller so it wakes
+                // immediately instead of waiting on the timer.
+                if let Ok(pollers) = state.leader_inbox_pollers.lock() {
+                    if let Some(entry) = pollers.get(leader_handle) {
+                        entry.notify.notify_one();
+                    }
+                }
+            }
+            Err(e) => {
+                // Fall back to legacy emit path on inbox-write failure so
+                // delivery never stalls. This is a defense-in-depth safety
+                // net; the typical Phase B success path doesn't emit.
+                eprintln!(
+                    "fsd: Phase B inbox-write failed ({}), falling back to legacy emit",
+                    e
+                );
+                let _ = app.emit(
+                    &format!("fsd-iteration-report-{}", leader_handle),
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "turn": turn,
+                        "report": report,
+                    }),
+                );
+            }
+        }
+    } else {
+        // Phase A legacy path: direct Tauri emit. Frontend listener on
+        // `fsd-iteration-report-{handle}` calls inject_into_pty with
+        // leader-tool-aware newline handling. Backend intentionally stays
+        // decoupled from ToolConfig.
+        let _ = app.emit(
+            &format!("fsd-iteration-report-{}", leader_handle),
+            serde_json::json!({
+                "run_id": run_id,
+                "turn": turn,
+                "report": report,
+            }),
+        );
+    }
+
+    // Plan v6 PR-4 shadow-audit hook (always runs regardless of flag).
+    // Best-effort write to `inbox/leader-<handle>/.audit/<filename>.json`
+    // for divergence analysis during the Phase A bake. Failure MUST NOT
+    // alter `DispatchResponse` — we swallow the error and log a warning.
+    // Plan v6 §2.4 + §2.6 + codex2 task-39 §6 (helper seam).
+    if let Err(e) = crate::fsd::inbox::write_iteration_report_audit(
+        &*state.seq_global,
+        leader_handle,
+        run_id,
+        turn,
+        report,
+    ) {
+        eprintln!(
+            "fsd: shadow-audit write failed for run {}/turn {}: {} \
+             (delivery via app.emit unaffected)",
+            run_id, turn, e
+        );
+    }
 }
 
 // ---- Helpers -----------------------------------------------------------------
@@ -1870,6 +2357,9 @@ mod tests {
                     prompt: "p".into(),
                     context_refs: vec![],
                     wallclock_ms_cap: 1000,
+                    agent_id: "00000001".into(),
+                    from_agent_id: None,
+                    to_agent_id: None,
                 },
                 "out".into(),
                 cwd.clone(),
@@ -1891,6 +2381,9 @@ mod tests {
                     tool: "claude_code".into(),
                     instance_idx: 1,
                     role_hint: None,
+                    agent_id: "00000001".into(),
+                    from_agent_id: None,
+                    to_agent_id: None,
                     prompt: "p".into(),
                     context_refs: vec![],
                     wallclock_ms_cap: 1000,
@@ -2138,6 +2631,9 @@ mod tests {
 
         let spec = TaskSpec {
             task_id: task_id.into(),
+                    agent_id: "00000001".into(),
+                    from_agent_id: None,
+                    to_agent_id: None,
             tool: "claude_code".into(),
             instance_idx: 1,
             role_hint: Some("test-role".into()),
@@ -2171,6 +2667,7 @@ mod tests {
             task_cancel_rx,
             Some(&runs),
             None, // no AppHandle in test
+            None, // no seq_global in test (broker not exercised — no from_agent_id)
         )
         .await;
 
@@ -2358,6 +2855,9 @@ mod tests {
             prompt: "fake prompt".into(),
             context_refs: vec![],
             wallclock_ms_cap: 60_000,
+            agent_id: "00000001".into(),
+            from_agent_id: None,
+            to_agent_id: None,
         };
         let task_path = TaskPath::try_new(&leader, run_id, turn, &task_spec.task_id).unwrap();
         let output_dir_rel = task_path
@@ -2600,5 +3100,219 @@ mod tests {
         assert!(handle.seen_cmd_ids.insert("dispatch-cmd-2".into()));
 
         assert_eq!(handle.seen_cmd_ids.len(), 3);
+    }
+
+    /// Build a minimal TaskSpec with the given agent_id for unit-test
+    /// fixtures. All other fields are filled with valid defaults.
+    fn make_task_spec_for_agent(agent_id: &str, task_id: &str) -> TaskSpec {
+        TaskSpec {
+            task_id: task_id.into(),
+            tool: "claude_code".into(),
+            instance_idx: 1,
+            role_hint: None,
+            prompt: "fixture prompt".into(),
+            context_refs: vec![],
+            wallclock_ms_cap: 60_000,
+            agent_id: agent_id.into(),
+            from_agent_id: None,
+            to_agent_id: None,
+        }
+    }
+
+    /// Round-10 reflection per codex3 task-5: PR-PreC dispatch-group
+    /// authorization assumes (run_id, agent_id) is unique within a turn.
+    /// `find_duplicate_agent_id` MUST surface the first repeat so
+    /// `handle_dispatch` can reject it as `Malformed` before any state
+    /// mutation. Closes the new "duplicate agent_id within one dispatch"
+    /// rejection path.
+    #[test]
+    fn find_duplicate_agent_id_returns_first_repeat() {
+        let tasks = vec![
+            make_task_spec_for_agent("aaaaaaaa", "t1"),
+            make_task_spec_for_agent("bbbbbbbb", "t2"),
+            make_task_spec_for_agent("aaaaaaaa", "t3"),
+        ];
+        assert_eq!(find_duplicate_agent_id(&tasks), Some("aaaaaaaa"));
+    }
+
+    #[test]
+    fn find_duplicate_agent_id_none_when_all_unique() {
+        let tasks = vec![
+            make_task_spec_for_agent("aaaaaaaa", "t1"),
+            make_task_spec_for_agent("bbbbbbbb", "t2"),
+            make_task_spec_for_agent("cccccccc", "t3"),
+        ];
+        assert_eq!(find_duplicate_agent_id(&tasks), None);
+    }
+
+    #[test]
+    fn find_duplicate_agent_id_none_for_empty_dispatch() {
+        let tasks: Vec<TaskSpec> = Vec::new();
+        assert_eq!(find_duplicate_agent_id(&tasks), None);
+    }
+
+    /// Round-10 reflection per claude2 task-2 §1: prove the conditional
+    /// transition helper rejects a stale write that would clobber a
+    /// terminal status. Closes the manifest-status race window between
+    /// `handle_dispatch`'s post-tasks `awaiting_leader` write and a
+    /// concurrent `handle_done`/`handle_blocked`/`cancel_run`.
+    #[test]
+    fn try_transition_manifest_status_rejects_when_terminal() {
+        // Set up env-isolated memory root + a manifest in Done state.
+        if std::env::var("CANVAS_TERMINAL_MEMORY_ROOT").is_err() {
+            let test_root = std::env::temp_dir()
+                .join(format!("canvas-terminal-fsd-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&test_root);
+            #[allow(unused_unsafe)]
+            unsafe {
+                std::env::set_var(
+                    "CANVAS_TERMINAL_MEMORY_ROOT",
+                    test_root.to_string_lossy().as_ref(),
+                );
+            }
+        }
+
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let leader = format!("test-race-{}-{}", std::process::id(), n);
+        let run_id = "race-run";
+
+        let manifest = RunManifest {
+            run_id: run_id.into(),
+            leader_handle: leader.clone(),
+            owner_pid: std::process::id(),
+            started_at: now_iso(),
+            last_heartbeat_at: now_iso(),
+            status: RunStatus::Done,
+            session_nonce: "abcdef01".into(),
+            run_nonce: "01234567".into(),
+        };
+        write_manifest(&leader, run_id, &manifest).expect("write manifest");
+
+        // Attempt to transition Done → AwaitingLeader with the precondition
+        // "prior must be Dispatching" — this is the exact pattern at the
+        // dispatch site. Should reject and leave manifest unchanged.
+        let result = try_transition_manifest_status(
+            &leader,
+            run_id,
+            RunStatus::AwaitingLeader,
+            |prior| prior == RunStatus::Dispatching,
+        );
+        assert!(
+            result.is_none(),
+            "transition must be rejected when prior is terminal (Done)"
+        );
+
+        // Verify the manifest still reads Done — no clobber.
+        let after = read_manifest_for_run(&leader, run_id).expect("read manifest");
+        assert_eq!(
+            after.status,
+            RunStatus::Done,
+            "Done status must not be clobbered by AwaitingLeader (claude2 §1 race closed)"
+        );
+    }
+
+    #[test]
+    fn try_transition_manifest_status_accepts_when_precondition_passes() {
+        if std::env::var("CANVAS_TERMINAL_MEMORY_ROOT").is_err() {
+            let test_root = std::env::temp_dir()
+                .join(format!("canvas-terminal-fsd-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&test_root);
+            #[allow(unused_unsafe)]
+            unsafe {
+                std::env::set_var(
+                    "CANVAS_TERMINAL_MEMORY_ROOT",
+                    test_root.to_string_lossy().as_ref(),
+                );
+            }
+        }
+
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let leader = format!("test-race-ok-{}-{}", std::process::id(), n);
+        let run_id = "race-run-ok";
+
+        let manifest = RunManifest {
+            run_id: run_id.into(),
+            leader_handle: leader.clone(),
+            owner_pid: std::process::id(),
+            started_at: now_iso(),
+            last_heartbeat_at: now_iso(),
+            status: RunStatus::Dispatching,
+            session_nonce: "abcdef01".into(),
+            run_nonce: "01234567".into(),
+        };
+        write_manifest(&leader, run_id, &manifest).expect("write manifest");
+
+        let result = try_transition_manifest_status(
+            &leader,
+            run_id,
+            RunStatus::AwaitingLeader,
+            |prior| prior == RunStatus::Dispatching,
+        );
+        assert_eq!(result, Some(RunStatus::Dispatching), "should return prior status");
+
+        let after = read_manifest_for_run(&leader, run_id).expect("read manifest");
+        assert_eq!(after.status, RunStatus::AwaitingLeader);
+    }
+
+    /// Round-11 reflection per codex1+claude2+codex2 (3/5 reviewers):
+    /// belt-and-braces in-memory `fsd_runs` check at the dispatch
+    /// finish site. Every terminal handler removes the run from
+    /// `fsd_runs` BEFORE its manifest write, so an absent in-memory
+    /// entry is a leading-edge signal that "run is terminating" and
+    /// the dispatch finish path should suppress its `AwaitingLeader`
+    /// transition + `inject_iteration_report` emit.
+    ///
+    /// This pure test exercises the in-memory contains_key invariant
+    /// the dispatch site uses (orchestrator.rs:951+989). The full
+    /// async path is exercised via the existing
+    /// `integration_plan_dispatch_iteration_report_done_flow`.
+    #[test]
+    fn fsd_runs_absent_signals_terminating_run() {
+        use crate::state::FsdRunHandle;
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Mutex;
+        use tokio::sync::oneshot;
+
+        let run_id = "race-runtime-removal";
+        let leader = "test-leader-race".to_string();
+
+        // Build a real fsd_runs map with one run registered.
+        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
+        let handle = FsdRunHandle {
+            leader_handle: leader.clone(),
+            run_id: run_id.into(),
+            cancel_tx: Some(cancel_tx),
+            task_cancel_txs: HashMap::new(),
+            max_turns: 4,
+            current_turn: 1,
+            seen_cmd_ids: HashSet::new(),
+            consecutive_strikes: 0,
+        };
+        let runs = Mutex::new({
+            let mut m = HashMap::new();
+            m.insert(run_id.to_string(), handle);
+            m
+        });
+
+        // Pre-check (run still alive) — dispatch finish would proceed.
+        assert!(
+            runs.lock().unwrap().contains_key(run_id),
+            "run must be present pre-check (terminal handler hasn't run yet)"
+        );
+
+        // Simulate handle_done's `remove_run_and_cancel` removing the
+        // entry — this is the leading edge of run termination.
+        let removed = runs.lock().unwrap().remove(run_id);
+        assert!(removed.is_some(), "run was registered, must remove cleanly");
+
+        // Post-check (run gone) — dispatch finish must suppress emit.
+        assert!(
+            !runs.lock().unwrap().contains_key(run_id),
+            "absent fsd_runs entry signals concurrent terminal handler — emit must be skipped"
+        );
     }
 }

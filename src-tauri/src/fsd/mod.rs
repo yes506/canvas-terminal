@@ -33,9 +33,13 @@
 //! Phase 1 ships: storage, process_group, recovery, schema, runner (stdio
 //! only), orchestrator (single-CLI Pilot per plan v5 §5.1).
 
+pub(crate) mod inbox;
+pub(crate) mod leader_outbox_watcher;
 pub(crate) mod orchestrator;
+pub(crate) mod poller;
 pub(crate) mod process_group;
 pub(crate) mod recovery;
 pub(crate) mod runner;
 pub(crate) mod schema;
 pub(crate) mod storage;
+pub(crate) mod worker_runner;

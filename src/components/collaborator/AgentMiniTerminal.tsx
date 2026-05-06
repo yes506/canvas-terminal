@@ -19,6 +19,23 @@ import { createFsdLineTap } from "../../lib/fsdLineTap";
 import type { ParseResult } from "../../lib/fsdProtocol";
 import { isEnvBootstrapped } from "../../lib/terminalManager";
 import type { ToolConfig } from "../../types/collaborator";
+import type { MessageKind } from "../../types/inbox";
+
+/// Plan v6 Phase B Tauri event payload for `fsd-inbox-leader-message-{handle}`.
+/// Mirrors the JSON emitted by `LeaderInboxPoller` at `poller.rs:223-231`.
+/// Round-8 reflection per claude5 task-85 §2.2: type `kind` as the typed
+/// `MessageKind` union from `types/inbox.ts` so a future `MessageKind`
+/// variant change surfaces as a TS compile error here, not a silent
+/// fallthrough to the `else` branch.
+type InboxLeaderEventPayload = {
+  message_id: string;
+  kind: MessageKind;
+  content: string;
+  run_id: string | null;
+  task_id: string | null;
+  turn: number | null;
+  seq_global: number;
+};
 import { X } from "lucide-react";
 import { FsdToggle } from "./FsdToggle";
 import { FsdRunChip } from "./FsdRunChip";
@@ -1149,6 +1166,34 @@ export function AgentMiniTerminal({
         );
       },
     );
+    // Plan v6 Phase B: when `fsd_inbox_delivery=true` the orchestrator
+    // routes iteration reports through `LeaderInboxPoller` which emits
+    // `fsd-inbox-leader-message-{handle}` instead of the legacy
+    // `fsd-iteration-report-{handle}`. Without this listener, enabling the
+    // feature flag would silently drop iteration reports — codex2 task-75
+    // P0 + codex3 task-77 P0. Maps to the same `injectFsdLeaderText`
+    // pipeline as the legacy event.
+    const unlistenInboxLeaderMsg = listen<InboxLeaderEventPayload>(
+      `fsd-inbox-leader-message-${handle}`,
+      (e) => {
+        const p = e.payload;
+        if (p.kind === "iteration_report" && p.turn != null && p.run_id != null) {
+          injectFsdLeaderText(
+            [
+              "[FSD ITERATION REPORT]",
+              `run_id: ${p.run_id}`,
+              `turn: ${p.turn}`,
+              "",
+              sanitizeFsd(p.content),
+            ].join("\n"),
+          );
+        } else {
+          // Other inbox kinds (broadcast, agent_message, control) inject the
+          // raw content; the leader's prompt handles classification.
+          injectFsdLeaderText(sanitizeFsd(p.content));
+        }
+      },
+    );
     // fsd-task-start makes the SwarmDrawer chip appear immediately when the
     // task is dispatched (per @claude2 task-49 §3.1) — without this the
     // drawer was empty until tasks completed.
@@ -1172,6 +1217,7 @@ export function AgentMiniTerminal({
     return () => {
       unlistenStart.then((u) => u()).catch(() => {});
       unlistenReport.then((u) => u()).catch(() => {});
+      unlistenInboxLeaderMsg.then((u) => u()).catch(() => {});
       unlistenTaskStart.then((u) => u()).catch(() => {});
       unlistenDone.then((u) => u()).catch(() => {});
       unlistenEnd.then((u) => u()).catch(() => {});

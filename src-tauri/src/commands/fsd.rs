@@ -20,8 +20,13 @@ pub struct FsdSetTierResponse {
 /// Activate FSD for a leader, generating a session_nonce. Tier 0 = Off
 /// (deactivates and cleans up). Tier ≥ 1 = active (Phase 1: only Pilot=1
 /// supported per plan v5 §5.1).
+///
+/// Plan v6 Phase B: also manages the per-leader `LeaderInboxPoller`
+/// lifecycle. On tier-on, spawn a poller for `leader_handle`. On tier-off,
+/// abort and remove the poller (handled via Drop on `LeaderPollerEntry`).
 #[tauri::command]
 pub fn fsd_set_tier(
+    app: AppHandle,
     state: State<'_, AppState>,
     leader_session_id: String,
     leader_handle: String,
@@ -30,6 +35,12 @@ pub fn fsd_set_tier(
     let mut leaders = state.fsd_leaders.lock().map_err(|e| e.to_string())?;
     if tier == 0 {
         leaders.remove(&leader_handle);
+        // Plan v6 Phase B: tier-off aborts the leader's inbox poller via
+        // `LeaderPollerEntry::Drop`. Removing the entry from the HashMap
+        // drops it, which calls `JoinHandle::abort()` on the spawned task.
+        if let Ok(mut pollers) = state.leader_inbox_pollers.lock() {
+            pollers.remove(&leader_handle);
+        }
         return Ok(FsdSetTierResponse {
             session_nonce: String::new(),
             emission_mode: EmissionMode::Unavailable,
@@ -52,6 +63,28 @@ pub fn fsd_set_tier(
             tier,
         },
     );
+
+    // Plan v6 Phase B: spawn the per-leader inbox poller. The poller's
+    // JoinHandle + Notify go into AppState.leader_inbox_pollers; tier-off
+    // removes the entry which triggers Drop → abort. Idempotent on tier-on
+    // for the same leader_handle: replace any existing entry.
+    if let Ok(mut pollers) = state.leader_inbox_pollers.lock() {
+        // If a previous poller exists for this handle, remove (and abort) it
+        // before inserting the new one — preserves single-poller-per-leader.
+        pollers.remove(&leader_handle);
+        let handle = crate::fsd::poller::spawn_leader_inbox_poller(
+            app.clone(),
+            leader_handle.clone(),
+        );
+        pollers.insert(
+            leader_handle.clone(),
+            crate::state::LeaderPollerEntry {
+                join: handle.join,
+                notify: handle.notify,
+            },
+        );
+    }
+
     Ok(FsdSetTierResponse {
         session_nonce,
         // Phase 1 default: prompt-eng path. MCP coexistence path (plan v5 §4.4)

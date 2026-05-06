@@ -36,6 +36,11 @@ futures = "0.3"
 rand = "0.8"
 hex = "0.4"
 
+# Plan v6 Phase B: filesystem watcher for the LeaderInboxPoller wake mechanism.
+# Primary wake on tokio::sync::Notify (in-process); fallback to notify (cross-
+# process / external recovery); 250ms timer as last-resort.
+notify = "6"
+
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` is the cleanest way to drive an axum Router
 # in unit tests without binding a real TCP port. Test-only — the production

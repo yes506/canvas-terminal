@@ -9,12 +9,27 @@ fn default_auto_check_updates() -> bool {
     true
 }
 
+fn default_fsd_inbox_delivery() -> bool {
+    // Plan v6 Phase B feature flag. Defaults `false` so Phase A's
+    // `app.emit("fsd-iteration-report-{handle}", ...)` path remains the
+    // canonical delivery mechanism until the bake validates the inbox
+    // path. Operators flip to `true` to switch the leader's
+    // iteration_report delivery to the `LeaderInboxPoller`-driven path.
+    false
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_auto_check_updates")]
     pub auto_check_updates: bool,
     #[serde(default)]
     pub last_skipped_version: Option<String>,
+    /// Plan v6 Phase B rollout flag. When `true`, iteration_report delivery
+    /// goes through `inbox/leader-<handle>/.pending/` + `LeaderInboxPoller`.
+    /// When `false`, the existing `fsd-iteration-report-<handle>` Tauri
+    /// event path is used directly. Default `false` for safe rollout.
+    #[serde(default = "default_fsd_inbox_delivery")]
+    pub fsd_inbox_delivery: bool,
 }
 
 impl Default for Settings {
@@ -22,6 +37,7 @@ impl Default for Settings {
         Self {
             auto_check_updates: true,
             last_skipped_version: None,
+            fsd_inbox_delivery: default_fsd_inbox_delivery(),
         }
     }
 }

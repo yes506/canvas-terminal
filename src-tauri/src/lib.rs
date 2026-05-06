@@ -94,6 +94,22 @@ pub fn run() {
             // IMPORTANT order: this runs FIRST and only matches `session-<pid>`
             // dirs (verified plan v5 §1.2), so `fsd-runs/` is preserved.
             let _ = commands::memory::clear_stale_sessions();
+            // Plan v6 PR-3a: recover the inbox `seq_global` counter from
+            // disk (persisted file fast-path + max-with-scan fallback) so
+            // the next-issued seq is monotonic across restart. MUST run
+            // BEFORE any inbox writers (e.g. the orchestrator's audit hook).
+            // Plan v6 §2.4 + §2.14 #21 (startup ordering).
+            //
+            // Then run the one-shot startup reapers (post-review wiring per
+            // claude5 task-49 §2.2): trim `.audit/` (>7d), `.processed/`
+            // (>24h), and stale `.processing/` claims (>30s). MUST run
+            // AFTER seq_global init so the scan sees all surviving files.
+            {
+                use tauri::Manager;
+                let state = app.state::<AppState>();
+                state.init_seq_global_from_disk();
+                state.init_inbox_reapers();
+            }
             // Then mark any in-flight FSD runs from a dead process as
             // interrupted (R15 catches both dead-PID and stale-heartbeat).
             // Run on a background tokio task so app setup isn't blocked.
@@ -155,6 +171,14 @@ pub fn run() {
             commands::fsd::fsd_cancel_run,
             commands::fsd::fsd_recover_runs,
             commands::fsd::fsd_report_malformed,
+            // FSD inbox subsystem (plan v6 PR-3b). Thin Tauri wrappers over
+            // the storage layer. No Phase A frontend consumer; scaffolded for
+            // Phase B's LeaderInboxPoller and Phase C's inbox UI.
+            commands::inbox::fsd_inbox_write_message,
+            commands::inbox::fsd_inbox_list_pending,
+            commands::inbox::fsd_inbox_claim,
+            commands::inbox::fsd_inbox_ack,
+            commands::inbox::fsd_inbox_reap_stale,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
