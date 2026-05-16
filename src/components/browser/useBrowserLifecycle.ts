@@ -199,14 +199,31 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
                 initialLoadIsBlankRef.current = initialUrl === "about:blank";
                 try {
                   await createBrowserWebview(initialUrl, rect);
+                  // Round-3 hygiene (impl-review @codex3 minor): the user
+                  // may have closed the drawer mid-build. If so, the queued
+                  // destroy will close the webview; don't mutate
+                  // Ready-related refs since they'd lie about the actual
+                  // state.
+                  if (cancelled || !useBrowserStore.getState().drawerOpen) {
+                    resolve();
+                    return;
+                  }
                   webviewReadyRef.current = true;
                   setError(null);
                   // Drain any URL deferred by the settings-resolve-during-
                   // create race (impl-review R2 codex2 P2 + codex3 #1).
+                  // Round-3 (impl-review @claude3 M1): only drain if the
+                  // user hasn't manually navigated away from about:blank
+                  // in the window between settings-resolve and our
+                  // createBrowserWebview returning. Address-bar submit
+                  // sets currentUrl directly via setCurrentUrl on
+                  // browser-loading, so this also covers the case where
+                  // an early manual navigation completed first.
                   if (
                     pendingRestoredUrlRef.current &&
                     initialUrl === "about:blank" &&
-                    useBrowserStore.getState().drawerOpen
+                    useBrowserStore.getState().drawerOpen &&
+                    useBrowserStore.getState().currentUrl === "about:blank"
                   ) {
                     const restored = pendingRestoredUrlRef.current;
                     pendingRestoredUrlRef.current = null;
@@ -219,6 +236,10 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
                         e,
                       );
                     }
+                  } else if (pendingRestoredUrlRef.current) {
+                    // User manually navigated already — discard the
+                    // pending restore so a later open doesn't surprise.
+                    pendingRestoredUrlRef.current = null;
                   }
                 } catch (err) {
                   const msg = err instanceof Error ? err.message : String(err);
