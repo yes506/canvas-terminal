@@ -1,8 +1,9 @@
 import { useRef, useCallback, RefObject } from "react";
 import { Globe, X } from "lucide-react";
 import { useBrowserStore } from "../../stores/browserStore";
-import { AddressBar } from "./AddressBar";
-import { NavControls } from "./NavControls";
+// DIAG: AddressBar + NavControls temporarily bypassed
+// import { AddressBar } from "./AddressBar";
+// import { NavControls } from "./NavControls";
 import { PageAreaHost } from "./PageAreaHost";
 import { useBrowserBounds } from "./useBrowserBounds";
 import { useBrowserLifecycle } from "./useBrowserLifecycle";
@@ -135,8 +136,44 @@ export function BrowserDrawer({
                 borderTop: "2px solid #00aaff", // TEMP DIAG
               }}
             >
-              <NavControls />
-              <AddressBar />
+              {/* DIAGNOSTIC: hardcoded raw input + button (NO child
+                  components) to isolate whether the issue is in
+                  NavControls/AddressBar themselves or in their
+                  parent's stacking context. If THIS raw input is
+                  visible, the issue is inside the child components.
+                  If it ISN'T visible, something is overlaying Row 2. */}
+              <button
+                type="button"
+                style={{
+                  padding: "4px 8px",
+                  background: "#ff00ff",
+                  color: "#ffffff",
+                  border: "1px solid #ffffff",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                  flexShrink: 0,
+                  fontSize: 11,
+                }}
+                onClick={() => console.info("[browser-drawer] DIAG button clicked")}
+              >
+                DIAG
+              </button>
+              <input
+                type="text"
+                placeholder="DIAG URL INPUT"
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  background: "#ffff00",
+                  color: "#000000",
+                  border: "2px solid #ff0000",
+                  borderRadius: 6,
+                  padding: "6px 12px",
+                  fontSize: 14,
+                  minHeight: 30,
+                  outline: "none",
+                }}
+              />
             </div>
             {/* Page area — the rect that Rust positions the child webview over */}
             <PageAreaHost ref={hostRef} />
