@@ -58,4 +58,12 @@ export interface DrawerLayoutClamp {
   clampDrawerWidth(input: ClampInput): number;
 }
 
+/**
+ * Phase-5 type-only placeholder. Same caveat as
+ * `urlScheme.ts::classifyScheme` — `declare const` is erased at TS
+ * emit time and has NO runtime binding. Implementation must replace
+ * with `export const clampDrawerWidth: DrawerLayoutClamp
+ * ["clampDrawerWidth"] = ...` (or function form) before any runtime
+ * consumer can use it.
+ */
 export declare const clampDrawerWidth: DrawerLayoutClamp["clampDrawerWidth"];

@@ -48,8 +48,18 @@ export interface UrlSchemeClassifier {
 }
 
 /**
- * Implemented during Phase-6+ (downstream task). Skeleton stub —
- * type-only export so downstream code can import without runtime
- * resolution failure.
+ * Phase-5 type-only placeholder.
+ *
+ * IMPORTANT (Phase-5 Round-1 codex2 P1 / codex3 #3 correction):
+ * `declare const` is erased at TS emit time and produces NO runtime
+ * binding. Type-checking succeeds, but any runtime import like
+ * `import { classifyScheme } from "./urlScheme"` followed by an
+ * actual call WILL FAIL at module load with "classifyScheme is not
+ * a function". Treat this export as a **type-check-only** signature
+ * placeholder; implementation must REPLACE this `declare const`
+ * with a real `export const classifyScheme: UrlSchemeClassifier
+ * ["classifyScheme"] = (input) => { ... }` or
+ * `export function classifyScheme(input) { ... }` form before any
+ * runtime consumer can use it.
  */
 export declare const classifyScheme: UrlSchemeClassifier["classifyScheme"];

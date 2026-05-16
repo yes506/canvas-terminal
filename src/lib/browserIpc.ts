@@ -294,7 +294,11 @@ export interface BrowserIpc {
    *   read-modify-write cycle.
    *
    * Preconditions: AppState.settings_io_lock is registered in the
-   *   Tauri app's managed state (Phase 5 skeleton adds this).
+   *   Tauri app's managed state. NOTE (Phase-5 Round-1 codex2 P2):
+   *   Phase 5 skeleton only DOCUMENTS this requirement; the field
+   *   itself is materialized during implementation (per
+   *   `.planner-state.json::implementation_prerequisites::
+   *   state_types_to_materialize`).
    *
    * Postconditions: The two browser fields in settings.json
    *   reflect the patch values; other fields (auto_check_updates,
