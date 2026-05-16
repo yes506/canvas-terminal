@@ -191,6 +191,25 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
                   width: r.width,
                   height: r.height,
                 };
+                // Diagnostic logging — investigating user report
+                // "URL input invisible". If the webview is overlapping
+                // Row 2, this rect's `y` will be SMALLER than expected
+                // (the drawer's chrome takes ~72px, so a correctly
+                // positioned host should have y >= chromeRowsHeight
+                // relative to its parent flex column).
+                console.info(
+                  "[browser-drawer] createBrowserWebview rect:",
+                  JSON.stringify(rect),
+                  "host parent rect:",
+                  host.parentElement
+                    ? JSON.stringify({
+                        x: host.parentElement.getBoundingClientRect().left,
+                        y: host.parentElement.getBoundingClientRect().top,
+                        w: host.parentElement.getBoundingClientRect().width,
+                        h: host.parentElement.getBoundingClientRect().height,
+                      })
+                    : "no parent",
+                );
                 if (rect.width <= 0 || rect.height <= 0) return resolve();
 
                 // Read latest store values INSIDE the rAF (codex3 #2 fix).
