@@ -18,14 +18,7 @@ export const PageAreaHost = forwardRef<HTMLDivElement>(function PageAreaHost(
       ref={ref}
       className="flex-1 min-h-0 w-full"
       data-browser-page-area
-      // TEMP DIAGNOSTIC (impl-review round 5-UX): bright red background
-      // so the user can visually see WHERE the host element is, which
-      // is also where the OS-layer webview is positioned. If red is
-      // visible above the URL input row, the rect/coordinate is wrong
-      // and the webview is covering Row 2. If red is only visible
-      // below Row 2, the rect is correct and the input invisibility
-      // has a different root cause.
-      style={{ background: "#ff0000" }}
+      style={{ background: "#0a0a0a" }}
     />
   );
 });
