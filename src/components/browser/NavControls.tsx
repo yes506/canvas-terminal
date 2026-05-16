@@ -12,63 +12,58 @@ import {
  * rendered separately in BrowserDrawer's top row so it can't squeeze the
  * address bar.
  *
- * Buttons are always-enabled (Phase-3 Round-2: Tauri 2 has no reliable
- * canGoBack/canGoForward source in v1). Clicks at history boundaries are
- * no-ops inside the webview.
+ * Round-5-UX: switched fully to inline styles to bypass any Tailwind
+ * JIT/cache miss. The previous Tailwind-based version may have had
+ * specific classes (text-text-muted, hover:bg-surface-lighter,
+ * text-accent, animate-spin) silently dropped from the dev bundle.
  */
 export function NavControls() {
   const isLoading = useBrowserStore((s) => s.isLoading);
 
   const fireAndForget = (fn: () => Promise<void>) => () => {
     fn().catch(() => {
-      // Silent; common case is "browser webview not created" if drawer is
-      // closing — the next open will re-create.
+      // Silent; "browser webview not created" if drawer is closing.
     });
   };
 
+  const btnStyle: React.CSSProperties = {
+    padding: 4,
+    color: "#999999",
+    background: "transparent",
+    border: "none",
+    cursor: "pointer",
+    borderRadius: 4,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  };
+
   return (
-    <div className="flex items-center gap-0.5 flex-shrink-0">
-      <button
-        type="button"
-        className="p-1 text-text-muted hover:text-text hover:bg-surface-lighter rounded transition-colors"
-        onClick={fireAndForget(browserGoBack)}
-        title="Back"
-        aria-label="Back"
-      >
-        <ArrowLeft size={14} />
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 2,
+        flexShrink: 0,
+      }}
+    >
+      <button type="button" style={btnStyle} onClick={fireAndForget(browserGoBack)} title="Back" aria-label="Back">
+        <ArrowLeft size={16} color="#cccccc" />
       </button>
-      <button
-        type="button"
-        className="p-1 text-text-muted hover:text-text hover:bg-surface-lighter rounded transition-colors"
-        onClick={fireAndForget(browserGoForward)}
-        title="Forward"
-        aria-label="Forward"
-      >
-        <ArrowRight size={14} />
+      <button type="button" style={btnStyle} onClick={fireAndForget(browserGoForward)} title="Forward" aria-label="Forward">
+        <ArrowRight size={16} color="#cccccc" />
       </button>
       {isLoading ? (
-        <button
-          type="button"
-          className="p-1 text-text-muted hover:text-text hover:bg-surface-lighter rounded transition-colors"
-          onClick={fireAndForget(browserStop)}
-          title="Stop"
-          aria-label="Stop"
-        >
-          <StopIcon size={14} />
+        <button type="button" style={btnStyle} onClick={fireAndForget(browserStop)} title="Stop" aria-label="Stop">
+          <StopIcon size={16} color="#cccccc" />
         </button>
       ) : (
-        <button
-          type="button"
-          className="p-1 text-text-muted hover:text-text hover:bg-surface-lighter rounded transition-colors"
-          onClick={fireAndForget(browserReload)}
-          title="Reload"
-          aria-label="Reload"
-        >
-          <RotateCw size={14} />
+        <button type="button" style={btnStyle} onClick={fireAndForget(browserReload)} title="Reload" aria-label="Reload">
+          <RotateCw size={16} color="#cccccc" />
         </button>
       )}
       {isLoading && (
-        <Loader2 size={12} className="text-accent animate-spin ml-1 flex-shrink-0" />
+        <Loader2 size={14} color="#ffffff" style={{ marginLeft: 4, flexShrink: 0 }} />
       )}
     </div>
   );

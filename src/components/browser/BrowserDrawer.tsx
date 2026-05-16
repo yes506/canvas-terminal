@@ -105,12 +105,25 @@ export function BrowserDrawer({
                 <X size={15} />
               </button>
             </div>
-            {/* Row 2: nav controls + address bar — gets the full drawer
-                width so the URL input is always usable. Inline bg keeps
-                the row visually distinct from the input field below. */}
+            {/* Row 2: nav controls + address bar. ALL inline styles
+                (no Tailwind) — round-5-UX investigation showed that
+                Row 2's contents weren't rendering even after the
+                AddressBar input was converted to inline styles. The
+                bright blue border is a TEMP DIAGNOSTIC to confirm the
+                row is in the DOM at all; will be reverted in the
+                next fix. */}
             <div
-              className="flex items-center gap-2 px-3 border-b border-surface-lighter flex-shrink-0"
-              style={{ background: "#1a1a1a", minHeight: 40 }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "0 12px",
+                background: "#1a1a1a",
+                minHeight: 44,
+                flexShrink: 0,
+                borderBottom: "1px solid #3a3a3a",
+                borderTop: "2px solid #00aaff", // TEMP DIAG
+              }}
             >
               <NavControls />
               <AddressBar />
