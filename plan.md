@@ -339,7 +339,7 @@ browser feature:
 | Criterion | Score | Notes |
 |---|---|---|
 | Decomposition completeness | 4 | Every Phase-1 in-scope feature (#1–#11) maps to at least one node in the 46-node decomposition. Verified in mapping table (Phase-3 revision 3). |
-| Docstring quality | 4 | All 19 emitted methods carry all 9 fields with substantive content. claude2 Round-1 spot-checked `create_browser_webview`: Failure-modes enumerates 4 distinct error variants; Postconditions calls out the lock-order invariant. |
+| Docstring quality | 4 | All 20 emitted methods plus the documented `ValidateBrowserUrlSignature` type-alias contract carry all 9 fields with substantive content. claude2 Round-1 spot-checked `create_browser_webview`: Failure-modes enumerates 4 distinct error variants; Postconditions calls out the lock-order invariant. |
 | Interface cohesion | 4 | `BrowserCommands` (9 methods) is cohesive — all 9 are Tauri commands operating on the browser webview's lifecycle / navigation / persistence. `BrowserIpc` mirrors it on the TS side. No god-interface; no grab-bags. |
 | Dependency direction | 4 | DAG (`plan.mmd`) is acyclic. The toggle convergence point (`browserStore.toggle()`) prevents a double-write race. Lock-order convention prevents Mutex inversions. Slot-reservation eliminates the create TOCTOU. |
 | Validation status | 4 | Phase 6 (`tsc --noEmit` + `cargo check`) passed cleanly first run; passed again after Round-1 patch. Phase 7 header/Mermaid smoke-check: PASS. |

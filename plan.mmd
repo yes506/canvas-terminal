@@ -1,8 +1,11 @@
 flowchart LR
     %% Plan-phase Mermaid DAG for browser-drawer feature.
     %% Generated at Phase 7 (feature lane) from Phase-3 decomposition.
-    %% Interface-level edges; per-method DAG lives in
-    %% shared-memory/task-30-claude1-plan-phase3.md.
+    %% Interface-level edges (~16 module nodes); the full per-method
+    %% DAG with 46 nodes lives in the sibling `plan-detail.mmd`
+    %% (also on the planner branch — added Round-1 plan.md/plan.mmd
+    %% review per @claude2 F1). Original Phase-3 reasoning is in
+    %% shared memory at task-30-claude1-plan-phase3.md (revision 3).
 
     subgraph User["User-trigger sources"]
         UDrag[Drag drawer edge]
