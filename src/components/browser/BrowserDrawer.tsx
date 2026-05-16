@@ -24,6 +24,7 @@ export function BrowserDrawer({
   const drawerWidth = useBrowserStore((s) => s.drawerWidth);
   const setDrawerWidth = useBrowserStore((s) => s.setDrawerWidth);
   const toggle = useBrowserStore((s) => s.toggle);
+  const pageTitle = useBrowserStore((s) => s.pageTitle);
 
   const hostRef = useRef<HTMLDivElement>(null) as RefObject<HTMLDivElement>;
   const draggingRef = useRef(false);
@@ -39,8 +40,6 @@ export function BrowserDrawer({
       draggingRef.current = true;
       const onMouseMove = (ev: MouseEvent) => {
         if (!draggingRef.current) return;
-        // Right-side drawer: cursor X from the right of the container is
-        // the proposed width.
         const proposed = containerWidth - ev.clientX;
         const clamped = clampDrawerWidth({
           proposedWidth: proposed,
@@ -62,7 +61,6 @@ export function BrowserDrawer({
 
   return (
     <>
-      {/* Drag handle — visible only when drawer is open */}
       {drawerOpen && (
         <div
           className="w-1 flex-shrink-0 bg-surface-lighter hover:bg-accent cursor-col-resize transition-colors"
@@ -71,7 +69,6 @@ export function BrowserDrawer({
           role="separator"
         />
       )}
-      {/* Drawer panel — always mounted, width controlled by CSS */}
       <div
         className="flex flex-col flex-shrink-0 h-full bg-surface-light border-l border-surface-lighter overflow-hidden"
         style={{
@@ -81,22 +78,34 @@ export function BrowserDrawer({
       >
         {drawerOpen && (
           <>
-            {/* Chrome row: nav buttons + address bar + close */}
-            <div className="flex items-center gap-1 px-2 py-1 border-b border-surface-lighter bg-surface flex-shrink-0">
+            {/* Row 1: title bar — Globe icon + page title + close button.
+                Two-row chrome layout (industry standard) keeps the address
+                bar from being squeezed when a long page title loads. */}
+            <div className="flex items-center gap-2 px-2 py-1.5 border-b border-surface-lighter bg-surface flex-shrink-0 min-h-[28px]">
               <Globe size={12} className="text-text-muted flex-shrink-0" />
-              <NavControls />
-              <AddressBar />
+              <span
+                className="flex-1 min-w-0 text-[11px] text-text-muted truncate"
+                title={pageTitle || "Browser"}
+              >
+                {pageTitle || "Browser"}
+              </span>
               <button
                 type="button"
                 className="p-1 text-text-muted hover:text-red-400 hover:bg-surface-lighter rounded transition-colors flex-shrink-0"
                 onClick={toggle}
-                title="Close Browser"
+                title="Close Browser (Cmd+Shift+B)"
                 aria-label="Close browser drawer"
               >
                 <X size={14} />
               </button>
             </div>
-            {/* Page area host — the rect that Rust positions the child webview over */}
+            {/* Row 2: nav controls + address bar — gets the full drawer
+                width so the URL input is always usable. */}
+            <div className="flex items-center gap-1 px-2 py-1.5 border-b border-surface-lighter bg-surface flex-shrink-0 min-h-[34px]">
+              <NavControls />
+              <AddressBar />
+            </div>
+            {/* Page area — the rect that Rust positions the child webview over */}
             <PageAreaHost ref={hostRef} />
           </>
         )}

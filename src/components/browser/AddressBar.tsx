@@ -40,13 +40,13 @@ export function AddressBar() {
         placeholder="Enter URL"
         className={`flex-1 min-w-0 bg-surface border ${
           error ? "border-red-400" : "border-surface-lighter"
-        } px-2 py-1 text-xs text-text rounded outline-none focus:border-accent`}
+        } px-2 py-1 text-xs text-text rounded outline-none focus:border-accent min-h-[24px]`}
         spellCheck={false}
         aria-label="Address bar"
       />
       {error && (
         <span
-          className="text-[10px] text-red-400 truncate max-w-[180px]"
+          className="text-[10px] text-red-400 truncate max-w-[180px] flex-shrink-0"
           title={error}
         >
           {error}

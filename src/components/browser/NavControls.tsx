@@ -8,15 +8,16 @@ import {
 } from "../../lib/browserIpc";
 
 /**
- * Back / forward / reload / stop + loading spinner + page title.
+ * Back / forward / reload-or-stop + loading spinner. The page title is
+ * rendered separately in BrowserDrawer's top row so it can't squeeze the
+ * address bar.
  *
- * Buttons are always-enabled (per Phase-3 Round-2: Tauri 2 has no reliable
+ * Buttons are always-enabled (Phase-3 Round-2: Tauri 2 has no reliable
  * canGoBack/canGoForward source in v1). Clicks at history boundaries are
  * no-ops inside the webview.
  */
 export function NavControls() {
   const isLoading = useBrowserStore((s) => s.isLoading);
-  const pageTitle = useBrowserStore((s) => s.pageTitle);
 
   const fireAndForget = (fn: () => Promise<void>) => () => {
     fn().catch(() => {
@@ -26,7 +27,7 @@ export function NavControls() {
   };
 
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="flex items-center gap-0.5 flex-shrink-0">
       <button
         type="button"
         className="p-1 text-text-muted hover:text-text hover:bg-surface-lighter rounded transition-colors"
@@ -68,14 +69,6 @@ export function NavControls() {
       )}
       {isLoading && (
         <Loader2 size={12} className="text-accent animate-spin ml-1 flex-shrink-0" />
-      )}
-      {pageTitle && (
-        <span
-          className="ml-2 text-[11px] text-text-muted truncate max-w-[160px]"
-          title={pageTitle}
-        >
-          {pageTitle}
-        </span>
       )}
     </div>
   );
