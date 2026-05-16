@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod canvas;
 pub mod dashboard;
 pub mod memory;
