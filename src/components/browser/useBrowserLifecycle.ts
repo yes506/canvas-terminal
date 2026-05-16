@@ -212,34 +212,53 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
                   setError(null);
                   // Drain any URL deferred by the settings-resolve-during-
                   // create race (impl-review R2 codex2 P2 + codex3 #1).
-                  // Round-3 (impl-review @claude3 M1): only drain if the
-                  // user hasn't manually navigated away from about:blank
-                  // in the window between settings-resolve and our
-                  // createBrowserWebview returning. Address-bar submit
-                  // sets currentUrl directly via setCurrentUrl on
-                  // browser-loading, so this also covers the case where
-                  // an early manual navigation completed first.
+                  //
+                  // Round-4 fix (impl-review R4 codex2 P1 + codex3 high,
+                  // 2-way convergent): the R3 manual-nav guard of
+                  // `currentUrl === "about:blank"` was too aggressive.
+                  // The settings-restore handler itself calls
+                  // setCurrentUrl(restored) BEFORE queuing
+                  // pendingRestoredUrlRef, so by the time we reach this
+                  // drain check, currentUrl is ALREADY the restored URL
+                  // — not the user manually navigating away. The R3
+                  // check discarded the pending URL in exactly the
+                  // scenario R2 was trying to fix.
+                  //
+                  // Correct "no manual nav" check: currentUrl is either
+                  // still about:blank (no writes since create started)
+                  // OR equals the pending restored URL (settings-restore
+                  // wrote it; that's the only writer that could have
+                  // fired during the create-in-flight window because
+                  // manual nav via navigateBrowser would have failed
+                  // with "browser webview not created").
                   if (
                     pendingRestoredUrlRef.current &&
                     initialUrl === "about:blank" &&
-                    useBrowserStore.getState().drawerOpen &&
-                    useBrowserStore.getState().currentUrl === "about:blank"
+                    useBrowserStore.getState().drawerOpen
                   ) {
                     const restored = pendingRestoredUrlRef.current;
-                    pendingRestoredUrlRef.current = null;
-                    try {
-                      await navigateBrowser(restored);
-                      initialLoadIsBlankRef.current = false;
-                    } catch (e) {
-                      console.debug(
-                        "[browser-drawer] deferred post-restore navigate failed:",
-                        e,
-                      );
+                    const current = useBrowserStore.getState().currentUrl;
+                    const noManualNav =
+                      current === "about:blank" || current === restored;
+                    if (noManualNav) {
+                      pendingRestoredUrlRef.current = null;
+                      try {
+                        await navigateBrowser(restored);
+                        initialLoadIsBlankRef.current = false;
+                      } catch (e) {
+                        console.debug(
+                          "[browser-drawer] deferred post-restore navigate failed:",
+                          e,
+                        );
+                      }
+                    } else {
+                      // currentUrl is neither blank nor the pending URL
+                      // → user manually navigated (only possible if a
+                      // browser-loading event already fired, which
+                      // requires the slot to have been Ready). Discard
+                      // pending so the later open doesn't surprise.
+                      pendingRestoredUrlRef.current = null;
                     }
-                  } else if (pendingRestoredUrlRef.current) {
-                    // User manually navigated already — discard the
-                    // pending restore so a later open doesn't surprise.
-                    pendingRestoredUrlRef.current = null;
                   }
                 } catch (err) {
                   const msg = err instanceof Error ? err.message : String(err);
