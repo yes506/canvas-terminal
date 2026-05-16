@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   createBrowserWebview,
   destroyBrowserWebview,
+  navigateBrowser,
   setBrowserSettings,
 } from "../../lib/browserIpc";
 import { useBrowserStore } from "../../stores/browserStore";
@@ -20,10 +21,47 @@ interface SettingsSnapshot {
   browser_last_url?: string;
 }
 
+// Standard pattern (impl-review @claude2 I1 + @codex3 low):
+// listen()'s returned unlisten function arrives via a Promise. If the
+// effect's cleanup runs before the Promise resolves, we must unlisten
+// once it does. This helper covers all 7 listener sites.
+function subscribeWithCleanup<T>(
+  eventName: string,
+  handler: (e: { payload: T }) => void,
+): () => void {
+  let cancelled = false;
+  let unlistenFn: (() => void) | null = null;
+  listen<T>(eventName, handler).then((fn) => {
+    if (cancelled) {
+      fn();
+    } else {
+      unlistenFn = fn;
+    }
+  });
+  return () => {
+    cancelled = true;
+    unlistenFn?.();
+  };
+}
+
 /**
  * Drawer lifecycle: create-on-open, destroy-on-close, subscribe to nav-event
- * back-channel, subscribe to the menu-toggle accelerator. Phase-3 nodes
- * #18–#22.
+ * back-channel, subscribe to the menu-toggle accelerator.
+ *
+ * Race fixes folded in (impl-review Round-1):
+ *   - close-during-create ghost webview (codex3 high #1): handled in Rust
+ *     via generation-tracked CreateGuard; this hook surfaces the
+ *     "cancelled by destroy" Err and reacts to it.
+ *   - currentUrl-cancels-rAF (codex3 high #2): create-on-open effect
+ *     does NOT depend on currentUrl; reads it inside the rAF via
+ *     useBrowserStore.getState().
+ *   - settings-restore race (codex2 P2): when settings resolves AFTER
+ *     the drawer is already open with about:blank, navigate the
+ *     existing webview to the restored URL.
+ *   - listener cleanup race (claude2 I1, codex3 low): all 7 listen()
+ *     sites use subscribeWithCleanup with a cancelled flag.
+ *   - fast close/reopen (codex2 P1): a single in-flight create operation
+ *     awaits any pending destroy via an inFlightOp promise chain.
  */
 export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
   const drawerOpen = useBrowserStore((s) => s.drawerOpen);
@@ -38,6 +76,12 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
 
   const initialLoadDoneRef = useRef(false);
   const lastPersistedRef = useRef<SettingsSnapshot>({});
+  // Serialized op chain: any create awaits any pending destroy and vice-versa.
+  const inFlightOpRef = useRef<Promise<void>>(Promise.resolve());
+  // Track whether the *currently visible* webview was initially seeded with
+  // about:blank because settings hadn't loaded yet. If so, when settings
+  // resolves with a non-default browser_last_url, navigate it.
+  const initialLoadIsBlankRef = useRef(false);
 
   // Initial settings load — restores drawer width + last URL.
   useEffect(() => {
@@ -49,8 +93,16 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
           setDrawerWidth(s.browser_drawer_width);
         }
         if (s.browser_last_url) {
-          // Don't navigate yet — only seed currentUrl so create-on-open uses it.
           setCurrentUrl(s.browser_last_url);
+          // Settings-restore race fix (codex2 P2): if the drawer is already
+          // open with about:blank (user opened the drawer before settings
+          // resolved), navigate the existing webview to the restored URL.
+          if (useBrowserStore.getState().drawerOpen && initialLoadIsBlankRef.current) {
+            navigateBrowser(s.browser_last_url).catch((err) => {
+              console.debug("[browser-drawer] post-restore navigate failed:", err);
+            });
+            initialLoadIsBlankRef.current = false;
+          }
         }
         lastPersistedRef.current = {
           browser_drawer_width: s.browser_drawer_width,
@@ -60,78 +112,97 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
       .catch((err) => console.debug("[browser-drawer] get_settings failed:", err));
   }, [setDrawerWidth, setCurrentUrl]);
 
-  // Nav-event back-channel subscription.
+  // Nav-event back-channel subscription. 4 listeners with cancellation-safe cleanup.
   useEffect(() => {
-    const unlistens: Array<() => void> = [];
-    listen<BrowserLoadingEvent>("browser-loading", (e) => {
-      setLoading(true);
-      setCurrentUrl(e.payload.url);
-      setError(null);
-    }).then((fn) => unlistens.push(fn));
-    listen<BrowserLoadedEvent>("browser-loaded", (e) => {
-      setLoading(false);
-      setCurrentUrl(e.payload.url);
-    }).then((fn) => unlistens.push(fn));
-    listen<BrowserTitleChangedEvent>("browser-title-changed", (e) => {
-      setPageTitle(e.payload.title);
-    }).then((fn) => unlistens.push(fn));
-    listen<BrowserErrorEvent>("browser-error", (e) => {
-      setError(e.payload.reason);
-      setLoading(false);
-    }).then((fn) => unlistens.push(fn));
-    return () => unlistens.forEach((fn) => fn());
+    const unsubs = [
+      subscribeWithCleanup<BrowserLoadingEvent>("browser-loading", (e) => {
+        setLoading(true);
+        setCurrentUrl(e.payload.url);
+        setError(null);
+      }),
+      subscribeWithCleanup<BrowserLoadedEvent>("browser-loaded", (e) => {
+        setLoading(false);
+        setCurrentUrl(e.payload.url);
+      }),
+      subscribeWithCleanup<BrowserTitleChangedEvent>("browser-title-changed", (e) => {
+        setPageTitle(e.payload.title);
+      }),
+      subscribeWithCleanup<BrowserErrorEvent>("browser-error", (e) => {
+        setError(e.payload.reason);
+        setLoading(false);
+      }),
+    ];
+    return () => unsubs.forEach((fn) => fn());
   }, [setLoading, setCurrentUrl, setPageTitle, setError]);
 
   // Menu-toggle subscription (the native-menu accelerator path).
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    listen("menu-toggle-browser", () => toggle()).then(
-      (fn) => (unlisten = fn),
-    );
-    return () => unlisten?.();
+    return subscribeWithCleanup<unknown>("menu-toggle-browser", () => toggle());
   }, [toggle]);
 
-  // create-on-open / destroy-on-close. Depends on drawerOpen and the host
-  // ref's existence (the rect can't be measured until React has mounted the
-  // PageAreaHost).
+  // create-on-open / destroy-on-close. Depends ONLY on drawerOpen (NOT
+  // currentUrl — that's read inside the rAF) so unrelated URL updates
+  // don't cancel an in-flight create (impl-review codex3 high #2 fix).
   const previousOpenRef = useRef(false);
   useEffect(() => {
     if (drawerOpen === previousOpenRef.current) return;
     previousOpenRef.current = drawerOpen;
 
     if (drawerOpen) {
-      // Wait one frame so PageAreaHost has been laid out, then measure
-      // and create the webview.
-      const handle = window.requestAnimationFrame(async () => {
-        const host = hostRef.current;
-        if (!host) return;
-        const r = host.getBoundingClientRect();
-        const rect: Rect = {
-          x: r.left,
-          y: r.top,
-          width: r.width,
-          height: r.height,
-        };
-        if (rect.width <= 0 || rect.height <= 0) return;
+      // Chain create after any pending destroy so fast close/reopen doesn't
+      // race (impl-review codex2 P1 + codex3 high #1 fix).
+      let cancelled = false;
+      inFlightOpRef.current = inFlightOpRef.current
+        .catch(() => undefined)
+        .then(
+          () =>
+            new Promise<void>((resolve) => {
+              if (cancelled) return resolve();
+              window.requestAnimationFrame(async () => {
+                if (cancelled) return resolve();
+                const host = hostRef.current;
+                if (!host) return resolve();
+                const r = host.getBoundingClientRect();
+                const rect: Rect = {
+                  x: r.left,
+                  y: r.top,
+                  width: r.width,
+                  height: r.height,
+                };
+                if (rect.width <= 0 || rect.height <= 0) return resolve();
 
-        const initialUrl = currentUrl || "about:blank";
-        try {
-          await createBrowserWebview(initialUrl, rect);
-          setError(null);
-        } catch (err) {
-          // Could be "browser webview already exists" if a previous destroy
-          // didn't complete; surface but continue.
-          const msg = err instanceof Error ? err.message : String(err);
-          setError(msg);
-        }
-      });
-      return () => window.cancelAnimationFrame(handle);
+                // Read latest store values INSIDE the rAF (codex3 #2 fix).
+                const initialUrl =
+                  useBrowserStore.getState().currentUrl || "about:blank";
+                initialLoadIsBlankRef.current = initialUrl === "about:blank";
+                try {
+                  await createBrowserWebview(initialUrl, rect);
+                  setError(null);
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  // If destroy raced us, the user likely toggled fast — the
+                  // next open will retry. Surface the message for debugging
+                  // but don't escalate.
+                  setError(msg);
+                }
+                resolve();
+              });
+            }),
+        );
+
+      return () => {
+        cancelled = true;
+      };
     } else {
-      destroyBrowserWebview().catch((err) =>
-        console.debug("[browser-drawer] destroy on close failed:", err),
-      );
+      inFlightOpRef.current = inFlightOpRef.current
+        .catch(() => undefined)
+        .then(() =>
+          destroyBrowserWebview().catch((err) =>
+            console.debug("[browser-drawer] destroy on close failed:", err),
+          ),
+        );
     }
-  }, [drawerOpen, hostRef, currentUrl, setError]);
+  }, [drawerOpen, hostRef, setError]);
 
   // Persist drawer width + last URL (debounced).
   useEffect(() => {

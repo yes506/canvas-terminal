@@ -59,8 +59,18 @@ fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Read the settings file. Acquires `settings_io_lock` so a concurrent
+/// truncate-and-write from `set_settings` / `set_browser_settings` can't
+/// expose a partial file mid-read (impl-review codex2 P3 + codex3 medium).
 #[tauri::command]
-pub fn get_settings(app: tauri::AppHandle) -> Result<Settings, String> {
+pub fn get_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Settings, String> {
+    let _guard = state
+        .settings_io_lock
+        .lock()
+        .map_err(|e| format!("settings_io_lock poisoned: {}", e))?;
     let path = settings_path(&app)?;
     if !path.exists() {
         return Ok(Settings::default());
@@ -141,22 +151,39 @@ pub fn set_browser_settings(
     write_settings_file(&app, &current)
 }
 
+/// Atomically write the settings file via temp-file + rename. Avoids the
+/// "partial JSON visible during truncate" failure mode that the old
+/// truncate-and-write path admitted (impl-review codex2 P3 + codex3 medium).
+/// `rename(2)` is atomic on POSIX when source and destination are on the
+/// same filesystem (which they are by construction — both inside
+/// `app_config_dir`).
+///
+/// Callers must hold `settings_io_lock` for the full read-modify-write
+/// cycle; the atomic rename here is the second line of defense against
+/// readers seeing a half-written file.
 fn write_settings_file(app: &tauri::AppHandle, settings: &Settings) -> Result<(), String> {
     let path = settings_path(app)?;
+    let tmp_path = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Cannot serialize settings: {}", e))?;
 
-    // O_NOFOLLOW so a symlink at the target path doesn't redirect us. Settings is
-    // a fixed path the user never chooses, so unlike canvas.rs we don't need full
-    // canonicalize+boundary validation.
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(|e| format!("Cannot open settings file: {}", e))?;
-    f.write_all(json.as_bytes())
-        .map_err(|e| format!("Cannot write settings: {}", e))?;
+    // Write to a same-directory temp file first. O_NOFOLLOW preserved
+    // for the security property the previous in-place writer carried.
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp_path)
+            .map_err(|e| format!("Cannot open settings tmp file: {}", e))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| format!("Cannot write settings tmp: {}", e))?;
+        // Sync so the rename can't expose a zero-length file post-crash.
+        let _ = f.sync_all();
+    }
+
+    fs::rename(&tmp_path, &path)
+        .map_err(|e| format!("Cannot rename settings tmp into place: {}", e))?;
     Ok(())
 }

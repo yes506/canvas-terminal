@@ -72,20 +72,26 @@ export function useBrowserBounds(
     // Window resize / fullscreen / minimize-restore.
     window.addEventListener("resize", scheduleSync);
 
-    // Tauri 2 built-in events. Both listen() calls return Promise<UnlistenFn>.
+    // Tauri 2 built-in events. Cancellation-safe pattern (impl-review
+    // claude2 I1 + codex3 low) — unlisten even if cleanup runs before
+    // the listen() promise resolves.
+    let cancelled = false;
     let unlistenScale: (() => void) | null = null;
     let unlistenResize: (() => void) | null = null;
-    listen(TauriEvent.WINDOW_SCALE_FACTOR_CHANGED, scheduleSync).then(
-      (fn) => (unlistenScale = fn),
-    );
-    listen(TauriEvent.WINDOW_RESIZED, scheduleSync).then(
-      (fn) => (unlistenResize = fn),
-    );
+    listen(TauriEvent.WINDOW_SCALE_FACTOR_CHANGED, scheduleSync).then((fn) => {
+      if (cancelled) fn();
+      else unlistenScale = fn;
+    });
+    listen(TauriEvent.WINDOW_RESIZED, scheduleSync).then((fn) => {
+      if (cancelled) fn();
+      else unlistenResize = fn;
+    });
 
     // Initial sync once mounted/enabled.
     scheduleSync();
 
     return () => {
+      cancelled = true;
       ro.disconnect();
       window.removeEventListener("resize", scheduleSync);
       if (rafIdRef.current !== null) {

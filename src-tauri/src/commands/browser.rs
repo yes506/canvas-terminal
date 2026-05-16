@@ -8,7 +8,7 @@
 use tauri::webview::{PageLoadEvent, WebviewBuilder};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl};
 
-use crate::state::{BrowserWebviewState, Rect};
+use crate::state::{BrowserWebviewState, FinalizeOutcome, Rect};
 
 const BROWSER_LABEL: &str = "browser";
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -23,6 +23,13 @@ const MAIN_WINDOW_LABEL: &str = "main";
 /// **Cross-reference requirement:** if you change this matrix, ALSO update
 /// `src/lib/urlScheme.ts::classifyScheme`. Phase 6 validation includes a
 /// manual cross-matrix check.
+///
+/// Asymmetry note (impl-review @claude3 J2): the TS-side `classifyScheme`
+/// has a permissive scheme-less fallback that normalizes `example.com` to
+/// `https://example.com` before crossing IPC. This Rust validator therefore
+/// only ever sees fully-qualified URLs from the navigate path; the
+/// `on_navigation` callback (where this is also called) sees URLs as the
+/// engine reports them, which always have a scheme. No fallback here.
 pub fn validate_browser_url(input: &str) -> Result<tauri::Url, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -160,14 +167,24 @@ pub fn create_browser_webview(
         )
         .map_err(|e| format!("Window::add_child failed: {}", e))?;
 
-    // 4. Finalize: Creating → Ready(webview).
-    guard.finalize(webview)?;
-
-    // 5. Seed last_bounds so the first set_bounds dedup is honest.
-    if let Ok(mut lb) = state.last_bounds.lock() {
-        *lb = Some(rect);
+    // 4. Finalize: Creating → Ready(webview) IF still our generation.
+    //    If destroy or a newer create has superseded us, close the webview
+    //    we just built (impl-review @codex3 high #1 fix).
+    match guard.finalize(webview)? {
+        FinalizeOutcome::Published => {
+            // 5. Seed last_bounds so the first set_bounds dedup is honest.
+            if let Ok(mut lb) = state.last_bounds.lock() {
+                *lb = Some(rect);
+            }
+            Ok(())
+        }
+        FinalizeOutcome::Cancelled(orphan) => {
+            let _ = orphan.close();
+            // Surface as Err so the frontend can react (rapid close→open
+            // path will retry).
+            Err("browser webview creation cancelled by destroy".to_string())
+        }
     }
-    Ok(())
 }
 
 /// Update the OS-layer webview bounds, with last_bounds dedup.
