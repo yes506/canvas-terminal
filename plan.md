@@ -227,24 +227,46 @@ Cross-boundary IPC contract:
 - **Built-in Tauri events consumed (2):** `tauri://resize`,
   `tauri://scale-change`.
 
-DAG: see `plan.mmd` in this directory (sibling file). The DAG is
-acyclic; every edge is justified by a `Collaborators` field in the
-emitted skeleton's 9-field docstring.
+DAG: see `plan.mmd` (sibling file, interface-level view, ~16 module
+nodes) and `plan-detail.mmd` (sibling file, full per-method DAG with
+46 nodes from the Phase-3 decomposition). Per @claude2 Round-1 F1:
+both views are committed so that post-merge readers on
+`feat/browser-integration` have access to the granular view without
+needing to read the shared-memory `task-30-claude1-plan-phase3.md`
+file (which is in the gitignored cache, not the tracked repo). The
+interface-level DAG is the primary review surface; the per-method
+DAG is the implementation reference. Both are acyclic; every edge is
+justified by a `Collaborators` field in the emitted skeleton's
+9-field docstring (where applicable) or by the Phase-3 reasoning
+text (for non-skeleton nodes).
 
 ---
 
 ## Interfaces emitted
 
-Phase 5 ran because the user typed `emit skeletons`. Six files, 19
-methods with 9-field docstrings, both validations green.
+Phase 5 ran because the user typed `emit skeletons`. Six files, **20
+methods with 9-field docstrings + 1 type-alias contract** (corrected
+after Round-1 cohort review of these artifacts — was "19 methods" pre-
+patch; the Phase-5 patch commit `8b18503` added `set_browser_settings`
+to the Rust trait, bringing trait method count from 8 → 9). Both
+validations green at every revision.
+
+**Note on coverage:** the 46-node Phase-3 decomposition translates to
+20 skeleton methods because 26 of the 46 nodes don't get skeletons by
+design — React FCs (no `interface` shape — props types are minimal),
+Zustand setters (inline-declared during implementation), run-loop
+closures (`RunEvent::Exit` body), one-line module-decl edits, and
+unchanged-in-skeleton backend files. The 20 emitted methods cover the
+cross-boundary IPC contract surface (TS↔Rust); other nodes are
+implementation detail.
 
 | File | Kind | Methods (with 9-field docstring) | Source path |
 |---|---|---|---|
 | `src/types/browser.ts` | TS types | 0 (type definitions: `Rect`, `SchemeClassification`, 4 event payloads, `BrowserState`, `BrowserSettingsPatch`) | `src/types/browser.ts` |
 | `src/lib/urlScheme.ts` | TS interface | 1: `classifyScheme` | `src/lib/urlScheme.ts` |
 | `src/lib/drawerLayout.ts` | TS interface | 1: `clampDrawerWidth` | `src/lib/drawerLayout.ts` |
-| `src/lib/browserIpc.ts` | TS interface | 9: `createBrowserWebview`, `setBrowserWebviewBounds`, `navigateBrowser`, `browserGoBack`, `browserGoForward`, `browserReload`, `browserStop`, `destroyBrowserWebview`, `setBrowserSettings` | `src/lib/browserIpc.ts` |
-| `src-tauri/src/commands/browser.rs` | Rust trait + module-level type alias | 9 trait methods + 1 `ValidateBrowserUrlSignature` type alias | `src-tauri/src/commands/browser.rs` |
+| `src/lib/browserIpc.ts` | TS interface | 9 methods: `createBrowserWebview`, `setBrowserWebviewBounds`, `navigateBrowser`, `browserGoBack`, `browserGoForward`, `browserReload`, `browserStop`, `destroyBrowserWebview`, `setBrowserSettings` | `src/lib/browserIpc.ts` |
+| `src-tauri/src/commands/browser.rs` | Rust trait + module-level type alias | 9 trait methods (the symmetric counterpart of the TS `BrowserIpc` 9; Round-1 patch fixed an initial asymmetry where `set_browser_settings` was missing) + 1 `ValidateBrowserUrlSignature` type alias (documented contract, not a method) | `src-tauri/src/commands/browser.rs` |
 | `src-tauri/src/commands/mod.rs` | Rust module declaration | 0 (one-line edit adding `pub mod browser;`) | `src-tauri/src/commands/mod.rs` |
 
 Round-1 reviewer cohort caught a 3-way convergent IPC contract
@@ -292,15 +314,23 @@ browser feature:
    ```
    Rationale: `Window::add_child` is `#[cfg(all(desktop, feature =
    "unstable"))]` per `tauri-2.10.3/src/window/mod.rs:1052`.
-2. **`url` crate** — promote from transitive Tauri dep to direct dep
-   if `validate_browser_url` uses `Result<url::Url, String>`. Or use
-   the `tauri::Url` re-export at `tauri/src/lib.rs:82` (cleaner;
-   matches the Phase-5 skeleton's `ValidateBrowserUrlSignature` type
-   alias).
+2. **`url` crate handling** — **prefer `tauri::Url` re-export** at
+   `tauri/src/lib.rs:82` (this is what the Phase-5 skeleton's
+   `ValidateBrowserUrlSignature` type alias uses). Only promote
+   `url` to a direct Cargo dep if implementation rejects the re-
+   export for a concrete reason (e.g., requiring a newer `url`
+   version than Tauri 2.10.3 carries transitively).
 3. **State types** — materialize `BrowserSlot`, `BrowserWebviewState`,
    `BrowserStateOps`, `CreateGuard`, `AppState.settings_io_lock`. The
    trailing `//` block in `commands/browser.rs` enumerates the
    expected shapes.
+4. **Symmetric settings serialization** — when adding
+   `AppState.settings_io_lock`, the EXISTING `commands::settings::
+   set_settings` body must ALSO acquire this lock at the top of its
+   read-modify-write cycle (NOT only the new `set_browser_settings`).
+   Per @claude3 Phase-3 G1: without symmetric acquisition,
+   `set_browser_settings`'s lock only protects ITS half of the race;
+   concurrent `set_settings` writes still cause lost updates.
 
 ---
 
@@ -319,6 +349,18 @@ browser feature:
 failure-handling step required (would trigger only on a "1
 (Beginning)" score).
 
+**Note on score timing** (per @claude2 Round-1 F2): these scores
+reflect the **post-cohort-convergence state** across 5 phases × 3–5
+review rounds each (~17 reviewer files across the 4 reviewers).
+First-pass scores were lower — the cohort caught real issues at
+every phase, including a security-relevant capability-scoping bug
+(Phase-2 R1), a non-existent `tauri-plugin-store` reference
+(Phase-1 R2), an unstable-feature gate (Phase-3 R1), and an
+IPC contract asymmetry on `set_browser_settings` (Phase-5 R1).
+Each is now reflected in the score's "Notes" column with file:
+line citations. The 24/24 is the converged state, not a first-
+pass claim.
+
 ---
 
 ## Human-confirmation checklist
@@ -327,8 +369,9 @@ failure-handling step required (would trigger only on a "1
 Reviewer checklist — please verify each:
 
 [ ] The decomposition table in Phase 3 matches the interfaces actually
-    emitted in Phase 5 (9 TS + 8 Rust + 1 Rust module decl + 1 Rust
-    type alias = 19 docstrings)
+    emitted in Phase 5 (11 TS methods + 9 Rust trait methods +
+    1 Rust type-alias contract = 20 methods with 9-field docstrings
+    + 1 type alias; corrected after Round-1 of plan.md/plan.mmd review)
 [ ] Every method has all 9 docstring fields (skim 3 random methods to
     spot-check)
 [ ] No interface looks like a grab-bag of unrelated methods

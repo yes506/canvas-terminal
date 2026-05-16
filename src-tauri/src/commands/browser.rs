@@ -379,8 +379,12 @@ pub trait BrowserCommands {
 /// type alias rather than a `fn ... ;` declaration (Rust requires
 /// bodies on free functions). The implementation phase resolves
 /// to: `pub(crate) fn validate_browser_url(input: &str) ->
-/// Result<url::Url, String>` (the `url` crate is a transitive
-/// Tauri 2 dep; add to direct deps at implementation time).
+/// Result<tauri::Url, String>` — the `tauri::Url` re-export at
+/// `tauri/src/lib.rs:82` is preferred over promoting the `url` crate
+/// to a direct dep (only promote `url` directly if implementation
+/// rejects the re-export for a concrete reason). The type alias
+/// `ValidateBrowserUrlSignature` below uses `tauri::Url` to lock
+/// this choice into the skeleton.
 ///
 /// **Responsibility:** Parse `input` and classify per the Phase-1
 /// Q5 ALLOW (`http:`/`https:`/`about:blank`) / FILTER (`javascript:`/
