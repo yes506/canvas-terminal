@@ -106,13 +106,23 @@ export function BrowserDrawer({
               </button>
             </div>
             {/* Row 2: nav controls + address bar. ALL inline styles
-                (no Tailwind) — round-5-UX investigation showed that
-                Row 2's contents weren't rendering even after the
-                AddressBar input was converted to inline styles. The
-                bright blue border is a TEMP DIAGNOSTIC to confirm the
-                row is in the DOM at all; will be reverted in the
-                next fix. */}
+                (no Tailwind) — round-5-UX investigation. The bright
+                blue border is a TEMP DIAGNOSTIC; will be reverted
+                once root cause is confirmed. */}
             <div
+              ref={(el) => {
+                if (el) {
+                  console.info(
+                    "[browser-drawer] Row 2 mounted at:",
+                    JSON.stringify({
+                      x: el.getBoundingClientRect().left,
+                      y: el.getBoundingClientRect().top,
+                      w: el.getBoundingClientRect().width,
+                      h: el.getBoundingClientRect().height,
+                    }),
+                  );
+                }
+              }}
               style={{
                 display: "flex",
                 alignItems: "center",

@@ -262,9 +262,17 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
                   }
                 } catch (err) {
                   const msg = err instanceof Error ? err.message : String(err);
-                  // If destroy raced us, the user likely toggled fast — the
-                  // next open will retry. Surface the message for debugging
-                  // but don't escalate.
+                  // Surface to browserStore.error (rendered in the
+                  // AddressBar error span when the drawer is open) AND
+                  // log explicitly so the failure is visible in the
+                  // dev console even if the AddressBar isn't rendering
+                  // (impl-review R5-UX). The user's earlier "set_bounds
+                  // failed: browser webview not created" was the
+                  // downstream symptom; this prints the root cause.
+                  console.error(
+                    "[browser-drawer] createBrowserWebview FAILED:",
+                    msg,
+                  );
                   setError(msg);
                 }
                 resolve();
