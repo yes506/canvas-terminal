@@ -38,9 +38,13 @@ export function AddressBar() {
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         placeholder="Enter URL"
-        className={`flex-1 min-w-0 bg-surface border ${
-          error ? "border-red-400" : "border-surface-lighter"
-        } px-2 py-1 text-xs text-text rounded outline-none focus:border-accent min-h-[24px]`}
+        // High-contrast against row's bg-surface (#1a1a1a): use
+        // bg-surface-lighter (#3a3a3a) + visible border. The previous
+        // bg-surface input + 1px border-surface-lighter was nearly
+        // invisible on a dark theme (user feedback round 4-UX).
+        className={`flex-1 min-w-0 bg-surface-lighter border ${
+          error ? "border-red-400" : "border-text-dim"
+        } px-3 py-1.5 text-xs text-text rounded-md outline-none focus:border-accent focus:ring-1 focus:ring-accent placeholder:text-text-muted min-h-[28px]`}
         spellCheck={false}
         aria-label="Address bar"
       />

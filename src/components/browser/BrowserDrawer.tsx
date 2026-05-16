@@ -79,12 +79,18 @@ export function BrowserDrawer({
         {drawerOpen && (
           <>
             {/* Row 1: title bar — Globe icon + page title + close button.
-                Two-row chrome layout (industry standard) keeps the address
-                bar from being squeezed when a long page title loads. */}
-            <div className="flex items-center gap-2 px-2 py-1.5 border-b border-surface-lighter bg-surface flex-shrink-0 min-h-[28px]">
-              <Globe size={12} className="text-text-muted flex-shrink-0" />
+                Inline bg color (rather than Tailwind class) matches the
+                canvas drawer's pattern and guarantees the row renders
+                visibly above the OS-layer child webview regardless of
+                Tailwind purge state. Taller rows + explicit minHeight
+                so chrome can't collapse below visible height. */}
+            <div
+              className="flex items-center gap-2 px-3 border-b border-surface-lighter flex-shrink-0"
+              style={{ background: "#2a2a2a", minHeight: 32 }}
+            >
+              <Globe size={13} className="text-text-muted flex-shrink-0" />
               <span
-                className="flex-1 min-w-0 text-[11px] text-text-muted truncate"
+                className="flex-1 min-w-0 text-[11px] text-text truncate"
                 title={pageTitle || "Browser"}
               >
                 {pageTitle || "Browser"}
@@ -96,12 +102,16 @@ export function BrowserDrawer({
                 title="Close Browser (Cmd+Shift+B)"
                 aria-label="Close browser drawer"
               >
-                <X size={14} />
+                <X size={15} />
               </button>
             </div>
             {/* Row 2: nav controls + address bar — gets the full drawer
-                width so the URL input is always usable. */}
-            <div className="flex items-center gap-1 px-2 py-1.5 border-b border-surface-lighter bg-surface flex-shrink-0 min-h-[34px]">
+                width so the URL input is always usable. Inline bg keeps
+                the row visually distinct from the input field below. */}
+            <div
+              className="flex items-center gap-2 px-3 border-b border-surface-lighter flex-shrink-0"
+              style={{ background: "#1a1a1a", minHeight: 40 }}
+            >
               <NavControls />
               <AddressBar />
             </div>
