@@ -10,13 +10,31 @@ src-tauri/target/
 .env
 .env.*
 
-# IDE / AI tools
+# IDE
 .vscode/
 .idea/
-.claude/
+.zed/
 *.swp
 *.swo
 .DS_Store
+
+# AI tool configuration
+.claude/
+.agents/
+.cursor/
+.cursorrules
+.aider*
+.continue/
+.copilot/
+.windsurf/
+.windsurfrules
+.codex/
+.gemini/
+.github/copilot-instructions.md
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+CODEX.md
 
 # Logs
 *.log
