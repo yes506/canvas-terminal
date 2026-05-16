@@ -156,11 +156,16 @@ impl<R: Runtime> BrowserWebviewState<R> {
     }
 
     /// Slot-reservation primitive (#36c) for create. Atomically:
-    /// 1. Bumps `generation` and captures the new value.
-    /// 2. Transitions slot to `Creating { generation }`. Returns Err if
-    ///    the slot is currently `Ready` (a different active webview exists).
-    ///    Returns Ok if slot was `Empty` OR `Creating` (later create wins;
-    ///    the earlier one's finalize will detect generation mismatch).
+    /// 1. Rejects if the slot is `Creating` OR `Ready` (impl-review R2
+    ///    @codex3 medium #2: keep the singleton-reservation guarantee.
+    ///    Allowing `Creating` to be superseded let two concurrent creates
+    ///    both call `Window::add_child("browser", ...)` simultaneously,
+    ///    which Tauri rejects on duplicate labels. The cancellation path
+    ///    is handled by `destroy_browser_webview_impl` transitioning
+    ///    `Creating → Empty`; the in-flight guard's `finalize` then sees
+    ///    the mismatch via the generation check and closes its orphan.)
+    /// 2. On `Empty`: bumps `generation`, transitions to `Creating { gen }`,
+    ///    returns a `CreateGuard` carrying that generation.
     pub fn try_reserve_for_create(&self) -> Result<CreateGuard<'_, R>, String> {
         use std::sync::atomic::Ordering;
         let mut guard = self
@@ -171,7 +176,10 @@ impl<R: Runtime> BrowserWebviewState<R> {
             BrowserSlot::Ready { .. } => {
                 return Err("browser webview already exists".to_string());
             }
-            BrowserSlot::Empty | BrowserSlot::Creating { .. } => {}
+            BrowserSlot::Creating { .. } => {
+                return Err("browser webview already being created".to_string());
+            }
+            BrowserSlot::Empty => {}
         }
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         *guard = BrowserSlot::Creating { generation: gen };

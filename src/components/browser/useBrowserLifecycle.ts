@@ -82,6 +82,15 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
   // about:blank because settings hadn't loaded yet. If so, when settings
   // resolves with a non-default browser_last_url, navigate it.
   const initialLoadIsBlankRef = useRef(false);
+  // True only between successful createBrowserWebview() return and the
+  // next destroyOnClose. Gates whether a settings-resolve-during-create
+  // can navigate immediately or must defer (impl-review R2 codex2 P2 +
+  // codex3 medium #1).
+  const webviewReadyRef = useRef(false);
+  // If settings resolves WHILE create is in flight, store the restored
+  // URL here. The create callback navigates to it after createBrowserWebview
+  // returns successfully. Cleared on destroy.
+  const pendingRestoredUrlRef = useRef<string | null>(null);
 
   // Initial settings load — restores drawer width + last URL.
   useEffect(() => {
@@ -94,14 +103,27 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
         }
         if (s.browser_last_url) {
           setCurrentUrl(s.browser_last_url);
-          // Settings-restore race fix (codex2 P2): if the drawer is already
-          // open with about:blank (user opened the drawer before settings
-          // resolved), navigate the existing webview to the restored URL.
-          if (useBrowserStore.getState().drawerOpen && initialLoadIsBlankRef.current) {
-            navigateBrowser(s.browser_last_url).catch((err) => {
-              console.debug("[browser-drawer] post-restore navigate failed:", err);
-            });
-            initialLoadIsBlankRef.current = false;
+          // Settings-restore race fix (impl-review R1 codex2 P2 + R2
+          // codex2 P2 / codex3 medium #1): the navigate path depends on
+          // whether the webview is already Ready or still being built.
+          if (
+            useBrowserStore.getState().drawerOpen &&
+            initialLoadIsBlankRef.current
+          ) {
+            if (webviewReadyRef.current) {
+              // Webview already Ready → navigate now.
+              navigateBrowser(s.browser_last_url).catch((err) => {
+                console.debug(
+                  "[browser-drawer] post-restore navigate failed:",
+                  err,
+                );
+              });
+              initialLoadIsBlankRef.current = false;
+            } else {
+              // Webview still being built; the create callback will
+              // navigate to this URL once createBrowserWebview returns.
+              pendingRestoredUrlRef.current = s.browser_last_url;
+            }
           }
         }
         lastPersistedRef.current = {
@@ -177,7 +199,27 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
                 initialLoadIsBlankRef.current = initialUrl === "about:blank";
                 try {
                   await createBrowserWebview(initialUrl, rect);
+                  webviewReadyRef.current = true;
                   setError(null);
+                  // Drain any URL deferred by the settings-resolve-during-
+                  // create race (impl-review R2 codex2 P2 + codex3 #1).
+                  if (
+                    pendingRestoredUrlRef.current &&
+                    initialUrl === "about:blank" &&
+                    useBrowserStore.getState().drawerOpen
+                  ) {
+                    const restored = pendingRestoredUrlRef.current;
+                    pendingRestoredUrlRef.current = null;
+                    try {
+                      await navigateBrowser(restored);
+                      initialLoadIsBlankRef.current = false;
+                    } catch (e) {
+                      console.debug(
+                        "[browser-drawer] deferred post-restore navigate failed:",
+                        e,
+                      );
+                    }
+                  }
                 } catch (err) {
                   const msg = err instanceof Error ? err.message : String(err);
                   // If destroy raced us, the user likely toggled fast — the
@@ -194,6 +236,10 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
         cancelled = true;
       };
     } else {
+      // Reset the ready flag + drop any pending restore URL before the
+      // destroy command runs; the next create will re-seed them.
+      webviewReadyRef.current = false;
+      pendingRestoredUrlRef.current = null;
       inFlightOpRef.current = inFlightOpRef.current
         .catch(() => undefined)
         .then(() =>
