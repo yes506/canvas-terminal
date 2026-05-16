@@ -5,9 +5,9 @@ mod state;
 use std::sync::atomic::Ordering;
 
 use dashboard::DashboardInfo;
-use state::AppState;
+use state::{AppState, BrowserWebviewState};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, RunEvent};
 
 /// Build a custom app menu that maps Cmd+W to "Close Tab" instead of the
 /// default "Close Window".  This prevents the native menu from closing the
@@ -62,6 +62,13 @@ fn build_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, tauri::Error> {
         true,
         Some("CmdOrCtrl+Shift+D"),
     )?;
+    let toggle_browser = MenuItem::with_id(
+        app,
+        "toggle_browser",
+        "Toggle Browser",
+        true,
+        Some("CmdOrCtrl+Shift+B"),
+    )?;
     let window_menu = Submenu::with_items(
         app,
         "Window",
@@ -71,6 +78,7 @@ fn build_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, tauri::Error> {
             &PredefinedMenuItem::maximize(app, None)?,
             &PredefinedMenuItem::separator(app)?,
             &open_dashboard,
+            &toggle_browser,
         ],
     )?;
 
@@ -86,6 +94,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .manage(DashboardInfo::new())
+        .manage(BrowserWebviewState::<tauri::Wry>::new())
         .setup(|app| {
             let menu = build_menu(app)?;
             app.set_menu(menu)?;
@@ -103,6 +112,9 @@ pub fn run() {
             } else if event.id() == "open_dashboard" {
                 // Frontend listens and calls invoke('open_dashboard')
                 let _ = app.emit("menu-open-dashboard", ());
+            } else if event.id() == "toggle_browser" {
+                // Frontend listens and calls browserStore.toggle()
+                let _ = app.emit("menu-toggle-browser", ());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -134,10 +146,19 @@ pub fn run() {
             commands::memory::get_memory_file_mtime,
             commands::settings::get_settings,
             commands::settings::set_settings,
+            commands::settings::set_browser_settings,
             commands::settings::open_external_url,
             commands::dashboard::open_dashboard,
             commands::dashboard::get_dashboard_info,
             commands::dashboard::copy_dashboard_url_with_token,
+            commands::browser::create_browser_webview,
+            commands::browser::set_browser_webview_bounds,
+            commands::browser::navigate_browser,
+            commands::browser::browser_go_back,
+            commands::browser::browser_go_forward,
+            commands::browser::browser_reload,
+            commands::browser::browser_stop,
+            commands::browser::destroy_browser_webview,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -179,6 +200,16 @@ pub fn run() {
                 let _ = commands::memory::clear_memory_dir();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let RunEvent::Exit = event {
+                // Phase-1 in-scope #6 (app-quit half): destroy the browser
+                // webview if it was left open at quit time. JS useEffect
+                // cleanup isn't reliable on hard quit; this is the Rust-side
+                // tear-down.
+                let state = app_handle.state::<BrowserWebviewState<tauri::Wry>>();
+                let _ = commands::browser::destroy_browser_webview_impl(&state);
+            }
+        });
 }
