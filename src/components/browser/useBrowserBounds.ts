@@ -56,10 +56,15 @@ export function useBrowserBounds(
         lastRectRef.current = rect;
         if (rect.width > 0 && rect.height > 0) {
           setBrowserWebviewBounds(rect).catch((err) => {
-            // Silent — caller has no recovery; the Rust side will return
-            // "browser webview not created" if drawer just closed. The
-            // next open will re-create.
-            console.debug("[browser-drawer] set_bounds failed:", err);
+            // "browser webview not created" is an expected race: the
+            // initial sync fires before createBrowserWebview finalizes
+            // (or during close). The Rust side seeds last_bounds on
+            // create so the next ResizeObserver tick reconciles. Drop
+            // that message; surface anything else.
+            const msg = typeof err === "string" ? err : String(err);
+            if (!msg.includes("not created")) {
+              console.debug("[browser-drawer] set_bounds failed:", err);
+            }
           });
         }
       });

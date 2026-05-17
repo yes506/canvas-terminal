@@ -13,6 +13,53 @@ use crate::state::{BrowserWebviewState, FinalizeOutcome, Rect};
 const BROWSER_LABEL: &str = "browser";
 const MAIN_WINDOW_LABEL: &str = "main";
 
+/// macOS title bar offset compensation.
+///
+/// With `decorations: true` + `macos-private-api` + `transparent: true`,
+/// Tauri 2's `Window::add_child` and `Webview::set_bounds` interpret `y=0`
+/// as the window's OUTER frame top (including title bar), while the
+/// frontend's `getBoundingClientRect().top` returns 0 as the viewport top
+/// (BELOW the title bar). The delta is the title bar height.
+///
+/// We prefer the dynamic `outer_size − inner_size` height delta because it
+/// reflects the real chrome (Stage Manager, fullscreen, custom title bar
+/// modes). On `macos-private-api` the content view extends to the outer
+/// frame top, which collapses both that delta AND `inner_position −
+/// outer_position` to zero — so on macOS we fall back to a hardcoded
+/// standard title bar height (28pt) when the dynamic value is 0.
+fn compute_macos_titlebar_offset<R: tauri::Runtime>(window: &tauri::Window<R>) -> f64 {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let outer_pos = window.outer_position().ok();
+    let inner_pos = window.inner_position().ok();
+    let outer_sz = window.outer_size().ok();
+    let inner_sz = window.inner_size().ok();
+
+    let pos_delta = match (outer_pos, inner_pos) {
+        (Some(o), Some(i)) => ((i.y - o.y) as f64) / scale,
+        _ => 0.0,
+    };
+    let size_delta = match (outer_sz, inner_sz) {
+        (Some(o), Some(i)) => ((o.height as f64 - i.height as f64).max(0.0)) / scale,
+        _ => 0.0,
+    };
+
+    // Prefer the larger of the two (more conservative — pushes the webview
+    // farther down so chrome stays visible). On macos-private-api both will
+    // typically be 0; fall back to the standard title bar height (28pt).
+    let dynamic = pos_delta.max(size_delta);
+    let resolved = if cfg!(target_os = "macos") && dynamic <= 0.5 {
+        28.0
+    } else {
+        dynamic
+    };
+
+    eprintln!(
+        "[browser] titlebar_offset: pos_delta={:.2} size_delta={:.2} scale={:.2} resolved={:.2}",
+        pos_delta, size_delta, scale, resolved,
+    );
+    resolved
+}
+
 // ---------------------------------------------------------------------------
 // URL validation (defense-in-depth mirror of src/lib/urlScheme.ts)
 // ---------------------------------------------------------------------------
@@ -115,6 +162,14 @@ pub fn create_browser_webview(
         .get_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| format!("main window not found (label '{}')", MAIN_WINDOW_LABEL))?;
 
+    // Apply macOS title-bar offset compensation (codex3 R5-UX diagnosis):
+    // `Window::add_child` positions relative to the outer window frame on
+    // macOS with decorations + macos-private-api; the rect we got from
+    // `getBoundingClientRect()` is relative to the viewport (below the
+    // title bar). Add the inner-outer Y delta to align them.
+    let titlebar_offset = compute_macos_titlebar_offset(&main_window);
+    let adjusted_y = rect.y + titlebar_offset;
+
     let app_for_loaded = app.clone();
     let app_for_title = app.clone();
     let app_for_nav = app.clone();
@@ -162,7 +217,7 @@ pub fn create_browser_webview(
     let webview = main_window
         .add_child(
             builder,
-            tauri::LogicalPosition::new(rect.x, rect.y),
+            tauri::LogicalPosition::new(rect.x, adjusted_y),
             tauri::LogicalSize::new(rect.width, rect.height),
         )
         .map_err(|e| format!("Window::add_child failed: {}", e))?;
@@ -193,6 +248,7 @@ pub fn create_browser_webview(
 pub fn set_browser_webview_bounds(
     rect: Rect,
     state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+    app: AppHandle<tauri::Wry>,
 ) -> Result<(), String> {
     // Dedup check (lock #1: last_bounds).
     {
@@ -209,11 +265,25 @@ pub fn set_browser_webview_bounds(
         .clone_webview()
         .ok_or_else(|| "browser webview not created".to_string())?;
 
+    // Apply the same macOS title-bar offset as create_browser_webview so
+    // the webview stays under the chrome rather than drifting up.
+    let main_window = app
+        .get_window(MAIN_WINDOW_LABEL)
+        .ok_or_else(|| format!("main window not found (label '{}')", MAIN_WINDOW_LABEL))?;
+    let titlebar_offset = compute_macos_titlebar_offset(&main_window);
+    let adjusted = Rect {
+        x: rect.x,
+        y: rect.y + titlebar_offset,
+        width: rect.width,
+        height: rect.height,
+    };
+
     webview
-        .set_bounds(rect.to_dpi_rect())
+        .set_bounds(adjusted.to_dpi_rect())
         .map_err(|e| format!("set_bounds failed: {}", e))?;
 
-    // Update the dedup cache after the OS call returned.
+    // Update the dedup cache with the ORIGINAL (unadjusted) rect — the
+    // frontend sends and compares against unadjusted coords.
     if let Ok(mut lb) = state.last_bounds.lock() {
         *lb = Some(rect);
     }

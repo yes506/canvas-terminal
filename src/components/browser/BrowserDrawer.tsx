@@ -1,9 +1,8 @@
 import { useRef, useCallback, RefObject } from "react";
 import { Globe, X } from "lucide-react";
 import { useBrowserStore } from "../../stores/browserStore";
-// DIAG: AddressBar + NavControls temporarily bypassed
-// import { AddressBar } from "./AddressBar";
-// import { NavControls } from "./NavControls";
+import { AddressBar } from "./AddressBar";
+import { NavControls } from "./NavControls";
 import { PageAreaHost } from "./PageAreaHost";
 import { useBrowserBounds } from "./useBrowserBounds";
 import { useBrowserLifecycle } from "./useBrowserLifecycle";
@@ -106,24 +105,10 @@ export function BrowserDrawer({
                 <X size={15} />
               </button>
             </div>
-            {/* Row 2: nav controls + address bar. ALL inline styles
-                (no Tailwind) — round-5-UX investigation. The bright
-                blue border is a TEMP DIAGNOSTIC; will be reverted
-                once root cause is confirmed. */}
+            {/* Row 2: nav controls + address bar. Inline styles bypass
+                Tailwind JIT entirely so this row renders even if a
+                class is dropped from the dev bundle. */}
             <div
-              ref={(el) => {
-                if (el) {
-                  console.info(
-                    "[browser-drawer] Row 2 mounted at:",
-                    JSON.stringify({
-                      x: el.getBoundingClientRect().left,
-                      y: el.getBoundingClientRect().top,
-                      w: el.getBoundingClientRect().width,
-                      h: el.getBoundingClientRect().height,
-                    }),
-                  );
-                }
-              }}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -133,47 +118,10 @@ export function BrowserDrawer({
                 minHeight: 44,
                 flexShrink: 0,
                 borderBottom: "1px solid #3a3a3a",
-                borderTop: "2px solid #00aaff", // TEMP DIAG
               }}
             >
-              {/* DIAGNOSTIC: hardcoded raw input + button (NO child
-                  components) to isolate whether the issue is in
-                  NavControls/AddressBar themselves or in their
-                  parent's stacking context. If THIS raw input is
-                  visible, the issue is inside the child components.
-                  If it ISN'T visible, something is overlaying Row 2. */}
-              <button
-                type="button"
-                style={{
-                  padding: "4px 8px",
-                  background: "#ff00ff",
-                  color: "#ffffff",
-                  border: "1px solid #ffffff",
-                  borderRadius: 4,
-                  cursor: "pointer",
-                  flexShrink: 0,
-                  fontSize: 11,
-                }}
-                onClick={() => console.info("[browser-drawer] DIAG button clicked")}
-              >
-                DIAG
-              </button>
-              <input
-                type="text"
-                placeholder="DIAG URL INPUT"
-                style={{
-                  flex: 1,
-                  minWidth: 0,
-                  background: "#ffff00",
-                  color: "#000000",
-                  border: "2px solid #ff0000",
-                  borderRadius: 6,
-                  padding: "6px 12px",
-                  fontSize: 14,
-                  minHeight: 30,
-                  outline: "none",
-                }}
-              />
+              <NavControls />
+              <AddressBar />
             </div>
             {/* Page area — the rect that Rust positions the child webview over */}
             <PageAreaHost ref={hostRef} />
