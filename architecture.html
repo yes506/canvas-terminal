@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Architecture report — browser-localfile</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+           max-width: 960px; margin: 2em auto; padding: 0 1em; color: #1a1a1a; }
+    h1 { border-bottom: 2px solid #1a1a1a; padding-bottom: .25em; }
+    h2 { margin-top: 2em; border-bottom: 1px solid #ccc; padding-bottom: .15em; }
+    h4 { margin-bottom: .25em; color: #444; }
+    code { background: #f4f4f4; padding: .15em .4em; border-radius: 3px; }
+    pre { background: #f9f9f9; padding: 1em; border-radius: 6px; overflow-x: auto; }
+    pre.doc { background: #fafaf2; border-left: 3px solid #ccc; padding: .6em .9em;
+              font-size: .85em; white-space: pre-wrap; }
+    summary { cursor: pointer; padding: .5em 0; }
+    details { margin: .5em 0; padding-left: 1em; border-left: 2px solid #eee; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    th, td { border: 1px solid #ddd; padding: .4em .6em; text-align: left; }
+    th { background: #f9f9f9; }
+    .meta { color: #666; font-size: .9em; }
+    .checklist { line-height: 1.8; }
+    .checklist li { list-style: none; }
+    .checklist li::before { content: "☐ "; color: #888; margin-right: .25em; }
+  </style>
+</head>
+<body>
+  <h1>browser-localfile</h1>
+  <p class="meta">Language: <strong>rust</strong> · Last completed phase: <strong>validated</strong></p>
+
+  <h2>Project plan</h2>
+  <p><strong>Goal:</strong> Let the user open a local file (HTML, PDF, image, plaintext) in any browser-drawer tab via a native file picker, without lifting the v1 deny on `file:` URLs. A new `localfile://&lt;22-char-token&gt;` custom URI scheme streams ONLY user-picked files, tab-scoped at the protocol handler.</p>
+<h4>In-scope</h4><ul>
+<li>F1 — &#x27;Open File&#x27; affordance in the browser-drawer chrome (placement inside NavControls as the leftmost icon).</li>
+<li>F2 — Native file picker via tauri-plugin-dialog (open({ multiple: false, directory: false })).</li>
+<li>F3 — New Tauri command mint_localfile_token(tabId, path) → token.</li>
+<li>F4 — New LocalFileTokenRegistry state: Mutex&lt;HashMap&lt;Token, TokenEntry&gt;&gt;.</li>
+<li>F5 — App-level custom URI scheme &#x27;localfile&#x27; registered via register_asynchronous_uri_scheme_protocol.</li>
+<li>F6 — Protocol handler enforces tab-scoping by reading UriSchemeContext::webview_label() and comparing to entry.tab_id.</li>
+<li>F7 — Strict response headers: Content-Type, Content-Length, CSP with sandbox, X-Content-Type-Options nosniff, Referrer-Policy no-referrer, MIME-class-driven Content-Disposition.</li>
+<li>F8 — Token revocation: destroy_browser_tab → revoke_for_tab; navigate to non-localfile → revoke_for_tab; destroy_all + Exit/Destroyed → clear.</li>
+<li>F9 — Frontend classifier (urlScheme.ts) allows strictly-shaped localfile://&lt;22-char-token&gt;; arbitrary localfile: typed input remains denied.</li>
+<li>F10 — Backend validate_browser_url mirrors F9 so existing navigate_browser_tab path accepts well-formed token URLs.</li>
+</ul>
+<h4>Out-of-scope</h4><ul>
+<li>Save-as / download endpoint.</li>
+<li>Drag-and-drop file → tab.</li>
+<li>Directory open or directory listing.</li>
+<li>Watching the picked file for changes (no inotify / fsevent).</li>
+<li>Windows / Linux platform support (the per-webview-protocol assumption in the original prompt was disproven; we use app-level registration + UriSchemeContext::webview_label for tab-scoping — portable in principle but needs per-OS validation in a future cycle).</li>
+<li>OS passkey / WebAuthn work (separate question, separate plan).</li>
+</ul>
+<h4>Constraints</h4><ul>
+<li>C1 — Defense-in-depth invariant from browser.rs:4-6 holds: every change to the ALLOW/FILTER/DENY matrix in validate_browser_url must land synchronously with the matching classifyScheme update in urlScheme.ts. This change extends that to a THREE-way invariant including commands::localfile::validate_localfile_url_shape.</li>
+<li>C2 — `file:` URLs remain DENIED. This change adds a SEPARATE scheme.</li>
+<li>C3 — No new entitlements. com.apple.security.files.user-selected.read-write in entitlements.plist already covers user-picked file reads.</li>
+<li>C4 — No changes to MAIN window CSP in tauri.conf.json — main window doesn&#x27;t load localfile://. The custom protocol response&#x27;s own CSP (F7) is what matters.</li>
+<li>C5 — Tokens are single-tab-scoped, NOT one-shot. They must survive reloads, sub-resource fetches, and re-navigation within the same tab&#x27;s lifetime.</li>
+<li>C6 — No TTL in v1. Tab-lifetime scoping (F8) is sufficient.</li>
+</ul>
+<h4>Success criteria</h4><ul>
+<li>S1 — User clicks Open File → dialog → picks PDF → active tab renders the PDF inline.</li>
+<li>S2 — Same flow with .html, .png, .txt — all render appropriately.</li>
+<li>S3 — Unit tests: validate_browser_url accepts a well-formed localfile://&lt;22-char-token&gt; string and rejects malformed variants; classifyScheme mirrors.</li>
+<li>S4 — Manual cross-tab test: a token minted for tab_A cannot be served if presented from tab_B&#x27;s webview (returns 404).</li>
+<li>S5 — Closing a tab purges its tokens (verifiable via instrumentation or test command).</li>
+<li>S6 — cargo check passes on the Phase 5 skeleton.</li>
+<li>S7 — cargo test passes on existing browser.rs::tests plus new shape-validation tests.</li>
+</ul>
+<h4>Open questions</h4><ul>
+<li>Q1 — async vs sync protocol handler. RECOMMENDATION: async (register_asynchronous_uri_scheme_protocol) so tokio::fs::read does not block the protocol thread. Implementer to confirm in body.</li>
+<li>Q2 — 256 MiB size cap; &gt;cap returns 413 with empty body. Streaming is v2.</li>
+<li>Q3 — CSP sandbox interaction with macOS PDFKit inline rendering. Initial recommendation: keep sandbox; PDFKit on macOS is the OS&#x27;s built-in viewer (no JS) so sandbox should be safe. Revisit if a real breakage surfaces.</li>
+<li>Q4 — Deny-prefix list initial set: /System, /private/var/db, /Library/Keychains, ~/Library/Keychains, ~/.ssh, ~/Library/Application Support, ~/Library/Cookies, /etc, /var, /usr (with /usr/local excepted). Implementer to finalize.</li>
+<li>Q5 — Mint-error surfacing via the existing per-tab error field on BrowserStore (same channel as URL-validation errors today).</li>
+<li>Q6 — Address-bar typed localfile://&lt;token&gt; is allowed at the classifier level (mirrors backend) but expected to see zero legitimate use; the value is paste-from-clipboard / programmatic re-set within a tab&#x27;s lifetime.</li>
+</ul>
+
+  <h2>Package layout</h2>
+  <ul><li><code>src-tauri/Cargo.toml [MODIFY at implementer time] +mime_guess +getrandom; tokio feature +fs</code></li><li><code>src-tauri/src/lib.rs [MODIFY at implementer time] register_asynchronous_uri_scheme_protocol(&#x27;localfile&#x27;, ...); .manage(LocalFileTokenRegistry); +mint_localfile_token in invoke_handler; hook revocation calls in WindowEvent::Destroyed and RunEvent::Exit</code></li><li><code>src-tauri/src/state.rs [MODIFIED in skeleton] +Token, +TokenEntry, +RegistryError, +LocalFileTokenStore trait, +LocalFileTokenRegistry struct + impl</code></li><li><code>src-tauri/src/commands/mod.rs [MODIFIED in skeleton] pub mod localfile;</code></li><li><code>src-tauri/src/commands/browser.rs [MODIFY at implementer time] extend validate_browser_url to dispatch to commands::localfile::validate_localfile_url_shape on `localfile:` inputs; add revoke_for_tab calls in destroy_browser_tab_impl, destroy_all_browser_tabs_impl, navigate_browser_tab (non-localfile dest); add tests for localfile shape allow + malformed deny</code></li><li><code>src-tauri/src/commands/localfile.rs [NEW in skeleton] validate_picked_path, classify_mime, generate_token, build_localfile_response, validate_localfile_url_shape, mint_localfile_token, localfile_protocol_handler</code></li><li><code>src/lib/urlScheme.ts [MODIFY at implementer time] add localfile://&lt;22-char-token&gt; allow branch (mirror of validate_browser_url change)</code></li><li><code>src/lib/browserIpc.ts [MODIFY at implementer time] +mintLocalFileToken IPC wrapper</code></li><li><code>src/components/browser/NavControls.tsx [MODIFY at implementer time] mount OpenFileButton as leftmost icon</code></li><li><code>src/components/browser/OpenFileButton.tsx [NEW at implementer time] dialog → mint → navigate; surfaces errors via setTabError</code></li></ul>
+
+  <h2>Interfaces &amp; method docstrings</h2>
+  <p class="meta">All interfaces are expanded by default so the reviewer can spot-check the 9-field docstrings without scrolling through a chat log.</p>
+  <details open><summary><strong>LocalFileTokenStore</strong> <small>(src-tauri/src/state.rs, cohesion: state + lifecycle + failure-domain (single Mutex&lt;HashMap&gt;, app-lifetime, lock-poisoning all callers share))</small></summary>
+<ul>
+<li><code>mint</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Atomically mint a fresh token, bind it to (tab_id, canonical_path, mime), store the entry, return the token. Token generation (16 bytes getrandom + URL-safe-base64 + collision check) is an internal impl detail under the same lock scope as the insert; not surfaced as a cross-interface collaborator.</pre>
+</li>
+<li><code>lookup</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Read-only lookup with tab-scope enforcement. Returns Some(entry) on hit AND tab match, None on miss OR tab mismatch (404-equivalent — caller cannot distinguish, deliberate). Mutex poison swallowed to None.</pre>
+</li>
+<li><code>revoke_for_tab</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Drop every entry whose tab_id matches. Best-effort: Mutex poison swallowed to 0 (preferring partial cleanup over leak). Idempotent. Called from commands::browser destroy and navigate-away hooks.</pre>
+</li>
+<li><code>clear</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Drain every entry. Used at app teardown (destroy_all_browser_tabs_impl, WindowEvent::Destroyed, RunEvent::Exit). Best-effort idempotent.</pre>
+</li>
+<li><code>new (LocalFileTokenRegistry::new)</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Construct an empty registry. Called once in lib.rs::run() before .manage().</pre>
+</li>
+</ul></details>
+<details open><summary><strong>commands::localfile</strong> <small>(src-tauri/src/commands/localfile.rs, cohesion: lifecycle (mint pipeline 1→2→3→4 + serve pipeline 6→fs→7) + collaboration boundary (both pipelines call LocalFileTokenStore))</small></summary>
+<ul>
+<li><code>validate_picked_path</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Canonicalize, reject directories/symlinks/sockets/FIFOs/devices, reject paths under v1 deny-prefix list. Returns the canonical PathBuf. Terminal validation step (no downstream collaborators).</pre>
+</li>
+<li><code>classify_mime</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Determine MIME from canonical path&#x27;s extension; application/octet-stream fallback. Pure; guaranteed no CR/LF/control bytes in output (header-safe).</pre>
+</li>
+<li><code>build_localfile_response</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Compose http::Response&lt;Vec&lt;u8&gt;&gt; with full v1 security-header set (CSP+sandbox, nosniff, no-referrer, MIME-class-driven Disposition).</pre>
+</li>
+<li><code>validate_localfile_url_shape</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Single source of truth for `localfile://&lt;token&gt;` shape gate. Used by extended validate_browser_url. Strict 22-char base64-url; rejects everything else.</pre>
+</li>
+<li><code>mint_localfile_token (#[tauri::command])</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Tauri command entry — orchestrates validate_picked_path → classify_mime → LocalFileTokenStore::mint. Returns token to frontend.</pre>
+</li>
+<li><code>localfile_protocol_handler</code>
+ <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
+<pre class="doc">Async URI-scheme handler. Parses token + reads UriSchemeContext::webview_label, strips `browser-tab-` prefix, LocalFileTokenStore::lookup (tab-scoped), tokio::fs::read, build_localfile_response, responder.respond.</pre>
+</li>
+</ul></details>
+
+  <h2>Dependency DAG (Mermaid source)</h2>
+  <p class="meta">Inline Mermaid source — this report is fully self-contained and does not load any external scripts. To render the diagram, paste the block below into a Mermaid renderer (e.g. <code>mermaid-cli</code> or <code>mermaid.live</code>) or open the sibling <code>architecture.mmd</code> file.</p>
+  <pre>
+graph LR
+  LocalFileTokenStore["LocalFileTokenStore"]
+  commands__localfile["commands::localfile"]
+  commands__localfile --> LocalFileTokenStore
+  </pre>
+
+  <h2>Self-verification rubric</h2>
+  <table><thead><tr><th>Criterion</th><th>Score</th></tr></thead><tbody><tr><td>Decomposition completeness</td><td>4/4</td></tr><tr><td>Docstring quality</td><td>4/4</td></tr><tr><td>Interface cohesion</td><td>4/4</td></tr><tr><td>Dependency direction</td><td>4/4</td></tr><tr><td>Validation status</td><td>3/4</td></tr><tr><td>Plan coverage</td><td>4/4</td></tr></tbody></table>
+
+  <h2>Reviewer checklist</h2>
+  <ul class="checklist">
+  <li>The decomposition table in Phase 3 matches the interfaces actually emitted in Phase 5</li>
+  <li>Every method has all 9 docstring fields (skim 3 random methods to spot-check)</li>
+  <li>No interface looks like a grab-bag of unrelated methods</li>
+  <li>The Mermaid DAG (architecture.mmd) is acyclic</li>
+  <li>No method body has been written (interface-only)</li>
+  <li>The validation command (Phase 6) passed — see <code>.planner-state.json</code>: <code>validation_status</code></li>
+</ul>
+</body>
+</html>

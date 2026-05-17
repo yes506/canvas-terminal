@@ -118,48 +118,12 @@ pub(crate) fn classify_mime(_canonical: &Path) -> String {
     )
 }
 
-/// Generate a 22-char URL-safe-base64-encoded 128-bit random
-/// token, retrying on the astronomically improbable collision
-/// with an existing registry entry.
-///
-/// **Responsibility:** Produce a token that is fresh in the
-/// registry at the moment of return; the caller's subsequent
-/// insert under it uses the same lock scope so the freshness
-/// check is honest.
-/// **Pipeline-position:** `classify_mime` -> THIS ->
-/// `LocalFileTokenStore::mint` (which inserts under the returned
-/// token).
-/// **Inputs:**
-/// - `registry`: `&LocalFileTokenRegistry` — used to verify the
-///   freshly generated token is not already a key.
-/// **Outputs:** `Token` — 22-char base64-url; guaranteed unique
-/// in the registry at the moment of return. A TOCTOU gap between
-/// this fn's return and the caller's insert is acceptable because
-/// `LocalFileTokenStore::mint` holds the registry lock across
-/// generate-and-insert (see its impl).
-/// **Side-effects:** consumes 16 bytes of `getrandom` entropy per
-/// attempt; transient Mutex acquisition on the registry per
-/// collision check.
-/// **Preconditions:** `getrandom` is functional. (Standard
-/// userspace assumption on macOS / Linux / Windows.)
-/// **Postconditions:** the return value is NOT a current key in
-/// the registry at generation time. Side-effect-free on the
-/// registry's contents.
-/// **Failure-modes:** None at the signature level. Collisions are
-/// retried internally up to a fixed budget (32 attempts); the
-/// budget-exhausted case panics, because a working 128-bit RNG
-/// cannot legitimately collide twice in a row — anything that
-/// does signals a broken RNG and the app is no longer secure.
-/// **Collaborators:** reads `LocalFileTokenRegistry::entries` for
-/// the collision check; does not call any other public interface.
-pub(crate) fn generate_token(_registry: &LocalFileTokenRegistry) -> Token {
-    todo!(
-        "Phase-5 skeleton — body delegated to codebase-implementer. \
-         Loop: getrandom 16 bytes -> base64-url encode -> check absence in \
-         registry.entries -> return on hit-not-found, retry on collision \
-         (cap 32, panic past)."
-    )
-}
+// Token generation (16 bytes getrandom -> URL-safe-base64) is an
+// internal concern of `LocalFileTokenStore::mint` and lives inside
+// the impl in `state.rs`. Keeping it inside the trait impl closes
+// the TOCTOU window between freshness check and insert (both happen
+// under the same lock scope) and avoids a cross-module dependency
+// cycle (commands::localfile -> state, never the reverse).
 
 /// Build a successful (`200 OK`) `http::Response` for a localfile
 /// fetch. Sets all v1 security headers and the

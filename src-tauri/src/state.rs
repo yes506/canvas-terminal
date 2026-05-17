@@ -403,9 +403,10 @@ pub trait LocalFileTokenStore: Send + Sync {
     /// unique across the live registry at the moment of return.
     /// **Side-effects:** mutates the registry's internal HashMap;
     /// holds the internal Mutex for the duration of the
-    /// generate-and-insert; consumes 16 bytes of RNG entropy per
-    /// generation attempt (via `generate_token`). No I/O; no time;
-    /// no network.
+    /// generate-and-insert (both happen under the SAME lock scope
+    /// to close the freshness-vs-insert TOCTOU window); consumes
+    /// 16 bytes of `getrandom` entropy per generation attempt. No
+    /// I/O; no time; no network.
     /// **Preconditions:** `canonical_path` exists, is a regular file
     /// (not a directory, symlink, socket, FIFO, or device), and is
     /// not under any entry in the deny-prefix list. `mime` is a
@@ -424,10 +425,11 @@ pub trait LocalFileTokenStore: Send + Sync {
     /// - `RegistryError::TokenSpaceExhausted` — random-token
     ///   generation collided too many times in a row (default
     ///   threshold: 32 rerolls); signals a broken RNG.
-    /// **Collaborators:**
-    /// `commands::localfile::generate_token` is called to produce
-    /// the random token under the lock; `mint` itself does not call
-    /// any other public interface.
+    /// **Collaborators:** None at the interface level. Token
+    /// generation (16 bytes `getrandom` -> URL-safe-base64 ->
+    /// collision check) is an internal concern of this trait's impl
+    /// and happens under the same lock scope as the insert, so it
+    /// is not surfaced as a separate collaborator.
     fn mint(
         &self,
         tab_id: TabId,
