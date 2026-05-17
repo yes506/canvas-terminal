@@ -1,411 +1,326 @@
-# Feature plan — browser-drawer
+# Feature plan — browser-tabs
 
-A built-in browser drawer for Canvas Terminal, modelled after cmux. Lives
-as a sibling of the existing canvas drawer (canvas slides out from the
-left, browser slides out from the right; terminal stays in the middle).
-One Tauri 2 child webview overlaid on the main window's DOM rect, with
-the IPC contract owned by Rust commands.
+> Supersedes the prior `browser-drawer` cycle plan (preserved in git
+> history at commits `8d92453`, `d439f0a`, `3a57d55`). This cycle adds
+> multi-tab support and fixes link-navigation + live-resize regressions
+> on top of the merged browser-drawer baseline.
 
-This file is the planner's tracked output for downstream implementers.
-Full rationale per phase is in shared memory under
-`task-30-claude1-plan-phase{1,2,2-verification,3,4,5}.md`; this is the
-trimmed version per `feature-lane.md`.
+## Revision history
 
-Marker on the merged branch: `(plan-feature, human-confirmed)`.
-
----
+- **r1** (`a718491`) — Initial Phase 7 artifacts (browser-tabs decomposition).
+- **r2** (`7cac8da`) — Cohort-feedback patch. Convergent issues addressed:
+  stale `plan-detail.mmd` removed (claude2/codex2/claude3/codex3); settings
+  restore + persistence decomposed into a new `BrowserTabsSettings` hook
+  (claude3/codex3); dependency-direction prose aligned to mmd arrows
+  (all 4); `last_bounds` / `generation` granularity pinned (claude2 M1);
+  B1 H1 fix path scope clarified vs out-of-scope (claude2 M2); drawer-close
+  wipes-all-tabs invariant made explicit (claude2 M3); event-rename intent
+  stated explicitly (claude3 #5); B1 verification target tightened (codex2 #3);
+  active-tab switch flicker guard noted (claude2 S4); UUID source picked
+  (claude2 S2); `browser_last_url` semantics defined (claude2 S3).
+- **r3** (`947d88e`) — r2 cohort-feedback polish. Convergent minor items:
+  added `BrowserDrawer → NavControls/AddressBar` edges to plan.mmd
+  (claude2 P1 + claude3 N1); corrected edge count 17→20 + relabeled
+  toposort to strict longest-path (claude3 N2 + claude2 P2); inlined B1
+  hypotheses + verification targets + investigation steps into plan.md
+  so it's self-contained for the downstream gate (codex3 #1 + codex2
+  note). Individual items: pinned BrowserTabsSettings file decision to
+  co-locate in `useBrowserLifecycle.ts` (codex3 #2); resolved
+  Rust/TS name collision by keeping TS shape as `BrowserState`
+  (extended), Rust owns `BrowserTabsState` exclusively (claude2 P3a);
+  added `Tab` history-lives-in-OS-layer note (claude2 P3b); rephrased
+  row #30 to remove "per-tab keyed by tab_id but scoped to first tab"
+  tension (claude3 N3).
+- **r4** (this commit) — r3 polish tail. Two residual nits closed:
+  package-layout block now says `Tab + BrowserState [extended]` to
+  match the r3 name-collision fix (claude3 N4 + codex2 nit, 2-way
+  convergent); dependency-direction prose now names both
+  `BrowserStore` (L2) and `BrowserTabsState` (L4) as sinks rather
+  than calling only `BrowserTabsState` the "single ultimate sink"
+  (codex3 low).
 
 ## Goal
 
-Add a built-in browser drawer at the same App-level as the canvas
-drawer, sliding out from the right. The browser AUGMENTS the user's
-external browser for quick in-context lookup — not a Chrome/Safari
-replacement. Single Tauri 2 child webview, no internal tabs, Rust-owned
-lifecycle and navigation, persistence via the existing settings.json
-command surface.
+Repair the built-in browser drawer in canvas-terminal: fix link-click
+navigation (B1), confirm/ensure live resize of webview content with the
+drawer/window (F1), and add Chrome-like multi-tab support inside the
+drawer (F2).
 
 ## In scope
 
-- New top-level right-side drawer in `App.tsx`, mirroring the canvas
-  drawer's open/closed/width pattern.
-- One Tauri 2 child webview overlaid on the drawer's page-area DOM rect
-  (via `Window::add_child` — requires `unstable` feature in
-  `Cargo.toml`).
-- Drawer chrome: address bar, back / forward / reload / stop, loading
-  state, page title.
-- Bounds-sync from 7 sources: window resize, scale-factor change,
-  drawer drag (browser + canvas), drawer open/close, fullscreen/title-
-  bar, UpdateBanner show/hide, minimize/restore.
-- Native-menu accelerator `CmdOrCtrl+Shift+B` to toggle the drawer
-  (works regardless of which webview has focus on all 3 desktop OSes).
-- Tear-down on drawer close AND on app quit (RunEvent::Exit hooked).
-- Single GLOBAL browser drawer instance (shared across terminal tabs).
-- Shared two-drawer width clamp math in `src/lib/drawerLayout.ts`.
-- Capability isolation — 4 layered protections (see Constraints).
-- Persistence of last URL + drawer width via the existing
-  `commands::settings` surface, extended with two `Option<T>` fields.
-- New TS Zustand `browserStore` for frontend state.
-- New Rust `BrowserCommands` IPC trait + `validate_browser_url`
-  defense-in-depth validator.
+- **B1** — Diagnose and fix all-link-clicks-broken inside the embedded child webview.
+- **F1** — Confirm + ensure webview live-resizes with drawer separator and window edge dragging.
+- **F2** — Multi-tab strip with manual `+` button (max 10 tabs), per-tab Chrome-like state, last-tab-close keeps one blank tab.
 
 ## Out of scope
 
-- Multiple browser tabs / tab strip inside the drawer.
-- Bookmarks UI, history UI, downloads tracking, extensions.
-- Per-pane cookie partitioning (uses Tauri/native webview's default app
-  data store).
-- DevTools UI surface (right-click dev-tools in dev builds only).
-- Browser as a tab kind or pane kind inside `PaneTree` (drawer pattern
-  only — scope=2 lock).
-- html2canvas / screenshot-into-canvas of the browser drawer (OS-layer
-  surface, not React DOM).
-- AI / collaborator integration with browser content (no IPC bridge in
-  v1).
-- In-page find (Cmd+F inside the rendered page).
-- `canGoBack` / `canGoForward` state tracking (Tauri 2 has no reliable
-  source; buttons always-enabled in v1).
-- Per-tab browser drawers.
+- **Spawning a new in-app tab** from `target="_blank"` / `window.open`. (See B1-scope-clarification below — wiring a new-window handler that *routes the click to the active tab's navigate* OR *no-ops with a warning event* is the in-scope fix path for H1; spawning a fresh in-app tab is what stays out.)
+- Middle-click / Cmd+click new-tab.
+- Persistence of the *tab list* across app restarts. (Single-URL persistence via `browser_last_url` is preserved — see Constraints below.)
+- Tab drag-reordering, thumbnails, pinning, favicons.
+- Bookmarks, history, downloads (already deferred in prior browser-drawer scope).
 
 ## Constraints
 
-- Tauri 2.10.3 (`macos-private-api` + `unstable` features); React 18;
-  Zustand 5; TypeScript strict.
-- Browser engine = Tauri 2 platform-native webview only (WKWebView /
-  WebView2 / WebKitGTK). No CEF / Servo / embedded engine.
-- Main-window CSP is NOT relaxed (the child webview has its own
-  browsing context).
-- Capability isolation — 4 layered protections:
-  - **(a)** `tauri.conf.json` keeps `withGlobalTauri: false` (the
-    global default).
-  - **(b)** Browser child created WITHOUT preload / init scripts
-    (`WebviewBuilder::initialization_script` not called).
-  - **(c)** No new `core:webview:*` permissions added to
-    `capabilities/default.json` — Rust-owned commands don't need
-    frontend capability grants. Layer (c) achieved by exclusion.
-  - **(d)** Phase-6 smoke test asserts `typeof window.__TAURI__ ===
-    "undefined"` inside the child webview at runtime.
-- URL-scheme address-bar policy:
-  - ALLOW: `http:`, `https:`, `about:blank`.
-  - FILTER at the input layer: `javascript:`, `tauri:`, `tauri-localhost:`,
-    `data:` (XSS / scheme-handler vectors).
-  - DENY: `file:` (local-file disclosure).
-- Keyboard focus contract: native-menu accelerator
-  (`CmdOrCtrl+Shift+B`) handles toggle for all OS-focus states; DOM
-  keydown path NOT added (dead code on macOS).
-- Lock-order convention: `last_bounds` BEFORE `webview` slot (no node
-  currently locks both simultaneously; documented for future
-  regression prevention).
-- CONCURRENCY INVARIANT: the `webview` Mutex MUST be released before
-  any blocking Tauri call. Enforced via two state-cell primitives
-  (`clone_webview` for non-destroy, `take_webview` for destroy) plus
-  a slot-reservation primitive (`try_reserve_for_create`) returning a
-  RAII `CreateGuard` for the create race.
+- Tauri 2 + `macos-private-api` child webview model (`Window::add_child`) — unchanged.
+- Each child webview needs a UNIQUE label (Tauri rejects duplicates); per-tab label scheme `browser-tab-<uuid>` required.
+- **Tab IDs are generated via `crypto.randomUUID()`** on the frontend (no new dependency required; available in Tauri's WebView2/WKWebView). Same string is used as the Rust webview label suffix.
+- Existing race-condition fixes (close-during-create generation tracking, settings-restore race, listener cleanup, in-flight op chain) must be preserved or replicated PER TAB.
+- **Rust state granularity**: `BrowserTabsState` holds `tabs: Mutex<HashMap<TabId, BrowserSlot<R>>>`; `last_bounds: Mutex<HashMap<TabId, Rect>>` (per-tab — singleton would thrash on every active-tab switch); `generation: AtomicU64` stays **global monotonic** (each tab's `CreateGuard` captures its slot generation independently from a shared counter).
+- **Drawer-close wipes all tabs**: closing the drawer (Cmd+Shift+B or X button) calls `destroy_all_browser_tabs` and clears the tabs slice. Reopen creates a fresh blank tab seeded from `browser_last_url` (or `about:blank`). State preservation across drawer-close is **out of scope** for this cycle.
+- **`browser_last_url` persistence semantics under multi-tab**: only the **active tab's URL** is persisted (debounced 800ms), and only when it is not `about:blank`. On next drawer-open, the **first tab** is seeded with the persisted URL.
+- **Event surface migration**: all old singleton events (`browser-loading`, `browser-loaded`, `browser-title-changed`, `browser-error`) are **removed and replaced** with `browser-tab-loading / -loaded / -title-changed / -error`, each carrying `{ tab_id, ...payload }`. No parallel deprecation period — frontend subscribers update in lockstep with the Rust emitter rename.
+- macOS title-bar offset compensation must continue to apply to whichever tab is active.
+- Capability config scopes to `windows: [main]`; multi-tab does not change this.
+- Tauri config CSP applies only to the Tauri-served frontend, not the child browser webview.
+
+### B1 scope clarification (cohort M2)
+
+`bug_investigations[B1].H1` proposes wiring a new-window event handler.
+That handler is **in scope** *only if* it forwards the requested URL to
+the **active tab's** `navigate` OR no-ops + emits a warning event.
+Spawning a brand-new in-app tab from `target="_blank"` is **out of
+scope** for this cycle. The plan keeps H1 as a candidate root cause for
+"all link clicks broken" without expanding feature scope.
 
 ## Success criteria
 
-- Toggle button or `CmdOrCtrl+Shift+B` → drawer slides out from the
-  right, child webview loads `about:blank` (Q2 default) within ~1s on
-  a warm app; first typed URL navigates within a further ~1s.
-- URL bar accepts a typed URL + Enter → webview navigates; address
-  bar updates on follow-on navigations.
-- Drag handle resizes drawer smoothly; webview tracks the rect each
-  frame without visible lag > 1 frame.
-- Closing the drawer destroys the webview; reopening creates a fresh
-  one on the persisted last URL.
-- Both drawers open simultaneously → terminal shrinks between them,
-  both drawers track their bounds correctly.
-- Browser child webview has NO `__TAURI__` / IPC injection.
-- `tsc --noEmit` clean; `cargo check` clean.
+- **SC1** — On any http/https page, clicking an in-page link navigates the webview.
+- **SC2** — Dragging the drawer separator or the OS window edge resizes the active webview live; its content reflows.
+- **SC3** — Click `+` opens a new about:blank tab and switches to it; switching tabs preserves each tab's URL/history; closing a tab destroys its webview; closing the last tab leaves one blank tab open; no leaked webviews; all prior single-tab race guarantees still hold per tab.
+- **SC4** — Tab count is capped at 10; the `+` button is disabled at the cap.
+- **SC5** — Settings restore + persistence: on cold start, the **first tab** is seeded with the persisted `browser_last_url`; the drawer width is restored; thereafter the active tab's non-blank URL and the drawer width are persisted with the existing 800ms debounce.
 
-## Open questions
+## Resolved open questions (from Phase 1)
 
-All Phase-1 Q1–Q10 resolved with explicit defaults (kept here for
-implementer awareness, not for re-asking):
+- **Q1** — Last-tab-close: keep one blank tab open (drawer stays open).
+- **Q2** — Max tabs: 10.
+- **Q3** — New-tab default URL: `about:blank`.
+- **Q4** — Per-tab state model: Chrome-like — each tab owns url/title/loading/error/history; URL bar + nav buttons + drawer title reflect the active tab only.
 
-- Q1 toggle shortcut: `CmdOrCtrl+Shift+B` (native-menu accelerator).
-- Q2 default homepage: `about:blank`.
-- Q3 both drawers at <600px: canvas wins clamp; shared math in
-  `src/lib/drawerLayout.ts`.
-- Q4 persistence: extend `commands::settings::Settings` with
-  `browser_drawer_width: Option<u32>` + `browser_last_url: Option<String>`.
-- Q5 URL policy: ALLOW http(s)+about:blank; FILTER javascript: /
-  tauri: / tauri-localhost: / data:; DENY file:.
-- Q6 cookies persist via engine default profile (NOT necessarily
-  shared with the OS user's Safari profile — Phase 4-Impl verifies
-  per-platform).
-- Q7 screenshot-into-canvas: out of v1 (OS-layer surface).
-- Q8 Tauri plugin needed: NO — `tauri::webview::WebviewBuilder` core
-  API is sufficient. Cargo.toml needs `"unstable"` feature.
-- Q9 page crash / hang: surface inline banner on nav error.
-- Q10 menu-accelerator vs DOM keydown: native-menu only (DOM path
-  dropped per Phase-3 Round-1).
+## Open investigations (not blockers — resolved during implementation)
 
----
+### B1 — All link clicks broken inside child webview
+
+**Hypotheses** (root cause TBD until reproduction):
+
+- **H1** — `target="_blank"` / `window.open` links fire a new-window
+  request that the WebviewBuilder does not currently subscribe to; the
+  click silently no-ops. Fix path (in-scope per the B1-scope-
+  clarification below): wire a new-window handler that **routes the
+  requested URL to the active tab's `navigate`**, OR **no-ops and emits
+  a warning event**. Spawning a brand-new in-app tab from this handler
+  is **out of scope**.
+- **H2** — `on_navigation` returning `false` on URLs the validator
+  rejects (e.g. `mailto:`, `tel:`, scheme-less forms WebKit forwards).
+  Fix: enumerate URL shapes Tauri actually delivers; route
+  `mailto:`/`tel:` via the existing `open_external_url` command;
+  tighten or relax the validator with a rationale comment that mirrors
+  the TS-side `classifyScheme`.
+- **H3** — z-order / bounds drift causes link-area clicks to miss the
+  OS-layer webview's bounds (titlebar offset miscompensation, scale
+  factor change, fullscreen toggle). Fix: confirm visually with a
+  temporary diagnostic overlay; correct the offset path in
+  `compute_macos_titlebar_offset` if drifted.
+- **H4** — DOM-layer click handler intercepts events before they reach
+  the OS-layer webview. Implausible since the child webview is OS-layer
+  not DOM, but verify if H3 turns out not to be the cause.
+
+**Verification targets** (must hit both during repro):
+
+- `https://en.wikipedia.org/wiki/Main_Page` — many in-page same-window
+  links of varied shapes (positive test for SC1).
+- `https://github.com` — many `target="_blank"` links (no-regression
+  boundary; H1 fix path must not spawn new in-app tabs).
+
+**Investigation steps:**
+
+1. Reproduce: open drawer, load Wikipedia, click an in-page link;
+   observe `browser-tab-loading` / `-loaded` / `-title-changed` /
+   `-error` events in the dev console.
+2. Add a temporary `println!` in the `on_navigation` closure to log
+   every `nav_url` and the validator outcome.
+3. If `on_navigation` never fires for the click → H1; add new-window
+   handling per the scope clarification.
+4. If it fires but returns `false` → H2; relax the validator for the
+   specific shape with a one-line rationale.
+5. Smoke-test GitHub for no-regression: `target="_blank"` link clicks
+   should follow the B1 scope clarification semantics.
+6. Land the minimum fix; keep diagnostic logs gated behind
+   `#[cfg(debug_assertions)]` so they don't leak into release builds.
 
 ## Package layout
 
+No new packages introduced. The feature lives entirely in existing
+locations:
+
 ```
 src/
-├── App.tsx                        [MODIFIED] right-side drawer panel
-├── stores/
-│   └── browserStore.ts            [NEW] Zustand state
-├── components/
-│   └── browser/                   [NEW package, mirrors canvas/]
-│       ├── BrowserDrawer.tsx
-│       ├── AddressBar.tsx
-│       ├── NavControls.tsx
-│       ├── PageAreaHost.tsx
-│       ├── useBrowserBounds.ts
-│       └── useBrowserLifecycle.ts
-├── hooks/
-│   └── useKeyboardShortcuts.ts    [UNCHANGED — DOM-path toggle dropped]
-├── lib/
-│   ├── urlScheme.ts               [NEW] scheme classifier (skeleton)
-│   ├── urlScheme.test.ts          [NEW] Vitest spec (implementation)
-│   ├── drawerLayout.ts            [NEW] shared clamp (skeleton)
-│   └── browserIpc.ts              [NEW] invoke wrappers (skeleton)
-└── types/
-    └── browser.ts                 [NEW] type definitions (skeleton)
+├── components/browser/
+│   ├── AddressBar.tsx              (modified)
+│   ├── BrowserDrawer.tsx           (modified)
+│   ├── NavControls.tsx             (modified)
+│   ├── PageAreaHost.tsx            (unchanged)
+│   ├── TabStrip.tsx                (NEW)
+│   ├── useBrowserBounds.ts         (modified → useBrowserTabsBounds)
+│   └── useBrowserLifecycle.ts      (modified → useBrowserTabsLifecycle
+│                                    + co-located BrowserTabsSettings sub-hook
+│                                    — single file, no new file beyond TabStrip.tsx)
+├── lib/browserIpc.ts               (modified — per-tab wrappers; preserves setBrowserSettings)
+├── stores/browserStore.ts          (modified — tabs slice)
+└── types/browser.ts                (modified — Tab + BrowserState [extended])
 
-src-tauri/
-├── Cargo.toml                     [MODIFIED] add "unstable" to tauri features
-├── tauri.conf.json                [VERIFIED] withGlobalTauri stays false
-├── capabilities/
-│   └── default.json               [UNCHANGED] no new core:webview:* perms
-└── src/
-    ├── lib.rs                     [MODIFIED] build_menu + on_menu_event arm
-    │                              + run() RunEvent::Exit handler
-    ├── state.rs                   [MODIFIED] BrowserWebviewState struct +
-    │                              BrowserStateOps trait + AppState.settings_io_lock
-    ├── commands/
-    │   ├── mod.rs                 [MODIFIED] pub mod browser;
-    │   ├── browser.rs             [NEW] BrowserCommands trait (skeleton)
-    │   │                          + validate_browser_url signature
-    │   └── settings.rs            [MODIFIED] Settings struct +2 fields +
-    │                              set_browser_settings partial-update command
-    └── (no new menu.rs file)      Existing build_menu extended in-place
+src-tauri/src/
+├── commands/browser.rs             (modified — 9 per-tab commands; per-tab event emitters)
+├── lib.rs                          (modified — handler registration + RunEvent::Exit)
+└── state.rs                        (modified — singleton → HashMap<TabId, BrowserSlot> + per-tab last_bounds)
 ```
 
-Dependency direction (one line):
-`App.tsx → components/browser → browserStore → browserIpc → invoke → BrowserCommands → BrowserStateOps → BrowserSlot/last_bounds`.
-
----
+Only new file: `src/components/browser/TabStrip.tsx`.
 
 ## Decomposition
 
-46 nodes across 15 interface groups. Full table + per-method
-reasoning is in `task-30-claude1-plan-phase3.md` (shared memory);
-condensed here for implementer reference:
+| # | Stage | Interface | Method | Belongs to | Notes |
+|---|---|---|---|---|---|
+| 1 | Reserve per-tab create slot | `BrowserTabsState` | `try_reserve_for_create(tab_id) -> CreateGuard` | `src-tauri/src/state.rs` | per-tab CreateGuard with generation tracking from a shared `AtomicU64` |
+| 2 | Look up tab webview | `BrowserTabsState` | `clone_tab(tab_id)`, `take_tab(tab_id)` | `src-tauri/src/state.rs` | mirrors current `clone_webview` / `take_webview` |
+| 3 | Build webview label | `BrowserTabsState` | `label_for(tab_id) -> String` | `src-tauri/src/state.rs` | `browser-tab-<uuid>` |
+| 4 | Create webview per tab | `BrowserTabCommands` | `create_browser_tab(tab_id, url, rect)` | `src-tauri/src/commands/browser.rs` | wires `on_navigation` / `on_page_load` / `on_document_title_changed` (+ new-window handler per B1 scope clarification); emits per-tab events |
+| 5 | Set tab bounds | `BrowserTabCommands` | `set_browser_tab_bounds(tab_id, rect, visible)` | `src-tauri/src/commands/browser.rs` | `visible=false` → off-screen position; per-tab `last_bounds` dedup |
+| 6 | Navigate a tab | `BrowserTabCommands` | `navigate_browser_tab(tab_id, url)` | `src-tauri/src/commands/browser.rs` | re-validates URL |
+| 7 | Tab history nav | `BrowserTabCommands` | `browser_tab_go_back / go_forward / reload / stop(tab_id)` | `src-tauri/src/commands/browser.rs` | 4 methods, identical shape |
+| 8 | Destroy single tab | `BrowserTabCommands` | `destroy_browser_tab(tab_id)` | `src-tauri/src/commands/browser.rs` | idempotent; clears per-tab `last_bounds` |
+| 9 | Destroy all tabs | `BrowserTabCommands` | `destroy_all_browser_tabs()` | `src-tauri/src/commands/browser.rs` | called from drawer-close + `RunEvent::Exit` |
+| 10 | Emit per-tab nav events | helper | `emit_tab_event(tab_id, kind, payload)` | `src-tauri/src/commands/browser.rs` | payload includes `tab_id`; emits `browser-tab-{loading,loaded,title-changed,error}` (old singleton names removed) |
+| 11 | **Repair link-click nav (B1)** | investigation node | TBD — fix lives in `create_browser_tab` (likely `on_navigation` closure or a new-window handler scoped per the B1 scope clarification above) | `src-tauri/src/commands/browser.rs` | hypotheses + verification targets + investigation steps inlined in the "## Open investigations" section above |
+| 12 | Tab-aware bounds sync | `useBrowserTabsBounds` | `useBrowserTabsBounds(hostRef, enabled)` — replaces `useBrowserBounds` | `src/components/browser/useBrowserBounds.ts` | active visible, others off-screen; on active-tab switch hide-prev + show-new in the **same rAF tick** (claude2 S4 — avoids one-frame off-screen flicker) |
+| 13 | **Verify live resize (F1)** | `useBrowserTabsBounds` | verification gate against ResizeObserver firing during drag | `src/components/browser/useBrowserBounds.ts` | see `verification_plans[F1]` |
+| 14 | New TS types | (type definitions) | `Tab`, `BrowserState` (extended) | `src/types/browser.ts` | `Tab = {id, url, title, isLoading, error}` (per-tab history lives in the OS-layer webview, not the TS shape); extend the existing `BrowserState` to `{ drawerOpen, drawerWidth, tabs: Tab[], activeTabId: string \| null }`. Name reuse intentional — TS shape keeps `BrowserState` to avoid colliding with Rust's `BrowserTabsState` struct |
+| 15 | TS IPC wrappers | `BrowserTabsIpc` | `createBrowserTab / setBrowserTabBounds / navigateBrowserTab / browserTab{GoBack,GoForward,Reload,Stop} / destroyBrowserTab / destroyAllBrowserTabs` + preserved `setBrowserSettings` | `src/lib/browserIpc.ts` | replaces 8 old single-webview wrappers; `setBrowserSettings` kept |
+| 16 | Zustand tabs slice | `BrowserStore` | shape `{drawerOpen, drawerWidth, tabs: Tab[], activeTabId}` + selectors `activeTab() / activeUrl() / activeTitle() / activeLoading() / activeError()` | `src/stores/browserStore.ts` | replaces single `currentUrl / pageTitle / isLoading / error` |
+| 17 | `newTab` | `BrowserStore` | `newTab()` | `src/stores/browserStore.ts` | enforce ≤ 10 cap; push blank Tab; set active; id = `crypto.randomUUID()` |
+| 18 | `closeTab` | `BrowserStore` | `closeTab(id)` | `src/stores/browserStore.ts` | last-tab-close → replace with one blank |
+| 19 | `setActiveTab` | `BrowserStore` | `setActiveTab(id)` | `src/stores/browserStore.ts` | triggers bounds re-sync |
+| 20 | Per-tab field setters | `BrowserStore` | `setTabUrl / setTabTitle / setTabLoading / setTabError` | `src/stores/browserStore.ts` | called by `browser-tab-*` event handlers |
+| 21 | Tab strip UI | `TabStrip` | `TabStrip()` | `src/components/browser/TabStrip.tsx` (NEW) | tab buttons + close × + `+` (disabled at 10) |
+| 22 | Drawer chrome integration | `BrowserDrawer` | mounts `TabStrip` above existing Row 2; chrome title = `activeTitle`; mounts lifecycle + bounds + settings hooks | `src/components/browser/BrowserDrawer.tsx` | layout: Row 0 TabStrip / Row 1 title / Row 2 nav+addr / Body Host |
+| 23 | Per-tab lifecycle | `useBrowserTabsLifecycle` | per-tab create-on-add / destroy-on-remove; nav event routing by `tab_id`; replicates race-fix invariants per tab (CreateGuard generation, in-flight op chain per slot, listener cleanup with cancellation flag) | `src/components/browser/useBrowserLifecycle.ts` | replaces `useBrowserLifecycle` |
+| 24 | Nav controls → active tab | `NavControls` | onClick handlers use `activeTabId` + per-tab IPC | `src/components/browser/NavControls.tsx` | small change |
+| 25 | Address bar → active tab | `AddressBar` | onSubmit uses `activeTabId` + `navigateBrowserTab` | `src/components/browser/AddressBar.tsx` | small change |
+| 26 | Handler registration | (binding) | register 9 new commands; remove 8 old single-webview commands | `src-tauri/src/lib.rs` | inside `tauri::generate_handler!` |
+| 27 | App-quit cleanup | (binding) | `RunEvent::Exit` calls `destroy_all_browser_tabs_impl` | `src-tauri/src/lib.rs` | replaces `destroy_browser_webview_impl` |
+| 28 | Restore drawer width on mount | `BrowserTabsSettings` | `restoreDrawerWidth()` | settings sub-hook | `get_settings` → `BrowserStore.setDrawerWidth` |
+| 29 | Seed first tab URL on mount | `BrowserTabsSettings` | `seedFirstTabUrl()` | settings sub-hook | if `tabs` empty: push one Tab with url = settings.browser_last_url ?? 'about:blank' |
+| 30 | Guard settings-restore-during-create | `BrowserTabsSettings` | `guardSettingsRestoreDuringCreate()` | settings sub-hook | applies only to the **first tab** created via `seedFirstTabUrl` — that's the single path that can race the cold-start `get_settings` resolve against a webview build. Subsequent user-`+` tab creates need no guard (no settings restore is in flight at that point). Mirrors the current R2/R3/R4 race fix |
+| 31 | Persist active-tab URL (debounced) | `BrowserTabsSettings` | `persistActiveTabUrl()` | settings sub-hook | 800ms debounce; only when activeTab.url !== 'about:blank' AND changed |
+| 32 | Persist drawer width (debounced) | `BrowserTabsSettings` | `persistDrawerWidth()` | settings sub-hook | 800ms debounce; only when changed |
 
-| Group | Nodes | Role |
-|---|---|---|
-| A. browserStore | #1–#7 | Zustand state actions (toggle, setters) |
-| B. BrowserDrawer | #8–#9 | Drawer container + drag handler |
-| C. AddressBar | #10–#11 | URL input + submit handler |
-| D. NavControls | #12 | Back/fwd/reload/stop buttons + spinner + title |
-| E. PageAreaHost | #13 | Empty rect-reporting `<div>` |
-| F. useBrowserBounds | #14–#17 | Subscribe scale-factor / resize / ResizeObserver + rAF sync |
-| G. useBrowserLifecycle | #18–#22 | createOnOpen / destroyOnClose / nav-event subscribe / menu-toggle subscribe / persistSettings |
-| H. useKeyboardShortcuts | (#23 DROPPED) | DOM-path toggle dropped; menu accelerator handles all OSes |
-| I. urlScheme | #24 | Pure classifier (TS) |
-| J. commands::browser | #25–#34c | 9 Tauri commands + `on_page_load` / `on_document_title_changed` / `on_navigation` callbacks |
-| K. BrowserWebviewState | #35, #36a–#36d | new + clone_webview + take_webview + try_reserve_for_create + AppState.settings_io_lock |
-| L. commands::settings | #37, #38, #44 | +2 struct fields + modified set_settings (lock acquisition) + new set_browser_settings partial-update |
-| M. lib.rs::build_menu | #39, #40 | toggle_browser MenuItem + on_menu_event arm emitting `menu-toggle-browser` |
-| N. lib.rs::run | #41 | RunEvent::Exit handler invoking destroy_browser_webview_impl |
-| O. New nodes (Phase-3 revision-2/3) | #42, #43, #43-test, #44 | clampDrawerWidth (pure TS), validate_browser_url (Rust defense-in-depth) + Rust unit-test, set_browser_settings (partial-update command) |
+### Cohesion grouping
 
-Cross-boundary IPC contract:
+- **`BrowserTabsState`** (#1–#3) — share Rust state (`HashMap<TabId, BrowserSlot<R>>` + per-tab `last_bounds`) and lifecycle (Empty→Creating→Ready per slot).
+- **`BrowserTabCommands`** (#4–#10) — share collaboration boundary (`tauri::generate_handler!`) and failure domain (all need `BrowserTabsState`).
+- **`BrowserStore` actions** (#16–#20) — share state (tabs slice) and lifecycle.
+- **`useBrowserTabsLifecycle`** (#23) — orchestrates per-tab create/destroy + event subscription with race-fix invariants.
+- **`useBrowserTabsBounds`** (#12, #13) — observes host rect, dispatches active-tab visible / inactive hidden (same-rAF switch).
+- **`BrowserTabsSettings`** (#28–#32, NEW after cohort feedback) — restore + persist drawer width and active-tab URL; preserves the settings-restore-during-create race guard scoped to first tab.
 
-- **Frontend → Rust invoke (10 commands):** `create_browser_webview`,
-  `set_browser_webview_bounds`, `navigate_browser`,
-  `browser_go_back/forward/reload/stop`, `destroy_browser_webview`,
-  `set_browser_settings`, `get_settings` (existing).
-- **Rust → Frontend events (5):** `menu-toggle-browser`,
-  `browser-loading`, `browser-loaded`, `browser-title-changed`,
-  `browser-error`.
-- **Built-in Tauri events consumed (2):** `tauri://resize`,
-  `tauri://scale-change`.
+### Cross-boundary contracts
 
-DAG: see `plan.mmd` (sibling file, interface-level view, ~16 module
-nodes) and `plan-detail.mmd` (sibling file, full per-method DAG with
-46 nodes from the Phase-3 decomposition). Per @claude2 Round-1 F1:
-both views are committed so that post-merge readers on
-`feat/browser-integration` have access to the granular view without
-needing to read the shared-memory `task-30-claude1-plan-phase3.md`
-file (which is in the gitignored cache, not the tracked repo). The
-interface-level DAG is the primary review surface; the per-method
-DAG is the implementation reference. Both are acyclic; every edge is
-justified by a `Collaborators` field in the emitted skeleton's
-9-field docstring (where applicable) or by the Phase-3 reasoning
-text (for non-skeleton nodes).
+Yes — the 9 new Tauri commands (#4–#10) are TS↔Rust IPC contracts. Per
+feature-lane spec, skeleton emission is optional and was **skipped** at
+user direction. The IPC shapes are documented in this plan and will live
+in `src/lib/browserIpc.ts` and `src-tauri/src/commands/browser.rs` upon
+implementation.
 
----
+## Dependency direction
+
+`plan.mmd` uses **"X depends-on Y"** arrows (consumer → collaborator),
+which is the Mermaid convention from the renderer. Reading the DAG:
+
+```
+BrowserDrawer    depends on  BrowserStore, TabStrip, NavControls,
+                             AddressBar, useBrowserTabsLifecycle,
+                             useBrowserTabsBounds, BrowserTabsSettings
+TabStrip         depends on  BrowserStore
+NavControls      depends on  BrowserTabsIpc, BrowserStore
+AddressBar       depends on  BrowserTabsIpc, BrowserStore
+useBrowserTabsLifecycle / useBrowserTabsBounds / BrowserTabsSettings
+                 depends on  BrowserTabsIpc, BrowserStore
+BrowserTabsIpc   depends on  BrowserTabCommands  (IPC contract)
+BrowserTabCommands
+                 depends on  BrowserTabsState
+```
+
+**Strict longest-path toposort** (sources → sinks of the depends-on relation;
+20 edges, 11 nodes — verified post-r3-mmd-rerender):
+
+```
+L0 (single source, no incoming):  BrowserDrawer
+L1 (longest-path = 1):            TabStrip, NavControls, AddressBar,
+                                   useBrowserTabsLifecycle,
+                                   useBrowserTabsBounds,
+                                   BrowserTabsSettings
+L2 (longest-path = 2):            BrowserTabsIpc, BrowserStore
+L3 (longest-path = 3):            BrowserTabCommands
+L4 (longest-path = 4; sinks,
+    no outgoing):                  BrowserTabsState
+```
+
+Note: `BrowserStore` lives at L2 by strict longest-path (its longest
+incoming chain is `BrowserDrawer (L0) → L1 hook → BrowserStore`).
+Earlier revisions placed it at L4 alongside `BrowserTabsState` because
+both are "leaf state sinks" semantically — that grouping is intuitive
+but not strict toposort. Corrected in r3 per claude3 N2 / claude2 P2.
+
+No cycles. Acyclicity verifiable by inspection (single source
+`BrowserDrawer`; two no-outgoing sinks `BrowserStore` at L2 and
+`BrowserTabsState` at L4, with `BrowserTabsState` the deepest by
+longest-path; fan-in/fan-out structure elsewhere). See `plan.mmd` for
+the literal Mermaid graph.
 
 ## Interfaces emitted
 
-Phase 5 ran because the user typed `emit skeletons`. Six files, **20
-methods with 9-field docstrings + 1 type-alias contract** (corrected
-after Round-1 cohort review of these artifacts — was "19 methods" pre-
-patch; the Phase-5 patch commit `8b18503` added `set_browser_settings`
-to the Rust trait, bringing trait method count from 8 → 9). Both
-validations green at every revision.
-
-**Note on coverage:** the 46-node Phase-3 decomposition translates to
-20 skeleton methods because 26 of the 46 nodes don't get skeletons by
-design — React FCs (no `interface` shape — props types are minimal),
-Zustand setters (inline-declared during implementation), run-loop
-closures (`RunEvent::Exit` body), one-line module-decl edits, and
-unchanged-in-skeleton backend files. The 20 emitted methods cover the
-cross-boundary IPC contract surface (TS↔Rust); other nodes are
-implementation detail.
-
-| File | Kind | Methods (with 9-field docstring) | Source path |
-|---|---|---|---|
-| `src/types/browser.ts` | TS types | 0 (type definitions: `Rect`, `SchemeClassification`, 4 event payloads, `BrowserState`, `BrowserSettingsPatch`) | `src/types/browser.ts` |
-| `src/lib/urlScheme.ts` | TS interface | 1: `classifyScheme` | `src/lib/urlScheme.ts` |
-| `src/lib/drawerLayout.ts` | TS interface | 1: `clampDrawerWidth` | `src/lib/drawerLayout.ts` |
-| `src/lib/browserIpc.ts` | TS interface | 9 methods: `createBrowserWebview`, `setBrowserWebviewBounds`, `navigateBrowser`, `browserGoBack`, `browserGoForward`, `browserReload`, `browserStop`, `destroyBrowserWebview`, `setBrowserSettings` | `src/lib/browserIpc.ts` |
-| `src-tauri/src/commands/browser.rs` | Rust trait + module-level type alias | 9 trait methods (the symmetric counterpart of the TS `BrowserIpc` 9; Round-1 patch fixed an initial asymmetry where `set_browser_settings` was missing) + 1 `ValidateBrowserUrlSignature` type alias (documented contract, not a method) | `src-tauri/src/commands/browser.rs` |
-| `src-tauri/src/commands/mod.rs` | Rust module declaration | 0 (one-line edit adding `pub mod browser;`) | `src-tauri/src/commands/mod.rs` |
-
-Round-1 reviewer cohort caught a 3-way convergent IPC contract
-asymmetry on `set_browser_settings` (initially Rust-skeleton was
-8 methods, TS was 9). Round-1 patch commit `8b18503` fixed this plus
-5 other items. See `task-30-claude1-plan-phase5.md` for the full
-reflection.
-
-Deferred-to-implementation (documented in `commands/browser.rs`
-trailing `//` block):
-
-- `BrowserSlot<R> { Empty, Creating, Ready(Webview<R>) }` enum
-- `BrowserWebviewState<R> { slot: Mutex<...>, last_bounds: Mutex<...> }`
-- `BrowserStateOps` trait (clone_webview / take_webview /
-  try_reserve_for_create primitives)
-- `CreateGuard<'a, R>` RAII guard with `finalize(Webview<R>)`
-- `AppState::settings_io_lock: Mutex<()>` field addition
-
----
+N/A — feature lane, skeletons skipped at user direction. The 11 interfaces
+above are described in this plan and exist as cohesion groupings, not as
+emitted source files at this phase.
 
 ## Validation
 
-| Stack | Command | Result | When |
-|---|---|---|---|
-| TypeScript | `npx tsc --noEmit` | PASS (no output) | Phase 6 inline + re-run after Round-1 patch |
-| Rust | `cargo check --offline --manifest-path src-tauri/Cargo.toml` | PASS (`Finished dev profile in 1.22s`) | Phase 6 inline + re-run after Round-1 patch |
-| Headers smoke-check (Phase 7) | `grep -c "^## " plan.md` | PASS (>= 9 required headers: Goal, In scope, Out of scope, Constraints, Success criteria, Open questions, Package layout, Decomposition, Validation) | this artifact |
-| Mermaid smoke-check (Phase 7) | `head -1 plan.mmd` returns `flowchart` | PASS (first line is `flowchart LR`) | this artifact |
+Smoke-check (Phase 7, feature-lane skeletons-skipped path):
 
-Phase 6 inline validation already passed cleanly on the Phase 5
-skeleton commit and again after the Phase 5 Round-1 patch. Plan
-artifacts (this file + `plan.mmd`) pass the feature-lane smoke check.
+- `plan.md` non-empty with required headers (`## Goal`, `## Package layout`, `## Decomposition`). ✅
+- `plan.mmd` parses as valid Mermaid (`head -1` returns `graph`). ✅
+- DAG is acyclic (toposort succeeds — 5 longest-path levels, 11 nodes, **20 edges**; verified by inspection). ✅
+- `plan-detail.mmd` removed (stale snapshot of prior cycle; cohort-feedback blocker resolved). ✅
+- B1 hypotheses + verification targets + investigation steps inlined in `plan.md` (no dependence on gitignored `.planner-state.json` for downstream contract). ✅
 
----
+Full compile validation (`tsc --noEmit` + `cargo check --manifest-path src-tauri/Cargo.toml`)
+is gated to the implementation phase — out of scope for the planner.
 
-## Implementation prerequisites
-
-The planner's Cargo.toml is NOT touched by this plan. Implementation
-must apply the following before any compilation that depends on the
-browser feature:
-
-1. **`src-tauri/Cargo.toml`** — add `"unstable"` to Tauri features:
-   ```toml
-   tauri = { version = "2", features = ["macos-private-api", "unstable"] }
-   ```
-   Rationale: `Window::add_child` is `#[cfg(all(desktop, feature =
-   "unstable"))]` per `tauri-2.10.3/src/window/mod.rs:1052`.
-2. **`url` crate handling** — **prefer `tauri::Url` re-export** at
-   `tauri/src/lib.rs:82` (this is what the Phase-5 skeleton's
-   `ValidateBrowserUrlSignature` type alias uses). Only promote
-   `url` to a direct Cargo dep if implementation rejects the re-
-   export for a concrete reason (e.g., requiring a newer `url`
-   version than Tauri 2.10.3 carries transitively).
-3. **State types** — materialize `BrowserSlot`, `BrowserWebviewState`,
-   `BrowserStateOps`, `CreateGuard`, `AppState.settings_io_lock`. The
-   trailing `//` block in `commands/browser.rs` enumerates the
-   expected shapes.
-4. **Symmetric settings serialization** — when adding
-   `AppState.settings_io_lock`, the EXISTING `commands::settings::
-   set_settings` body must ALSO acquire this lock at the top of its
-   read-modify-write cycle (NOT only the new `set_browser_settings`).
-   Per @claude3 Phase-3 G1: without symmetric acquisition,
-   `set_browser_settings`'s lock only protects ITS half of the race;
-   concurrent `set_settings` writes still cause lost updates.
-
----
-
-## Self-verification rubric (6 criteria, full system-lane set per `emit skeletons`)
+## Rubric (Phase 7 — 4-criterion feature-lane variant)
 
 | Criterion | Score | Notes |
 |---|---|---|
-| Decomposition completeness | 4 | Every Phase-1 in-scope feature (#1–#11) maps to at least one node in the 46-node decomposition. Verified in mapping table (Phase-3 revision 3). |
-| Docstring quality | 4 | All 20 emitted methods plus the documented `ValidateBrowserUrlSignature` type-alias contract carry all 9 fields with substantive content. claude2 Round-1 spot-checked `create_browser_webview`: Failure-modes enumerates 4 distinct error variants; Postconditions calls out the lock-order invariant. |
-| Interface cohesion | 4 | `BrowserCommands` (9 methods) is cohesive — all 9 are Tauri commands operating on the browser webview's lifecycle / navigation / persistence. `BrowserIpc` mirrors it on the TS side. No god-interface; no grab-bags. |
-| Dependency direction | 4 | DAG (`plan.mmd`) is acyclic. The toggle convergence point (`browserStore.toggle()`) prevents a double-write race. Lock-order convention prevents Mutex inversions. Slot-reservation eliminates the create TOCTOU. |
-| Validation status | 4 | Phase 6 (`tsc --noEmit` + `cargo check`) passed cleanly first run; passed again after Round-1 patch. Phase 7 header/Mermaid smoke-check: PASS. |
-| Plan coverage | 4 | Every Phase-1 in-scope bullet has a named owner file in the Package layout. Every emitted interface traces back to a Phase-1 feature. |
+| Decomposition completeness | **4** | r2 closed the settings restore/persistence gap (rows #28–#32); every E2E stage now has a method node. B1 and F1 remain first-class. |
+| Dependency direction | **4** | Acyclic, 5-level toposort. r2 reconciled prose with mmd arrow convention. |
+| Validation status | **3** | Smoke-check only (no skeletons emitted). Full `tsc` + `cargo check` runs at implementation time. |
+| Plan coverage | **4** | Every Phase-1 in-scope item (B1, F1, F2) + every Constraint (race-fix preservation, settings restore, event rename, drawer-close wipe) has a decomposition row or explicit constraint statement. |
 
-**Total: 24 / 24.** No criterion below "Excellent". No Phase-7
-failure-handling step required (would trigger only on a "1
-(Beginning)" score).
+Total: **15 / 16**.
 
-**Note on score timing** (per @claude2 Round-1 F2): these scores
-reflect the **post-cohort-convergence state** across 5 phases × 3–5
-review rounds each (~17 reviewer files across the 4 reviewers).
-First-pass scores were lower — the cohort caught real issues at
-every phase, including a security-relevant capability-scoping bug
-(Phase-2 R1), a non-existent `tauri-plugin-store` reference
-(Phase-1 R2), an unstable-feature gate (Phase-3 R1), and an
-IPC contract asymmetry on `set_browser_settings` (Phase-5 R1).
-Each is now reflected in the score's "Notes" column with file:
-line citations. The 24/24 is the converged state, not a first-
-pass claim.
+## Reviewer checklist
 
----
+Please verify each before typing `confirm plan`:
 
-## Human-confirmation checklist
+- [ ] The decomposition table covers every Phase-1 in-scope item (B1, F1, F2) AND every Constraint (settings restore, drawer-close wipe, event rename).
+- [ ] No interface looks like a grab-bag of unrelated methods (cohesion test passes — `BrowserTabsSettings` is a coherent restore-and-persist boundary).
+- [ ] `plan.mmd` (Mermaid `graph LR`) is acyclic.
+- [ ] `plan-detail.mmd` is removed (no stale per-method DAG from the prior cycle floating in the worktree).
+- [ ] Out-of-scope items are correctly excluded (target=_blank in-app new-tab, middle-click, tab-list persistence, etc.); B1-scope-clarification reads OK.
+- [ ] The resolved Q1–Q4 answers reflect what you actually want.
+- [ ] B1 hypothesis list + verification targets (Wikipedia + GitHub) are reasonable; you're OK with the investigate-then-fix approach (root cause TBD until reproduction).
+- [ ] Tab IDs via `crypto.randomUUID()` is acceptable (no new dependency required).
+- [ ] `BrowserTabsSettings` co-located in `useBrowserLifecycle.ts` (single file, no new file beyond `TabStrip.tsx`) is acceptable.
+- [ ] TS type collision avoided: TS shape is `BrowserState` (extended); Rust owns `BrowserTabsState` exclusively.
 
-```
-Reviewer checklist — please verify each:
-
-[ ] The decomposition table in Phase 3 matches the interfaces actually
-    emitted in Phase 5 (11 TS methods + 9 Rust trait methods +
-    1 Rust type-alias contract = 20 methods with 9-field docstrings
-    + 1 type alias; corrected after Round-1 of plan.md/plan.mmd review)
-[ ] Every method has all 9 docstring fields (skim 3 random methods to
-    spot-check)
-[ ] No interface looks like a grab-bag of unrelated methods
-[ ] The Mermaid DAG (plan.mmd) is acyclic
-[ ] No method body has been written (interface-only) — TS uses
-    `interface` / `declare const` patterns; Rust trait methods end
-    with `;`; `validate_browser_url` is a `pub type` alias, not a
-    free `pub fn`
-[ ] The validation command (Phase 6) passed — see
-    .planner-state.json: phase_6_validation
-[ ] The Cargo.toml `"unstable"` feature requirement is recorded as an
-    implementation prerequisite (NOT applied in the planner worktree)
-
-Above-bar comments (optional):
 Below-bar comments (REQUIRED if any box unchecked):
-```
-
----
-
-## Round-1 reviewer cohort summary (shared-memory pointers)
-
-| Phase | Rounds | Reviewer files | Net |
-|---|---|---|---|
-| Phase 1 | 5 (R1 absence + 4 substantive) | 16 review files (4 reviewers × ~4 rounds) | Compression curve: 15→10→3→1→0 |
-| Phase 2 | 4 rounds | 16 review files | Compression curve: 15→10→3 (textual) →1 (cosmetic) →0 |
-| Phase 2.5 | inline | 1 verification file + Phase-3 R1 correction (unstable gate) | Phase-2.5 #1/#2-residual/#3 resolved cleanly with one simplification (custom scale-factor bridge dropped) |
-| Phase 3 | 3 rounds | 12 review files | Round-1 caught Phase-2.5 unstable-feature gap; Round-2 fixed slot-reservation + settings_io_lock + stale nav-state |
-| Phase 4 | 1 round | (no review) | Worktree created cleanly; SKILL Phase 4 step list followed |
-| Phase 5 | 1 round + 1 patch | 4 review files | 3-way convergent IPC asymmetry caught; patch commit fixed 6 items |
-
-All cohort artifacts live in `/Users/donghyeon/.cache/canvas-terminal/collab-memory/session-1844/`.
-
----
-
-Next: Phase 8 (human gate + merge) — see `task-30-claude1-plan-phase4.md`
-for the SKILL contract. On `confirm plan` the planner-branch merges to
-`feat/browser-integration` with marker `(plan-feature, human-confirmed)`.
