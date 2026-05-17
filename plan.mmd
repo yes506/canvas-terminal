@@ -1,128 +1,26 @@
-flowchart LR
-    %% Plan-phase Mermaid DAG for browser-drawer feature.
-    %% Generated at Phase 7 (feature lane) from Phase-3 decomposition.
-    %% Interface-level edges (~16 module nodes); the full per-method
-    %% DAG with 46 nodes lives in the sibling `plan-detail.mmd`
-    %% (also on the planner branch — added Round-1 plan.md/plan.mmd
-    %% review per @claude2 F1). Original Phase-3 reasoning is in
-    %% shared memory at task-30-claude1-plan-phase3.md (revision 3).
-
-    subgraph User["User-trigger sources"]
-        UDrag[Drag drawer edge]
-        UType[Type URL + Enter]
-        UNav[Click back/fwd/reload/stop]
-        UToggle[Toggle drawer]
-        UKbd[Cmd+Shift+B]
-        UResize[Resize window]
-        UDPR[Move to other DPR monitor]
-        UQuit[App quit]
-    end
-
-    subgraph TSUI["TS / src/components/browser/"]
-        BrowserDrawer[BrowserDrawer.tsx]
-        AddressBar[AddressBar.tsx]
-        NavControls[NavControls.tsx]
-        PageAreaHost[PageAreaHost.tsx]
-        useBrowserBounds[useBrowserBounds.ts]
-        useBrowserLifecycle[useBrowserLifecycle.ts]
-    end
-
-    subgraph TSStore["TS / src/stores/"]
-        browserStore["browserStore<br/>(Zustand)"]
-    end
-
-    subgraph TSLib["TS / src/lib/"]
-        urlScheme[urlScheme.classifyScheme<br/>pure]
-        drawerLayout[drawerLayout.clampDrawerWidth<br/>pure]
-        browserIpc[browserIpc<br/>invoke wrappers]
-    end
-
-    subgraph TauriEvents["Tauri 2 built-in events"]
-        TE1["tauri://resize"]
-        TE2["tauri://scale-change"]
-    end
-
-    subgraph TauriCustom["Custom Tauri events"]
-        TCMenu[menu-toggle-browser]
-        TCNav["browser-loading<br/>browser-loaded<br/>browser-title-changed<br/>browser-error"]
-    end
-
-    subgraph RustCmds["Rust / src-tauri/src/commands/"]
-        BrowserCommands["BrowserCommands trait<br/>(9 methods)"]
-        validateBrowserUrl["validate_browser_url<br/>(defense-in-depth)"]
-        settingsRs["settings.rs<br/>get_settings / set_settings<br/>(+ settings_io_lock)"]
-        modBrowser["mod.rs<br/>(pub mod browser;)"]
-    end
-
-    subgraph RustState["Rust / src-tauri/src/state.rs (impl phase)"]
-        BrowserSlot["BrowserSlot enum<br/>Empty | Creating | Ready(Webview&lt;R&gt;)"]
-        BrowserWebviewState["BrowserWebviewState&lt;R&gt;<br/>slot + last_bounds"]
-        BrowserStateOps["BrowserStateOps trait<br/>clone_webview / take_webview /<br/>try_reserve_for_create"]
-        CreateGuard["CreateGuard&lt;'a, R&gt;<br/>RAII rollback"]
-        AppStateLock["AppState.settings_io_lock<br/>Mutex&lt;()&gt;"]
-    end
-
-    subgraph RustLib["Rust / src-tauri/src/lib.rs"]
-        buildMenu["build_menu<br/>(MenuItem toggle_browser)"]
-        onMenuEvent[on_menu_event arm]
-        runExit["run RunEvent::Exit handler"]
-    end
-
-    %% User → UI
-    UDrag --> BrowserDrawer
-    UType --> AddressBar
-    UNav --> NavControls
-    UToggle --> BrowserDrawer
-    UKbd --> buildMenu
-    UResize --> TE1
-    UDPR --> TE2
-    UQuit --> runExit
-
-    %% UI internals
-    BrowserDrawer --> drawerLayout
-    BrowserDrawer --> browserStore
-    BrowserDrawer --> PageAreaHost
-    AddressBar --> urlScheme
-    AddressBar --> browserIpc
-    AddressBar --> browserStore
-    NavControls --> browserIpc
-
-    %% Hooks
-    useBrowserBounds --> TE1
-    useBrowserBounds --> TE2
-    useBrowserBounds --> PageAreaHost
-    useBrowserBounds --> browserIpc
-    useBrowserLifecycle --> TCMenu
-    useBrowserLifecycle --> TCNav
-    useBrowserLifecycle --> browserIpc
-    useBrowserLifecycle --> browserStore
-
-    %% Menu chain
-    buildMenu --> onMenuEvent
-    onMenuEvent --> TCMenu
-
-    %% IPC frontend → Rust
-    browserIpc --> BrowserCommands
-    browserIpc --> settingsRs
-
-    %% Rust commands → state
-    BrowserCommands --> validateBrowserUrl
-    BrowserCommands --> BrowserStateOps
-    BrowserStateOps --> BrowserSlot
-    BrowserStateOps --> BrowserWebviewState
-    BrowserStateOps --> CreateGuard
-    settingsRs --> AppStateLock
-    runExit --> BrowserStateOps
-
-    %% Rust nav-event back-channel
-    BrowserCommands -.installs.-> TCNav
-
-    classDef pure fill:#cfe,stroke:#393;
-    classDef tauriEvent fill:#ffe,stroke:#a90;
-    classDef rustState fill:#fcc,stroke:#900;
-    classDef skeleton fill:#eef,stroke:#33a;
-
-    class urlScheme,drawerLayout pure
-    class TE1,TE2,TCMenu,TCNav tauriEvent
-    class BrowserSlot,BrowserWebviewState,BrowserStateOps,CreateGuard,AppStateLock rustState
-    class BrowserCommands,browserIpc skeleton
+graph LR
+  BrowserTabsState["BrowserTabsState"]
+  BrowserTabCommands["BrowserTabCommands"]
+  BrowserTabsIpc["BrowserTabsIpc"]
+  BrowserStore["BrowserStore"]
+  useBrowserTabsLifecycle["useBrowserTabsLifecycle"]
+  useBrowserTabsBounds["useBrowserTabsBounds"]
+  TabStrip["TabStrip"]
+  BrowserDrawer["BrowserDrawer"]
+  NavControls["NavControls"]
+  AddressBar["AddressBar"]
+  BrowserTabCommands --> BrowserTabsState
+  BrowserTabsIpc --> BrowserTabCommands
+  useBrowserTabsLifecycle --> BrowserTabsIpc
+  useBrowserTabsLifecycle --> BrowserStore
+  useBrowserTabsBounds --> BrowserTabsIpc
+  useBrowserTabsBounds --> BrowserStore
+  TabStrip --> BrowserStore
+  BrowserDrawer --> BrowserStore
+  BrowserDrawer --> TabStrip
+  BrowserDrawer --> useBrowserTabsLifecycle
+  BrowserDrawer --> useBrowserTabsBounds
+  NavControls --> BrowserTabsIpc
+  NavControls --> BrowserStore
+  AddressBar --> BrowserTabsIpc
+  AddressBar --> BrowserStore
