@@ -8,7 +8,7 @@
 ## Revision history
 
 - **r1** (`a718491`) — Initial Phase 7 artifacts (browser-tabs decomposition).
-- **r2** (this commit) — Cohort-feedback patch. Convergent issues addressed:
+- **r2** (`7cac8da`) — Cohort-feedback patch. Convergent issues addressed:
   stale `plan-detail.mmd` removed (claude2/codex2/claude3/codex3); settings
   restore + persistence decomposed into a new `BrowserTabsSettings` hook
   (claude3/codex3); dependency-direction prose aligned to mmd arrows
@@ -18,6 +18,19 @@
   stated explicitly (claude3 #5); B1 verification target tightened (codex2 #3);
   active-tab switch flicker guard noted (claude2 S4); UUID source picked
   (claude2 S2); `browser_last_url` semantics defined (claude2 S3).
+- **r3** (this commit) — r2 cohort-feedback polish. Convergent minor items:
+  added `BrowserDrawer → NavControls/AddressBar` edges to plan.mmd
+  (claude2 P1 + claude3 N1); corrected edge count 17→20 + relabeled
+  toposort to strict longest-path (claude3 N2 + claude2 P2); inlined B1
+  hypotheses + verification targets + investigation steps into plan.md
+  so it's self-contained for the downstream gate (codex3 #1 + codex2
+  note). Individual items: pinned BrowserTabsSettings file decision to
+  co-locate in `useBrowserLifecycle.ts` (codex3 #2); resolved
+  Rust/TS name collision by keeping TS shape as `BrowserState`
+  (extended), Rust owns `BrowserTabsState` exclusively (claude2 P3a);
+  added `Tab` history-lives-in-OS-layer note (claude2 P3b); rephrased
+  row #30 to remove "per-tab keyed by tab_id but scoped to first tab"
+  tension (claude3 N3).
 
 ## Goal
 
@@ -80,7 +93,54 @@ scope** for this cycle. The plan keeps H1 as a candidate root cause for
 
 ## Open investigations (not blockers — resolved during implementation)
 
-- **B1 root cause** — Four hypotheses (target=_blank new-window event unhandled / validator false-reject / bounds drift / DOM click intercept). First step is reproduction in dev with diagnostic logging in `on_navigation`. **Verification targets**: a page with a same-window link (e.g. https://en.wikipedia.org/wiki/Main_Page — many in-page links of varied shapes), AND a page known to use `target="_blank"` (e.g. https://github.com — many external-target links) for the no-regression boundary. `example.com` alone is too thin (single canonical link). Full hypothesis list + steps in `.planner-state.json::bug_investigations[B1]`.
+### B1 — All link clicks broken inside child webview
+
+**Hypotheses** (root cause TBD until reproduction):
+
+- **H1** — `target="_blank"` / `window.open` links fire a new-window
+  request that the WebviewBuilder does not currently subscribe to; the
+  click silently no-ops. Fix path (in-scope per the B1-scope-
+  clarification below): wire a new-window handler that **routes the
+  requested URL to the active tab's `navigate`**, OR **no-ops and emits
+  a warning event**. Spawning a brand-new in-app tab from this handler
+  is **out of scope**.
+- **H2** — `on_navigation` returning `false` on URLs the validator
+  rejects (e.g. `mailto:`, `tel:`, scheme-less forms WebKit forwards).
+  Fix: enumerate URL shapes Tauri actually delivers; route
+  `mailto:`/`tel:` via the existing `open_external_url` command;
+  tighten or relax the validator with a rationale comment that mirrors
+  the TS-side `classifyScheme`.
+- **H3** — z-order / bounds drift causes link-area clicks to miss the
+  OS-layer webview's bounds (titlebar offset miscompensation, scale
+  factor change, fullscreen toggle). Fix: confirm visually with a
+  temporary diagnostic overlay; correct the offset path in
+  `compute_macos_titlebar_offset` if drifted.
+- **H4** — DOM-layer click handler intercepts events before they reach
+  the OS-layer webview. Implausible since the child webview is OS-layer
+  not DOM, but verify if H3 turns out not to be the cause.
+
+**Verification targets** (must hit both during repro):
+
+- `https://en.wikipedia.org/wiki/Main_Page` — many in-page same-window
+  links of varied shapes (positive test for SC1).
+- `https://github.com` — many `target="_blank"` links (no-regression
+  boundary; H1 fix path must not spawn new in-app tabs).
+
+**Investigation steps:**
+
+1. Reproduce: open drawer, load Wikipedia, click an in-page link;
+   observe `browser-tab-loading` / `-loaded` / `-title-changed` /
+   `-error` events in the dev console.
+2. Add a temporary `println!` in the `on_navigation` closure to log
+   every `nav_url` and the validator outcome.
+3. If `on_navigation` never fires for the click → H1; add new-window
+   handling per the scope clarification.
+4. If it fires but returns `false` → H2; relax the validator for the
+   specific shape with a one-line rationale.
+5. Smoke-test GitHub for no-regression: `target="_blank"` link clicks
+   should follow the B1 scope clarification semantics.
+6. Land the minimum fix; keep diagnostic logs gated behind
+   `#[cfg(debug_assertions)]` so they don't leak into release builds.
 
 ## Package layout
 
@@ -97,9 +157,8 @@ src/
 │   ├── TabStrip.tsx                (NEW)
 │   ├── useBrowserBounds.ts         (modified → useBrowserTabsBounds)
 │   └── useBrowserLifecycle.ts      (modified → useBrowserTabsLifecycle
-│                                    + new BrowserTabsSettings sub-hook,
-│                                    co-located or split into useBrowserTabsSettings.ts;
-│                                    implementer's call)
+│                                    + co-located BrowserTabsSettings sub-hook
+│                                    — single file, no new file beyond TabStrip.tsx)
 ├── lib/browserIpc.ts               (modified — per-tab wrappers; preserves setBrowserSettings)
 ├── stores/browserStore.ts          (modified — tabs slice)
 └── types/browser.ts                (modified — Tab + BrowserTabsState)
@@ -126,10 +185,10 @@ Only new file: `src/components/browser/TabStrip.tsx`.
 | 8 | Destroy single tab | `BrowserTabCommands` | `destroy_browser_tab(tab_id)` | `src-tauri/src/commands/browser.rs` | idempotent; clears per-tab `last_bounds` |
 | 9 | Destroy all tabs | `BrowserTabCommands` | `destroy_all_browser_tabs()` | `src-tauri/src/commands/browser.rs` | called from drawer-close + `RunEvent::Exit` |
 | 10 | Emit per-tab nav events | helper | `emit_tab_event(tab_id, kind, payload)` | `src-tauri/src/commands/browser.rs` | payload includes `tab_id`; emits `browser-tab-{loading,loaded,title-changed,error}` (old singleton names removed) |
-| 11 | **Repair link-click nav (B1)** | investigation node | TBD — fix lives in `create_browser_tab` (likely `on_navigation` closure or a new-window handler scoped per B1 scope clarification) | `src-tauri/src/commands/browser.rs` | hypotheses + steps in `.planner-state.json::bug_investigations[B1]` |
+| 11 | **Repair link-click nav (B1)** | investigation node | TBD — fix lives in `create_browser_tab` (likely `on_navigation` closure or a new-window handler scoped per the B1 scope clarification above) | `src-tauri/src/commands/browser.rs` | hypotheses + verification targets + investigation steps inlined in the "## Open investigations" section above |
 | 12 | Tab-aware bounds sync | `useBrowserTabsBounds` | `useBrowserTabsBounds(hostRef, enabled)` — replaces `useBrowserBounds` | `src/components/browser/useBrowserBounds.ts` | active visible, others off-screen; on active-tab switch hide-prev + show-new in the **same rAF tick** (claude2 S4 — avoids one-frame off-screen flicker) |
 | 13 | **Verify live resize (F1)** | `useBrowserTabsBounds` | verification gate against ResizeObserver firing during drag | `src/components/browser/useBrowserBounds.ts` | see `verification_plans[F1]` |
-| 14 | New TS types | (type definitions) | `Tab`, `BrowserTabsState` | `src/types/browser.ts` | `Tab = {id, url, title, isLoading, error}`; `BrowserTabsState = { drawerOpen, drawerWidth, tabs: Tab[], activeTabId: string \| null }` |
+| 14 | New TS types | (type definitions) | `Tab`, `BrowserState` (extended) | `src/types/browser.ts` | `Tab = {id, url, title, isLoading, error}` (per-tab history lives in the OS-layer webview, not the TS shape); extend the existing `BrowserState` to `{ drawerOpen, drawerWidth, tabs: Tab[], activeTabId: string \| null }`. Name reuse intentional — TS shape keeps `BrowserState` to avoid colliding with Rust's `BrowserTabsState` struct |
 | 15 | TS IPC wrappers | `BrowserTabsIpc` | `createBrowserTab / setBrowserTabBounds / navigateBrowserTab / browserTab{GoBack,GoForward,Reload,Stop} / destroyBrowserTab / destroyAllBrowserTabs` + preserved `setBrowserSettings` | `src/lib/browserIpc.ts` | replaces 8 old single-webview wrappers; `setBrowserSettings` kept |
 | 16 | Zustand tabs slice | `BrowserStore` | shape `{drawerOpen, drawerWidth, tabs: Tab[], activeTabId}` + selectors `activeTab() / activeUrl() / activeTitle() / activeLoading() / activeError()` | `src/stores/browserStore.ts` | replaces single `currentUrl / pageTitle / isLoading / error` |
 | 17 | `newTab` | `BrowserStore` | `newTab()` | `src/stores/browserStore.ts` | enforce ≤ 10 cap; push blank Tab; set active; id = `crypto.randomUUID()` |
@@ -145,7 +204,7 @@ Only new file: `src/components/browser/TabStrip.tsx`.
 | 27 | App-quit cleanup | (binding) | `RunEvent::Exit` calls `destroy_all_browser_tabs_impl` | `src-tauri/src/lib.rs` | replaces `destroy_browser_webview_impl` |
 | 28 | Restore drawer width on mount | `BrowserTabsSettings` | `restoreDrawerWidth()` | settings sub-hook | `get_settings` → `BrowserStore.setDrawerWidth` |
 | 29 | Seed first tab URL on mount | `BrowserTabsSettings` | `seedFirstTabUrl()` | settings sub-hook | if `tabs` empty: push one Tab with url = settings.browser_last_url ?? 'about:blank' |
-| 30 | Guard settings-restore-during-create | `BrowserTabsSettings` | `guardSettingsRestoreDuringCreate()` | settings sub-hook | per-tab pendingRestoredUrlRef keyed by `tab_id` (mirrors current R2/R3/R4 race fix, scoped to first tab) |
+| 30 | Guard settings-restore-during-create | `BrowserTabsSettings` | `guardSettingsRestoreDuringCreate()` | settings sub-hook | applies only to the **first tab** created via `seedFirstTabUrl` — that's the single path that can race the cold-start `get_settings` resolve against a webview build. Subsequent user-`+` tab creates need no guard (no settings restore is in flight at that point). Mirrors the current R2/R3/R4 race fix |
 | 31 | Persist active-tab URL (debounced) | `BrowserTabsSettings` | `persistActiveTabUrl()` | settings sub-hook | 800ms debounce; only when activeTab.url !== 'about:blank' AND changed |
 | 32 | Persist drawer width (debounced) | `BrowserTabsSettings` | `persistDrawerWidth()` | settings sub-hook | 800ms debounce; only when changed |
 
@@ -172,31 +231,43 @@ implementation.
 which is the Mermaid convention from the renderer. Reading the DAG:
 
 ```
-BrowserDrawer depends on   BrowserStore, TabStrip, useBrowserTabsLifecycle,
-                           useBrowserTabsBounds, BrowserTabsSettings
-TabStrip / NavControls / AddressBar
-                depends on BrowserStore (+ BrowserTabsIpc for the two
-                           that issue IPC)
+BrowserDrawer    depends on  BrowserStore, TabStrip, NavControls,
+                             AddressBar, useBrowserTabsLifecycle,
+                             useBrowserTabsBounds, BrowserTabsSettings
+TabStrip         depends on  BrowserStore
+NavControls      depends on  BrowserTabsIpc, BrowserStore
+AddressBar       depends on  BrowserTabsIpc, BrowserStore
 useBrowserTabsLifecycle / useBrowserTabsBounds / BrowserTabsSettings
-                depends on BrowserTabsIpc, BrowserStore
-BrowserTabsIpc  depends on BrowserTabCommands  (IPC contract)
+                 depends on  BrowserTabsIpc, BrowserStore
+BrowserTabsIpc   depends on  BrowserTabCommands  (IPC contract)
 BrowserTabCommands
-                depends on BrowserTabsState
+                 depends on  BrowserTabsState
 ```
 
-Toposort levels (sources → sinks of the depends-on relation):
+**Strict longest-path toposort** (sources → sinks of the depends-on relation;
+20 edges, 11 nodes — verified post-r3-mmd-rerender):
 
 ```
-L0 (sources, no incoming):     BrowserDrawer
-L1:                             TabStrip, NavControls, AddressBar,
-                                useBrowserTabsLifecycle,
-                                useBrowserTabsBounds, BrowserTabsSettings
-L2:                             BrowserTabsIpc
-L3:                             BrowserTabCommands
-L4 (sinks, no outgoing):       BrowserTabsState, BrowserStore
+L0 (single source, no incoming):  BrowserDrawer
+L1 (longest-path = 1):            TabStrip, NavControls, AddressBar,
+                                   useBrowserTabsLifecycle,
+                                   useBrowserTabsBounds,
+                                   BrowserTabsSettings
+L2 (longest-path = 2):            BrowserTabsIpc, BrowserStore
+L3 (longest-path = 3):            BrowserTabCommands
+L4 (longest-path = 4; sinks,
+    no outgoing):                  BrowserTabsState
 ```
 
-Strict layering. No cycles. See `plan.mmd` for the literal Mermaid graph.
+Note: `BrowserStore` lives at L2 by strict longest-path (its longest
+incoming chain is `BrowserDrawer (L0) → L1 hook → BrowserStore`).
+Earlier revisions placed it at L4 alongside `BrowserTabsState` because
+both are "leaf state sinks" semantically — that grouping is intuitive
+but not strict toposort. Corrected in r3 per claude3 N2 / claude2 P2.
+
+No cycles. Acyclicity verifiable by inspection (single source, single
+ultimate sink, fan-in/fan-out structure). See `plan.mmd` for the
+literal Mermaid graph.
 
 ## Interfaces emitted
 
@@ -210,8 +281,9 @@ Smoke-check (Phase 7, feature-lane skeletons-skipped path):
 
 - `plan.md` non-empty with required headers (`## Goal`, `## Package layout`, `## Decomposition`). ✅
 - `plan.mmd` parses as valid Mermaid (`head -1` returns `graph`). ✅
-- DAG is acyclic (toposort succeeds — 5 levels, 11 nodes, 17 edges; verified by inspection). ✅
+- DAG is acyclic (toposort succeeds — 5 longest-path levels, 11 nodes, **20 edges**; verified by inspection). ✅
 - `plan-detail.mmd` removed (stale snapshot of prior cycle; cohort-feedback blocker resolved). ✅
+- B1 hypotheses + verification targets + investigation steps inlined in `plan.md` (no dependence on gitignored `.planner-state.json` for downstream contract). ✅
 
 Full compile validation (`tsc --noEmit` + `cargo check --manifest-path src-tauri/Cargo.toml`)
 is gated to the implementation phase — out of scope for the planner.
@@ -239,5 +311,7 @@ Please verify each before typing `confirm plan`:
 - [ ] The resolved Q1–Q4 answers reflect what you actually want.
 - [ ] B1 hypothesis list + verification targets (Wikipedia + GitHub) are reasonable; you're OK with the investigate-then-fix approach (root cause TBD until reproduction).
 - [ ] Tab IDs via `crypto.randomUUID()` is acceptable (no new dependency required).
+- [ ] `BrowserTabsSettings` co-located in `useBrowserLifecycle.ts` (single file, no new file beyond `TabStrip.tsx`) is acceptable.
+- [ ] TS type collision avoided: TS shape is `BrowserState` (extended); Rust owns `BrowserTabsState` exclusively.
 
 Below-bar comments (REQUIRED if any box unchecked):
