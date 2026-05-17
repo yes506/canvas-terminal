@@ -322,7 +322,10 @@ impl<'a, R: Runtime> Drop for CreateGuard<'a, R> {
 //
 // See `commands::localfile` for the orchestrating Tauri command,
 // protocol handler, and private helpers (validate_picked_path,
-// classify_mime, generate_token, build_localfile_response).
+// classify_mime, build_localfile_response, validate_localfile_url_shape).
+// Token generation is intentionally NOT a separate helper — it
+// happens inside `LocalFileTokenStore::mint` under the same lock
+// scope as the insert (TOCTOU-safe).
 // ---------------------------------------------------------------------------
 
 use std::path::PathBuf;
@@ -387,8 +390,11 @@ pub trait LocalFileTokenStore: Send + Sync {
     /// **Responsibility:** Atomically mint a fresh token, bind it
     /// to the supplied tab + canonical path + MIME, store the entry
     /// in the registry, and return the token to the caller.
-    /// **Pipeline-position:** `commands::localfile::generate_token`
+    /// **Pipeline-position:** `commands::localfile::classify_mime`
     /// -> THIS -> Tauri command boundary (returned to the frontend).
+    /// Token generation (16 bytes `getrandom` -> URL-safe-base64
+    /// + collision check against `self.entries`) happens INSIDE
+    /// `mint`'s impl under the same lock scope as the insert.
     /// **Inputs:**
     /// - `tab_id`: `TabId` — UUID-shaped string of the tab that owns
     ///   this picked file; the protocol handler enforces that only

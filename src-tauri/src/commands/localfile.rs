@@ -1,15 +1,35 @@
-//! Custom `localfile://<token>` URI scheme — Phase-5 skeleton.
+//! Custom `localfile://localhost/<token>` URI scheme — Phase-5
+//! skeleton.
 //!
 //! v1 cycle: `browser-localfile` (codebase-planner system lane).
 //! Streams ONLY files the user has picked via the native dialog,
 //! gated by a tab-scoped token. See `state::LocalFileTokenStore`
-//! for the registry contract and the `plan.md` threat model
-//! section for the defended attack classes.
+//! for the registry contract and the threat-model section of
+//! `architecture.html` / `.planner-state.json` (rendered by the
+//! planner) for the defended attack classes. (System-lane runs do
+//! not emit `plan.md`; the architecture HTML report is the
+//! canonical reviewer artifact.)
 //!
-//! Cross-reference (THREE-way invariant — this extends the prior
-//! TWO-way invariant called out in `commands::browser` lines 4-6):
-//! if you change the shape check for `localfile://<token>` URLs
-//! here, ALSO update:
+//! ## URL shape — single source of truth
+//!
+//! v1 URL shape is **path-based**:
+//!
+//!   `localfile://localhost/<22-char-url-safe-base64-token>`
+//!
+//! Rationale: Tauri's custom-protocol Origin on macOS / iOS /
+//! Linux is `<scheme>://localhost/<path>` (per
+//! `tauri::Builder::register_uri_scheme_protocol` docs); WebKit
+//! normalizes the host to `localhost` regardless of what the
+//! navigation URL specifies. Putting the token in the PATH
+//! (`request.uri().path()` -> `/<token>` -> strip leading `/`)
+//! avoids the ambiguity of authority-based parsing and matches
+//! the post-normalization shape on macOS.
+//!
+//! ## Cross-reference (THREE-way invariant)
+//!
+//! Extends the prior TWO-way invariant called out in
+//! `commands::browser` lines 4-6. If you change the shape check
+//! for `localfile://` URLs here, ALSO update:
 //!   1. `commands::browser::validate_browser_url`
 //!      (defense-in-depth at the navigate IPC boundary)
 //!   2. `src/lib/urlScheme.ts::classifyScheme`
@@ -58,27 +78,32 @@ pub const LOCALFILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// **Outputs:** `PathBuf` — the canonicalized absolute path; safe
 /// to store and re-open later. Caller treats the value as
 /// authoritative; the registry does NOT re-canonicalize on serve.
-/// **Side-effects:** one `std::fs::canonicalize` syscall (which
-/// performs the readlink chain); one `symlink_metadata` syscall
-/// for the symlink rejection check. No mutation of any state.
+/// **Side-effects:** one `symlink_metadata` syscall on the INPUT
+/// path (BEFORE canonicalize — see below); one `canonicalize`
+/// syscall (which performs the readlink chain) only if the input
+/// was not itself a symlink. No mutation of any state.
 /// **Preconditions:** None. (All validation happens inside.)
 /// **Postconditions:** the returned PathBuf satisfies:
 ///   (a) `is_file()` (not a directory, FIFO, socket, device),
-///   (b) `!symlink_metadata().file_type().is_symlink()`
-///       (symlinks rejected — even if they resolve to a regular
-///       file — to keep the registry's path stable),
+///   (b) the ORIGINAL input was not itself a symlink (caught by
+///       step 1 below — `canonicalize` resolves symlinks so a
+///       check on the canonical path cannot detect this),
 ///   (c) is NOT under any entry in the v1 deny-prefix list.
-/// **Failure-modes:**
-/// - `Err("canonicalize failed: <io>")` — `std::fs::canonicalize`
-///   rejected the path (does-not-exist, permission denied, etc.).
-/// - `Err("not a regular file")` — directory / socket / FIFO /
-///   device.
-/// - `Err("symlinks rejected")` — `symlink_metadata` reports
-///   symlink. Defense-in-depth even though `canonicalize` resolves
-///   them; this catches the case where the original picked path
-///   is itself a symlink.
-/// - `Err("path under deny-prefix: <prefix>")` — caught by the
-///   deny list (`/System`, `/Library/Keychains`, `~/.ssh`, etc.).
+/// **Failure-modes:** Order of checks matters — `symlink_metadata`
+/// on the INPUT path MUST happen before canonicalize, otherwise
+/// the canonical-resolved path will lie about whether the picked
+/// item was a symlink.
+///   1. `Err("symlinks rejected")` — `symlink_metadata(input)`
+///      reports `file_type().is_symlink()`. Runs BEFORE
+///      canonicalize so the user-picked symlink is caught even
+///      when its target is a regular file.
+///   2. `Err("canonicalize failed: <io>")` — `std::fs::canonicalize`
+///      rejected the path (does-not-exist, permission denied, etc.).
+///   3. `Err("not a regular file")` — canonical path is a
+///      directory / socket / FIFO / device.
+///   4. `Err("path under deny-prefix: <prefix>")` — canonical path
+///      starts with an entry in the deny list (see v1 default list
+///      in plan constraint C7).
 /// **Collaborators:** None. (terminal validation step.)
 pub(crate) fn validate_picked_path(_path: &Path) -> Result<PathBuf, String> {
     todo!(
@@ -94,7 +119,8 @@ pub(crate) fn validate_picked_path(_path: &Path) -> Result<PathBuf, String> {
 /// extension, for the Content-Type response header and the
 /// disposition-by-class decision in `build_localfile_response`.
 /// **Pipeline-position:** `validate_picked_path` -> THIS ->
-/// `generate_token`.
+/// `LocalFileTokenStore::mint` (token generation is internal to
+/// `mint`'s impl scope; no separate `generate_token` node).
 /// **Inputs:**
 /// - `canonical`: `&Path` — canonical path returned by
 ///   `validate_picked_path`; extension is what's read.
@@ -177,14 +203,16 @@ pub(crate) fn build_localfile_response(
 }
 
 /// Validate that an arbitrary string is a well-formed
-/// `localfile://<22-char-base64url-token>` URL and extract the
-/// token on success.
+/// `localfile://localhost/<22-char-base64url-token>` URL and
+/// extract the token on success.
 ///
 /// **Responsibility:** Single-source-of-truth shape check for
 /// `localfile://` URLs at the Rust boundary. Consumed by both the
 /// extended `commands::browser::validate_browser_url` (so the
 /// existing navigate IPC accepts well-formed token URLs) and any
-/// future caller that needs the same shape gate.
+/// future caller that needs the same shape gate. The v1 shape is
+/// fixed to `localfile://localhost/<token>` (path-based; see the
+/// module doc-comment for the rationale).
 /// **Pipeline-position:** `commands::browser::validate_browser_url`
 /// dispatcher -> THIS -> caller treats `Ok` as allow,
 /// `Err(reason)` as filter/deny per the existing policy.
@@ -202,15 +230,16 @@ pub(crate) fn build_localfile_response(
 /// touch the registry.)
 /// **Failure-modes:**
 /// - `Err("filter: localfile shape mismatch")` — anything that
-///   isn't `localfile://<22-char-token>` (wrong length, invalid
-///   alphabet, missing scheme, extra path segments, query string,
-///   fragment).
+///   isn't `localfile://localhost/<22-char-token>` exactly (wrong
+///   scheme, missing or non-`localhost` host, missing path,
+///   wrong length, invalid alphabet, extra path segments beyond
+///   the single token, query string, fragment).
 /// **Collaborators:** None.
 pub(crate) fn validate_localfile_url_shape(_input: &str) -> Result<Token, String> {
     todo!(
         "Phase-5 skeleton — body delegated to codebase-implementer. \
-         Strict regex / char-by-char shape check; reject everything \
-         except `localfile://<22 url-safe-base64 chars>`."
+         Strict shape check; accept ONLY `localfile://localhost/<22 \
+         url-safe-base64 chars>`, reject everything else."
     )
 }
 
@@ -221,12 +250,14 @@ pub(crate) fn validate_localfile_url_shape(_input: &str) -> Result<Token, String
 ///
 /// **Responsibility:** Orchestrate `validate_picked_path` ->
 /// `classify_mime` -> `LocalFileTokenStore::mint`, returning the
-/// minted token to the frontend. (Note: `generate_token` is called
-/// inside `mint` under the registry lock — not before — to close
-/// the TOCTOU window between freshness check and insert.)
+/// minted token to the frontend. (Note: random-token generation
+/// happens INSIDE `mint` under the registry lock — not as a
+/// separate caller-visible step — to close the TOCTOU window
+/// between freshness check and insert.)
 /// **Pipeline-position:** Frontend
 /// `invoke('mint_localfile_token', { tabId, path })` -> THIS ->
-/// frontend `navigateBrowserTab(tabId, 'localfile://<token>')`.
+/// frontend
+/// `navigateBrowserTab(tabId, 'localfile://localhost/<token>')`.
 /// **Inputs:**
 /// - `tabId`: `TabId` — UUID-shaped tab id (the active tab in the
 ///   browser drawer at the moment the user clicked Open File).
@@ -239,9 +270,10 @@ pub(crate) fn validate_localfile_url_shape(_input: &str) -> Result<Token, String
 /// URL-safe-base64) or `Err(reason)` (human-readable; surfaced to
 /// the per-tab error field on `BrowserStore` via the existing
 /// red-bordered AddressBar error pattern).
-/// **Side-effects:** one stat / readlink (`validate_picked_path`);
-/// one RNG draw of 16 bytes (`generate_token`, inside `mint`);
-/// inserts one entry into the registry.
+/// **Side-effects:** one stat / readlink pair
+/// (`validate_picked_path`); one RNG draw of 16 bytes performed
+/// inside `LocalFileTokenStore::mint` under its lock; inserts one
+/// entry into the registry.
 /// **Preconditions:** `tabId` is a live tab in `BrowserTabsState`.
 /// (Frontend guarantees this — the IPC fires only from the active
 /// tab's Open File button.) NOT verified here; the protocol
@@ -257,8 +289,8 @@ pub(crate) fn validate_localfile_url_shape(_input: &str) -> Result<Token, String
 /// - `RegistryError::TokenSpaceExhausted` -> `"token generator
 ///   exhausted (broken RNG?)"`.
 /// **Collaborators:** `validate_picked_path`, `classify_mime`
-/// (this module), `LocalFileTokenStore::mint` (which itself calls
-/// `generate_token`).
+/// (this module), `LocalFileTokenStore::mint` (which performs its
+/// own internal token generation under-lock).
 #[tauri::command]
 pub fn mint_localfile_token(
     #[allow(non_snake_case)] tabId: TabId,
@@ -298,9 +330,13 @@ pub fn mint_localfile_token(
 ///   request from any other webview (the main window's own
 ///   webview, etc.) gets 404 because no entry in the registry
 ///   will match that label.
-/// - `request`: `http::Request<Vec<u8>>` — the URI is the only
-///   field consumed; method is implicitly GET for resource
-///   requests.
+/// - `request`: `http::Request<Vec<u8>>` — incoming URL. Token is
+///   read from `request.uri().path()`: WebKit's localhost
+///   normalization on macOS makes the URI shape
+///   `localfile://localhost/<token>`, so path is `"/<token>"`
+///   exactly. Handler strips the leading `/`, then performs the
+///   strict 22-char base64-url shape check before lookup.
+///   Method is implicitly GET for resource requests.
 /// - `responder`: `UriSchemeResponder` — async sink delivering
 ///   the response back to WebKit. Tauri requires exactly one
 ///   `respond` call per invocation.
@@ -343,4 +379,3 @@ pub fn localfile_protocol_handler<R: Runtime>(
          build_localfile_response docstring for header/size invariants."
     )
 }
-
