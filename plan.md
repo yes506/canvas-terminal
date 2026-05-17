@@ -5,6 +5,20 @@
 > multi-tab support and fixes link-navigation + live-resize regressions
 > on top of the merged browser-drawer baseline.
 
+## Revision history
+
+- **r1** (`a718491`) — Initial Phase 7 artifacts (browser-tabs decomposition).
+- **r2** (this commit) — Cohort-feedback patch. Convergent issues addressed:
+  stale `plan-detail.mmd` removed (claude2/codex2/claude3/codex3); settings
+  restore + persistence decomposed into a new `BrowserTabsSettings` hook
+  (claude3/codex3); dependency-direction prose aligned to mmd arrows
+  (all 4); `last_bounds` / `generation` granularity pinned (claude2 M1);
+  B1 H1 fix path scope clarified vs out-of-scope (claude2 M2); drawer-close
+  wipes-all-tabs invariant made explicit (claude2 M3); event-rename intent
+  stated explicitly (claude3 #5); B1 verification target tightened (codex2 #3);
+  active-tab switch flicker guard noted (claude2 S4); UUID source picked
+  (claude2 S2); `browser_last_url` semantics defined (claude2 S3).
+
 ## Goal
 
 Repair the built-in browser drawer in canvas-terminal: fix link-click
@@ -20,9 +34,9 @@ drawer (F2).
 
 ## Out of scope
 
-- `target="_blank"` / `window.open` spawning new in-app tabs.
+- **Spawning a new in-app tab** from `target="_blank"` / `window.open`. (See B1-scope-clarification below — wiring a new-window handler that *routes the click to the active tab's navigate* OR *no-ops with a warning event* is the in-scope fix path for H1; spawning a fresh in-app tab is what stays out.)
 - Middle-click / Cmd+click new-tab.
-- Persistence of tab list across app restarts.
+- Persistence of the *tab list* across app restarts. (Single-URL persistence via `browser_last_url` is preserved — see Constraints below.)
 - Tab drag-reordering, thumbnails, pinning, favicons.
 - Bookmarks, history, downloads (already deferred in prior browser-drawer scope).
 
@@ -30,10 +44,24 @@ drawer (F2).
 
 - Tauri 2 + `macos-private-api` child webview model (`Window::add_child`) — unchanged.
 - Each child webview needs a UNIQUE label (Tauri rejects duplicates); per-tab label scheme `browser-tab-<uuid>` required.
+- **Tab IDs are generated via `crypto.randomUUID()`** on the frontend (no new dependency required; available in Tauri's WebView2/WKWebView). Same string is used as the Rust webview label suffix.
 - Existing race-condition fixes (close-during-create generation tracking, settings-restore race, listener cleanup, in-flight op chain) must be preserved or replicated PER TAB.
+- **Rust state granularity**: `BrowserTabsState` holds `tabs: Mutex<HashMap<TabId, BrowserSlot<R>>>`; `last_bounds: Mutex<HashMap<TabId, Rect>>` (per-tab — singleton would thrash on every active-tab switch); `generation: AtomicU64` stays **global monotonic** (each tab's `CreateGuard` captures its slot generation independently from a shared counter).
+- **Drawer-close wipes all tabs**: closing the drawer (Cmd+Shift+B or X button) calls `destroy_all_browser_tabs` and clears the tabs slice. Reopen creates a fresh blank tab seeded from `browser_last_url` (or `about:blank`). State preservation across drawer-close is **out of scope** for this cycle.
+- **`browser_last_url` persistence semantics under multi-tab**: only the **active tab's URL** is persisted (debounced 800ms), and only when it is not `about:blank`. On next drawer-open, the **first tab** is seeded with the persisted URL.
+- **Event surface migration**: all old singleton events (`browser-loading`, `browser-loaded`, `browser-title-changed`, `browser-error`) are **removed and replaced** with `browser-tab-loading / -loaded / -title-changed / -error`, each carrying `{ tab_id, ...payload }`. No parallel deprecation period — frontend subscribers update in lockstep with the Rust emitter rename.
 - macOS title-bar offset compensation must continue to apply to whichever tab is active.
 - Capability config scopes to `windows: [main]`; multi-tab does not change this.
 - Tauri config CSP applies only to the Tauri-served frontend, not the child browser webview.
+
+### B1 scope clarification (cohort M2)
+
+`bug_investigations[B1].H1` proposes wiring a new-window event handler.
+That handler is **in scope** *only if* it forwards the requested URL to
+the **active tab's** `navigate` OR no-ops + emits a warning event.
+Spawning a brand-new in-app tab from `target="_blank"` is **out of
+scope** for this cycle. The plan keeps H1 as a candidate root cause for
+"all link clicks broken" without expanding feature scope.
 
 ## Success criteria
 
@@ -41,6 +69,7 @@ drawer (F2).
 - **SC2** — Dragging the drawer separator or the OS window edge resizes the active webview live; its content reflows.
 - **SC3** — Click `+` opens a new about:blank tab and switches to it; switching tabs preserves each tab's URL/history; closing a tab destroys its webview; closing the last tab leaves one blank tab open; no leaked webviews; all prior single-tab race guarantees still hold per tab.
 - **SC4** — Tab count is capped at 10; the `+` button is disabled at the cap.
+- **SC5** — Settings restore + persistence: on cold start, the **first tab** is seeded with the persisted `browser_last_url`; the drawer width is restored; thereafter the active tab's non-blank URL and the drawer width are persisted with the existing 800ms debounce.
 
 ## Resolved open questions (from Phase 1)
 
@@ -51,7 +80,7 @@ drawer (F2).
 
 ## Open investigations (not blockers — resolved during implementation)
 
-- **B1 root cause** — Four hypotheses (target=_blank new-window event unhandled / validator false-reject / bounds drift / DOM click intercept). First step is reproduction in dev with diagnostic logging in `on_navigation`. See `bug_investigations` in `.planner-state.json`.
+- **B1 root cause** — Four hypotheses (target=_blank new-window event unhandled / validator false-reject / bounds drift / DOM click intercept). First step is reproduction in dev with diagnostic logging in `on_navigation`. **Verification targets**: a page with a same-window link (e.g. https://en.wikipedia.org/wiki/Main_Page — many in-page links of varied shapes), AND a page known to use `target="_blank"` (e.g. https://github.com — many external-target links) for the no-regression boundary. `example.com` alone is too thin (single canonical link). Full hypothesis list + steps in `.planner-state.json::bug_investigations[B1]`.
 
 ## Package layout
 
@@ -61,21 +90,24 @@ locations:
 ```
 src/
 ├── components/browser/
-│   ├── AddressBar.tsx           (modified)
-│   ├── BrowserDrawer.tsx        (modified)
-│   ├── NavControls.tsx          (modified)
-│   ├── PageAreaHost.tsx         (unchanged)
-│   ├── TabStrip.tsx             (NEW)
-│   ├── useBrowserBounds.ts      (modified → useBrowserTabsBounds)
-│   └── useBrowserLifecycle.ts   (modified → useBrowserTabsLifecycle)
-├── lib/browserIpc.ts            (modified — per-tab wrappers)
-├── stores/browserStore.ts       (modified — tabs slice)
-└── types/browser.ts             (modified — Tab + BrowserTabsState)
+│   ├── AddressBar.tsx              (modified)
+│   ├── BrowserDrawer.tsx           (modified)
+│   ├── NavControls.tsx             (modified)
+│   ├── PageAreaHost.tsx            (unchanged)
+│   ├── TabStrip.tsx                (NEW)
+│   ├── useBrowserBounds.ts         (modified → useBrowserTabsBounds)
+│   └── useBrowserLifecycle.ts      (modified → useBrowserTabsLifecycle
+│                                    + new BrowserTabsSettings sub-hook,
+│                                    co-located or split into useBrowserTabsSettings.ts;
+│                                    implementer's call)
+├── lib/browserIpc.ts               (modified — per-tab wrappers; preserves setBrowserSettings)
+├── stores/browserStore.ts          (modified — tabs slice)
+└── types/browser.ts                (modified — Tab + BrowserTabsState)
 
 src-tauri/src/
-├── commands/browser.rs          (modified — 9 per-tab commands)
-├── lib.rs                       (modified — handler registration + RunEvent::Exit)
-└── state.rs                     (modified — BrowserSlot → HashMap<TabId, BrowserSlot>)
+├── commands/browser.rs             (modified — 9 per-tab commands; per-tab event emitters)
+├── lib.rs                          (modified — handler registration + RunEvent::Exit)
+└── state.rs                        (modified — singleton → HashMap<TabId, BrowserSlot> + per-tab last_bounds)
 ```
 
 Only new file: `src/components/browser/TabStrip.tsx`.
@@ -84,41 +116,47 @@ Only new file: `src/components/browser/TabStrip.tsx`.
 
 | # | Stage | Interface | Method | Belongs to | Notes |
 |---|---|---|---|---|---|
-| 1 | Reserve per-tab create slot | `BrowserTabsState` | `try_reserve_for_create(tab_id) -> CreateGuard` | `src-tauri/src/state.rs` | per-tab CreateGuard with generation tracking |
+| 1 | Reserve per-tab create slot | `BrowserTabsState` | `try_reserve_for_create(tab_id) -> CreateGuard` | `src-tauri/src/state.rs` | per-tab CreateGuard with generation tracking from a shared `AtomicU64` |
 | 2 | Look up tab webview | `BrowserTabsState` | `clone_tab(tab_id)`, `take_tab(tab_id)` | `src-tauri/src/state.rs` | mirrors current `clone_webview` / `take_webview` |
 | 3 | Build webview label | `BrowserTabsState` | `label_for(tab_id) -> String` | `src-tauri/src/state.rs` | `browser-tab-<uuid>` |
-| 4 | Create webview per tab | `BrowserTabCommands` | `create_browser_tab(tab_id, url, rect)` | `src-tauri/src/commands/browser.rs` | wires `on_navigation` / `on_page_load` / `on_document_title_changed`; emits per-tab events |
-| 5 | Set tab bounds | `BrowserTabCommands` | `set_browser_tab_bounds(tab_id, rect, visible)` | `src-tauri/src/commands/browser.rs` | `visible=false` → off-screen position |
+| 4 | Create webview per tab | `BrowserTabCommands` | `create_browser_tab(tab_id, url, rect)` | `src-tauri/src/commands/browser.rs` | wires `on_navigation` / `on_page_load` / `on_document_title_changed` (+ new-window handler per B1 scope clarification); emits per-tab events |
+| 5 | Set tab bounds | `BrowserTabCommands` | `set_browser_tab_bounds(tab_id, rect, visible)` | `src-tauri/src/commands/browser.rs` | `visible=false` → off-screen position; per-tab `last_bounds` dedup |
 | 6 | Navigate a tab | `BrowserTabCommands` | `navigate_browser_tab(tab_id, url)` | `src-tauri/src/commands/browser.rs` | re-validates URL |
 | 7 | Tab history nav | `BrowserTabCommands` | `browser_tab_go_back / go_forward / reload / stop(tab_id)` | `src-tauri/src/commands/browser.rs` | 4 methods, identical shape |
-| 8 | Destroy single tab | `BrowserTabCommands` | `destroy_browser_tab(tab_id)` | `src-tauri/src/commands/browser.rs` | idempotent |
+| 8 | Destroy single tab | `BrowserTabCommands` | `destroy_browser_tab(tab_id)` | `src-tauri/src/commands/browser.rs` | idempotent; clears per-tab `last_bounds` |
 | 9 | Destroy all tabs | `BrowserTabCommands` | `destroy_all_browser_tabs()` | `src-tauri/src/commands/browser.rs` | called from drawer-close + `RunEvent::Exit` |
-| 10 | Emit per-tab nav events | helper | `emit_tab_event(tab_id, kind, payload)` | `src-tauri/src/commands/browser.rs` | payload includes `tab_id` |
-| 11 | **Repair link-click nav (B1)** | investigation node | TBD — fix lives in `create_browser_tab` (likely `on_navigation` closure or a new-window handler) | `src-tauri/src/commands/browser.rs` | hypotheses in `.planner-state.json::bug_investigations[B1]` |
-| 12 | Tab-aware bounds sync | `useBrowserTabsBounds` | `useBrowserTabsBounds(hostRef, enabled)` — replaces `useBrowserBounds` | `src/components/browser/useBrowserBounds.ts` | active visible, others off-screen |
+| 10 | Emit per-tab nav events | helper | `emit_tab_event(tab_id, kind, payload)` | `src-tauri/src/commands/browser.rs` | payload includes `tab_id`; emits `browser-tab-{loading,loaded,title-changed,error}` (old singleton names removed) |
+| 11 | **Repair link-click nav (B1)** | investigation node | TBD — fix lives in `create_browser_tab` (likely `on_navigation` closure or a new-window handler scoped per B1 scope clarification) | `src-tauri/src/commands/browser.rs` | hypotheses + steps in `.planner-state.json::bug_investigations[B1]` |
+| 12 | Tab-aware bounds sync | `useBrowserTabsBounds` | `useBrowserTabsBounds(hostRef, enabled)` — replaces `useBrowserBounds` | `src/components/browser/useBrowserBounds.ts` | active visible, others off-screen; on active-tab switch hide-prev + show-new in the **same rAF tick** (claude2 S4 — avoids one-frame off-screen flicker) |
 | 13 | **Verify live resize (F1)** | `useBrowserTabsBounds` | verification gate against ResizeObserver firing during drag | `src/components/browser/useBrowserBounds.ts` | see `verification_plans[F1]` |
-| 14 | New TS types | (type definitions) | `Tab`, `BrowserTabsState` | `src/types/browser.ts` | `Tab = {id, url, title, isLoading, error}` |
-| 15 | TS IPC wrappers | `BrowserTabsIpc` | `createBrowserTab / setBrowserTabBounds / navigateBrowserTab / browserTab{GoBack,GoForward,Reload,Stop} / destroyBrowserTab / destroyAllBrowserTabs` | `src/lib/browserIpc.ts` | replaces old single-webview wrappers |
-| 16 | Zustand tabs slice | `BrowserStore` | shape `{drawerOpen, drawerWidth, tabs: Tab[], activeTabId}` + selectors | `src/stores/browserStore.ts` | replaces single `currentUrl / pageTitle / isLoading / error` |
-| 17 | `newTab` | `BrowserStore` | `newTab()` | `src/stores/browserStore.ts` | enforce ≤ 10 cap; push blank Tab; set active |
+| 14 | New TS types | (type definitions) | `Tab`, `BrowserTabsState` | `src/types/browser.ts` | `Tab = {id, url, title, isLoading, error}`; `BrowserTabsState = { drawerOpen, drawerWidth, tabs: Tab[], activeTabId: string \| null }` |
+| 15 | TS IPC wrappers | `BrowserTabsIpc` | `createBrowserTab / setBrowserTabBounds / navigateBrowserTab / browserTab{GoBack,GoForward,Reload,Stop} / destroyBrowserTab / destroyAllBrowserTabs` + preserved `setBrowserSettings` | `src/lib/browserIpc.ts` | replaces 8 old single-webview wrappers; `setBrowserSettings` kept |
+| 16 | Zustand tabs slice | `BrowserStore` | shape `{drawerOpen, drawerWidth, tabs: Tab[], activeTabId}` + selectors `activeTab() / activeUrl() / activeTitle() / activeLoading() / activeError()` | `src/stores/browserStore.ts` | replaces single `currentUrl / pageTitle / isLoading / error` |
+| 17 | `newTab` | `BrowserStore` | `newTab()` | `src/stores/browserStore.ts` | enforce ≤ 10 cap; push blank Tab; set active; id = `crypto.randomUUID()` |
 | 18 | `closeTab` | `BrowserStore` | `closeTab(id)` | `src/stores/browserStore.ts` | last-tab-close → replace with one blank |
 | 19 | `setActiveTab` | `BrowserStore` | `setActiveTab(id)` | `src/stores/browserStore.ts` | triggers bounds re-sync |
 | 20 | Per-tab field setters | `BrowserStore` | `setTabUrl / setTabTitle / setTabLoading / setTabError` | `src/stores/browserStore.ts` | called by `browser-tab-*` event handlers |
 | 21 | Tab strip UI | `TabStrip` | `TabStrip()` | `src/components/browser/TabStrip.tsx` (NEW) | tab buttons + close × + `+` (disabled at 10) |
-| 22 | Drawer chrome integration | `BrowserDrawer` | mounts `TabStrip` above existing Row 2; chrome title = `activeTitle` | `src/components/browser/BrowserDrawer.tsx` | layout: Row 0 TabStrip / Row 1 title / Row 2 nav+addr / Body Host |
-| 23 | Per-tab lifecycle | `useBrowserTabsLifecycle` | per-tab create-on-add / destroy-on-remove; nav event routing by `tab_id` | `src/components/browser/useBrowserLifecycle.ts` | replaces `useBrowserLifecycle`; preserves race-fix invariants per tab |
+| 22 | Drawer chrome integration | `BrowserDrawer` | mounts `TabStrip` above existing Row 2; chrome title = `activeTitle`; mounts lifecycle + bounds + settings hooks | `src/components/browser/BrowserDrawer.tsx` | layout: Row 0 TabStrip / Row 1 title / Row 2 nav+addr / Body Host |
+| 23 | Per-tab lifecycle | `useBrowserTabsLifecycle` | per-tab create-on-add / destroy-on-remove; nav event routing by `tab_id`; replicates race-fix invariants per tab (CreateGuard generation, in-flight op chain per slot, listener cleanup with cancellation flag) | `src/components/browser/useBrowserLifecycle.ts` | replaces `useBrowserLifecycle` |
 | 24 | Nav controls → active tab | `NavControls` | onClick handlers use `activeTabId` + per-tab IPC | `src/components/browser/NavControls.tsx` | small change |
 | 25 | Address bar → active tab | `AddressBar` | onSubmit uses `activeTabId` + `navigateBrowserTab` | `src/components/browser/AddressBar.tsx` | small change |
 | 26 | Handler registration | (binding) | register 9 new commands; remove 8 old single-webview commands | `src-tauri/src/lib.rs` | inside `tauri::generate_handler!` |
 | 27 | App-quit cleanup | (binding) | `RunEvent::Exit` calls `destroy_all_browser_tabs_impl` | `src-tauri/src/lib.rs` | replaces `destroy_browser_webview_impl` |
+| 28 | Restore drawer width on mount | `BrowserTabsSettings` | `restoreDrawerWidth()` | settings sub-hook | `get_settings` → `BrowserStore.setDrawerWidth` |
+| 29 | Seed first tab URL on mount | `BrowserTabsSettings` | `seedFirstTabUrl()` | settings sub-hook | if `tabs` empty: push one Tab with url = settings.browser_last_url ?? 'about:blank' |
+| 30 | Guard settings-restore-during-create | `BrowserTabsSettings` | `guardSettingsRestoreDuringCreate()` | settings sub-hook | per-tab pendingRestoredUrlRef keyed by `tab_id` (mirrors current R2/R3/R4 race fix, scoped to first tab) |
+| 31 | Persist active-tab URL (debounced) | `BrowserTabsSettings` | `persistActiveTabUrl()` | settings sub-hook | 800ms debounce; only when activeTab.url !== 'about:blank' AND changed |
+| 32 | Persist drawer width (debounced) | `BrowserTabsSettings` | `persistDrawerWidth()` | settings sub-hook | 800ms debounce; only when changed |
 
 ### Cohesion grouping
 
-- **`BrowserTabsState`** (#1–#3) — share Rust state (`HashMap<TabId, BrowserSlot<R>>`) and lifecycle (Empty→Creating→Ready per slot).
+- **`BrowserTabsState`** (#1–#3) — share Rust state (`HashMap<TabId, BrowserSlot<R>>` + per-tab `last_bounds`) and lifecycle (Empty→Creating→Ready per slot).
 - **`BrowserTabCommands`** (#4–#10) — share collaboration boundary (`tauri::generate_handler!`) and failure domain (all need `BrowserTabsState`).
 - **`BrowserStore` actions** (#16–#20) — share state (tabs slice) and lifecycle.
 - **`useBrowserTabsLifecycle`** (#23) — orchestrates per-tab create/destroy + event subscription with race-fix invariants.
-- **`useBrowserTabsBounds`** (#12, #13) — observes host rect, dispatches active-tab visible / inactive hidden.
+- **`useBrowserTabsBounds`** (#12, #13) — observes host rect, dispatches active-tab visible / inactive hidden (same-rAF switch).
+- **`BrowserTabsSettings`** (#28–#32, NEW after cohort feedback) — restore + persist drawer width and active-tab URL; preserves the settings-restore-during-create race guard scoped to first tab.
 
 ### Cross-boundary contracts
 
@@ -130,27 +168,39 @@ implementation.
 
 ## Dependency direction
 
+`plan.mmd` uses **"X depends-on Y"** arrows (consumer → collaborator),
+which is the Mermaid convention from the renderer. Reading the DAG:
+
 ```
-Rust state (1-3)
-  -> Rust commands (4-10)
-  -> handler registration (26, 27)
-
-Rust commands (4-10)
-  -> TS IPC wrappers (15)
-  -> TS hooks (12, 23)
-  -> React UI (21, 22, 24, 25)
-
-TS types (14)
-  -> TS store (16-20)
-  -> React UI + hooks
+BrowserDrawer depends on   BrowserStore, TabStrip, useBrowserTabsLifecycle,
+                           useBrowserTabsBounds, BrowserTabsSettings
+TabStrip / NavControls / AddressBar
+                depends on BrowserStore (+ BrowserTabsIpc for the two
+                           that issue IPC)
+useBrowserTabsLifecycle / useBrowserTabsBounds / BrowserTabsSettings
+                depends on BrowserTabsIpc, BrowserStore
+BrowserTabsIpc  depends on BrowserTabCommands  (IPC contract)
+BrowserTabCommands
+                depends on BrowserTabsState
 ```
 
-One-way fan-out. No cycles. See `plan.mmd` (Mermaid `graph LR`) for the
-inter-interface DAG.
+Toposort levels (sources → sinks of the depends-on relation):
+
+```
+L0 (sources, no incoming):     BrowserDrawer
+L1:                             TabStrip, NavControls, AddressBar,
+                                useBrowserTabsLifecycle,
+                                useBrowserTabsBounds, BrowserTabsSettings
+L2:                             BrowserTabsIpc
+L3:                             BrowserTabCommands
+L4 (sinks, no outgoing):       BrowserTabsState, BrowserStore
+```
+
+Strict layering. No cycles. See `plan.mmd` for the literal Mermaid graph.
 
 ## Interfaces emitted
 
-N/A — feature lane, skeletons skipped at user direction. The 10 interfaces
+N/A — feature lane, skeletons skipped at user direction. The 11 interfaces
 above are described in this plan and exist as cohesion groupings, not as
 emitted source files at this phase.
 
@@ -160,7 +210,8 @@ Smoke-check (Phase 7, feature-lane skeletons-skipped path):
 
 - `plan.md` non-empty with required headers (`## Goal`, `## Package layout`, `## Decomposition`). ✅
 - `plan.mmd` parses as valid Mermaid (`head -1` returns `graph`). ✅
-- DAG is acyclic (verified by inspection — strict fan-out from Rust state to React UI). ✅
+- DAG is acyclic (toposort succeeds — 5 levels, 11 nodes, 17 edges; verified by inspection). ✅
+- `plan-detail.mmd` removed (stale snapshot of prior cycle; cohort-feedback blocker resolved). ✅
 
 Full compile validation (`tsc --noEmit` + `cargo check --manifest-path src-tauri/Cargo.toml`)
 is gated to the implementation phase — out of scope for the planner.
@@ -169,10 +220,10 @@ is gated to the implementation phase — out of scope for the planner.
 
 | Criterion | Score | Notes |
 |---|---|---|
-| Decomposition completeness | 4 | Every E2E stage from Phase 1 has a method node; B1 and F1 are first-class nodes (#11, #13). |
-| Dependency direction | 4 | Acyclic: Rust state → Rust commands → TS IPC → TS store → React UI + hooks. |
-| Validation status | 3 | Smoke-check only (no skeletons emitted). Full `tsc` + `cargo check` runs at implementation time. |
-| Plan coverage | 4 | Every Phase-1 in-scope item (B1, F1, F2) has dedicated decomposition nodes; every interface traces back to a feature. |
+| Decomposition completeness | **4** | r2 closed the settings restore/persistence gap (rows #28–#32); every E2E stage now has a method node. B1 and F1 remain first-class. |
+| Dependency direction | **4** | Acyclic, 5-level toposort. r2 reconciled prose with mmd arrow convention. |
+| Validation status | **3** | Smoke-check only (no skeletons emitted). Full `tsc` + `cargo check` runs at implementation time. |
+| Plan coverage | **4** | Every Phase-1 in-scope item (B1, F1, F2) + every Constraint (race-fix preservation, settings restore, event rename, drawer-close wipe) has a decomposition row or explicit constraint statement. |
 
 Total: **15 / 16**.
 
@@ -180,11 +231,13 @@ Total: **15 / 16**.
 
 Please verify each before typing `confirm plan`:
 
-- [ ] The decomposition table covers every Phase-1 in-scope item (B1, F1, F2).
-- [ ] No interface looks like a grab-bag of unrelated methods (cohesion test passes).
+- [ ] The decomposition table covers every Phase-1 in-scope item (B1, F1, F2) AND every Constraint (settings restore, drawer-close wipe, event rename).
+- [ ] No interface looks like a grab-bag of unrelated methods (cohesion test passes — `BrowserTabsSettings` is a coherent restore-and-persist boundary).
 - [ ] `plan.mmd` (Mermaid `graph LR`) is acyclic.
-- [ ] Out-of-scope items are correctly excluded (target=_blank, middle-click, persistence, etc.).
+- [ ] `plan-detail.mmd` is removed (no stale per-method DAG from the prior cycle floating in the worktree).
+- [ ] Out-of-scope items are correctly excluded (target=_blank in-app new-tab, middle-click, tab-list persistence, etc.); B1-scope-clarification reads OK.
 - [ ] The resolved Q1–Q4 answers reflect what you actually want.
-- [ ] B1 hypothesis list is reasonable; you're OK with the investigate-then-fix approach (root cause TBD until reproduction).
+- [ ] B1 hypothesis list + verification targets (Wikipedia + GitHub) are reasonable; you're OK with the investigate-then-fix approach (root cause TBD until reproduction).
+- [ ] Tab IDs via `crypto.randomUUID()` is acceptable (no new dependency required).
 
 Below-bar comments (REQUIRED if any box unchecked):

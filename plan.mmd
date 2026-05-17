@@ -4,6 +4,7 @@ graph LR
   BrowserTabsIpc["BrowserTabsIpc"]
   BrowserStore["BrowserStore"]
   useBrowserTabsLifecycle["useBrowserTabsLifecycle"]
+  BrowserTabsSettings["BrowserTabsSettings"]
   useBrowserTabsBounds["useBrowserTabsBounds"]
   TabStrip["TabStrip"]
   BrowserDrawer["BrowserDrawer"]
@@ -13,6 +14,8 @@ graph LR
   BrowserTabsIpc --> BrowserTabCommands
   useBrowserTabsLifecycle --> BrowserTabsIpc
   useBrowserTabsLifecycle --> BrowserStore
+  BrowserTabsSettings --> BrowserStore
+  BrowserTabsSettings --> BrowserTabsIpc
   useBrowserTabsBounds --> BrowserTabsIpc
   useBrowserTabsBounds --> BrowserStore
   TabStrip --> BrowserStore
@@ -20,6 +23,7 @@ graph LR
   BrowserDrawer --> TabStrip
   BrowserDrawer --> useBrowserTabsLifecycle
   BrowserDrawer --> useBrowserTabsBounds
+  BrowserDrawer --> BrowserTabsSettings
   NavControls --> BrowserTabsIpc
   NavControls --> BrowserStore
   AddressBar --> BrowserTabsIpc
