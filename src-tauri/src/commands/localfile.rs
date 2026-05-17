@@ -246,7 +246,7 @@ pub(crate) fn validate_localfile_url_shape(_input: &str) -> Result<Token, String
 /// Tauri command — orchestrates the mint pipeline. Frontend calls
 /// this after the file picker dialog returns a path; result is the
 /// token that the frontend then navigates the active tab to via
-/// `localfile://<token>`.
+/// `localfile://localhost/<token>` (per C9).
 ///
 /// **Responsibility:** Orchestrate `validate_picked_path` ->
 /// `classify_mime` -> `LocalFileTokenStore::mint`, returning the
@@ -305,7 +305,7 @@ pub fn mint_localfile_token(
     )
 }
 
-/// Async URI-scheme protocol handler for `localfile://<token>`.
+/// Async URI-scheme protocol handler for `localfile://localhost/<token>` (per C9).
 /// Registered once in `lib.rs::run()` via
 /// `tauri::Builder::register_asynchronous_uri_scheme_protocol`.
 /// Reads `UriSchemeContext::webview_label`, extracts the owning
@@ -317,7 +317,7 @@ pub fn mint_localfile_token(
 /// AT THE PROTOCOL LAYER: a token presented from a different tab
 /// MUST receive a 404. Streams the canonical file's bytes wrapped
 /// in the v1 security-header set.
-/// **Pipeline-position:** WebKit `localfile://<token>`
+/// **Pipeline-position:** WebKit `localfile://localhost/<token>` (per C9)
 /// resource-request arrives via the Tauri runtime -> THIS ->
 /// `UriSchemeResponder::respond(http::Response<...>)`.
 /// **Inputs:**

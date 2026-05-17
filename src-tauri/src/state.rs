@@ -315,7 +315,7 @@ impl<'a, R: Runtime> Drop for CreateGuard<'a, R> {
 // LocalFileTokenRegistry (browser-localfile cycle — feat/browser-integration)
 //
 // Phase-5 skeleton (codebase-planner system lane). Defines the public
-// contract for the `localfile://<token>` URI scheme's token-binding
+// contract for the `localfile://localhost/<token>` URI scheme's token-binding
 // registry. Method bodies are `todo!()` placeholders; the downstream
 // codebase-implementer fills them in under the
 // (interfaces only, human-confirmed) marker.

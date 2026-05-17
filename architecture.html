@@ -29,7 +29,7 @@
   <p class="meta">Language: <strong>rust</strong> · Last completed phase: <strong>artifacts_emitted</strong></p>
 
   <h2>Project plan</h2>
-  <p><strong>Goal:</strong> Let the user open a local file (HTML, PDF, image, plaintext) in any browser-drawer tab via a native file picker, without lifting the v1 deny on `file:` URLs. A new `localfile://&lt;22-char-token&gt;` custom URI scheme streams ONLY user-picked files, tab-scoped at the protocol handler.</p>
+  <p><strong>Goal:</strong> Let the user open a local file (HTML, PDF, image, plaintext) in any browser-drawer tab via a native file picker, without lifting the v1 deny on `file:` URLs. A new `localfile://localhost/&lt;22-char-token&gt;` custom URI scheme (path-based shape, locked by C9) streams ONLY user-picked files, tab-scoped at the protocol handler.</p>
 <h4>In-scope</h4><ul>
 <li>F1 — &#x27;Open File&#x27; affordance in the browser-drawer chrome (placement inside NavControls as the leftmost icon).</li>
 <li>F2 — Native file picker via tauri-plugin-dialog (open({ multiple: false, directory: false })).</li>
@@ -38,7 +38,7 @@
 <li>F5 — App-level custom URI scheme &#x27;localfile&#x27; registered via register_asynchronous_uri_scheme_protocol.</li>
 <li>F6 — Protocol handler enforces tab-scoping by reading UriSchemeContext::webview_label() and comparing to entry.tab_id.</li>
 <li>F7 — Strict response headers: Content-Type, Content-Length, CSP with sandbox, X-Content-Type-Options nosniff, Referrer-Policy no-referrer, MIME-class-driven Content-Disposition.</li>
-<li>F8 — Token revocation: destroy_browser_tab → revoke_for_tab; navigate to non-localfile → revoke_for_tab; destroy_all + Exit/Destroyed → clear.</li>
+<li>F8 — Token revocation: destroy_browser_tab → revoke_for_tab; navigate to non-localfile → revoke_for_tab; destroy_all + Exit/Destroyed → clear. <em>UX consequence (claude2 r1 N2):</em> once a tab navigates away from a localfile URL, the token is purged, so a subsequent Back/Forward to that localfile URL returns 404. Users must re-pick the file to re-mint. v1 design choice — alternatives (refcount on history entries, sticky tokens) defer to a future cycle.</li>
 <li>F9 — Frontend classifier (urlScheme.ts) allows strictly-shaped localfile://localhost/&lt;22-char-token&gt;; arbitrary localfile: typed input remains denied. URL shape locked by C9.</li>
 <li>F10 — Backend validate_browser_url mirrors F9 so existing navigate_browser_tab path accepts well-formed token URLs. Dispatches to commands::localfile::validate_localfile_url_shape for the strict check (single source of truth).</li>
 </ul>
@@ -64,7 +64,7 @@
 <h4>Success criteria</h4><ul>
 <li>S1 — User clicks Open File → dialog → picks PDF → active tab renders the PDF inline.</li>
 <li>S2 — Same flow with .html, .png, .txt — all render appropriately.</li>
-<li>S3 — Unit tests: validate_browser_url accepts a well-formed localfile://&lt;22-char-token&gt; string and rejects malformed variants; classifyScheme mirrors.</li>
+<li>S3 — Unit tests: validate_browser_url accepts a well-formed `localfile://localhost/&lt;22-char-token&gt;` string and rejects malformed variants (wrong host, wrong scheme, missing path, malformed token alphabet, query/fragment present); classifyScheme mirrors. Test names should reference C9 shape.</li>
 <li>S4 — Manual cross-tab test: a token minted for tab_A cannot be served if presented from tab_B&#x27;s webview (returns 404).</li>
 <li>S5 — Closing a tab purges its tokens (verifiable via instrumentation or test command).</li>
 <li>S6 — cargo check passes on the Phase 5 skeleton.</li>
@@ -80,7 +80,7 @@
 </ul>
 
   <h2>Package layout</h2>
-  <ul><li><code>src-tauri/Cargo.toml [MODIFY at implementer time] +mime_guess +getrandom; tokio feature +fs</code></li><li><code>src-tauri/src/lib.rs [MODIFY at implementer time] register_asynchronous_uri_scheme_protocol(&#x27;localfile&#x27;, ...); .manage(LocalFileTokenRegistry); +mint_localfile_token in invoke_handler; hook revocation calls in WindowEvent::Destroyed and RunEvent::Exit</code></li><li><code>src-tauri/src/state.rs [MODIFIED in skeleton] +Token, +TokenEntry, +RegistryError, +LocalFileTokenStore trait, +LocalFileTokenRegistry struct + impl</code></li><li><code>src-tauri/src/commands/mod.rs [MODIFIED in skeleton] pub mod localfile;</code></li><li><code>src-tauri/src/commands/browser.rs [MODIFY at implementer time] extend validate_browser_url to dispatch to commands::localfile::validate_localfile_url_shape on `localfile:` inputs; add revoke_for_tab calls in destroy_browser_tab_impl, destroy_all_browser_tabs_impl, navigate_browser_tab (non-localfile dest); add tests for localfile shape allow + malformed deny</code></li><li><code>src-tauri/src/commands/localfile.rs [NEW in skeleton] validate_picked_path, classify_mime, build_localfile_response, validate_localfile_url_shape, mint_localfile_token, localfile_protocol_handler (token generation is internal to LocalFileTokenStore::mint&#x27;s impl scope under-lock — not a separate module fn — to close the freshness-vs-insert TOCTOU window)</code></li><li><code>src/lib/urlScheme.ts [MODIFY at implementer time] add localfile://&lt;22-char-token&gt; allow branch (mirror of validate_browser_url change)</code></li><li><code>src/lib/browserIpc.ts [MODIFY at implementer time] +mintLocalFileToken IPC wrapper</code></li><li><code>src/components/browser/NavControls.tsx [MODIFY at implementer time] mount OpenFileButton as leftmost icon</code></li><li><code>src/components/browser/OpenFileButton.tsx [NEW at implementer time] dialog → mint → navigate; surfaces errors via setTabError</code></li></ul>
+  <ul><li><code>src-tauri/Cargo.toml [MODIFY at implementer time] +mime_guess +getrandom; tokio feature +fs</code></li><li><code>src-tauri/src/lib.rs [MODIFY at implementer time] register_asynchronous_uri_scheme_protocol(&#x27;localfile&#x27;, ...); .manage(LocalFileTokenRegistry); +mint_localfile_token in invoke_handler; hook revocation calls in WindowEvent::Destroyed and RunEvent::Exit</code></li><li><code>src-tauri/src/state.rs [MODIFIED in skeleton] +Token, +TokenEntry, +RegistryError, +LocalFileTokenStore trait, +LocalFileTokenRegistry struct + impl</code></li><li><code>src-tauri/src/commands/mod.rs [MODIFIED in skeleton] pub mod localfile;</code></li><li><code>src-tauri/src/commands/browser.rs [MODIFY at implementer time] extend validate_browser_url to dispatch to commands::localfile::validate_localfile_url_shape on `localfile:` inputs; add revoke_for_tab calls in destroy_browser_tab_impl, destroy_all_browser_tabs_impl, navigate_browser_tab (non-localfile dest); add tests for localfile shape allow + malformed deny</code></li><li><code>src-tauri/src/commands/localfile.rs [NEW in skeleton] validate_picked_path, classify_mime, build_localfile_response, validate_localfile_url_shape, mint_localfile_token, localfile_protocol_handler (token generation is internal to LocalFileTokenStore::mint&#x27;s impl scope under-lock — not a separate module fn — to close the freshness-vs-insert TOCTOU window)</code></li><li><code>src/lib/urlScheme.ts [MODIFY at implementer time] add `localfile://localhost/&lt;22-char-token&gt;` allow branch (strict shape per C9; mirror of validate_browser_url change)</code></li><li><code>src/lib/browserIpc.ts [MODIFY at implementer time] +mintLocalFileToken IPC wrapper</code></li><li><code>src/components/browser/NavControls.tsx [MODIFY at implementer time] mount OpenFileButton as leftmost icon</code></li><li><code>src/components/browser/OpenFileButton.tsx [NEW at implementer time] dialog → mint → navigate; surfaces errors via setTabError</code></li></ul>
 
   <h2>Interfaces &amp; method docstrings</h2>
   <p class="meta">All interfaces are expanded by default so the reviewer can spot-check the 9-field docstrings without scrolling through a chat log.</p>
@@ -123,7 +123,7 @@
 </li>
 <li><code>validate_localfile_url_shape</code>
  <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
-<pre class="doc">Single source of truth for `localfile://&lt;token&gt;` shape gate. Used by extended validate_browser_url. Strict 22-char base64-url; rejects everything else.</pre>
+<pre class="doc">Single source of truth for `localfile://localhost/&lt;token&gt;` shape gate (path-based; C9). Used by extended validate_browser_url. Strict: scheme `localfile`, host `localhost`, path `/&lt;22-char-base64url&gt;`; rejects everything else.</pre>
 </li>
 <li><code>mint_localfile_token (#[tauri::command])</code>
  <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
@@ -131,7 +131,7 @@
 </li>
 <li><code>localfile_protocol_handler</code>
  <small class="meta">fields: responsibility, pipeline_position, inputs, outputs, side_effects, preconditions, postconditions, failure_modes, collaborators</small>
-<pre class="doc">Async URI-scheme handler. Parses token + reads UriSchemeContext::webview_label, strips `browser-tab-` prefix, LocalFileTokenStore::lookup (tab-scoped), tokio::fs::read, build_localfile_response, responder.respond.</pre>
+<pre class="doc">Async URI-scheme handler. Parses token from `request.uri().path()` (strip leading `/`; per C9 path-based shape), reads `UriSchemeContext::webview_label` and strips `browser-tab-` prefix to derive owning_tab_id, calls `LocalFileTokenStore::lookup` (tab-scoped), `tokio::fs::read` on canonical path, `build_localfile_response`, `responder.respond` exactly once.</pre>
 </li>
 </ul></details>
 
@@ -148,7 +148,7 @@ graph LR
   <table><thead><tr><th>Criterion</th><th>Score</th><th>Notes</th></tr></thead><tbody>
     <tr><td>Decomposition completeness</td><td>4/4</td><td>Every E2E stage from Phase 1's three sub-pipelines (mint, serve, revoke) has a method node. No method-shaped class; <code>mint_localfile_token</code> explicitly orchestrates named nodes (validate &rarr; classify &rarr; mint).</td></tr>
     <tr><td>Docstring quality</td><td>4/4</td><td>All 9 fields present on every method per source-of-truth review of <code>state.rs</code> and <code>commands/localfile.rs</code>. Inputs carry semantic constraints (e.g. <code>mint.canonical_path</code>: "already validated; mint does NOT re-validate, by design"). No thin fields.</td></tr>
-    <tr><td>Interface cohesion</td><td>4/4</td><td><code>LocalFileTokenStore</code>: 4 methods on shared HashMap state (state + failure-domain). <code>commands::localfile</code>: 6 fns clustered around mint + serve pipelines (lifecycle + collaboration boundary). Neither is a god-interface.</td></tr>
+    <tr><td>Interface cohesion</td><td>4/4</td><td><code>LocalFileTokenStore</code>: 4 methods on shared HashMap state (state + failure-domain). <code>commands::localfile</code>: 6 fns clustered around mint + serve pipelines (lifecycle + collaboration boundary) &mdash; was 7 before Phase 7 absorbed <code>generate_token</code> into the trait impl; rubric notes corrected in r2 after codex3 r2 #3. Neither is a god-interface.</td></tr>
     <tr><td>Dependency direction</td><td>4/4</td><td>Acyclic: <code>commands::localfile &rarr; LocalFileTokenStore</code>; no back-edge. Token generation absorbed into trait impl during Phase 7 revision to close the previously-emitted phantom cycle.</td></tr>
     <tr><td>Validation status</td><td>3/4</td><td>Phase 6 <code>cargo check</code> passed first run with 13 unused-pub-item warnings (cargo footer count, authoritative; expected for skeleton &mdash; implementer wiring in <code>lib.rs</code> clears). Per rubric, "passed with warnings" = 3.</td></tr>
     <tr><td>Plan coverage</td><td>4/4</td><td>Every Phase 1 in-scope feature F1&ndash;F10 maps to a node or to implementer-time wiring (F5 protocol registration, F8 revocation hooks land in <code>lib.rs</code> / <code>browser.rs</code> at implement time, with contracts documented in the trait/fn docstrings).</td></tr>
@@ -169,6 +169,19 @@ graph LR
     <li><strong>claude3 F4 (warning count drift):</strong> RESOLVED &mdash; normalized on cargo-footer count (13) throughout state file and rubric notes.</li>
     <li><strong>claude3 F1 / codex2 #3 (DAG coarseness):</strong> ACKNOWLEDGED &mdash; not changed. The script collapses by interface; adding <code>commands::browser</code> as an "interface" would force an abstraction (we are modifying existing fns, not creating a new interface). The cross-module edges (browser&rarr;localfile dispatch and browser&rarr;LocalFileTokenStore revocation calls) are documented in the package layout above and in the C1, F8, F10 plan entries.</li>
     <li><strong>claude3 F5:</strong> ACKNOWLEDGED &mdash; note-only for implementer.</li>
+  </ul>
+
+  <h2>Round-2 review feedback &mdash; closed items</h2>
+  <p class="meta">After commit <code>e7881a1</code> (r1 polish), three reviewers (claude2 r2, codex2 r2, codex3 r2) re-ran and converged on remaining URL-shape shorthand drift; one reviewer (claude3 r2) gave Accept/Ratify. The r2 polish closes the convergent findings.</p>
+  <ul>
+    <li><strong>claude2 R2-F1 / codex2 r2 #1 / codex3 r2 #1 (URL-shape shorthand not propagated):</strong> RESOLVED &mdash; all four sites (Goal, S3, package layout urlScheme.ts row, <code>validate_localfile_url_shape</code> docstring summary) updated from `localfile://&lt;token&gt;` to `localfile://localhost/&lt;token&gt;` in both <code>.planner-state.json</code> and <code>architecture.html</code>. Source docstrings at <code>commands/localfile.rs</code> module doc, <code>mint_localfile_token</code>, <code>localfile_protocol_handler</code> header, and pipeline-position also updated.</li>
+    <li><strong>claude2 R2-F2 (protocol_handler summary missing path-parsing step):</strong> RESOLVED &mdash; HTML summary now reads "Parses token from <code>request.uri().path()</code> (strip leading <code>/</code>; per C9 path-based shape)".</li>
+    <li><strong>codex3 r2 #2 (source docstrings shorthand):</strong> RESOLVED &mdash; <code>localfile.rs</code> lines 249 / 308 / 320 / module doc and <code>state.rs</code> line 318 all updated to `localfile://localhost/&lt;token&gt;`.</li>
+    <li><strong>codex3 r2 #3 (rubric_notes "7 fns" vs HTML "6 fns" drift):</strong> RESOLVED &mdash; <code>.planner-state.json::rubric_notes</code> Interface cohesion entry corrected to "6 fns" with explanation referencing the Phase-7 generate_token absorption. HTML rubric Notes column also annotated.</li>
+    <li><strong>claude2 r1 N2 (Back/Forward after revoke returns 404):</strong> RESOLVED in r2 &mdash; F8 in-scope item now spells out the consequence: "once a tab navigates away from a localfile URL, the token is purged, so a subsequent Back/Forward to that localfile URL returns 404. Users must re-pick the file to re-mint."</li>
+    <li><strong>claude2 r1 N3 (nodes_phase3 audit gap):</strong> ACKNOWLEDGED, kept &mdash; the <code>{"id": 3, "stage": "(removed in Phase 7 revision...)"}</code> placeholder is deliberate audit history; renumbering would lose the trail.</li>
+    <li><strong>claude2 r2 S1 (deny-prefix `/usr` rationale):</strong> ACKNOWLEDGED &mdash; the v1 list in C7 is committed; rationale for adding `/usr` is "defense-in-depth against attacker-controlled file path slipping through validation." Implementer may pin this in a comment next to the deny-prefix constant at impl time.</li>
+    <li><strong>codex2 r2 #2 (Mermaid DAG unchanged):</strong> ACKNOWLEDGED &mdash; same disposition as round-1 F1 / codex2 #3; the script collapses by interface and the package layout + C1 + F8 + F10 capture the cross-module relationships in prose.</li>
   </ul>
 
   <h2>Reviewer checklist</h2>
