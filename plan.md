@@ -18,7 +18,7 @@
   stated explicitly (claude3 #5); B1 verification target tightened (codex2 #3);
   active-tab switch flicker guard noted (claude2 S4); UUID source picked
   (claude2 S2); `browser_last_url` semantics defined (claude2 S3).
-- **r3** (this commit) — r2 cohort-feedback polish. Convergent minor items:
+- **r3** (`947d88e`) — r2 cohort-feedback polish. Convergent minor items:
   added `BrowserDrawer → NavControls/AddressBar` edges to plan.mmd
   (claude2 P1 + claude3 N1); corrected edge count 17→20 + relabeled
   toposort to strict longest-path (claude3 N2 + claude2 P2); inlined B1
@@ -31,6 +31,13 @@
   added `Tab` history-lives-in-OS-layer note (claude2 P3b); rephrased
   row #30 to remove "per-tab keyed by tab_id but scoped to first tab"
   tension (claude3 N3).
+- **r4** (this commit) — r3 polish tail. Two residual nits closed:
+  package-layout block now says `Tab + BrowserState [extended]` to
+  match the r3 name-collision fix (claude3 N4 + codex2 nit, 2-way
+  convergent); dependency-direction prose now names both
+  `BrowserStore` (L2) and `BrowserTabsState` (L4) as sinks rather
+  than calling only `BrowserTabsState` the "single ultimate sink"
+  (codex3 low).
 
 ## Goal
 
@@ -161,7 +168,7 @@ src/
 │                                    — single file, no new file beyond TabStrip.tsx)
 ├── lib/browserIpc.ts               (modified — per-tab wrappers; preserves setBrowserSettings)
 ├── stores/browserStore.ts          (modified — tabs slice)
-└── types/browser.ts                (modified — Tab + BrowserTabsState)
+└── types/browser.ts                (modified — Tab + BrowserState [extended])
 
 src-tauri/src/
 ├── commands/browser.rs             (modified — 9 per-tab commands; per-tab event emitters)
@@ -265,9 +272,11 @@ Earlier revisions placed it at L4 alongside `BrowserTabsState` because
 both are "leaf state sinks" semantically — that grouping is intuitive
 but not strict toposort. Corrected in r3 per claude3 N2 / claude2 P2.
 
-No cycles. Acyclicity verifiable by inspection (single source, single
-ultimate sink, fan-in/fan-out structure). See `plan.mmd` for the
-literal Mermaid graph.
+No cycles. Acyclicity verifiable by inspection (single source
+`BrowserDrawer`; two no-outgoing sinks `BrowserStore` at L2 and
+`BrowserTabsState` at L4, with `BrowserTabsState` the deepest by
+longest-path; fan-in/fan-out structure elsewhere). See `plan.mmd` for
+the literal Mermaid graph.
 
 ## Interfaces emitted
 
