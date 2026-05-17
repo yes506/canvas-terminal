@@ -310,3 +310,285 @@ impl<'a, R: Runtime> Drop for CreateGuard<'a, R> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// LocalFileTokenRegistry (browser-localfile cycle — feat/browser-integration)
+//
+// Phase-5 skeleton (codebase-planner system lane). Defines the public
+// contract for the `localfile://localhost/<token>` URI scheme's token-binding
+// registry. Method bodies are `todo!()` placeholders; the downstream
+// codebase-implementer fills them in under the
+// (interfaces only, human-confirmed) marker.
+//
+// See `commands::localfile` for the orchestrating Tauri command,
+// protocol handler, and private helpers (validate_picked_path,
+// classify_mime, build_localfile_response, validate_localfile_url_shape).
+// Token generation is intentionally NOT a separate helper — it
+// happens inside `LocalFileTokenStore::mint` under the same lock
+// scope as the insert (TOCTOU-safe).
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+/// URL-safe-base64-encoded 128-bit random token. Strict shape:
+/// `^[A-Za-z0-9_-]{22}$`. Used at the IPC boundary, in the URI
+/// path, and as the registry map key.
+pub type Token = String;
+
+/// Per-token entry stored by `LocalFileTokenRegistry`.
+///
+/// Tab-scoping invariant: `tab_id` is the tab that MINTED this
+/// token. The protocol handler enforces that any incoming request
+/// bearing this token originated from the same tab — by reading
+/// `UriSchemeContext::webview_label()`, stripping the
+/// `browser-tab-` prefix produced by `BrowserTabsState::label_for`,
+/// and comparing against this field.
+#[derive(Debug, Clone)]
+pub struct TokenEntry {
+    pub tab_id: TabId,
+    pub canonical_path: PathBuf,
+    pub mime: String,
+    pub minted_at: Instant,
+}
+
+/// Errors returned by `LocalFileTokenStore::mint`. Read-only and
+/// best-effort methods (`lookup`, `revoke_for_tab`, `clear`) are
+/// total over their inputs by design — their Mutex-poisoning case
+/// is swallowed and surfaced as `None` / `0` to keep the security
+/// default safe (404 on uncertainty; best-effort cleanup over leak).
+#[derive(Debug)]
+pub enum RegistryError {
+    /// Mutex poisoned by a panic on a prior call holding the lock.
+    /// Not retryable. Caller bubbles the failure to the user; the
+    /// app is in a degraded state that requires restart.
+    LockPoisoned,
+    /// Collision-budget exhausted after N rerolls. Astronomically
+    /// improbable with 128-bit tokens; signals a broken RNG path
+    /// (e.g. getrandom failing silently).
+    TokenSpaceExhausted,
+}
+
+/// Registry contract for the `localfile://` URI scheme.
+///
+/// Cohesion source: all methods operate on the same private
+/// `HashMap<Token, TokenEntry>` guarded by a single Mutex; same
+/// failure domain (lock poisoning); shared lifecycle (app process
+/// lifetime).
+///
+/// Lock-order convention: this Mutex is independent of
+/// `BrowserTabsState`'s `tabs` and `last_bounds` mutexes. No code
+/// path currently locks both this Mutex AND any `BrowserTabsState`
+/// Mutex simultaneously. If a future code path needs to, the
+/// convention is `LocalFileTokenRegistry` AFTER `BrowserTabsState`
+/// locks (i.e. last_bounds -> tabs -> registry).
+pub trait LocalFileTokenStore: Send + Sync {
+    /// Atomically mint a fresh token, bind it to the supplied tab +
+    /// canonical path + MIME, store the entry in the registry, and
+    /// return the token to the caller.
+    ///
+    /// **Responsibility:** Atomically mint a fresh token, bind it
+    /// to the supplied tab + canonical path + MIME, store the entry
+    /// in the registry, and return the token to the caller.
+    /// **Pipeline-position:** `commands::localfile::classify_mime`
+    /// -> THIS -> Tauri command boundary (returned to the frontend).
+    /// Token generation (16 bytes `getrandom` -> URL-safe-base64
+    /// + collision check against `self.entries`) happens INSIDE
+    /// `mint`'s impl under the same lock scope as the insert.
+    /// **Inputs:**
+    /// - `tab_id`: `TabId` — UUID-shaped string of the tab that owns
+    ///   this picked file; the protocol handler enforces that only
+    ///   requests originating from this tab can be served.
+    /// - `canonical_path`: `PathBuf` — already canonicalized AND
+    ///   already validated (regular file, not under deny-prefix);
+    ///   `mint` does NOT re-validate, by design.
+    /// - `mime`: `String` — MIME type for the response Content-Type
+    ///   header; precomputed by the caller via `classify_mime`; must
+    ///   contain no CR/LF/control bytes.
+    /// **Outputs:** `Token` — 22-char URL-safe-base64 string;
+    /// unique across the live registry at the moment of return.
+    /// **Side-effects:** mutates the registry's internal HashMap;
+    /// holds the internal Mutex for the duration of the
+    /// generate-and-insert (both happen under the SAME lock scope
+    /// to close the freshness-vs-insert TOCTOU window); consumes
+    /// 16 bytes of `getrandom` entropy per generation attempt. No
+    /// I/O; no time; no network.
+    /// **Preconditions:** `canonical_path` exists, is a regular file
+    /// (not a directory, symlink, socket, FIFO, or device), and is
+    /// not under any entry in the deny-prefix list. `mime` is a
+    /// syntactically valid MIME string. These invariants are
+    /// established by `commands::localfile::validate_picked_path`
+    /// and `classify_mime` and trusted here.
+    /// **Postconditions:** the registry contains exactly one new
+    /// `TokenEntry` keyed by the returned `Token`; that entry's
+    /// `tab_id` equals the supplied `tab_id`; `minted_at` is set to
+    /// `Instant::now()` at insert time. Each call produces a fresh
+    /// token even with identical inputs — re-picking the same file
+    /// twice yields two independent tokens (deliberate).
+    /// **Failure-modes:**
+    /// - `RegistryError::LockPoisoned` — internal Mutex poisoned by
+    ///   a prior panic; not retryable.
+    /// - `RegistryError::TokenSpaceExhausted` — random-token
+    ///   generation collided too many times in a row (default
+    ///   threshold: 32 rerolls); signals a broken RNG.
+    /// **Collaborators:** None at the interface level. Token
+    /// generation (16 bytes `getrandom` -> URL-safe-base64 ->
+    /// collision check) is an internal concern of this trait's impl
+    /// and happens under the same lock scope as the insert, so it
+    /// is not surfaced as a separate collaborator.
+    fn mint(
+        &self,
+        tab_id: TabId,
+        canonical_path: PathBuf,
+        mime: String,
+    ) -> Result<Token, RegistryError>;
+
+    /// Look up a token, verify it belongs to the requesting tab,
+    /// return a clone of the entry on success.
+    ///
+    /// **Responsibility:** Atomically retrieve the `TokenEntry` for
+    /// `token`, verify `entry.tab_id == owning_tab_id`, return a
+    /// clone on hit. Return `None` on miss OR tab-mismatch — caller
+    /// cannot distinguish the two by design (deliberate
+    /// information-leak prevention).
+    /// **Pipeline-position:** `localfile_protocol_handler` (parsing
+    /// the URL and `UriSchemeContext::webview_label`) -> THIS ->
+    /// caller decides 200 (proceed to read+respond) vs 404.
+    /// **Inputs:**
+    /// - `token`: `&str` — caller-supplied; expected shape is the
+    ///   22-char base64-url alphabet, but `lookup` does NOT validate
+    ///   shape (cheap; HashMap miss handles malformed input).
+    /// - `owning_tab_id`: `&str` — tab_id extracted from
+    ///   `UriSchemeContext::webview_label`. Caller has already
+    ///   stripped the `browser-tab-` prefix.
+    /// **Outputs:** `Option<TokenEntry>` — `Some(clone)` on hit AND
+    /// tab match; `None` on miss OR tab mismatch OR (swallowed)
+    /// lock poison.
+    /// **Side-effects:** holds the internal Mutex briefly for read
+    /// + clone. No I/O; no mutation of the registry contents.
+    /// **Preconditions:** None. (`token` and `owning_tab_id` may be
+    /// any string slice; registry handles miss gracefully.)
+    /// **Postconditions:** the registry is unchanged. Read-only,
+    /// idempotent.
+    /// **Failure-modes:** None at the signature level. Mutex
+    /// poisoning is swallowed and surfaced as `None`, because the
+    /// protocol handler treats a poisoned mutex the same as a miss
+    /// (refuse to serve over leaking a stale token).
+    /// **Collaborators:** None. (terminal lookup against the local
+    /// HashMap.)
+    fn lookup(&self, token: &str, owning_tab_id: &str) -> Option<TokenEntry>;
+
+    /// Drop every token whose `tab_id` matches the supplied id.
+    ///
+    /// **Responsibility:** Remove every registry entry whose
+    /// `tab_id` equals the supplied id. Used by browser-tab destroy
+    /// and navigate-away hooks to bound a token's lifetime to its
+    /// tab's lifetime.
+    /// **Pipeline-position:**
+    /// `commands::browser::destroy_browser_tab_impl` OR
+    /// `commands::browser::navigate_browser_tab` (when destination
+    /// is NOT a `localfile://` URL) -> THIS.
+    /// **Inputs:**
+    /// - `tab_id`: `&str` — id of the tab being destroyed or
+    ///   navigating away from a localfile URL.
+    /// **Outputs:** `usize` — count of entries removed; zero is a
+    /// valid result (no localfile tokens were minted in this tab).
+    /// **Side-effects:** mutates the internal HashMap by removing
+    /// matching entries; holds the Mutex for the duration of the
+    /// scan-and-remove pass.
+    /// **Preconditions:** None.
+    /// **Postconditions:** the registry contains no entry whose
+    /// `tab_id` equals the supplied `tab_id`. Other entries are
+    /// unchanged. Idempotent: repeated calls with the same id
+    /// return 0 after the first.
+    /// **Failure-modes:** None at the signature level. Mutex
+    /// poisoning swallowed and surfaced as 0 — best-effort
+    /// revocation beats panicking, because the alternative is
+    /// leaking tokens past their tab's lifetime.
+    /// **Collaborators:** None.
+    fn revoke_for_tab(&self, tab_id: &str) -> usize;
+
+    /// Drop every entry in the registry.
+    ///
+    /// **Responsibility:** Atomically remove every entry. Used at
+    /// app teardown so no stale token-to-path mappings survive
+    /// process restart (defense-in-depth — the registry is
+    /// in-memory only, so process-restart already loses them).
+    /// **Pipeline-position:**
+    /// `commands::browser::destroy_all_browser_tabs_impl` OR
+    /// `lib.rs::run()` `WindowEvent::Destroyed` / `RunEvent::Exit`
+    /// hooks -> THIS.
+    /// **Inputs:** None.
+    /// **Outputs:** `usize` — count of entries dropped; zero is a
+    /// valid result.
+    /// **Side-effects:** mutates the internal HashMap (drains all
+    /// entries); holds the Mutex for the duration of the drain.
+    /// **Preconditions:** None.
+    /// **Postconditions:** the registry is empty after return.
+    /// Idempotent.
+    /// **Failure-modes:** None at the signature level. Mutex
+    /// poisoning swallowed for the same reason as `revoke_for_tab`.
+    /// **Collaborators:** None.
+    fn clear(&self) -> usize;
+}
+
+/// Concrete implementation of `LocalFileTokenStore`. Internal
+/// layout: `Mutex<HashMap<Token, TokenEntry>>`. Single source of
+/// truth for the registry's contents; no shadow state, no caching,
+/// no TTL. Created once in `lib.rs::run()` and `.manage()`'d.
+pub struct LocalFileTokenRegistry {
+    pub entries: Mutex<HashMap<Token, TokenEntry>>,
+}
+
+impl LocalFileTokenRegistry {
+    /// Construct an empty registry.
+    ///
+    /// **Responsibility:** Initialize a fresh, empty registry.
+    /// Called once in `lib.rs::run()` before `.manage()`.
+    /// **Pipeline-position:** `lib.rs::run()` -> THIS -> registry
+    /// is `.manage()`'d on the Tauri builder and from then on lives
+    /// inside the app's typemap until process exit.
+    /// **Inputs:** None.
+    /// **Outputs:** `Self` — empty registry; `entries.lock()` would
+    /// observe an empty HashMap.
+    /// **Side-effects:** None. (no I/O; one empty HashMap allocation.)
+    /// **Preconditions:** None.
+    /// **Postconditions:** the returned registry contains zero
+    /// entries; the internal Mutex is unlocked.
+    /// **Failure-modes:** None. (total over its (empty) inputs.)
+    /// **Collaborators:** None.
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for LocalFileTokenRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalFileTokenStore for LocalFileTokenRegistry {
+    fn mint(
+        &self,
+        _tab_id: TabId,
+        _canonical_path: PathBuf,
+        _mime: String,
+    ) -> Result<Token, RegistryError> {
+        todo!("Phase-5 skeleton — body delegated to codebase-implementer; see trait docstring for the contract.")
+    }
+
+    fn lookup(&self, _token: &str, _owning_tab_id: &str) -> Option<TokenEntry> {
+        todo!("Phase-5 skeleton — body delegated to codebase-implementer; see trait docstring for the contract.")
+    }
+
+    fn revoke_for_tab(&self, _tab_id: &str) -> usize {
+        todo!("Phase-5 skeleton — body delegated to codebase-implementer; see trait docstring for the contract.")
+    }
+
+    fn clear(&self) -> usize {
+        todo!("Phase-5 skeleton — body delegated to codebase-implementer; see trait docstring for the contract.")
+    }
+}
