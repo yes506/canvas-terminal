@@ -5,7 +5,7 @@ mod state;
 use std::sync::atomic::Ordering;
 
 use dashboard::DashboardInfo;
-use state::{AppState, BrowserWebviewState};
+use state::AppState;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{Emitter, Manager, RunEvent};
 
@@ -94,7 +94,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .manage(DashboardInfo::new())
-        .manage(BrowserWebviewState::<tauri::Wry>::new())
+        .manage(state::BrowserTabsState::<tauri::Wry>::new())
         .setup(|app| {
             let menu = build_menu(app)?;
             app.set_menu(menu)?;
@@ -151,14 +151,15 @@ pub fn run() {
             commands::dashboard::open_dashboard,
             commands::dashboard::get_dashboard_info,
             commands::dashboard::copy_dashboard_url_with_token,
-            commands::browser::create_browser_webview,
-            commands::browser::set_browser_webview_bounds,
-            commands::browser::navigate_browser,
-            commands::browser::browser_go_back,
-            commands::browser::browser_go_forward,
-            commands::browser::browser_reload,
-            commands::browser::browser_stop,
-            commands::browser::destroy_browser_webview,
+            commands::browser::create_browser_tab,
+            commands::browser::set_browser_tab_bounds,
+            commands::browser::navigate_browser_tab,
+            commands::browser::browser_tab_go_back,
+            commands::browser::browser_tab_go_forward,
+            commands::browser::browser_tab_reload,
+            commands::browser::browser_tab_stop,
+            commands::browser::destroy_browser_tab,
+            commands::browser::destroy_all_browser_tabs,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -193,6 +194,16 @@ pub fn run() {
                         sessions.clear();
                     }
                 }
+                // Browser tabs: defensive cleanup on window-destroy. On
+                // macOS, the red traffic-light close fires
+                // WindowEvent::Destroyed but NOT RunEvent::Exit (app
+                // stays alive in the dock). Without this, BrowserTabsState
+                // would hold dead webview handles until app-quit.
+                if let Some(browser_state) =
+                    window.try_state::<state::BrowserTabsState<tauri::Wry>>()
+                {
+                    let _ = commands::browser::destroy_all_browser_tabs_impl(&browser_state);
+                }
                 // Clean up temporary canvas files
                 let _ = commands::canvas::cleanup_snapshot();
                 let _ = commands::canvas::cleanup_import_file(None);
@@ -204,12 +215,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let RunEvent::Exit = event {
-                // Phase-1 in-scope #6 (app-quit half): destroy the browser
-                // webview if it was left open at quit time. JS useEffect
-                // cleanup isn't reliable on hard quit; this is the Rust-side
-                // tear-down.
-                let state = app_handle.state::<BrowserWebviewState<tauri::Wry>>();
-                let _ = commands::browser::destroy_browser_webview_impl(&state);
+                // App-quit cleanup: destroy every browser tab webview that
+                // may still be open. JS useEffect cleanup isn't reliable on
+                // hard quit; this is the Rust-side tear-down.
+                let state = app_handle.state::<state::BrowserTabsState<tauri::Wry>>();
+                let _ = commands::browser::destroy_all_browser_tabs_impl(&state);
             }
         });
 }

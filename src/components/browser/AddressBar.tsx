@@ -1,44 +1,44 @@
 import { useState, useEffect, FormEvent } from "react";
-import { useBrowserStore } from "../../stores/browserStore";
+import {
+  useBrowserStore,
+  selectActiveUrl,
+  selectActiveError,
+} from "../../stores/browserStore";
 import { classifyScheme } from "../../lib/urlScheme";
-import { navigateBrowser } from "../../lib/browserIpc";
+import { navigateBrowserTab } from "../../lib/browserIpc";
 
 export function AddressBar() {
-  const currentUrl = useBrowserStore((s) => s.currentUrl);
-  const setError = useBrowserStore((s) => s.setError);
-  const error = useBrowserStore((s) => s.error);
-  const [draft, setDraft] = useState(currentUrl);
+  const activeUrl = useBrowserStore(selectActiveUrl);
+  const error = useBrowserStore(selectActiveError);
+  const setTabError = useBrowserStore((s) => s.setTabError);
 
-  // Keep the visible draft in sync with the canonical store value when the
-  // browser navigates on its own (link clicks, history pop, etc.).
+  const [draft, setDraft] = useState(activeUrl);
+
+  // Sync draft with the active tab's URL when it changes (link clicks,
+  // history pop, tab switch).
   useEffect(() => {
-    setDraft(currentUrl);
-  }, [currentUrl]);
+    setDraft(activeUrl);
+  }, [activeUrl]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    const tabId = useBrowserStore.getState().activeTabId;
+    if (!tabId) return;
+
     const result = classifyScheme(draft);
     if (result.action !== "allow") {
-      setError(`${result.action}: ${result.reason}`);
+      setTabError(tabId, `${result.action}: ${result.reason}`);
       return;
     }
     try {
-      await navigateBrowser(result.normalizedUrl);
-      setError(null);
+      await navigateBrowserTab(tabId, result.normalizedUrl);
+      setTabError(tabId, null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
+      setTabError(tabId, msg);
     }
   };
 
-  // INLINE STYLES — round 5-UX investigation showed Row 2 is rendering at
-  // the correct DOM location but the input element itself was invisible.
-  // The chrome ROWS use inline styles and ARE visible; the INPUT inside
-  // used Tailwind classes (bg-surface-lighter, border-text-dim,
-  // placeholder:text-text-muted, focus:ring-1) and was NOT. Hypothesis:
-  // Tailwind JIT missed emitting these classes (hot-reload cache or
-  // scan-glob miss). Switching to inline styles guarantees rendering
-  // regardless of Tailwind build state.
   return (
     <form
       onSubmit={handleSubmit}

@@ -1,6 +1,4 @@
-// Phase 5 interface skeleton — emitted by codebase-planner on
-// 2026-05-17 for feature `browser-drawer`. Implementation must
-// preserve every method's 9-field docstring and the type shapes.
+// Browser-tabs cycle types. Per-tab Chrome-like state.
 
 /**
  * Rect — DOM/CSS-pixel rectangle relative to the parent window.
@@ -25,36 +23,57 @@ export type SchemeClassification =
   | { action: "filter"; reason: string }
   | { action: "deny"; reason: string };
 
-/** Browser nav-event payloads, emitted from Rust → JS. */
-export interface BrowserLoadingEvent {
+/**
+ * Per-tab state. `history` is owned by the OS-layer WKWebView (not the
+ * TS shape) — `browserTabGoBack` / `browserTabGoForward` eval against
+ * the live history stack inside that webview.
+ */
+export interface Tab {
+  id: string;
+  url: string;
+  title: string;
+  isLoading: boolean;
+  error: string | null;
+}
+
+/**
+ * Rust → JS event payloads. Every per-tab event carries `tabId` so
+ * frontend subscribers route to the matching Tab in the tabs slice.
+ */
+export interface BrowserTabLoadingEvent {
+  tabId: string;
   url: string;
 }
-export interface BrowserLoadedEvent {
+export interface BrowserTabLoadedEvent {
+  tabId: string;
   url: string;
 }
-export interface BrowserTitleChangedEvent {
+export interface BrowserTabTitleChangedEvent {
+  tabId: string;
   title: string;
 }
-export interface BrowserErrorEvent {
+export interface BrowserTabErrorEvent {
+  tabId: string;
   url: string;
   reason: string;
 }
 
 /**
  * Frontend state cell for the browser drawer (the Zustand store's
- * snapshot shape). Public API surface for components subscribing
- * via selectors.
+ * snapshot shape). Extended from the prior single-webview shape with
+ * a tabs slice. `activeTabId` is `null` only before the very first
+ * drawer-open of an app session (cold-start, before
+ * `seedInitialTab` runs); once seeded it stays non-null across
+ * subsequent drawer close→reopen cycles per the r4 spec amendment.
  */
 export interface BrowserState {
   drawerOpen: boolean;
   drawerWidth: number;
-  currentUrl: string;
-  pageTitle: string;
-  isLoading: boolean;
-  error: string | null;
+  tabs: Tab[];
+  activeTabId: string | null;
 }
 
-/** Partial-update patch for `set_browser_settings` IPC. */
+/** Partial-update patch for `set_browser_settings` IPC (unchanged). */
 export interface BrowserSettingsPatch {
   browser_drawer_width?: number;
   browser_last_url?: string;

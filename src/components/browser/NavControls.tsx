@@ -1,28 +1,27 @@
 import { ArrowLeft, ArrowRight, RotateCw, X as StopIcon, Loader2 } from "lucide-react";
-import { useBrowserStore } from "../../stores/browserStore";
 import {
-  browserGoBack,
-  browserGoForward,
-  browserReload,
-  browserStop,
+  useBrowserStore,
+  selectActiveLoading,
+} from "../../stores/browserStore";
+import {
+  browserTabGoBack,
+  browserTabGoForward,
+  browserTabReload,
+  browserTabStop,
 } from "../../lib/browserIpc";
 
 /**
- * Back / forward / reload-or-stop + loading spinner. The page title is
- * rendered separately in BrowserDrawer's top row so it can't squeeze the
- * address bar.
- *
- * Round-5-UX: switched fully to inline styles to bypass any Tailwind
- * JIT/cache miss. The previous Tailwind-based version may have had
- * specific classes (text-text-muted, hover:bg-surface-lighter,
- * text-accent, animate-spin) silently dropped from the dev bundle.
+ * Back / forward / reload-or-stop + loading spinner — routed to the
+ * active tab via the BrowserStore.activeTabId.
  */
 export function NavControls() {
-  const isLoading = useBrowserStore((s) => s.isLoading);
+  const isLoading = useBrowserStore(selectActiveLoading);
 
-  const fireAndForget = (fn: () => Promise<void>) => () => {
-    fn().catch(() => {
-      // Silent; "browser webview not created" if drawer is closing.
+  const fireAndForget = (fn: (tabId: string) => Promise<void>) => () => {
+    const tabId = useBrowserStore.getState().activeTabId;
+    if (!tabId) return;
+    fn(tabId).catch(() => {
+      // Silent; "browser tab not created" if the drawer is closing.
     });
   };
 
@@ -47,18 +46,42 @@ export function NavControls() {
         flexShrink: 0,
       }}
     >
-      <button type="button" style={btnStyle} onClick={fireAndForget(browserGoBack)} title="Back" aria-label="Back">
+      <button
+        type="button"
+        style={btnStyle}
+        onClick={fireAndForget(browserTabGoBack)}
+        title="Back"
+        aria-label="Back"
+      >
         <ArrowLeft size={16} color="#cccccc" />
       </button>
-      <button type="button" style={btnStyle} onClick={fireAndForget(browserGoForward)} title="Forward" aria-label="Forward">
+      <button
+        type="button"
+        style={btnStyle}
+        onClick={fireAndForget(browserTabGoForward)}
+        title="Forward"
+        aria-label="Forward"
+      >
         <ArrowRight size={16} color="#cccccc" />
       </button>
       {isLoading ? (
-        <button type="button" style={btnStyle} onClick={fireAndForget(browserStop)} title="Stop" aria-label="Stop">
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={fireAndForget(browserTabStop)}
+          title="Stop"
+          aria-label="Stop"
+        >
           <StopIcon size={16} color="#cccccc" />
         </button>
       ) : (
-        <button type="button" style={btnStyle} onClick={fireAndForget(browserReload)} title="Reload" aria-label="Reload">
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={fireAndForget(browserTabReload)}
+          title="Reload"
+          aria-label="Reload"
+        >
           <RotateCw size={16} color="#cccccc" />
         </button>
       )}

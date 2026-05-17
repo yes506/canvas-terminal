@@ -1,17 +1,86 @@
-//! Browser-drawer Tauri commands. Implements the 9-method `BrowserCommands`
-//! IPC surface designed in Phase 3 / refined in Phase 5 Round-1.
+//! Browser-drawer Tauri commands — per-tab IPC surface for the
+//! browser-tabs cycle. Implements the 9 per-tab commands from plan.md.
 //!
 //! Cross-reference (Phase-3 Round-2 G3): if you change the ALLOW / FILTER /
 //! DENY matrix in `validate_browser_url`, ALSO update
 //! `src/lib/urlScheme.ts::classifyScheme`.
+//!
+//! Per-tab event surface (replaces the prior singleton events):
+//! - `browser-tab-loading`        { tabId, url }
+//! - `browser-tab-loaded`         { tabId, url }
+//! - `browser-tab-title-changed`  { tabId, title }
+//! - `browser-tab-error`          { tabId, url, reason }
 
 use tauri::webview::{PageLoadEvent, WebviewBuilder};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl};
 
-use crate::state::{BrowserWebviewState, FinalizeOutcome, Rect};
+use crate::state::{BrowserTabsState, FinalizeOutcome, Rect, TabId};
 
-const BROWSER_LABEL: &str = "browser";
 const MAIN_WINDOW_LABEL: &str = "main";
+
+/// Off-screen y-coordinate used when `set_browser_tab_bounds` is called
+/// with `visible: false`. Far enough out that the webview is invisible
+/// without WebKit pausing the page (zero-sized bounds can throttle the
+/// render loop). Inactive tabs keep running so users don't lose page
+/// state on tab switch (Chrome-like behaviour).
+const HIDDEN_TAB_Y: f64 = -99999.0;
+
+/// B1 fix — route `target="_blank"` / `window.open` / `form target="_blank"`
+/// requests to the SAME webview's navigation instead of letting WebKit
+/// emit a new-window request that no handler is subscribed to (silent
+/// no-op on sites like NAVER that wrap every link in `target="_blank"`).
+///
+/// Capability isolation note: this script does NOT touch `__TAURI__`
+/// or any IPC bridge — it's a pure DOM behavior patch. The prior cycle's
+/// "no initialization_script" stance was about avoiding IPC injection
+/// into the browser child; this script preserves that property.
+///
+/// Per the plan.md B1 scope clarification, routing new-window requests
+/// to the active tab's navigate is in-scope; spawning a fresh in-app
+/// tab from `target="_blank"` is out of scope.
+const NEW_WINDOW_INTERCEPTOR: &str = r#"
+(function () {
+  // Route any new-window request to the SAME webview by mutating
+  // window.location.href. Try/catch guards against pages that have
+  // already locked window.location with a getter.
+  var route = function (url) {
+    if (typeof url !== 'string' || !url) return;
+    try { window.location.href = url; } catch (e) {}
+  };
+
+  // 1. window.open(url, ...) — always route, return null so caller code
+  //    that checks the return value doesn't proceed with a phantom window.
+  try {
+    Object.defineProperty(window, 'open', {
+      configurable: true,
+      writable: true,
+      value: function (url) { route(url); return null; }
+    });
+  } catch (e) {}
+
+  // 2. <a target="_blank"> — intercept at the capture phase so site
+  //    handlers don't preventDefault before us.
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    var a = t.closest('a[target="_blank"], a[target="_new"]');
+    if (a && a.href) {
+      e.preventDefault();
+      e.stopPropagation();
+      route(a.href);
+    }
+  }, true);
+
+  // 3. <form target="_blank"> — strip the target so the form submits
+  //    in the same webview.
+  document.addEventListener('submit', function (e) {
+    var f = e.target;
+    if (f && (f.target === '_blank' || f.target === '_new')) {
+      f.target = '_self';
+    }
+  }, true);
+})();
+"#;
 
 /// macOS title bar offset compensation.
 ///
@@ -43,9 +112,6 @@ fn compute_macos_titlebar_offset<R: tauri::Runtime>(window: &tauri::Window<R>) -
         _ => 0.0,
     };
 
-    // Prefer the larger of the two (more conservative — pushes the webview
-    // farther down so chrome stays visible). On macos-private-api both will
-    // typically be 0; fall back to the standard title bar height (28pt).
     let dynamic = pos_delta.max(size_delta);
     let resolved = if cfg!(target_os = "macos") && dynamic <= 0.5 {
         28.0
@@ -53,10 +119,6 @@ fn compute_macos_titlebar_offset<R: tauri::Runtime>(window: &tauri::Window<R>) -
         dynamic
     };
 
-    eprintln!(
-        "[browser] titlebar_offset: pos_delta={:.2} size_delta={:.2} scale={:.2} resolved={:.2}",
-        pos_delta, size_delta, scale, resolved,
-    );
     resolved
 }
 
@@ -66,17 +128,6 @@ fn compute_macos_titlebar_offset<R: tauri::Runtime>(window: &tauri::Window<R>) -
 
 /// Classify a URL string per the Phase-1 Q5 policy. Returns the parsed URL on
 /// ALLOW; an `Err` with a labelled reason on FILTER/DENY/parse-failure.
-///
-/// **Cross-reference requirement:** if you change this matrix, ALSO update
-/// `src/lib/urlScheme.ts::classifyScheme`. Phase 6 validation includes a
-/// manual cross-matrix check.
-///
-/// Asymmetry note (impl-review @claude3 J2): the TS-side `classifyScheme`
-/// has a permissive scheme-less fallback that normalizes `example.com` to
-/// `https://example.com` before crossing IPC. This Rust validator therefore
-/// only ever sees fully-qualified URLs from the navigate path; the
-/// `on_navigation` callback (where this is also called) sees URLs as the
-/// engine reports them, which always have a scheme. No fallback here.
 pub fn validate_browser_url(input: &str) -> Result<tauri::Url, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -84,7 +135,6 @@ pub fn validate_browser_url(input: &str) -> Result<tauri::Url, String> {
     }
 
     let lower = trimmed.to_lowercase();
-    // Filter dangerous schemes BEFORE parse, so a parser-quirk can't smuggle them.
     for filtered in [
         "javascript:",
         "data:",
@@ -117,21 +167,28 @@ pub fn validate_browser_url(input: &str) -> Result<tauri::Url, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Helper event payloads
+// Event payloads — every per-tab event carries `tabId` so frontend
+// subscribers can route to the matching Tab in the BrowserStore tabs slice.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, serde::Serialize)]
-struct BrowserUrlEventPayload {
+struct BrowserTabUrlPayload {
+    #[serde(rename = "tabId")]
+    tab_id: String,
     url: String,
 }
 
 #[derive(Clone, serde::Serialize)]
-struct BrowserTitleChangedPayload {
+struct BrowserTabTitlePayload {
+    #[serde(rename = "tabId")]
+    tab_id: String,
     title: String,
 }
 
 #[derive(Clone, serde::Serialize)]
-struct BrowserErrorPayload {
+struct BrowserTabErrorPayload {
+    #[serde(rename = "tabId")]
+    tab_id: String,
     url: String,
     reason: String,
 }
@@ -140,21 +197,25 @@ struct BrowserErrorPayload {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Create the singleton browser child webview overlaid on the main window's
-/// DOM rect. Phase-3 node #25. Uses slot-reservation (BrowserSlot::Creating)
-/// to close the create-race TOCTOU.
+/// Create a child webview for `tab_id` overlaid at `rect`. The webview's
+/// label is `browser-tab-<tab_id>` (deterministic from `BrowserTabsState::label_for`).
+/// Slot reservation closes the create-race TOCTOU; an in-flight destroy
+/// supersedes via generation tracking.
 #[tauri::command]
-pub fn create_browser_webview(
+pub fn create_browser_tab(
+    #[allow(non_snake_case)] tabId: TabId,
     url: String,
     rect: Rect,
-    state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
     app: AppHandle<tauri::Wry>,
 ) -> Result<(), String> {
+    let tab_id = tabId;
+
     // 1. Validate URL FIRST (defense-in-depth alongside frontend classifyScheme).
     let parsed = validate_browser_url(&url)?;
 
     // 2. Reserve the slot (Empty → Creating). Drop-guard rolls back on failure.
-    let guard = state.try_reserve_for_create()?;
+    let guard = state.try_reserve_for_create(&tab_id)?;
 
     // 3. Build the webview OUTSIDE the slot lock. The `unstable` feature gate
     //    is required for `Window::add_child`; see Cargo.toml.
@@ -162,49 +223,73 @@ pub fn create_browser_webview(
         .get_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| format!("main window not found (label '{}')", MAIN_WINDOW_LABEL))?;
 
-    // Apply macOS title-bar offset compensation (codex3 R5-UX diagnosis):
-    // `Window::add_child` positions relative to the outer window frame on
-    // macOS with decorations + macos-private-api; the rect we got from
-    // `getBoundingClientRect()` is relative to the viewport (below the
-    // title bar). Add the inner-outer Y delta to align them.
     let titlebar_offset = compute_macos_titlebar_offset(&main_window);
     let adjusted_y = rect.y + titlebar_offset;
 
+    let label = BrowserTabsState::<tauri::Wry>::label_for(&tab_id);
+
+    // Capture tab_id for each closure so events carry it through.
+    let tab_id_for_page = tab_id.clone();
+    let tab_id_for_title = tab_id.clone();
+    let tab_id_for_nav = tab_id.clone();
     let app_for_loaded = app.clone();
     let app_for_title = app.clone();
     let app_for_nav = app.clone();
 
     let builder: WebviewBuilder<tauri::Wry> =
-        WebviewBuilder::new(BROWSER_LABEL, WebviewUrl::External(parsed))
-            // Capability isolation layer (b): NO initialization_script call —
-            // the browser child gets no preload script.
+        WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+            // B1 fix — DOM-only new-window interceptor. Does NOT touch
+            // `__TAURI__` / IPC, so the prior cycle's capability isolation
+            // intent (no Tauri bridge in the browser child) holds. See
+            // NEW_WINDOW_INTERCEPTOR for rationale + the plan.md B1
+            // scope clarification.
+            .initialization_script(NEW_WINDOW_INTERCEPTOR)
             .on_page_load(move |_webview, payload| {
                 let event_name = match payload.event() {
-                    PageLoadEvent::Started => "browser-loading",
-                    PageLoadEvent::Finished => "browser-loaded",
+                    PageLoadEvent::Started => "browser-tab-loading",
+                    PageLoadEvent::Finished => "browser-tab-loaded",
                 };
                 let _ = app_for_loaded.emit(
                     event_name,
-                    BrowserUrlEventPayload {
+                    BrowserTabUrlPayload {
+                        tab_id: tab_id_for_page.clone(),
                         url: payload.url().to_string(),
                     },
                 );
             })
             .on_document_title_changed(move |_webview, title| {
                 let _ = app_for_title.emit(
-                    "browser-title-changed",
-                    BrowserTitleChangedPayload { title },
+                    "browser-tab-title-changed",
+                    BrowserTabTitlePayload {
+                        tab_id: tab_id_for_title.clone(),
+                        title,
+                    },
                 );
             })
             .on_navigation(move |nav_url| {
-                // Defense-in-depth: re-validate every navigation, not just the
-                // initial URL. Block if Rust policy rejects.
+                // B1 diagnostic logging — gated behind debug_assertions so it
+                // doesn't leak into release. Per plan.md, B1 root cause is
+                // TBD until user reproduction with Wikipedia + GitHub targets;
+                // this log surfaces every nav_url WebKit/WRY delivers so the
+                // first repro identifies which hypothesis applies.
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[browser-tab {}] on_navigation: nav_url='{}'",
+                    tab_id_for_nav, nav_url
+                );
+
                 match validate_browser_url(nav_url.as_str()) {
                     Ok(_) => true,
                     Err(reason) => {
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "[browser-tab {}] on_navigation REJECTED: {} reason='{}'",
+                            tab_id_for_nav, nav_url, reason
+                        );
                         let _ = app_for_nav.emit(
-                            "browser-error",
-                            BrowserErrorPayload {
+                            "browser-tab-error",
+                            BrowserTabErrorPayload {
+                                tab_id: tab_id_for_nav.clone(),
                                 url: nav_url.to_string(),
                                 reason,
                             },
@@ -223,163 +308,203 @@ pub fn create_browser_webview(
         .map_err(|e| format!("Window::add_child failed: {}", e))?;
 
     // 4. Finalize: Creating → Ready(webview) IF still our generation.
-    //    If destroy or a newer create has superseded us, close the webview
-    //    we just built (impl-review @codex3 high #1 fix).
     match guard.finalize(webview)? {
         FinalizeOutcome::Published => {
             // 5. Seed last_bounds so the first set_bounds dedup is honest.
             if let Ok(mut lb) = state.last_bounds.lock() {
-                *lb = Some(rect);
+                lb.insert(tab_id.clone(), rect);
             }
             Ok(())
         }
         FinalizeOutcome::Cancelled(orphan) => {
             let _ = orphan.close();
-            // Surface as Err so the frontend can react (rapid close→open
-            // path will retry).
-            Err("browser webview creation cancelled by destroy".to_string())
+            Err(format!(
+                "browser tab '{}' creation cancelled by destroy",
+                tab_id
+            ))
         }
     }
 }
 
-/// Update the OS-layer webview bounds, with last_bounds dedup.
-/// Phase-3 node #26. Lock-order: last_bounds BEFORE slot (no overlap).
+/// Update an existing tab's OS-layer webview bounds, with per-tab dedup.
+/// When `visible` is `false`, the webview is positioned off-screen via
+/// `HIDDEN_TAB_Y` (page keeps running — inactive tabs preserve state).
 #[tauri::command]
-pub fn set_browser_webview_bounds(
+pub fn set_browser_tab_bounds(
+    #[allow(non_snake_case)] tabId: TabId,
     rect: Rect,
-    state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+    visible: bool,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
     app: AppHandle<tauri::Wry>,
 ) -> Result<(), String> {
-    // Dedup check (lock #1: last_bounds).
+    let tab_id = tabId;
+
+    // The "effective" rect we send to the OS layer: same width/height,
+    // but y is replaced with HIDDEN_TAB_Y when visible=false.
+    let effective = if visible {
+        rect
+    } else {
+        Rect {
+            x: rect.x,
+            y: HIDDEN_TAB_Y,
+            width: rect.width,
+            height: rect.height,
+        }
+    };
+
+    // Per-tab dedup (lock #1: last_bounds).
     {
         let lb = state
             .last_bounds
             .lock()
             .map_err(|e| format!("last_bounds lock poisoned: {}", e))?;
-        if *lb == Some(rect) {
+        if lb.get(&tab_id) == Some(&effective) {
             return Ok(());
         }
     }
 
     let webview = state
-        .clone_webview()
-        .ok_or_else(|| "browser webview not created".to_string())?;
+        .clone_tab(&tab_id)
+        .ok_or_else(|| format!("browser tab '{}' not created", tab_id))?;
 
-    // Apply the same macOS title-bar offset as create_browser_webview so
-    // the webview stays under the chrome rather than drifting up.
     let main_window = app
         .get_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| format!("main window not found (label '{}')", MAIN_WINDOW_LABEL))?;
     let titlebar_offset = compute_macos_titlebar_offset(&main_window);
-    let adjusted = Rect {
-        x: rect.x,
-        y: rect.y + titlebar_offset,
-        width: rect.width,
-        height: rect.height,
+
+    let positioned = Rect {
+        x: effective.x,
+        y: effective.y + titlebar_offset,
+        width: effective.width,
+        height: effective.height,
     };
 
     webview
-        .set_bounds(adjusted.to_dpi_rect())
+        .set_bounds(positioned.to_dpi_rect())
         .map_err(|e| format!("set_bounds failed: {}", e))?;
 
-    // Update the dedup cache with the ORIGINAL (unadjusted) rect — the
-    // frontend sends and compares against unadjusted coords.
+    // Lock-error asymmetry note (claude3 C): the read-side dedup lock
+    // above propagates poison via `?` so callers see a hard error; the
+    // write-side lock below is intentionally lenient with `if let Ok`.
+    // Rationale: the OS-level `set_bounds` already succeeded; failing to
+    // update the dedup cache only costs one redundant IPC on the next
+    // tick. Propagating a write-side Err here would surface a phantom
+    // failure for an operation that actually completed.
     if let Ok(mut lb) = state.last_bounds.lock() {
-        *lb = Some(rect);
+        lb.insert(tab_id, effective);
     }
     Ok(())
 }
 
-/// Navigate the browser webview. Re-validates Rust-side (defense-in-depth).
-/// Phase-3 node #27.
 #[tauri::command]
-pub fn navigate_browser(
+pub fn navigate_browser_tab(
+    #[allow(non_snake_case)] tabId: TabId,
     url: String,
-    state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
 ) -> Result<(), String> {
     let parsed = validate_browser_url(&url)?;
     let webview = state
-        .clone_webview()
-        .ok_or_else(|| "browser webview not created".to_string())?;
+        .clone_tab(&tabId)
+        .ok_or_else(|| format!("browser tab '{}' not created", tabId))?;
     webview
         .navigate(parsed)
         .map_err(|e| format!("navigate failed: {}", e))
 }
 
 #[tauri::command]
-pub fn browser_go_back(
-    state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+pub fn browser_tab_go_back(
+    #[allow(non_snake_case)] tabId: TabId,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
 ) -> Result<(), String> {
     let webview = state
-        .clone_webview()
-        .ok_or_else(|| "browser webview not created".to_string())?;
+        .clone_tab(&tabId)
+        .ok_or_else(|| format!("browser tab '{}' not created", tabId))?;
     webview
         .eval("window.history.back()")
         .map_err(|e| format!("eval back failed: {}", e))
 }
 
 #[tauri::command]
-pub fn browser_go_forward(
-    state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+pub fn browser_tab_go_forward(
+    #[allow(non_snake_case)] tabId: TabId,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
 ) -> Result<(), String> {
     let webview = state
-        .clone_webview()
-        .ok_or_else(|| "browser webview not created".to_string())?;
+        .clone_tab(&tabId)
+        .ok_or_else(|| format!("browser tab '{}' not created", tabId))?;
     webview
         .eval("window.history.forward()")
         .map_err(|e| format!("eval forward failed: {}", e))
 }
 
 #[tauri::command]
-pub fn browser_reload(
-    state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+pub fn browser_tab_reload(
+    #[allow(non_snake_case)] tabId: TabId,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
 ) -> Result<(), String> {
     let webview = state
-        .clone_webview()
-        .ok_or_else(|| "browser webview not created".to_string())?;
+        .clone_tab(&tabId)
+        .ok_or_else(|| format!("browser tab '{}' not created", tabId))?;
     webview
         .reload()
         .map_err(|e| format!("reload failed: {}", e))
 }
 
 #[tauri::command]
-pub fn browser_stop(
-    state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+pub fn browser_tab_stop(
+    #[allow(non_snake_case)] tabId: TabId,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
 ) -> Result<(), String> {
     let webview = state
-        .clone_webview()
-        .ok_or_else(|| "browser webview not created".to_string())?;
+        .clone_tab(&tabId)
+        .ok_or_else(|| format!("browser tab '{}' not created", tabId))?;
     webview
         .eval("window.stop()")
         .map_err(|e| format!("eval stop failed: {}", e))
 }
 
-/// Tauri command wrapper for destroy. Delegates to the impl helper so the
-/// same logic is callable from `RunEvent::Exit` per Phase-2 L3.
 #[tauri::command]
-pub fn destroy_browser_webview(
-    state: tauri::State<'_, BrowserWebviewState<tauri::Wry>>,
+pub fn destroy_browser_tab(
+    #[allow(non_snake_case)] tabId: TabId,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
 ) -> Result<(), String> {
-    destroy_browser_webview_impl(&state)
+    destroy_browser_tab_impl(&tabId, &state)
 }
 
-/// Pure-Rust destroy helper. Called from both the IPC command (#32) and
-/// `lib.rs::run()`'s `RunEvent::Exit` handler (#41). Takes the webview via
-/// `take_webview` (#36b) — the slot ends `Empty`. Idempotent: calling on
-/// Empty is a no-op Ok.
-pub fn destroy_browser_webview_impl(
-    state: &BrowserWebviewState<tauri::Wry>,
+/// Pure-Rust destroy helper for a single tab. Idempotent: calling on a
+/// missing/Empty slot is a no-op `Ok`.
+pub fn destroy_browser_tab_impl(
+    tab_id: &str,
+    state: &BrowserTabsState<tauri::Wry>,
 ) -> Result<(), String> {
-    let webview = match state.take_webview() {
+    let webview = match state.take_tab(tab_id) {
         Some(w) => w,
         None => return Ok(()),
     };
     if let Ok(mut lb) = state.last_bounds.lock() {
-        *lb = None;
+        lb.remove(tab_id);
     }
     webview
         .close()
         .map_err(|e| format!("Webview::close failed: {}", e))
+}
+
+#[tauri::command]
+pub fn destroy_all_browser_tabs(
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
+) -> Result<(), String> {
+    destroy_all_browser_tabs_impl(&state)
+}
+
+/// Pure-Rust destroy-all helper. Called from the IPC command and from
+/// `lib.rs::run()`'s `RunEvent::Exit` handler.
+pub fn destroy_all_browser_tabs_impl(
+    state: &BrowserTabsState<tauri::Wry>,
+) -> Result<(), String> {
+    for webview in state.take_all_tabs() {
+        let _ = webview.close();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

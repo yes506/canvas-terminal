@@ -1,11 +1,18 @@
 import { useRef, useCallback, RefObject } from "react";
 import { Globe, X } from "lucide-react";
-import { useBrowserStore } from "../../stores/browserStore";
+import {
+  useBrowserStore,
+  selectActiveTitle,
+} from "../../stores/browserStore";
 import { AddressBar } from "./AddressBar";
 import { NavControls } from "./NavControls";
 import { PageAreaHost } from "./PageAreaHost";
-import { useBrowserBounds } from "./useBrowserBounds";
-import { useBrowserLifecycle } from "./useBrowserLifecycle";
+import { TabStrip } from "./TabStrip";
+import { useBrowserTabsBounds } from "./useBrowserBounds";
+import {
+  useBrowserTabsLifecycle,
+  useBrowserTabsSettings,
+} from "./useBrowserLifecycle";
 import { clampDrawerWidth } from "../../lib/drawerLayout";
 
 interface BrowserDrawerProps {
@@ -24,14 +31,17 @@ export function BrowserDrawer({
   const drawerWidth = useBrowserStore((s) => s.drawerWidth);
   const setDrawerWidth = useBrowserStore((s) => s.setDrawerWidth);
   const toggle = useBrowserStore((s) => s.toggle);
-  const pageTitle = useBrowserStore((s) => s.pageTitle);
+  const activeTitle = useBrowserStore(selectActiveTitle);
 
   const hostRef = useRef<HTMLDivElement>(null) as RefObject<HTMLDivElement>;
   const draggingRef = useRef(false);
 
-  // Subscribe rect changes + lifecycle.
-  useBrowserBounds(hostRef, drawerOpen);
-  useBrowserLifecycle(hostRef);
+  // Mount the three hooks: settings (restore/persist) → lifecycle
+  // (per-tab create/destroy + event routing) → bounds (active visible,
+  // others hidden, same-rAF switch).
+  useBrowserTabsSettings();
+  useBrowserTabsLifecycle(hostRef);
+  useBrowserTabsBounds(hostRef, drawerOpen);
 
   // Drag handle on the LEFT edge of the right-side drawer.
   const handleDragStart = useCallback(
@@ -78,12 +88,9 @@ export function BrowserDrawer({
       >
         {drawerOpen && (
           <>
-            {/* Row 1: title bar — Globe icon + page title + close button.
-                Inline bg color (rather than Tailwind class) matches the
-                canvas drawer's pattern and guarantees the row renders
-                visibly above the OS-layer child webview regardless of
-                Tailwind purge state. Taller rows + explicit minHeight
-                so chrome can't collapse below visible height. */}
+            {/* Row 0: Chrome-like tab strip. */}
+            <TabStrip />
+            {/* Row 1: title bar — Globe icon + active tab title + close. */}
             <div
               className="flex items-center gap-2 px-3 border-b border-surface-lighter flex-shrink-0"
               style={{ background: "#2a2a2a", minHeight: 32 }}
@@ -91,9 +98,9 @@ export function BrowserDrawer({
               <Globe size={13} className="text-text-muted flex-shrink-0" />
               <span
                 className="flex-1 min-w-0 text-[11px] text-text truncate"
-                title={pageTitle || "Browser"}
+                title={activeTitle || "Browser"}
               >
-                {pageTitle || "Browser"}
+                {activeTitle || "Browser"}
               </span>
               <button
                 type="button"
@@ -105,9 +112,7 @@ export function BrowserDrawer({
                 <X size={15} />
               </button>
             </div>
-            {/* Row 2: nav controls + address bar. Inline styles bypass
-                Tailwind JIT entirely so this row renders even if a
-                class is dropped from the dev bundle. */}
+            {/* Row 2: nav controls + address bar. */}
             <div
               style={{
                 display: "flex",
@@ -123,7 +128,7 @@ export function BrowserDrawer({
               <NavControls />
               <AddressBar />
             </div>
-            {/* Page area — the rect that Rust positions the child webview over */}
+            {/* Page area — Rust positions the active child webview over this rect */}
             <PageAreaHost ref={hostRef} />
           </>
         )}

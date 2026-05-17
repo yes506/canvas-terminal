@@ -31,13 +31,30 @@
   added `Tab` history-lives-in-OS-layer note (claude2 P3b); rephrased
   row #30 to remove "per-tab keyed by tab_id but scoped to first tab"
   tension (claude3 N3).
-- **r4** (this commit) — r3 polish tail. Two residual nits closed:
+- **r4** (`2735ed7`) — r3 polish tail. Two residual nits closed:
   package-layout block now says `Tab + BrowserState [extended]` to
   match the r3 name-collision fix (claude3 N4 + codex2 nit, 2-way
   convergent); dependency-direction prose now names both
   `BrowserStore` (L2) and `BrowserTabsState` (L4) as sinks rather
   than calling only `BrowserTabsState` the "single ultimate sink"
   (codex3 low).
+- **post-merge amendment** (this commit, recorded after the merged
+  `(plan-feature, human-confirmed)` gate) — **spec change**
+  authorized via the local-lane planner cycle (chat-only
+  `(plan-local, human-confirmed)` marker, conversation transcript
+  in `~/.cache/canvas-terminal/collab-memory/session-1844/`): the
+  **"Drawer-close wipes all tabs"** Constraint below is superseded.
+  New behavior: drawer-close HIDES every tab webview off-screen via
+  `setBrowserTabBounds(tabId, _, visible=false)` and preserves the
+  tabs slice + active-tab id; per-tab page state (URL, scroll,
+  forms, history) is retained for the next drawer-open within the
+  same app session. Full destroy of every tab now happens only on
+  `RunEvent::Exit` (app quit) and `WindowEvent::Destroyed`
+  (macOS red-traffic-light close). App-restart persistence remains
+  out of scope: on next cold start, `useBrowserTabsSettings` seeds
+  one fresh first tab from `browser_last_url`. Bounds IPCs are
+  serialized per-tab via `enqueueBoundsOp` to eliminate the tokio-
+  worker hide/show ordering race (2-way convergent r6 finding).
 
 ## Goal
 
@@ -67,7 +84,7 @@ drawer (F2).
 - **Tab IDs are generated via `crypto.randomUUID()`** on the frontend (no new dependency required; available in Tauri's WebView2/WKWebView). Same string is used as the Rust webview label suffix.
 - Existing race-condition fixes (close-during-create generation tracking, settings-restore race, listener cleanup, in-flight op chain) must be preserved or replicated PER TAB.
 - **Rust state granularity**: `BrowserTabsState` holds `tabs: Mutex<HashMap<TabId, BrowserSlot<R>>>`; `last_bounds: Mutex<HashMap<TabId, Rect>>` (per-tab — singleton would thrash on every active-tab switch); `generation: AtomicU64` stays **global monotonic** (each tab's `CreateGuard` captures its slot generation independently from a shared counter).
-- **Drawer-close wipes all tabs**: closing the drawer (Cmd+Shift+B or X button) calls `destroy_all_browser_tabs` and clears the tabs slice. Reopen creates a fresh blank tab seeded from `browser_last_url` (or `about:blank`). State preservation across drawer-close is **out of scope** for this cycle.
+- ~~**Drawer-close wipes all tabs**: closing the drawer (Cmd+Shift+B or X button) calls `destroy_all_browser_tabs` and clears the tabs slice. Reopen creates a fresh blank tab seeded from `browser_last_url` (or `about:blank`). State preservation across drawer-close is **out of scope** for this cycle.~~ **— SUPERSEDED by post-merge amendment (see Revision history).** Current behavior: drawer-close HIDES each tab webview off-screen and preserves the tabs slice; full destroy only on app-quit / window-destroy. Cold-start still seeds one fresh tab from `browser_last_url`.
 - **`browser_last_url` persistence semantics under multi-tab**: only the **active tab's URL** is persisted (debounced 800ms), and only when it is not `about:blank`. On next drawer-open, the **first tab** is seeded with the persisted URL.
 - **Event surface migration**: all old singleton events (`browser-loading`, `browser-loaded`, `browser-title-changed`, `browser-error`) are **removed and replaced** with `browser-tab-loading / -loaded / -title-changed / -error`, each carrying `{ tab_id, ...payload }`. No parallel deprecation period — frontend subscribers update in lockstep with the Rust emitter rename.
 - macOS title-bar offset compensation must continue to apply to whichever tab is active.

@@ -2,17 +2,22 @@ import { useEffect, useRef, RefObject } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  createBrowserWebview,
-  destroyBrowserWebview,
-  navigateBrowser,
+  createBrowserTab,
+  destroyBrowserTab,
+  navigateBrowserTab,
+  setBrowserTabBounds,
   setBrowserSettings,
 } from "../../lib/browserIpc";
-import { useBrowserStore } from "../../stores/browserStore";
+import { enqueueBoundsOp } from "./useBrowserBounds";
+import {
+  useBrowserStore,
+  selectActiveTab,
+} from "../../stores/browserStore";
 import type {
-  BrowserErrorEvent,
-  BrowserLoadingEvent,
-  BrowserLoadedEvent,
-  BrowserTitleChangedEvent,
+  BrowserTabLoadingEvent,
+  BrowserTabLoadedEvent,
+  BrowserTabTitleChangedEvent,
+  BrowserTabErrorEvent,
   Rect,
 } from "../../types/browser";
 
@@ -21,10 +26,17 @@ interface SettingsSnapshot {
   browser_last_url?: string;
 }
 
-// Standard pattern (impl-review @claude2 I1 + @codex3 low):
-// listen()'s returned unlisten function arrives via a Promise. If the
-// effect's cleanup runs before the Promise resolves, we must unlisten
-// once it does. This helper covers all 7 listener sites.
+// Module-level handoff between `useBrowserTabsSettings` (the producer)
+// and `useBrowserTabsLifecycle` (the drain). Keyed by tab id so that
+// when `get_settings` resolves WHILE a first-tab's webview is still in
+// `Creating` state, the resolved URL is parked here; the lifecycle hook
+// drains it immediately after `createBrowserTab` returns Ok. Mirrors
+// the prior-cycle R4 race fix, scoped to a per-tab map for multi-tab.
+// 4-way convergent post-impl-review fix (Finding B).
+const pendingRestoreByTab = new Map<string, string>();
+
+// Standard cancellation-safe `listen()` wrapper — survives an unmount
+// before the listen() Promise resolves.
 function subscribeWithCleanup<T>(
   eventName: string,
   handler: (e: { payload: T }) => void,
@@ -44,146 +56,116 @@ function subscribeWithCleanup<T>(
   };
 }
 
-/**
- * Drawer lifecycle: create-on-open, destroy-on-close, subscribe to nav-event
- * back-channel, subscribe to the menu-toggle accelerator.
- *
- * Race fixes folded in (impl-review Round-1):
- *   - close-during-create ghost webview (codex3 high #1): handled in Rust
- *     via generation-tracked CreateGuard; this hook surfaces the
- *     "cancelled by destroy" Err and reacts to it.
- *   - currentUrl-cancels-rAF (codex3 high #2): create-on-open effect
- *     does NOT depend on currentUrl; reads it inside the rAF via
- *     useBrowserStore.getState().
- *   - settings-restore race (codex2 P2): when settings resolves AFTER
- *     the drawer is already open with about:blank, navigate the
- *     existing webview to the restored URL.
- *   - listener cleanup race (claude2 I1, codex3 low): all 7 listen()
- *     sites use subscribeWithCleanup with a cancelled flag.
- *   - fast close/reopen (codex2 P1): a single in-flight create operation
- *     awaits any pending destroy via an inFlightOp promise chain.
- */
-export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
+// ---------------------------------------------------------------------------
+// useBrowserTabsLifecycle — plan.md row #23
+//
+// Per-tab create-on-add / destroy-on-remove. Subscribes to browser-tab-*
+// events once and routes payloads by tab_id to the matching Tab in the
+// store. Race-fix invariants:
+//  - CreateGuard generation tracking lives on the Rust side
+//    (`BrowserTabsState.try_reserve_for_create`). The frontend just
+//    surfaces the "cancelled by destroy" Err if it happens.
+//  - In-flight op chain is now PER TAB (not global) — fast close/reopen
+//    of one tab doesn't block parallel ops on a sibling tab.
+//  - All four event listeners use `subscribeWithCleanup` with a
+//    cancellation flag for unmount-before-resolve safety.
+//  - Closing the drawer HIDES every tab webview off-screen (r4
+//    local-lane spec change — preserves per-tab state across
+//    close→reopen). Full destroy only happens on `RunEvent::Exit`
+//    and `WindowEvent::Destroyed` in `src-tauri/src/lib.rs`.
+// ---------------------------------------------------------------------------
+export function useBrowserTabsLifecycle(hostRef: RefObject<HTMLDivElement>) {
   const drawerOpen = useBrowserStore((s) => s.drawerOpen);
-  const drawerWidth = useBrowserStore((s) => s.drawerWidth);
-  const currentUrl = useBrowserStore((s) => s.currentUrl);
-  const setCurrentUrl = useBrowserStore((s) => s.setCurrentUrl);
-  const setPageTitle = useBrowserStore((s) => s.setPageTitle);
-  const setLoading = useBrowserStore((s) => s.setLoading);
-  const setError = useBrowserStore((s) => s.setError);
+
+  const setTabUrl = useBrowserStore((s) => s.setTabUrl);
+  const setTabTitle = useBrowserStore((s) => s.setTabTitle);
+  const setTabLoading = useBrowserStore((s) => s.setTabLoading);
+  const setTabError = useBrowserStore((s) => s.setTabError);
   const toggle = useBrowserStore((s) => s.toggle);
-  const setDrawerWidth = useBrowserStore((s) => s.setDrawerWidth);
 
-  const initialLoadDoneRef = useRef(false);
-  const lastPersistedRef = useRef<SettingsSnapshot>({});
-  // Serialized op chain: any create awaits any pending destroy and vice-versa.
-  const inFlightOpRef = useRef<Promise<void>>(Promise.resolve());
-  // Track whether the *currently visible* webview was initially seeded with
-  // about:blank because settings hadn't loaded yet. If so, when settings
-  // resolves with a non-default browser_last_url, navigate it.
-  const initialLoadIsBlankRef = useRef(false);
-  // True only between successful createBrowserWebview() return and the
-  // next destroyOnClose. Gates whether a settings-resolve-during-create
-  // can navigate immediately or must defer (impl-review R2 codex2 P2 +
-  // codex3 medium #1).
-  const webviewReadyRef = useRef(false);
-  // If settings resolves WHILE create is in flight, store the restored
-  // URL here. The create callback navigates to it after createBrowserWebview
-  // returns successfully. Cleared on destroy.
-  const pendingRestoredUrlRef = useRef<string | null>(null);
+  // Tabs whose Rust webview has been (or is being) created.
+  const trackedTabsRef = useRef<Set<string>>(new Set());
+  // Per-tab in-flight chain (serializes create/destroy for the same tab id).
+  const inFlightByTabRef = useRef<Map<string, Promise<void>>>(new Map());
 
-  // Initial settings load — restores drawer width + last URL.
-  useEffect(() => {
-    if (initialLoadDoneRef.current) return;
-    initialLoadDoneRef.current = true;
-    invoke<SettingsSnapshot>("get_settings")
-      .then((s) => {
-        if (typeof s.browser_drawer_width === "number" && s.browser_drawer_width > 0) {
-          setDrawerWidth(s.browser_drawer_width);
-        }
-        if (s.browser_last_url) {
-          setCurrentUrl(s.browser_last_url);
-          // Settings-restore race fix (impl-review R1 codex2 P2 + R2
-          // codex2 P2 / codex3 medium #1): the navigate path depends on
-          // whether the webview is already Ready or still being built.
-          if (
-            useBrowserStore.getState().drawerOpen &&
-            initialLoadIsBlankRef.current
-          ) {
-            if (webviewReadyRef.current) {
-              // Webview already Ready → navigate now.
-              navigateBrowser(s.browser_last_url).catch((err) => {
-                console.debug(
-                  "[browser-drawer] post-restore navigate failed:",
-                  err,
-                );
-              });
-              initialLoadIsBlankRef.current = false;
-            } else {
-              // Webview still being built; the create callback will
-              // navigate to this URL once createBrowserWebview returns.
-              pendingRestoredUrlRef.current = s.browser_last_url;
-            }
-          }
-        }
-        lastPersistedRef.current = {
-          browser_drawer_width: s.browser_drawer_width,
-          browser_last_url: s.browser_last_url,
-        };
-      })
-      .catch((err) => console.debug("[browser-drawer] get_settings failed:", err));
-  }, [setDrawerWidth, setCurrentUrl]);
-
-  // Nav-event back-channel subscription. 4 listeners with cancellation-safe cleanup.
+  // 1. Per-tab event subscriptions — wire ONCE, route by tab_id.
   useEffect(() => {
     const unsubs = [
-      subscribeWithCleanup<BrowserLoadingEvent>("browser-loading", (e) => {
-        setLoading(true);
-        setCurrentUrl(e.payload.url);
-        setError(null);
+      subscribeWithCleanup<BrowserTabLoadingEvent>("browser-tab-loading", (e) => {
+        setTabLoading(e.payload.tabId, true);
+        setTabUrl(e.payload.tabId, e.payload.url);
+        setTabError(e.payload.tabId, null);
       }),
-      subscribeWithCleanup<BrowserLoadedEvent>("browser-loaded", (e) => {
-        setLoading(false);
-        setCurrentUrl(e.payload.url);
+      subscribeWithCleanup<BrowserTabLoadedEvent>("browser-tab-loaded", (e) => {
+        setTabLoading(e.payload.tabId, false);
+        setTabUrl(e.payload.tabId, e.payload.url);
       }),
-      subscribeWithCleanup<BrowserTitleChangedEvent>("browser-title-changed", (e) => {
-        setPageTitle(e.payload.title);
-      }),
-      subscribeWithCleanup<BrowserErrorEvent>("browser-error", (e) => {
-        setError(e.payload.reason);
-        setLoading(false);
+      subscribeWithCleanup<BrowserTabTitleChangedEvent>(
+        "browser-tab-title-changed",
+        (e) => {
+          setTabTitle(e.payload.tabId, e.payload.title);
+        },
+      ),
+      subscribeWithCleanup<BrowserTabErrorEvent>("browser-tab-error", (e) => {
+        setTabError(e.payload.tabId, e.payload.reason);
+        setTabLoading(e.payload.tabId, false);
       }),
     ];
     return () => unsubs.forEach((fn) => fn());
-  }, [setLoading, setCurrentUrl, setPageTitle, setError]);
+  }, [setTabUrl, setTabTitle, setTabLoading, setTabError]);
 
-  // Menu-toggle subscription (the native-menu accelerator path).
+  // 2. Menu-toggle subscription (native menu accelerator path).
   useEffect(() => {
     return subscribeWithCleanup<unknown>("menu-toggle-browser", () => toggle());
   }, [toggle]);
 
-  // create-on-open / destroy-on-close. Depends ONLY on drawerOpen (NOT
-  // currentUrl — that's read inside the rAF) so unrelated URL updates
-  // don't cancel an in-flight create (impl-review codex3 high #2 fix).
-  const previousOpenRef = useRef(false);
+  // 3. Diff tabs[] against trackedTabsRef on every render; queue
+  //    create for new ids, destroy for removed ids.
+  //
+  //    We subscribe to the whole store so unmount + tab additions both
+  //    trigger this effect. The shallow `tabs` selector is replaced by a
+  //    custom equality check on length + ids.
+  const tabs = useBrowserStore((s) => s.tabs);
   useEffect(() => {
-    if (drawerOpen === previousOpenRef.current) return;
-    previousOpenRef.current = drawerOpen;
+    const liveIds = new Set(tabs.map((t) => t.id));
+    const tracked = trackedTabsRef.current;
+    const inFlight = inFlightByTabRef.current;
 
-    if (drawerOpen) {
-      // Chain create after any pending destroy so fast close/reopen doesn't
-      // race (impl-review codex2 P1 + codex3 high #1 fix).
-      let cancelled = false;
-      inFlightOpRef.current = inFlightOpRef.current
+    // CREATE side — for each new tab, chain create after any pending
+    // destroy for the same id.
+    for (const tab of tabs) {
+      if (tracked.has(tab.id)) continue;
+      tracked.add(tab.id);
+
+      const prev = inFlight.get(tab.id) ?? Promise.resolve();
+      // eslint-disable-next-line prefer-const
+      let next: Promise<void>;
+      next = prev
         .catch(() => undefined)
         .then(
           () =>
             new Promise<void>((resolve) => {
-              if (cancelled) return resolve();
               window.requestAnimationFrame(async () => {
-                if (cancelled) return resolve();
+                // Helper to clean up tracking on any early-return path
+                // so the next diff fire (e.g. drawer reopen) can re-queue
+                // create instead of treating this id as "already tracked".
+                // Fix per codex3 r4 #1.
+                const abandonAndResolve = () => {
+                  tracked.delete(tab.id);
+                  resolve();
+                };
+
                 const host = hostRef.current;
-                if (!host) return resolve();
+                if (!host) return abandonAndResolve();
+                if (!useBrowserStore.getState().drawerOpen) {
+                  return abandonAndResolve();
+                }
+                // Tab might have been closed mid-rAF.
+                const tabStillLive = useBrowserStore
+                  .getState()
+                  .tabs.some((t) => t.id === tab.id);
+                if (!tabStillLive) return abandonAndResolve();
+
                 const r = host.getBoundingClientRect();
                 const rect: Rect = {
                   x: r.left,
@@ -191,144 +173,329 @@ export function useBrowserLifecycle(hostRef: RefObject<HTMLDivElement>) {
                   width: r.width,
                   height: r.height,
                 };
-                if (rect.width <= 0 || rect.height <= 0) return resolve();
+                if (rect.width <= 0 || rect.height <= 0) {
+                  return abandonAndResolve();
+                }
 
-                // Read latest store values INSIDE the rAF (codex3 #2 fix).
-                const initialUrl =
-                  useBrowserStore.getState().currentUrl || "about:blank";
-                initialLoadIsBlankRef.current = initialUrl === "about:blank";
+                const url =
+                  useBrowserStore
+                    .getState()
+                    .tabs.find((t) => t.id === tab.id)?.url ?? "about:blank";
+
                 try {
-                  await createBrowserWebview(initialUrl, rect);
-                  // Round-3 hygiene (impl-review @codex3 minor): the user
-                  // may have closed the drawer mid-build. If so, the queued
-                  // destroy will close the webview; don't mutate
-                  // Ready-related refs since they'd lie about the actual
-                  // state.
-                  if (cancelled || !useBrowserStore.getState().drawerOpen) {
+                  await createBrowserTab(tab.id, url, rect);
+
+                  // Post-create drawer-close race fix (4-way convergent
+                  // r4 finding G1): drawer may have closed while WRY
+                  // was building the webview. The close-effect couldn't
+                  // hide this tab because it was still in Creating state
+                  // (clone_tab returned None). Now that we're Ready,
+                  // hide immediately so the user doesn't see a stranded
+                  // webview at the original on-screen rect.
+                  if (!useBrowserStore.getState().drawerOpen) {
+                    // Serialized via the bounds-op queue so a fresh
+                    // reopen-show can't land before this hide.
+                    enqueueBoundsOp(tab.id, () =>
+                      setBrowserTabBounds(
+                        tab.id,
+                        { x: 0, y: 0, width: 1, height: 1 },
+                        false,
+                      ).catch(() => {
+                        /* webview may have been destroyed by
+                           RunEvent::Exit or WindowEvent::Destroyed; safe
+                           to ignore. */
+                      }),
+                    );
                     resolve();
                     return;
                   }
-                  webviewReadyRef.current = true;
-                  setError(null);
-                  // Drain any URL deferred by the settings-resolve-during-
-                  // create race (impl-review R2 codex2 P2 + codex3 #1).
-                  //
-                  // Round-4 fix (impl-review R4 codex2 P1 + codex3 high,
-                  // 2-way convergent): the R3 manual-nav guard of
-                  // `currentUrl === "about:blank"` was too aggressive.
-                  // The settings-restore handler itself calls
-                  // setCurrentUrl(restored) BEFORE queuing
-                  // pendingRestoredUrlRef, so by the time we reach this
-                  // drain check, currentUrl is ALREADY the restored URL
-                  // — not the user manually navigating away. The R3
-                  // check discarded the pending URL in exactly the
-                  // scenario R2 was trying to fix.
-                  //
-                  // Correct "no manual nav" check: currentUrl is either
-                  // still about:blank (no writes since create started)
-                  // OR equals the pending restored URL (settings-restore
-                  // wrote it; that's the only writer that could have
-                  // fired during the create-in-flight window because
-                  // manual nav via navigateBrowser would have failed
-                  // with "browser webview not created").
-                  if (
-                    pendingRestoredUrlRef.current &&
-                    initialUrl === "about:blank" &&
-                    useBrowserStore.getState().drawerOpen
-                  ) {
-                    const restored = pendingRestoredUrlRef.current;
-                    const current = useBrowserStore.getState().currentUrl;
+
+                  // Drain any settings-restore URL that landed in
+                  // `pendingRestoreByTab` while we were Creating.
+                  // Per the plan's settings-restore-during-create race
+                  // fix: only drain if the user hasn't manually navigated
+                  // since we started — i.e. current url is still
+                  // about:blank OR is already the pending value (the
+                  // settings handler may have optimistically called
+                  // navigateBrowserTab in parallel; either way we want
+                  // exactly one navigation to the restored URL).
+                  const restoreUrl = pendingRestoreByTab.get(tab.id);
+                  if (restoreUrl) {
+                    pendingRestoreByTab.delete(tab.id);
+                    const current = useBrowserStore
+                      .getState()
+                      .tabs.find((t) => t.id === tab.id)?.url;
                     const noManualNav =
-                      current === "about:blank" || current === restored;
+                      current === "about:blank" || current === restoreUrl;
                     if (noManualNav) {
-                      pendingRestoredUrlRef.current = null;
                       try {
-                        await navigateBrowser(restored);
-                        initialLoadIsBlankRef.current = false;
+                        await navigateBrowserTab(tab.id, restoreUrl);
                       } catch (e) {
                         console.debug(
-                          "[browser-drawer] deferred post-restore navigate failed:",
+                          "[browser-tabs] deferred post-restore navigate failed:",
                           e,
                         );
                       }
-                    } else {
-                      // currentUrl is neither blank nor the pending URL
-                      // → user manually navigated (only possible if a
-                      // browser-loading event already fired, which
-                      // requires the slot to have been Ready). Discard
-                      // pending so the later open doesn't surprise.
-                      pendingRestoredUrlRef.current = null;
                     }
                   }
                 } catch (err) {
                   const msg = err instanceof Error ? err.message : String(err);
-                  // Surface to browserStore.error (rendered in the
-                  // AddressBar error span when the drawer is open) AND
-                  // log explicitly so the failure is visible in the
-                  // dev console even if the AddressBar isn't rendering
-                  // (impl-review R5-UX). The user's earlier "set_bounds
-                  // failed: browser webview not created" was the
-                  // downstream symptom; this prints the root cause.
                   console.error(
-                    "[browser-drawer] createBrowserWebview FAILED:",
+                    "[browser-tabs] createBrowserTab FAILED for tab",
+                    tab.id,
+                    ":",
                     msg,
                   );
-                  setError(msg);
+                  setTabError(tab.id, msg);
+                  pendingRestoreByTab.delete(tab.id);
+                  // Forget so we don't re-attempt forever on this tab.
+                  // (User can close and reopen the drawer to recover.)
                 }
                 resolve();
               });
             }),
-        );
+        )
+        .finally(() => {
+          // Prune entry only if no newer op chained on top of us — mirrors
+          // the boundsOpQueue prune pattern (claude2 r7 H1).
+          if (inFlight.get(tab.id) === next) {
+            inFlight.delete(tab.id);
+          }
+        });
+      inFlight.set(tab.id, next);
+    }
 
-      return () => {
-        cancelled = true;
-      };
-    } else {
-      // Reset the ready flag + drop any pending restore URL before the
-      // destroy command runs; the next create will re-seed them.
-      webviewReadyRef.current = false;
-      pendingRestoredUrlRef.current = null;
-      inFlightOpRef.current = inFlightOpRef.current
+    // DESTROY side — for each tracked id no longer in tabs[], destroy.
+    const toRemove: string[] = [];
+    tracked.forEach((id) => {
+      if (!liveIds.has(id)) toRemove.push(id);
+    });
+    for (const id of toRemove) {
+      tracked.delete(id);
+      const prev = inFlight.get(id) ?? Promise.resolve();
+      // eslint-disable-next-line prefer-const
+      let next: Promise<void>;
+      next = prev
         .catch(() => undefined)
         .then(() =>
-          destroyBrowserWebview().catch((err) =>
-            console.debug("[browser-drawer] destroy on close failed:", err),
+          destroyBrowserTab(id).catch((err) =>
+            console.debug("[browser-tabs] destroyBrowserTab failed:", err),
           ),
-        );
+        )
+        .finally(() => {
+          if (inFlight.get(id) === next) {
+            inFlight.delete(id);
+          }
+        });
+      inFlight.set(id, next);
     }
-  }, [drawerOpen, hostRef, setError]);
+    // drawerOpen is in the dep array so that a drawer-reopen re-runs the
+    // diff. After codex3 r4 #1, an early-return path (host null, drawer
+    // closing during the rAF gap, zero-rect host) cleans `tracked`; on
+    // reopen this effect re-fires and re-queues create for tabs that
+    // are in tabs[] but missing from tracked.
+  }, [tabs, hostRef, setTabError, drawerOpen]);
 
-  // Persist drawer width + last URL (debounced).
+  // 4. Drawer close → hide every tab webview off-screen instead of
+  //    destroying. Preserves per-tab page state (URL, scroll, forms,
+  //    history) for the next drawer-open. App-quit and window-destroy
+  //    still wipe everything via RunEvent::Exit / WindowEvent::Destroyed
+  //    in src-tauri/src/lib.rs — close→reopen persistence is intentional;
+  //    app-restart persistence is not (user's local-lane spec change).
+  const previousOpenRef = useRef(false);
+  useEffect(() => {
+    const wasOpen = previousOpenRef.current;
+    previousOpenRef.current = drawerOpen;
+
+    if (wasOpen && !drawerOpen) {
+      // Hide every existing tab webview via the visible=false path.
+      // Rect is ignored when visible=false (Rust positions at
+      // HIDDEN_TAB_Y); pass a minimal placeholder. Serialize per-tab
+      // via enqueueBoundsOp so a subsequent drawer-reopen's show IPC
+      // is forced to wait for the matching hide to finish — closes
+      // the 2-way convergent r5 hide/show ordering race (codex2 +
+      // codex3).
+      const placeholder: Rect = { x: 0, y: 0, width: 1, height: 1 };
+      const { tabs } = useBrowserStore.getState();
+      for (const t of tabs) {
+        enqueueBoundsOp(t.id, () =>
+          setBrowserTabBounds(t.id, placeholder, false).catch((err) => {
+            const msg = typeof err === "string" ? err : String(err);
+            if (!msg.includes("not created")) {
+              console.debug("[browser-tabs] hide-on-close failed:", err);
+            }
+          }),
+        );
+      }
+      // Defensive: any settings-restore URL parked during this session
+      // should not survive a drawer cycle (the resolver fires only on
+      // cold-start, but clearing is cheap and prevents stale entries
+      // if a future code path enqueues during a reopen).
+      pendingRestoreByTab.clear();
+
+      // INTENTIONALLY NOT cleared: trackedTabsRef, inFlightByTabRef,
+      // useBrowserStore.tabs, activeTabId. The Rust webviews are still
+      // alive; the lifecycle diff effect must continue to recognise
+      // them as "already tracked" on reopen so no duplicate creates
+      // fire.
+    }
+  }, [drawerOpen]);
+}
+
+// ---------------------------------------------------------------------------
+// BrowserTabsSettings sub-hook — plan.md rows #28-#32 (co-located here
+// per the planner decision; no new file).
+//
+// Restores drawer width + seeds first tab URL from `browser_last_url` on
+// mount. Persists drawer width + active-tab URL (non-blank) via
+// debounced `set_browser_settings` patch. Settings-restore-during-create
+// race guard is scoped to the first tab — that's the single path that
+// can race the cold-start `get_settings` resolve against a webview build.
+// ---------------------------------------------------------------------------
+export function useBrowserTabsSettings() {
+  const drawerOpen = useBrowserStore((s) => s.drawerOpen);
+  const drawerWidth = useBrowserStore((s) => s.drawerWidth);
+  const tabs = useBrowserStore((s) => s.tabs);
+  const setDrawerWidth = useBrowserStore((s) => s.setDrawerWidth);
+  const seedInitialTab = useBrowserStore((s) => s.seedInitialTab);
+
+  const initialLoadDoneRef = useRef(false);
+  // Single source of truth for both (a) the "what did we last persist"
+  // dedup AND (b) the "what URL should we seed the first tab with on
+  // drawer-open" lookup. Seeded by cold-start `get_settings` AND
+  // updated by every successful `persistActiveTabUrl`, so it always
+  // reflects the freshest `browser_last_url`. (Earlier r2 introduced
+  // a separate `restoredFirstTabUrlRef` that froze on cold-start and
+  // produced stale-seed reopens; 4-way-convergent r3 fix dropped it
+  // in favor of this single ref.)
+  const lastPersistedRef = useRef<SettingsSnapshot>({});
+
+  // 1. Restore drawer width + record `browser_last_url` on first mount.
+  //    `get_settings` is async. Two handling paths depending on whether
+  //    a first tab already exists when settings resolves:
+  //    - tabs[].length === 0 → just stash the URL for next drawer-open.
+  //    - tabs[0] exists with url=about:blank → park URL in
+  //      `pendingRestoreByTab` (cross-hook handoff) AND optimistically
+  //      try `navigateBrowserTab`. If the webview is still Creating,
+  //      the IPC will fail; the lifecycle hook drains the pending entry
+  //      after `createBrowserTab` succeeds. (Mirrors prior cycle's R4.)
+  useEffect(() => {
+    if (initialLoadDoneRef.current) return;
+    initialLoadDoneRef.current = true;
+
+    invoke<SettingsSnapshot>("get_settings")
+      .then((s) => {
+        if (
+          typeof s.browser_drawer_width === "number" &&
+          s.browser_drawer_width > 0
+        ) {
+          setDrawerWidth(s.browser_drawer_width);
+        }
+
+        const restoredUrl = s.browser_last_url;
+        if (restoredUrl) {
+          const state = useBrowserStore.getState();
+          if (state.tabs.length > 0) {
+            const firstTab = state.tabs[0];
+            if (firstTab && firstTab.url === "about:blank") {
+              // Park the pending URL FIRST so the lifecycle drain has a
+              // chance even if the optimistic navigate below races a
+              // still-Creating slot.
+              pendingRestoreByTab.set(firstTab.id, restoredUrl);
+              navigateBrowserTab(firstTab.id, restoredUrl)
+                .then(() => {
+                  // Success — drain the pending so the lifecycle doesn't
+                  // double-navigate after createBrowserTab finalizes.
+                  pendingRestoreByTab.delete(firstTab.id);
+                })
+                .catch((err) => {
+                  // Expected when the slot is still Creating; the
+                  // lifecycle's post-create drain will fire later.
+                  const msg = typeof err === "string" ? err : String(err);
+                  if (!msg.includes("not created")) {
+                    console.debug(
+                      "[browser-tabs] post-restore navigate failed:",
+                      err,
+                    );
+                  }
+                });
+            }
+          }
+        }
+
+        lastPersistedRef.current = {
+          browser_drawer_width: s.browser_drawer_width,
+          browser_last_url: s.browser_last_url,
+        };
+      })
+      .catch((err) =>
+        console.debug("[browser-tabs] get_settings failed:", err),
+      );
+  }, [setDrawerWidth]);
+
+  // 2. On every drawer-open: seed the first tab (if missing) using the
+  //    last-known `browser_last_url` (or `about:blank` fallback). This
+  //    fires on first-ever open AND on every subsequent reopen — fixes
+  //    Finding B (subsequent reopens didn't re-seed in r1 impl).
+  const previousOpenRef = useRef(false);
+  useEffect(() => {
+    const wasOpen = previousOpenRef.current;
+    previousOpenRef.current = drawerOpen;
+
+    if (!wasOpen && drawerOpen) {
+      const state = useBrowserStore.getState();
+      if (state.tabs.length === 0) {
+        // Single source of truth: lastPersistedRef is seeded by
+        // cold-start get_settings AND updated by every successful
+        // persist, so it always reflects the freshest browser_last_url.
+        const seedUrl =
+          lastPersistedRef.current.browser_last_url ?? "about:blank";
+        seedInitialTab(seedUrl);
+      }
+    }
+  }, [drawerOpen, seedInitialTab]);
+
+  // 3. Persist drawer width (debounced) when changed.
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      const patch: SettingsSnapshot = {};
-      if (drawerWidth !== lastPersistedRef.current.browser_drawer_width) {
-        patch.browser_drawer_width = Math.round(drawerWidth);
-      }
-      if (
-        currentUrl &&
-        currentUrl !== "about:blank" &&
-        currentUrl !== lastPersistedRef.current.browser_last_url
-      ) {
-        patch.browser_last_url = currentUrl;
-      }
-      if (
-        patch.browser_drawer_width === undefined &&
-        patch.browser_last_url === undefined
-      ) {
-        return;
-      }
-      setBrowserSettings(patch)
+      const rounded = Math.round(drawerWidth);
+      if (rounded === lastPersistedRef.current.browser_drawer_width) return;
+      setBrowserSettings({ browser_drawer_width: rounded })
         .then(() => {
           lastPersistedRef.current = {
             ...lastPersistedRef.current,
-            ...patch,
+            browser_drawer_width: rounded,
           };
         })
         .catch((err) =>
-          console.debug("[browser-drawer] persist settings failed:", err),
+          console.debug("[browser-tabs] persist width failed:", err),
         );
     }, 800);
     return () => window.clearTimeout(timer);
-  }, [drawerWidth, currentUrl]);
+  }, [drawerWidth]);
+
+  // 4. Persist active-tab URL (debounced) — only when non-blank and changed.
+  const activeUrl = useBrowserStore((s) => selectActiveTab(s)?.url) ?? "";
+  useEffect(() => {
+    if (!activeUrl || activeUrl === "about:blank") return;
+    if (activeUrl === lastPersistedRef.current.browser_last_url) return;
+
+    const timer = window.setTimeout(() => {
+      setBrowserSettings({ browser_last_url: activeUrl })
+        .then(() => {
+          lastPersistedRef.current = {
+            ...lastPersistedRef.current,
+            browser_last_url: activeUrl,
+          };
+        })
+        .catch((err) =>
+          console.debug("[browser-tabs] persist last_url failed:", err),
+        );
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [activeUrl]);
+
+  // tabs is intentionally consumed to keep the hook reactive across tab
+  // changes (e.g. the seed effect re-runs on drawer toggle).
+  void tabs;
 }
