@@ -15,7 +15,7 @@
 // which is intentionally outside the `src/**` glob so the grep excludes it
 // by path.
 
-use canvas_terminal_lib::commands::transcripts::{
+use canvas_terminal_lib::{
     ContentBlockTable, DiscoveryError, NormalizeContext, NormalizedTurn, RawTurn,
     TranscriptAdapter, TranscriptHandle,
 };

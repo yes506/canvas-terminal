@@ -5,8 +5,8 @@
 // normalized to a tool-agnostic `NormalizedTurn` record. Real-time tailing
 // via notify/fsevents; one-way (tool → shared memory). Adapter trait is the
 // system-lane deliverable; per K3 the production adapter set is fixed
-// (Claude Code + Codex CLI + Gemini CLI). Aider lives only as a test fixture
-// at `src-tauri/tests/transcript_adapter_contract.rs`.
+// (Claude Code + Codex CLI + Gemini CLI). Extensibility is proven by a
+// test-only fixture at `src-tauri/tests/transcript_adapter_contract.rs`.
 
 pub mod adapters;
 pub mod fs_gate;

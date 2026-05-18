@@ -1,185 +1,172 @@
 // Per-stream byte tailer with inode-anchored offset persistence.
 //
-// One `Tailer` per active `WatchToken`. Reads bounded chunks of new bytes
-// from the bound JSONL, hands them to the adapter's `parse_native_lines`,
-// and persists the resulting offset+inode to `.state.json` via
-// `write_memory_file_atomic`.
+// State storage layout: a single JSON file at
+// `<session-memory-dir>/contexts/.state.json` holding a map keyed by the
+// source-path string (per `persist_offset`'s explicit
+// "keyed by `state.path` inside the JSON document" contract). Each value
+// is a `TailState` carrying path / inode / byte_offset /
+// last_normalized_turn_index. The store is read-modify-write per persist
+// — the watcher serializes calls per-token, so concurrent writers race
+// only on distinct keys at worst, and the atomic-rename underlying
+// `memory::write_memory_file_atomic` makes the final visibility atomic.
+//
+// In-bounds writable path is supplied via `TranscriptHandle::memory_dir`
+// (planner touch-up `bffb828` delta A): the external transcript root is
+// strictly read-only by the peer-context-mirror "one-way mirror" rule;
+// state lives inside `collab-memory/session-<pid>/contexts/`.
 
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
+use super::super::memory;
 use super::{TranscriptHandle, WatcherError};
 
 /// Resumable tail state — written to and read from
-/// `session-<pid>/contexts/.state.json` per agent.
+/// `session-<pid>/contexts/.state.json` per agent (multi-agent map keyed
+/// by source-path string).
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct TailState {
     pub path: PathBuf,
-    /// `lstat` inode at last successful poll. Compared on resume to detect
-    /// rotation/deletion at the source (R2).
     pub inode: u64,
-    /// Bytes consumed so far. `parse_native_lines` returns how many bytes
-    /// to advance — partial trailing lines are NOT consumed.
     pub byte_offset: u64,
-    /// Last `turn_index` minted by `normalize` (independent of skip filter
-    /// — increments even when the turn produced `None`).
     pub last_normalized_turn_index: u64,
 }
 
-/// Read the persisted state, validate inode against current `lstat`, and
-/// return either the resumable state or a fresh-start state.
+/// `relative_path` argument used with `memory::write_memory_file_atomic` and
+/// equivalent direct reads. Single source of truth so resume / persist /
+/// inode-change agree on layout.
+const STATE_FILE_RELPATH: &str = "contexts/.state.json";
+
+/// Compute the absolute on-disk path of the multi-agent `.state.json`.
 ///
-/// # Inputs
-/// `handle`: the binding that identifies which `.state.json` entry to read.
-///
-/// # Returns
-/// `Ok(TailState)` ready to drive the next poll. If `.state.json` has no
-/// entry for this handle OR the stored inode differs from `lstat(path)`'s
-/// current inode (R2: source rotation/deletion), returns a fresh
-/// `TailState { byte_offset: 0, last_normalized_turn_index: 0, ... }`.
-///
-/// # Errors
-/// - `WatcherError::Io` if `.state.json` cannot be read AND a fresh state
-///   cannot be created.
-/// - `WatcherError::StateCorrupted` if `.state.json` parses but its schema
-///   is unknown.
-///
-/// # Side effects
-/// One read of `.state.json` (cached after first read per session).
-///
-/// # Invariants
-/// On `Ok`, returned `TailState::path` equals `handle.source_path`. If the
-/// inode mismatch path was taken, `byte_offset` is 0.
-///
-/// # Concurrency
-/// Safe to call concurrently across handles; per-handle state is keyed
-/// by `agent_handle`.
-///
-/// # Lifecycle
-/// Called once per `TranscriptWatcher::watch` immediately after
-/// subscription registration.
-///
-/// # Test contract
-/// Stored state with `inode=42`, current `lstat` returning `inode=99` MUST
-/// reset offset to 0 and emit no error. Missing `.state.json` entry MUST
-/// produce a fresh state, not an error.
+/// Uses `handle.memory_dir` (populated by `TranscriptWatcher::watch` from
+/// `memory::get_memory_dir()` at watch-registration time). In-process this
+/// equals `memory::get_memory_dir()`; on the write side `persist_offset`
+/// calls `memory::write_memory_file_atomic` which re-derives the same dir
+/// — by construction the read and write target the same file.
+fn state_file_path(handle: &TranscriptHandle) -> PathBuf {
+    handle.memory_dir.join(STATE_FILE_RELPATH)
+}
+
+/// Read the multi-agent state map from disk. Absent file returns an empty
+/// map (fresh-session semantics). Malformed JSON returns
+/// `WatcherError::StateCorrupted` so the caller can surface a diagnostic
+/// rather than silently clobber the file.
+fn read_state_map(path: &std::path::Path) -> Result<HashMap<String, TailState>, WatcherError> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents).map_err(|e| {
+            WatcherError::StateCorrupted(format!("parse {}: {}", path.display(), e))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(WatcherError::Io(e)),
+    }
+}
+
+/// Key the per-handle entry by the source-path string (matches
+/// `persist_offset`'s docstring "keyed by `state.path` inside the JSON
+/// document"). Lossy conversion is acceptable: transcript roots are
+/// adapter-pinned ASCII (`~/.claude/projects/...`, `~/.codex/sessions/...`,
+/// `~/.gemini/tmp/...`); non-UTF-8 components don't occur in practice.
+fn key_for(path: &std::path::Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
 pub fn resume_from_state(handle: &TranscriptHandle) -> Result<TailState, WatcherError> {
-    let _ = handle;
-    todo!()
+    let stored = read_state_map(&state_file_path(handle))?
+        .remove(&key_for(&handle.source_path));
+
+    // Current inode for rotation detection (R2). Source file may not exist
+    // yet — Codex creates the rollout JSONL only on first model call, not
+    // at session-bind — so NotFound here is normal and yields a fresh
+    // state using the binding-time inode placeholder.
+    let current_inode = match std::fs::metadata(&handle.source_path) {
+        Ok(m) => m.ino(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TailState {
+                path: handle.source_path.clone(),
+                inode: handle.source_inode,
+                byte_offset: 0,
+                last_normalized_turn_index: 0,
+            });
+        }
+        Err(e) => return Err(WatcherError::Io(e)),
+    };
+
+    Ok(match stored {
+        Some(s) if s.inode == current_inode => s,
+        // Stored inode differs (rotation since last persist) OR no stored
+        // entry — fresh start. R2 contract: byte_offset and turn_index
+        // reset to 0.
+        _ => TailState {
+            path: handle.source_path.clone(),
+            inode: current_inode,
+            byte_offset: 0,
+            last_normalized_turn_index: 0,
+        },
+    })
 }
 
-/// Read up to `MAX_POLL_BYTES` of new bytes from `path` starting at `offset`.
-///
-/// # Inputs
-/// - `handle`: identifies the bound transcript.
-/// - `offset`: byte offset to read from (matches `TailState::byte_offset`).
-///
-/// # Returns
-/// `Ok(Vec<u8>)` containing the bytes read. May be empty if the source
-/// hasn't grown since the last poll. May end mid-line — the adapter's
-/// `parse_native_lines` handles partial trailing lines.
-///
-/// # Errors
-/// `WatcherError::Io` on read failure or if the inode at `path` no longer
-/// matches the bound inode (caller must call `handle_inode_change`).
-///
-/// # Side effects
-/// One `pread`-style read on the source file.
-///
-/// # Invariants
-/// Returned bytes have length ≤ `MAX_POLL_BYTES`. The source file's read
-/// position is NOT advanced (we use offset-based reads, not stateful fds).
-///
-/// # Concurrency
-/// One poll in flight per handle; the watcher serializes them per token.
-///
-/// # Lifecycle
-/// Called by `on_fs_event` routing layer after debounce.
-///
-/// # Test contract
-/// Polling at `offset == file_size` returns empty `Vec`, not error.
-/// Polling after the source file's inode changed (detected by mismatched
-/// `lstat`) returns `WatcherError::Io`.
 pub fn poll_new_bytes(handle: &TranscriptHandle, offset: u64) -> Result<Vec<u8>, WatcherError> {
-    let _ = (handle, offset);
-    todo!()
+    let mut file = std::fs::File::open(&handle.source_path)
+        .map_err(WatcherError::Io)?;
+    let lstat = file.metadata().map_err(WatcherError::Io)?;
+    let current_inode = lstat.ino();
+    if current_inode != handle.source_inode {
+        return Err(WatcherError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "inode mismatch — caller must handle_inode_change",
+        )));
+    }
+    let size = lstat.len();
+    if offset >= size {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start(offset)).map_err(WatcherError::Io)?;
+    let to_read = std::cmp::min((size - offset) as usize, MAX_POLL_BYTES);
+    let mut buf = vec![0u8; to_read];
+    let n = file.read(&mut buf).map_err(WatcherError::Io)?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
-/// Persist updated `TailState` to `.state.json` via atomic write.
-///
-/// # Inputs
-/// `state`: the post-poll state to persist.
-///
-/// # Returns
-/// `Ok(())` once the new state is visible to readers.
-///
-/// # Errors
-/// `WatcherError::Io` on write failure.
-///
-/// # Side effects
-/// Single call to `memory.rs::write_memory_file_atomic` against the
-/// `.state.json` path (rename-based, fsync'd — N2).
-///
-/// # Invariants
-/// Readers never see a half-written `.state.json` (atomic-rename
-/// guarantee). If the prior state had a higher `byte_offset`, writing a
-/// lower one is allowed (rotation reset case — caller handles inode bump).
-///
-/// # Concurrency
-/// Concurrent writes for distinct agents are independent — keyed by
-/// `state.path` inside the JSON document. The atomic-rename pattern means
-/// concurrent writers will race for the final rename, last-writer-wins;
-/// the watcher serializes within an agent.
-///
-/// # Lifecycle
-/// Called after each successful `poll_new_bytes` + `parse_native_lines`
-/// pass, with `byte_offset` advanced by the parser's `consumed_bytes`.
-///
-/// # Test contract
-/// Crash between tmp-write and rename leaves the prior `.state.json`
-/// intact (atomic-rename invariant). After crash recovery, `resume_from_state`
-/// returns the pre-crash state.
 pub fn persist_offset(state: &TailState) -> Result<(), WatcherError> {
-    let _ = state;
-    todo!()
+    // Read-modify-write. memory::write_memory_file_atomic uses
+    // memory::get_memory_dir() (process-scoped session-<pid>); in-process
+    // this agrees with the handle.memory_dir resume_from_state read from,
+    // so the round-trip is consistent.
+    let dir = memory::get_memory_dir()
+        .map_err(|e| WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    let full_path = dir.join(STATE_FILE_RELPATH);
+
+    let mut map = read_state_map(&full_path)?;
+    map.insert(key_for(&state.path), state.clone());
+
+    let serialized = serde_json::to_string(&map).map_err(|e| {
+        WatcherError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+
+    memory::write_memory_file_atomic(STATE_FILE_RELPATH.to_string(), serialized)
+        .map_err(|e| WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+    Ok(())
 }
 
-/// Reset offset to 0 and re-bind inode on detected source rotation.
-///
-/// # Inputs
-/// `handle`: the binding whose inode mismatch was detected.
-///
-/// # Returns
-/// `Ok(TailState)` with byte_offset=0 and the freshly-read inode.
-///
-/// # Errors
-/// `WatcherError::Io` if `lstat` on the new file fails.
-///
-/// # Side effects
-/// Calls `persist_offset` with the reset state. Does NOT replay any
-/// content from before the rotation point — pre-rotation turns are
-/// considered "already mirrored" for any prior tailer pass, and are
-/// not re-mirrored from the new source file.
-///
-/// # Invariants
-/// After return, the new `TailState::inode` matches `lstat(path).inode`
-/// at the moment of return.
-///
-/// # Concurrency
-/// Mutually exclusive with `poll_new_bytes` on the same handle.
-///
-/// # Lifecycle
-/// Called from `poll_new_bytes` when it detects an inode mismatch, OR
-/// called from `resume_from_state` on the same condition at startup.
-///
-/// # Test contract
-/// Inducing a `mv source other; touch source` between two polls MUST
-/// cause this function to fire on the second poll and reset offset
-/// to 0. The new `byte_offset` MUST be 0.
 pub fn handle_inode_change(handle: &TranscriptHandle) -> Result<TailState, WatcherError> {
-    let _ = handle;
-    todo!()
+    // R2: source rotated (current inode differs from previously-tracked
+    // inode). Reset offset to 0 and re-bind the TailState entry to the new
+    // inode. Persist immediately — a crash between this and the next poll
+    // would otherwise allow the watcher to mis-resume from a stale state.
+    let lstat = std::fs::metadata(&handle.source_path).map_err(WatcherError::Io)?;
+    let new_state = TailState {
+        path: handle.source_path.clone(),
+        inode: lstat.ino(),
+        byte_offset: 0,
+        last_normalized_turn_index: 0,
+    };
+    persist_offset(&new_state)?;
+    Ok(new_state)
 }
 
-/// Read-bound for a single poll. Mirrors the choice in `memory.rs` —
-/// callers chunk under this to avoid blocking on huge appends.
 pub const MAX_POLL_BYTES: usize = 1 * 1024 * 1024;
