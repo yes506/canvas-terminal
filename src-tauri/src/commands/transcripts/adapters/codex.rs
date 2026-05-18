@@ -70,8 +70,32 @@ impl TranscriptAdapter for CodexAdapter {
         pid: i32,
         spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
-        let _ = (agent_handle, pid, spawned_at_unix_ms);
-        todo!()
+        // Codex creates the rollout JSONL on first model call, not on CLI
+        // launch — `discover_pid_fd` will return `Ok(None)` and the helper
+        // surfaces `NoMatchingFd` until the user types their first prompt.
+        // The trait contract permits this (NoMatchingFd is documented).
+        let _ = spawned_at_unix_ms;
+
+        let home = dirs::home_dir().ok_or_else(|| {
+            DiscoveryError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "home dir not resolvable",
+            ))
+        })?;
+        let root = home.join(".codex").join("sessions");
+
+        super::discover_handle(self.tool_id(), agent_handle, pid, |p| {
+            // Codex layout: ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<...>.jsonl
+            // Filter by root + extension + basename prefix; the dated
+            // sub-directories are enforced by the predicate's `starts_with`
+            // (root) AND `rollout-` prefix on the filename.
+            if !p.starts_with(&root) || p.extension().map_or(true, |e| e != "jsonl") {
+                return false;
+            }
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with("rollout-"))
+        })
     }
 
     /// # Returns `&INCLUSION_TABLE`. # Errors None. # Side effects None.

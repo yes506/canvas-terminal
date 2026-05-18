@@ -71,8 +71,41 @@ impl TranscriptAdapter for GeminiAdapter {
         pid: i32,
         spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
-        let _ = (agent_handle, pid, spawned_at_unix_ms);
-        todo!()
+        // Per docstring test-contract: hosts where ~/.gemini/tmp does not
+        // exist MUST produce NoMatchingFd (not a panic / filesystem error).
+        // `discover_pid_fd` already fail-softs: if /proc/<pid>/fd has no
+        // link into ~/.gemini/tmp, OR if lsof reports no such file, the
+        // helper returns Ok(None) → NoMatchingFd from discover_handle.
+        let _ = spawned_at_unix_ms;
+
+        let home = dirs::home_dir().ok_or_else(|| {
+            DiscoveryError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "home dir not resolvable",
+            ))
+        })?;
+        let root = home.join(".gemini").join("tmp");
+
+        super::discover_handle(self.tool_id(), agent_handle, pid, |p| {
+            // Gemini layout: ~/.gemini/tmp/<project-slug>/chats/session-<...>.jsonl
+            // Predicate: under root + has `chats` as a path component +
+            // basename matches `session-*.jsonl`.
+            if !p.starts_with(&root) || p.extension().map_or(true, |e| e != "jsonl") {
+                return false;
+            }
+            // Find a `chats` segment in the path components. Using
+            // `components()` is safer than string-contains; defends against
+            // a project-slug literally named "chats".
+            let has_chats = p
+                .components()
+                .any(|c| c.as_os_str() == std::ffi::OsStr::new("chats"));
+            if !has_chats {
+                return false;
+            }
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with("session-"))
+        })
     }
 
     /// # Returns `&INCLUSION_TABLE`. # Errors None. # Side effects None.
