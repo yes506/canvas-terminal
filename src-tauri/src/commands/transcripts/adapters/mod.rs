@@ -11,11 +11,34 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{DiscoveryError, TranscriptHandle};
+use super::{DiscoveryError, TranscriptAdapter, TranscriptHandle};
 
 pub mod claude_code;
 pub mod codex;
 pub mod gemini;
+
+// Static instances of the three production adapter unit-structs. Used by
+// `TranscriptWatcher::watch` to resolve a `TranscriptHandle.adapter_id`
+// (a `&'static str`) back to a `&'static dyn TranscriptAdapter` it can
+// invoke `parse_native_lines` / `normalize` on. Unit structs are `Sync` +
+// const-constructable, so static storage is safe.
+pub(super) static CLAUDE_CODE_ADAPTER: claude_code::ClaudeCodeAdapter =
+    claude_code::ClaudeCodeAdapter;
+pub(super) static CODEX_ADAPTER: codex::CodexAdapter = codex::CodexAdapter;
+pub(super) static GEMINI_ADAPTER: gemini::GeminiAdapter = gemini::GeminiAdapter;
+
+/// Map `adapter_id` (the `&'static str` carried on every `TranscriptHandle`)
+/// back to the corresponding adapter trait object. Returns `None` when the
+/// id is unknown — defensive; in practice only the three production
+/// adapter ids are ever issued via `discover_session`.
+pub(super) fn adapter_for(adapter_id: &str) -> Option<&'static dyn TranscriptAdapter> {
+    match adapter_id {
+        "claude_code" => Some(&CLAUDE_CODE_ADAPTER),
+        "codex" => Some(&CODEX_ADAPTER),
+        "gemini" => Some(&GEMINI_ADAPTER),
+        _ => None,
+    }
+}
 
 /// Locate which file open under `pid` matches the caller-supplied predicate.
 ///

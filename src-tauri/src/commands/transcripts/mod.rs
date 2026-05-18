@@ -13,7 +13,11 @@ pub mod fs_gate;
 pub mod tailer;
 pub mod watcher;
 
+use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// Canonical form version emitted in every `NormalizedTurn`. Bump on any
 /// breaking field change. Frontend refuses to render records with a higher
@@ -391,14 +395,63 @@ pub trait TranscriptAdapter: Send + Sync {
     fn normalize(&self, raw: RawTurn, ctx: NormalizeContext<'_>) -> Option<NormalizedTurn>;
 }
 
+/// Per-token state record stored inside the watcher's internal map.
+/// Lives behind `Inner`'s `Mutex`; mutability is at the entry level
+/// (e.g. `tail_state.byte_offset` advances on each successful poll;
+/// `last_event_at` updates on each fired notification for debounce).
+pub(in crate::commands::transcripts) struct Entry {
+    pub(in crate::commands::transcripts) handle: TranscriptHandle,
+    pub(in crate::commands::transcripts) subscription_id: u64,
+    pub(in crate::commands::transcripts) tail_state: tailer::TailState,
+    pub(in crate::commands::transcripts) adapter: &'static dyn TranscriptAdapter,
+    /// Last-fired debounce timestamp. None until the first event arrives;
+    /// after that, on_fs_event refuses to re-poll within 100ms of this
+    /// stamp (coalesces FSEvents under macOS's ~250-1000ms floor — see
+    /// watcher.rs::on_fs_event docstring).
+    pub(in crate::commands::transcripts) last_event_at: Option<std::time::Instant>,
+}
+
+/// Internal mutable state of `TranscriptWatcher`. Held behind one `Mutex`
+/// inside an `Arc` so `watcher.rs::subscribe_fsevents` / `on_fs_event`
+/// can hold their own clone via `OnceLock` (the notify callback runs on
+/// the notify thread, which doesn't have direct access to the Tauri
+/// `State<TranscriptWatcher>`).
+pub(in crate::commands::transcripts) struct Inner {
+    /// notify-crate watcher. `None` until `start_if_needed` promotes to
+    /// `Some`; cleared on `shutdown()` (drops the underlying FSEvents
+    /// thread).
+    pub(in crate::commands::transcripts) watcher: Option<notify::RecommendedWatcher>,
+    /// `WatchToken.0` → Entry. Mutable per-token state lives here.
+    pub(in crate::commands::transcripts) entries: HashMap<u64, Entry>,
+    /// Parent-dir → subscription ref-count. FSEvents subscribes at the
+    /// parent dir (NB2 — JSONL writes via atomic-rename change the
+    /// watched inode), so multiple agents whose JSONLs share a parent
+    /// dir share one notify registration. Decrementing to zero
+    /// `notify::Watcher::unwatch`-es the path.
+    pub(in crate::commands::transcripts) parent_dir_refs: HashMap<PathBuf, u32>,
+    /// Monotonic counter for both `WatchToken` and `Subscription` ids.
+    pub(in crate::commands::transcripts) next_id: u64,
+    /// Set to true by `shutdown()`. After this, new `watch()` calls
+    /// return `WatcherError::NotStarted`; outstanding tokens'
+    /// `unwatch` becomes a silent no-op (the entries map is cleared).
+    pub(in crate::commands::transcripts) shutdown: bool,
+}
+
 /// Centralized watcher owning the lifecycle of every active mirror stream.
 ///
 /// Per Q5: lifecycle is on this struct, not on `TranscriptAdapter`. Adapters
 /// supply per-tool normalization; the watcher owns FSEvents subscriptions,
 /// rotation, `.state.json`, and the unwatch teardown path. Stored in
 /// Tauri `State<>`; single instance per app.
+///
+/// Internal state lives in `Inner` behind `Arc<Mutex<>>` so the
+/// `watcher.rs` callback (which runs on the notify thread) can access
+/// it via a `OnceLock` installed at `start_if_needed` time. Without
+/// this indirection the notify closure would have no way back to the
+/// `TranscriptWatcher` (Tauri `State<>` is only available with an
+/// `AppHandle`, and the notify thread doesn't carry one).
 pub struct TranscriptWatcher {
-    // intentionally opaque; populated at Phase 6 implementation
+    pub(in crate::commands::transcripts) inner: Arc<Mutex<Inner>>,
 }
 
 impl TranscriptWatcher {
@@ -430,7 +483,15 @@ impl TranscriptWatcher {
     /// # Test contract
     /// Calling `shutdown()` immediately after `new()` is a no-op.
     pub fn new() -> Self {
-        todo!()
+        Self {
+            inner: Arc::new(Mutex::new(Inner {
+                watcher: None,
+                entries: HashMap::new(),
+                parent_dir_refs: HashMap::new(),
+                next_id: 0,
+                shutdown: false,
+            })),
+        }
     }
 
     /// Lazy-start the FSEvents thread on first opt-in publish. Idempotent.
@@ -463,7 +524,59 @@ impl TranscriptWatcher {
     /// Two concurrent first-time calls result in exactly one FSEvents
     /// thread (test by inspecting thread-name count).
     pub fn start_if_needed(&self) -> Result<(), WatcherError> {
-        todo!()
+        // Fast-path: already started or shut down.
+        {
+            let g = self
+                .inner
+                .lock()
+                .map_err(|_| WatcherError::NotStarted)?;
+            if g.shutdown {
+                return Err(WatcherError::NotStarted);
+            }
+            if g.watcher.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Install OnceLock so watcher.rs::subscribe_fsevents / on_fs_event
+        // can reach the Inner from the notify-thread closure context.
+        watcher::install_inner(self.inner.clone());
+
+        // notify's RecommendedWatcher invokes its callback on its own
+        // background thread. We route each event path through on_fs_event,
+        // which scans entries for a matching source_path and triggers the
+        // poll→parse→normalize→append pipeline. Subscription(0) is a
+        // placeholder — on_fs_event routes by event_path, not by id.
+        let new_watcher = notify::recommended_watcher(
+            move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    for path in &event.paths {
+                        watcher::on_fs_event(&watcher::Subscription(0), path);
+                    }
+                }
+                // Errors are logged-and-swallowed per the watcher.rs
+                // on_fs_event docstring: tailer poll retries on next event.
+            },
+        )
+        .map_err(|e| {
+            WatcherError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
+
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| WatcherError::NotStarted)?;
+        // Race recheck: between the fast-path lock and now another caller
+        // might have installed a watcher. Drop ours if so (the just-built
+        // RecommendedWatcher is dropped, halting its FSEvents thread).
+        if g.watcher.is_some() {
+            return Ok(());
+        }
+        g.watcher = Some(new_watcher);
+        Ok(())
     }
 
     /// Register a new (agent, transcript) binding. Increments ref-count.
@@ -501,8 +614,51 @@ impl TranscriptWatcher {
     /// `WatchToken`s. Each token's `unwatch` decrements ref-count
     /// independently.
     pub fn watch(&self, handle: TranscriptHandle) -> Result<WatchToken, WatcherError> {
-        let _ = handle;
-        todo!()
+        // Lazily start FSEvents on first watch().
+        self.start_if_needed()?;
+
+        // Re-verify the path through fs_gate (handle was issued earlier by
+        // discover_session; the file may have been removed between
+        // discovery and this watch call — gate spec X1 calls this out).
+        let _canonical = fs_gate::check_transcript_root(handle.adapter_id, &handle.source_path)
+            .map_err(|e| WatcherError::GateRejected(format!("{:?}", e)))?;
+
+        // Resolve adapter_id → trait object. Unknown id is GateRejected
+        // (rather than Io) — caller's adapter registry has drifted from
+        // the production trio.
+        let adapter = adapters::adapter_for(handle.adapter_id).ok_or_else(|| {
+            WatcherError::GateRejected(format!("unknown adapter_id: {}", handle.adapter_id))
+        })?;
+
+        // Resume TailState (touch-up A: uses handle.memory_dir for the
+        // .state.json read; inode mismatch resets byte_offset to 0).
+        let tail_state = tailer::resume_from_state(&handle)?;
+
+        // Register the parent dir on the RecommendedWatcher via
+        // subscribe_fsevents. The Subscription's id is stored on the
+        // Entry so unwatch can decrement the parent_dir_refs ref-count.
+        let subscription = watcher::subscribe_fsevents(&handle)?;
+
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| WatcherError::NotStarted)?;
+        if g.shutdown {
+            return Err(WatcherError::NotStarted);
+        }
+        g.next_id += 1;
+        let token_id = g.next_id;
+        g.entries.insert(
+            token_id,
+            Entry {
+                handle,
+                subscription_id: subscription.0,
+                tail_state,
+                adapter,
+                last_event_at: None,
+            },
+        );
+        Ok(WatchToken(token_id))
     }
 
     /// Unregister a previously-issued token. Decrements ref-count.
@@ -538,8 +694,44 @@ impl TranscriptWatcher {
     /// time. After the last `unwatch` for a path, no further FSEvents
     /// callbacks fire for that path.
     pub fn unwatch(&self, token: WatchToken) {
-        let _ = token;
-        todo!()
+        // Idempotent: unknown / already-removed token is a silent no-op
+        // per the trait docstring (Q6). Lock-poisoning is also silent —
+        // we're in a teardown path that shouldn't panic.
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let entry = match g.entries.remove(&token.0) {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Decrement parent_dir_refs. When the count hits zero, no other
+        // agent shares this parent dir — unregister the FSEvents
+        // subscription. The mirror file in `contexts/<agent>.jsonl`
+        // stays on disk (clean-up is the user's call; matches the
+        // session-lifetime retention default).
+        if let Some(parent) = entry.handle.source_path.parent() {
+            let parent_path = parent.to_path_buf();
+            let prev = g
+                .parent_dir_refs
+                .get(&parent_path)
+                .copied()
+                .unwrap_or(0);
+            let next = prev.saturating_sub(1);
+            if next == 0 {
+                g.parent_dir_refs.remove(&parent_path);
+                if let Some(w) = g.watcher.as_mut() {
+                    use notify::Watcher;
+                    // Best-effort: errors are swallowed (the path may
+                    // already be unwatched if FSEvents detected the dir
+                    // disappear).
+                    let _ = w.unwatch(&parent_path);
+                }
+            } else {
+                g.parent_dir_refs.insert(parent_path, next);
+            }
+        }
     }
 
     /// Persist one normalized turn to `contexts/<agent>.jsonl`.
@@ -580,8 +772,60 @@ impl TranscriptWatcher {
         token: &WatchToken,
         turn: NormalizedTurn,
     ) -> Result<(), WatcherError> {
-        let _ = (token, turn);
-        todo!()
+        // Resolve agent_handle under the lock; release before the file
+        // IO so a slow disk doesn't block concurrent watch/unwatch.
+        let agent_handle = {
+            let g = self
+                .inner
+                .lock()
+                .map_err(|_| WatcherError::NotStarted)?;
+            if g.shutdown {
+                return Err(WatcherError::NotStarted);
+            }
+            let entry = g.entries.get(&token.0).ok_or_else(|| {
+                WatcherError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "unknown WatchToken",
+                ))
+            })?;
+            entry.handle.agent_handle.clone()
+        };
+
+        // Serialize to one line, terminated by \n. Readers split on '\n';
+        // never partially-readable per the docstring invariant.
+        let mut line = serde_json::to_string(&turn).map_err(|e| {
+            WatcherError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
+        line.push('\n');
+
+        let dir = super::memory::get_memory_dir().map_err(|e| {
+            WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+        })?;
+        let full_path = dir.join("contexts").join(format!("{}.jsonl", agent_handle));
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).map_err(WatcherError::Io)?;
+        }
+
+        // O_NOFOLLOW + append + create. memory.rs's `write_memory_file_atomic`
+        // is rename-based (overwrite semantics) and doesn't fit the per-line
+        // append pattern; we open with `append(true)` and fsync after each
+        // line. Crash-safety: write_all + sync_data leaves either the full
+        // line or nothing — never a partial line (POSIX guarantees
+        // append-write atomicity within a single write() syscall for
+        // payloads under PIPE_BUF, which our serialized turns satisfy).
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&full_path)
+            .map_err(WatcherError::Io)?;
+        file.write_all(line.as_bytes()).map_err(WatcherError::Io)?;
+        file.sync_data().map_err(WatcherError::Io)?;
+        drop(file);
+
+        // Check for rotation after the append.
+        self.rotate_if_needed(token)?;
+        Ok(())
     }
 
     /// Rotate `contexts/<agent>.jsonl` if it exceeds the active-file cap.
@@ -623,8 +867,60 @@ impl TranscriptWatcher {
     /// "no auto-promote" rule MUST then create a fresh active on the
     /// next write.
     pub fn rotate_if_needed(&self, token: &WatchToken) -> Result<(), WatcherError> {
-        let _ = token;
-        todo!()
+        let agent_handle = {
+            let g = self
+                .inner
+                .lock()
+                .map_err(|_| WatcherError::NotStarted)?;
+            let entry = match g.entries.get(&token.0) {
+                Some(e) => e,
+                None => return Ok(()),
+            };
+            entry.handle.agent_handle.clone()
+        };
+
+        let dir = super::memory::get_memory_dir().map_err(|e| {
+            WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+        })?;
+        let active_path = dir.join("contexts").join(format!("{}.jsonl", agent_handle));
+
+        let size = match std::fs::metadata(&active_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(WatcherError::Io(e)),
+        };
+        if size <= ACTIVE_FILE_BYTE_CAP {
+            return Ok(());
+        }
+
+        // Scan archive indices (T1: directory listing is authoritative).
+        let indices = self.scan_archive_indices(&agent_handle);
+        let next_n = indices.iter().max().copied().unwrap_or(0) + 1;
+        let archive_path = dir
+            .join("contexts")
+            .join(format!("{}.{}.jsonl", agent_handle, next_n));
+
+        // 1. fsync current active before renaming.
+        {
+            let f = std::fs::File::open(&active_path).map_err(WatcherError::Io)?;
+            f.sync_all().map_err(WatcherError::Io)?;
+        }
+        // 2. Atomic rename active → archive.
+        std::fs::rename(&active_path, &archive_path).map_err(WatcherError::Io)?;
+
+        // 3. Create new empty active via tmp + rename so readers never see
+        //    a missing active (atomic-rename pattern from M2). Crash
+        //    between steps 2 and 3 leaves archive present and active
+        //    missing — the docstring's "no auto-promote" recovery rule
+        //    relies on the next append's O_CREAT to materialize active.
+        let tmp_active = dir
+            .join("contexts")
+            .join(format!("{}.jsonl.tmp", agent_handle));
+        let f = std::fs::File::create(&tmp_active).map_err(WatcherError::Io)?;
+        f.sync_all().map_err(WatcherError::Io)?;
+        drop(f);
+        std::fs::rename(&tmp_active, &active_path).map_err(WatcherError::Io)?;
+        Ok(())
     }
 
     /// List the archive indices currently on disk for `agent_handle`.
@@ -657,8 +953,30 @@ impl TranscriptWatcher {
     /// Returns `[]` when no archives exist. Returns `[1, 2, 5]` when
     /// `<agent>.{1,2,5}.jsonl` exist — gaps are preserved, not filled.
     pub fn scan_archive_indices(&self, agent_handle: &str) -> Vec<u32> {
-        let _ = agent_handle;
-        todo!()
+        // T1: dir-listing is authoritative for "next archive N" — never
+        // substitute a state-file cache. The state cache can lag a
+        // successful rename and produce a colliding N on the next rotate.
+        let dir = match super::memory::get_memory_dir() {
+            Ok(d) => d.join("contexts"),
+            Err(_) => return Vec::new(),
+        };
+        let prefix = format!("{}.", agent_handle);
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Some(rest) = name.strip_prefix(&prefix) {
+                        if let Some(num) = rest.strip_suffix(".jsonl") {
+                            if let Ok(n) = num.parse::<u32>() {
+                                out.push(n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Drop the watcher: unsubscribe every FSEvents handle, stop the thread.
@@ -694,6 +1012,22 @@ impl TranscriptWatcher {
     /// Calling `shutdown()` then issuing a new `watch()` call returns
     /// `WatcherError::NotStarted` until `start_if_needed` is called again.
     pub fn shutdown(&self) {
-        todo!()
+        // Idempotent — multiple calls (RunEvent::Exit + WindowEvent::Destroyed
+        // both fire on macOS in some configurations per claude2 r5 O1).
+        // Lock-poisoning is silent: shutdown is best-effort.
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        g.shutdown = true;
+        g.entries.clear();
+        g.parent_dir_refs.clear();
+        // Drop the notify::RecommendedWatcher — its Drop impl stops the
+        // FSEvents thread. Per the docstring's invariant: no further
+        // callbacks fire after this returns. The OnceLock-installed
+        // Arc<Mutex<Inner>> remains live (its strong-count drops by 1
+        // here; the OnceLock holds the other), but with `shutdown=true`
+        // any in-flight on_fs_event observes the flag and bails.
+        g.watcher = None;
     }
 }
