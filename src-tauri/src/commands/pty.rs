@@ -336,6 +336,56 @@ pub fn spawn_process(
     Ok(())
 }
 
+/// Spawn an interactive shell PTY session.
+///
+/// Per the peer-context-mirror K1/C1 reviewer-folded contract, this command
+/// accepts a caller-provided `extra_env` map (matching `spawn_process`'s
+/// existing shape) so the shell-fallback launch path can propagate
+/// `CT_AGENT_ID` / `CT_COLLAB_SESSION_ID` at spawn time. The implementation
+/// wiring — calling `apply_extra_env(&mut cmd, extra_env.as_ref())` after
+/// `apply_baseline_env` — is deferred to the implementer cycle. This
+/// signature-only change unblocks the implementer's scope discipline (the
+/// implementer cannot add parameters to planner-committed functions).
+///
+/// # Inputs
+/// - `app` / `state`: standard Tauri injection.
+/// - `session_id`: caller-allocated session identifier; must be unique.
+/// - `cols` / `rows`: initial PTY size.
+/// - `cwd`: optional working directory; `None` inherits the host process.
+/// - `login`: when `Some(true)`, uses `-l` (sources the full login profile
+///   chain); when `None`/`Some(false)`, uses `-i` and injects the cached env.
+/// - `extra_env`: caller-provided env merged AFTER `apply_baseline_env`.
+///   `None` is observationally equivalent to omitting the argument; an
+///   empty map is also a no-op. Implementation wiring deferred per above.
+///
+/// # Returns
+/// `Ok(())` on successful spawn (session is registered in `state.sessions`).
+///
+/// # Errors
+/// Returns `Err(String)` on PTY open failure, lock poisoning, or
+/// `spawn_command` failure.
+///
+/// # Side effects
+/// Allocates a PTY pair, spawns a child process, starts a reader thread,
+/// inserts a `PtySession` into the shared session map.
+///
+/// # Invariants
+/// Each call inserts at most one session into `state.sessions`; on early
+/// error no session is inserted.
+///
+/// # Concurrency
+/// Internally serialized at the `state.sessions` mutex; safe to call from
+/// multiple Tauri IPC handlers concurrently.
+///
+/// # Lifecycle
+/// Called from the frontend `AgentMiniTerminal` / shell-fallback launch
+/// path; paired with `kill_pty(session_id)` for teardown.
+///
+/// # Test contract
+/// `extra_env = Some({"CT_AGENT_ID": "claude3"})` MUST result in the spawned
+/// child seeing `CT_AGENT_ID=claude3` in its environment (test deferred to
+/// the implementer cycle that wires `apply_extra_env`). `extra_env = None`
+/// MUST behave identically to the pre-touchup call shape.
 #[tauri::command]
 pub fn spawn_shell(
     app: AppHandle,
@@ -345,7 +395,11 @@ pub fn spawn_shell(
     rows: u16,
     cwd: Option<String>,
     login: Option<bool>,
+    extra_env: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
+    // Signature-only addition — wiring to `apply_extra_env` is the implementer's
+    // job. Silence the unused-param warning until then.
+    let _ = &extra_env;
     let pty_system = native_pty_system();
 
     let pair = pty_system
