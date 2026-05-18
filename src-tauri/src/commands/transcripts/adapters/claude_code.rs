@@ -89,8 +89,25 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
         pid: i32,
         spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
-        let _ = (agent_handle, pid, spawned_at_unix_ms);
-        todo!()
+        // M8: lsof gives authoritative open-fd info, so the
+        // spawned_at_unix_ms tiebreaker isn't needed for Claude Code (one
+        // JSONL open per CLI process). Kept in the trait signature for
+        // adapters that need it (Gemini's session-dir triangulation can
+        // use it for same-cwd-twice races).
+        let _ = spawned_at_unix_ms;
+
+        let home = dirs::home_dir().ok_or_else(|| {
+            DiscoveryError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "home dir not resolvable",
+            ))
+        })?;
+        let root = home.join(".claude").join("projects");
+
+        super::discover_handle(self.tool_id(), agent_handle, pid, |p| {
+            p.starts_with(&root)
+                && p.extension().map_or(false, |e| e == "jsonl")
+        })
     }
 
     /// Per-adapter content-block inclusion table.
