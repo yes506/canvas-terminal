@@ -57,10 +57,9 @@ import type { ToolId } from "../types/collaborator";
  * `nextOrdinal` ledger.
  */
 export function reserveAgentHandle(
-  collabSessionId: string,
-  tool: ToolId,
+  _collabSessionId: string,
+  _tool: ToolId,
 ): AgentHandleReservation {
-  const _ = { collabSessionId, tool };
   throw new Error("reserveAgentHandle: not yet implemented (phase 6)");
 }
 
@@ -87,8 +86,7 @@ export function reserveAgentHandle(
  * Test contract: release of an unknown id is a no-op. Release followed by
  * a fresh reservation in the same pane/tool reuses the released ordinal.
  */
-export function releaseReservation(reservationId: string): void {
-  const _ = reservationId;
+export function releaseReservation(_reservationId: string): void {
   throw new Error("releaseReservation: not yet implemented (phase 6)");
 }
 
@@ -119,8 +117,7 @@ export function releaseReservation(reservationId: string): void {
  * Test contract: consuming an unknown id throws. Consuming a previously-
  * released id throws (release is irreversible).
  */
-export function consumeReservation(reservationId: string): void {
-  const _ = reservationId;
+export function consumeReservation(_reservationId: string): void {
   throw new Error("consumeReservation: not yet implemented (phase 6)");
 }
 
@@ -191,9 +188,8 @@ export async function hasContextsBreadcrumb(): Promise<boolean> {
  * returns `[]`.
  */
 export async function loadActive(
-  agentHandle: string,
+  _agentHandle: string,
 ): Promise<NormalizedTurn[]> {
-  const _ = agentHandle;
   throw new Error("loadActive: not yet implemented (phase 6)");
 }
 
@@ -221,10 +217,9 @@ export async function loadActive(
  * Test contract: passing `archiveN` that does not exist returns `[]`.
  */
 export async function loadLastArchive(
-  agentHandle: string,
-  archiveN: number,
+  _agentHandle: string,
+  _archiveN: number,
 ): Promise<NormalizedTurn[]> {
-  const _ = { agentHandle, archiveN };
   throw new Error("loadLastArchive: not yet implemented (phase 6)");
 }
 
@@ -254,8 +249,7 @@ export async function loadLastArchive(
  * Test contract: `[1, 2, 5]` is returned for archives 1, 2, 5 present —
  * gaps preserved. Sibling agents' archives are NOT returned.
  */
-export async function listArchives(agentHandle: string): Promise<number[]> {
-  const _ = agentHandle;
+export async function listArchives(_agentHandle: string): Promise<number[]> {
   throw new Error("listArchives: not yet implemented (phase 6)");
 }
 
@@ -287,8 +281,7 @@ export async function listArchives(agentHandle: string): Promise<number[]> {
  * `archivesBeyondWindow` is 2.
  */
 export async function loadSnapshot(
-  agentHandle: string,
+  _agentHandle: string,
 ): Promise<PeerContextSnapshot> {
-  const _ = agentHandle;
   throw new Error("loadSnapshot: not yet implemented (phase 6)");
 }
