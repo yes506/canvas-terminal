@@ -258,6 +258,25 @@ function nextOrdinal(collabSessionId: string, tool: ToolId): number {
   return next;
 }
 
+/**
+ * Public wrapper around `nextOrdinal` for `peerContext.ts::reserveAgentHandle`.
+ *
+ * Per K5/W2: `reserveAgentHandle` needs the SAME ordinal counter that
+ * `addAgent` uses so a reserved handle pre-spawn and an `addAgent` call
+ * post-spawn agree. Direct export of `nextOrdinal` would make a private
+ * helper public; this named wrapper keeps the call-site explicit.
+ *
+ * Test contract: identical to `nextOrdinal` — distinct calls for the
+ * same `(collabSessionId, tool)` pair return strictly increasing
+ * integers; first call returns 1.
+ */
+export function reserveOrdinalForPeerContext(
+  collabSessionId: string,
+  tool: ToolId,
+): number {
+  return nextOrdinal(collabSessionId, tool);
+}
+
 function resetOrdinalCounters(forSession: string): void {
   for (const key of toolOrdinalCounters.keys()) {
     if (key.startsWith(`${forSession}:`)) {

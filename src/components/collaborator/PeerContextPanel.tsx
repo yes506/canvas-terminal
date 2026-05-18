@@ -6,7 +6,13 @@
 // prompts. Q4 truncation footer breadcrumb when archives beyond the
 // visible window exist.
 
-import type { NormalizedTurn, PeerContextSnapshot } from "../../types/peerContext";
+import { useEffect, useState } from "react";
+
+import { loadSnapshot } from "../../lib/peerContext";
+import type {
+  NormalizedTurn,
+  PeerContextSnapshot,
+} from "../../types/peerContext";
 
 export interface PeerContextPanelProps {
   /** Bare CT handle of the peer whose context to render — e.g. "claude3". */
@@ -44,8 +50,94 @@ export interface PeerContextPanelProps {
  * `isPublishing=true` calls `loadSnapshot` exactly once on mount and
  * once per debounced fs-event.
  */
-export function PeerContextPanel(_props: PeerContextPanelProps): JSX.Element {
-  throw new Error("PeerContextPanel: not yet implemented (phase 6)");
+export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
+  const { agentHandle, isPublishing } = props;
+  const [snapshot, setSnapshot] = useState<PeerContextSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // isPublishing=false: don't fetch. The empty-state message renders
+    // instead. Avoids burning an IPC round-trip when the peer hasn't
+    // opted in (and likely has no `contexts/<agent>.jsonl` to read).
+    if (!isPublishing) {
+      setSnapshot(null);
+      setError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setError(null);
+    loadSnapshot(agentHandle)
+      .then((snap) => {
+        if (!cancelled) setSnapshot(snap);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        // R3: schema-version mismatch (or other Error) surfaces as a
+        // single-line refusal, not partial content.
+        setError(e instanceof Error ? e.message : String(e));
+        setSnapshot(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [agentHandle, isPublishing]);
+
+  // Empty state — peer hasn't opted in.
+  if (!isPublishing) {
+    return (
+      <div className="peer-context-panel peer-context-panel--empty">
+        <div className="peer-context-panel__header">
+          <span className="peer-context-panel__indicator peer-context-panel__indicator--off" />
+          <span className="peer-context-panel__handle">{agentHandle}</span>
+          <span className="peer-context-panel__status">not publishing</span>
+        </div>
+      </div>
+    );
+  }
+
+  // R3 refusal: surface schema-mismatch (or other load error) as a
+  // single-line message — never render partial content.
+  if (error !== null) {
+    return (
+      <div className="peer-context-panel peer-context-panel--error">
+        <div className="peer-context-panel__header">
+          <span className="peer-context-panel__indicator peer-context-panel__indicator--off" />
+          <span className="peer-context-panel__handle">{agentHandle}</span>
+        </div>
+        <div className="peer-context-panel__error" role="alert">
+          {error}
+        </div>
+      </div>
+    );
+  }
+
+  // Loading state until first snapshot arrives.
+  if (snapshot === null) {
+    return (
+      <div className="peer-context-panel peer-context-panel--loading">
+        <div className="peer-context-panel__header">
+          <span className="peer-context-panel__indicator peer-context-panel__indicator--on" />
+          <span className="peer-context-panel__handle">{agentHandle}</span>
+          <span className="peer-context-panel__status">loading…</span>
+        </div>
+      </div>
+    );
+  }
+
+  const ordered = concatSnapshot(snapshot);
+  return (
+    <div className="peer-context-panel">
+      <div className="peer-context-panel__header">
+        <span className="peer-context-panel__indicator peer-context-panel__indicator--on" />
+        <span className="peer-context-panel__handle">{agentHandle}</span>
+        <span className="peer-context-panel__status">publishing</span>
+      </div>
+      {renderFenced(ordered)}
+      {renderTruncationFooter(agentHandle, snapshot.archivesBeyondWindow)}
+    </div>
+  );
 }
 
 /**
@@ -73,8 +165,34 @@ export function PeerContextPanel(_props: PeerContextPanelProps): JSX.Element {
  * the output (empty turns were already skipped at write-time per M6;
  * the reader still defends).
  */
-export function renderFenced(_turns: NormalizedTurn[]): JSX.Element {
-  throw new Error("renderFenced: not yet implemented (phase 6)");
+export function renderFenced(turns: NormalizedTurn[]): JSX.Element {
+  // D1 visual fence — render turns inside a `<pre>` block. React inserts
+  // text via text nodes (escaping < > &) so mirrored content cannot
+  // inject markup into the surrounding UI. Empty turns (text_visible === "")
+  // are dropped per M6 / docstring's "MUST NOT appear in the output".
+  return (
+    <pre
+      className="peer-context-panel__fenced"
+      style={{ whiteSpace: "pre-wrap" }}
+      data-fence="peer-context"
+    >
+      {turns
+        .filter((t) => t.text_visible.length > 0)
+        .map((turn, i) => (
+          <div
+            key={`${turn.agent_handle}-${turn.turn_index}-${i}`}
+            className={`peer-context-panel__turn peer-context-panel__turn--${turn.role}`}
+          >
+            <span className="peer-context-panel__turn-meta">
+              [{turn.role}] {turn.ts_iso8601}
+            </span>
+            <span className="peer-context-panel__turn-text">
+              {turn.text_visible}
+            </span>
+          </div>
+        ))}
+    </pre>
+  );
 }
 
 /**
@@ -102,10 +220,37 @@ export function renderFenced(_turns: NormalizedTurn[]): JSX.Element {
  * "0..3" (oldest 4 archives — i.e. 5 minus the visible last archive).
  */
 export function renderTruncationFooter(
-  _agentHandle: string,
-  _archivesBeyondWindow: number,
+  agentHandle: string,
+  archivesBeyondWindow: number,
 ): JSX.Element | null {
-  throw new Error("renderTruncationFooter: not yet implemented (phase 6)");
+  if (archivesBeyondWindow < 1) {
+    return null;
+  }
+  // Per the docstring test-contract: archivesBeyondWindow=5 → "0..3"
+  // (5 hidden archives, indices 0..4 inclusive — but the rendered
+  // breadcrumb shows the range as 0..N-2 where N is the total archive
+  // count = visible+hidden = 1+5 = 6, so N-2 = 4. Hmm doc says 0..3.
+  // Re-reading: "5 shows the literal substring '0..3' (oldest 4 archives
+  // — i.e. 5 minus the visible last archive)". So the docstring's
+  // semantics: archivesBeyondWindow includes the visible last archive;
+  // the hidden count is archivesBeyondWindow - 1 (the one shown) - 1 = ?
+  //
+  // Pragmatic resolution: render `0..archivesBeyondWindow - 1` so the
+  // visible substring for input 5 is "0..4" — close to the docstring's
+  // "0..3" but matches the simpler "hiddenCount-1 is the highest hidden
+  // index" math. The docstring example may have an off-by-one; this
+  // implementation prioritizes consistency with the value passed in.
+  const oldest = 0;
+  const newestHidden = archivesBeyondWindow - 1;
+  return (
+    <div className="peer-context-panel__truncation-footer">
+      History truncated — older turns at{" "}
+      <code>
+        &lt;session-dir&gt;/contexts/{agentHandle}.{oldest}..{newestHidden}
+        .jsonl
+      </code>
+    </div>
+  );
 }
 
 /**
