@@ -1,4 +1,4 @@
-# Implementation report — peer-context-mirror (session 5 — Cluster C+D: TranscriptWatcher + watcher.rs + lib.rs wiring)
+# Implementation report — peer-context-mirror (session 6 — Cluster E+F+G + Rust IPC bridge)
 
 ## Source
 - Planner marker (original): `system` from commit `e3a132e` (interfaces only, human-confirmed)
@@ -7,25 +7,39 @@
 - Plan ingestion: `~/.cache/canvas-terminal/collab-memory/session-2103/task-24-claude1-context-sharing-plan.md` (56-delta fold-in matrix, 4 review rounds × 4 reviewers)
 - Peer reviews folded across the planner+implementer cycles: claude2 B1+B2+B3, claude3 I1+I2, codex2 Blockers 2-3 + Major 6 + B4, codex3 P0×2 + P1×2, claude3 task-2 N1+N2 (touch-up)
 
-## Status: **partial completion (session 5) — Rust side complete; recommend `keep`**
+## Status: **near-complete (session 6) — recommend `keep`; one TS wiring deferred**
 
-Validation passes (`cargo check` + test fixture both green), now with
-**28 of 37 methods carrying real bodies** (up from 18 in session 4).
-The Rust side of peer-context-mirror is now **runtime-complete** — the
-full call graph (frontend → watch → subscribe_fsevents → notify event
-→ on_fs_event → poll → parse → normalize → append → contexts/.jsonl)
-has no `todo!()` gaps remaining. 9 items stubbed; all 9 are TypeScript
-frontend.
+Validation passes (`cargo check` + `tsc --noEmit` + test fixture all
+green), now with **36 of 37 methods carrying real bodies** (up from 28
+in session 5). Clusters E (reader helpers × 5), F (reservation API × 3),
+and G (React component × 3) are closed; the Rust IPC bridge
+(`watch_transcript` / `unwatch_transcript`) is wired and reachable
+from `tauri::generate_handler!`. **Cluster H (AgentMiniTerminal
+useEffect, 1 item) is deferred** — it requires the larger publish-opt-in
+lifecycle refactor (collaboratorStore `publishOptedIn` flag, PID
+accessor, spawn-time identity propagation) that's TS-side and warrants
+its own focused session.
 
 ## Work queue summary
 
 - Total items: 37
-- **Completed (real bodies)**: 28 (was 18 after session 4; +10 this session)
-- **Stubbed (`todo!()` / `throw`)**: 9 (was 19 after session 4)
+- **Completed (real bodies)**: 36 (was 28 after session 5; +8 frontend bodies + 2 Rust IPC wrappers + 1 store-export this session)
+- **Stubbed**: 1 (only AgentMiniTerminal.tsx useEffect wiring; deferred per architecture-implied scope rather than blocked)
 - **Reverted post-review**: 0 (unchanged)
+
+## Multi-stack scope deviation
+
+This session deliberately deviated from the spec's "refuse to operate
+on multiple stacks in a single run" rule. The user opted in via
+`proceed mixed` at the Phase 0/cluster-selection prompt. The deviation
+was bounded: 3 small Rust additions (2 thin `#[tauri::command]`
+wrappers + 1 handler-registration block) to enable end-to-end closure
+of peer-context-mirror in a single merge. The TS work (11 items) is
+the session's center of mass; the Rust additions are the smallest
+bridge that lets the TS work be runnable.
 - **Architecture-implied lib.rs wiring**: 1 (registered TranscriptWatcher in Tauri State; shutdown wired to WindowEvent::Destroyed + RunEvent::Exit per W1)
 
-## Items completed (28)
+## Items completed (36)
 
 | # | Method | File | Post-review state |
 |---|---|---|---|
@@ -58,6 +72,21 @@ frontend.
 | 27 | `watcher::subscribe_fsevents` | `transcripts/watcher.rs` | **NEW (session 5)** — registers parent dir on shared RecommendedWatcher (NonRecursive); ref-counted with rollback on notify failure |
 | 28 | `watcher::on_fs_event` | `transcripts/watcher.rs` | **NEW (session 5)** — three-phase: locked entry match + debounce, lock-released poll/parse/normalize, locked TailState update + persist_offset |
 | (arch) | `lib.rs` Tauri State + shutdown wiring | `src/lib.rs` | **NEW (session 5)** — `.manage(TranscriptWatcher::new())` + WindowEvent::Destroyed + RunEvent::Exit shutdown calls (architecture-implied; not in original 37 count) |
+| 29 | `peerContext.ts::reserveAgentHandle` | `src/lib/peerContext.ts` | **NEW (session 6)** — mints ordinal via `collaboratorStore.reserveOrdinalForPeerContext`; stores entry in module-private registry; returns AgentHandleReservation |
+| 30 | `peerContext.ts::releaseReservation` | same | **NEW (session 6)** — idempotent map removal; ordinal not rolled back (slot becomes a numbering gap; docstring's "MAY reuse" permits) |
+| 31 | `peerContext.ts::consumeReservation` | same | **NEW (session 6)** — throws on unknown id; clears slot. Docstring deviation documented: actual `addAgent` push is caller's responsibility |
+| 32 | `peerContext.ts::hasContextsBreadcrumb` | same | **NEW (session 6)** — `list_memory_files` IPC + filter to `contexts/*`; silent-false on IPC failure |
+| 33 | `peerContext.ts::loadActive` | same | **NEW (session 6)** — `read_memory_file('contexts/<agent>.jsonl')`; JSONL parse with R3 schema-version forward-compat |
+| 34 | `peerContext.ts::loadLastArchive` | same | **NEW (session 6)** — same shape, archive index `N` |
+| 35 | `peerContext.ts::listArchives` | same | **NEW (session 6)** — `list_memory_files` + per-handle regex + sort ascending |
+| 36 | `peerContext.ts::loadSnapshot` | same | **NEW (session 6)** — orchestrates listArchives + loadActive + loadLastArchive via Promise.all; archivesBeyondWindow per Q4 |
+| 37 | `PeerContextPanel.tsx::PeerContextPanel` | `src/components/collaborator/PeerContextPanel.tsx` | **NEW (session 6)** — React component; useEffect on (agentHandle, isPublishing); empty-state short-circuit; R3 error refusal; loading state; renders header + fenced + footer |
+| 38 | `PeerContextPanel.tsx::renderFenced` | same | **NEW (session 6)** — `<pre>` with React text-node insertion (XSS-safe); filters empty turns per M6 |
+| 39 | `PeerContextPanel.tsx::renderTruncationFooter` | same | **NEW (session 6)** — null when count<1; otherwise breadcrumb with literal "History truncated" + path range |
+| (arch) | `collaboratorStore.ts::reserveOrdinalForPeerContext` | `src/stores/collaboratorStore.ts` | **NEW (session 6)** — thin public wrapper around private `nextOrdinal` so reservation API uses same counter as addAgent |
+| (arch) | `transcripts/mod.rs::watch_transcript` (Tauri IPC) | `src-tauri/src/commands/transcripts/mod.rs` | **NEW (session 6)** — adapter_for(tool) → discover_session → watch → returns token.0 as u64. Multi-stack-deviation note. |
+| (arch) | `transcripts/mod.rs::unwatch_transcript` (Tauri IPC) | same | **NEW (session 6)** — state.unwatch(WatchToken(token)). Idempotent. |
+| (arch) | `lib.rs` IPC handler registration | `src-tauri/src/lib.rs` | **NEW (session 6)** — adds `commands::transcripts::watch_transcript` + `commands::transcripts::unwatch_transcript` to `tauri::generate_handler!` |
 
 ## Post-review fixes applied this revision
 
@@ -106,16 +135,30 @@ change). Test fixture now compiles and **passes (1/1)**.
 - All comments still mention the test fixture by file path
 **CI grep now returns 0 matches.**
 
-## Items NOT implemented (9) — all frontend TS
+## Items NOT implemented (1) — Cluster H only
 
 ### Cluster A — adapter `discover_session` × 3 — ✅ **CLOSED in session 4 (89bd4e8)**
 ### Cluster B — adapter `normalize` × 3 — ✅ **CLOSED in session 3 (c99a04f)**
 ### Cluster C — `TranscriptWatcher` × 8 — ✅ **CLOSED in session 5 (1aabafa)**
 ### Cluster D — `watcher.rs` × 2 — ✅ **CLOSED in session 5 (1aabafa)**
-### Cluster E — frontend reader helpers × 5 (Tauri `invoke()` wrappers in `src/lib/peerContext.ts`)
-### Cluster F — frontend reservation API × 3 (`reserveAgentHandle` / `releaseReservation` / `consumeReservation` in `src/lib/peerContext.ts`)
-### Cluster G — React component × 3 (`PeerContextPanel` / `renderFenced` / `renderTruncationFooter` in `src/components/collaborator/PeerContextPanel.tsx`)
-### Cluster H — `AgentMiniTerminal` useEffect cleanup × 1
+### Cluster E — frontend reader helpers × 5 — ✅ **CLOSED in session 6 (27e5644)**
+### Cluster F — frontend reservation API × 3 — ✅ **CLOSED in session 6 (27e5644)**
+### Cluster G — React component × 3 — ✅ **CLOSED in session 6 (27e5644)**
+### Cluster H — `AgentMiniTerminal` useEffect lifecycle × 1 — **DEFERRED**
+
+Cluster H requires the publish-opt-in lifecycle refactor: a
+`publishOptedIn` flag on the agent record in `collaboratorStore`, a
+PID accessor (either `get_pty_pid(session_id)` Tauri command or
+`watch_transcript` refactor to accept `session_id` instead of `pid`),
+and spawn-time identity propagation (already supported on the Rust
+side via `spawn_shell::extra_env` from touch-up B; just needs the TS
+caller to pass `CT_AGENT_ID` / `CT_COLLAB_SESSION_ID` in the spawn
+invoke). All TS-side; recommend a focused TS-only follow-up session.
+
+The IPC commands (`watch_transcript` / `unwatch_transcript`) are
+reachable from `tauri::generate_handler!`; the follow-up's job is
+purely to wire the AgentMiniTerminal useEffect to invoke them.
+
 ### Cluster X — Tailer state I/O × 3 — ✅ **CLOSED in session 2 (b484621)**
 
 **Note**: The 3 IPC commands the frontend will invoke (`watch_transcript`,
@@ -147,6 +190,20 @@ land before the feature is merge-ready:
 | codex2 Major 7 | `fsync` after tmp-write in `persist_offset` | Crash-safety polish; relevant once persist_offset is re-implemented |
 
 ## Validation
+
+### Session 6 (Cluster E+F+G + Rust IPC bridge)
+- Baseline exit (BASE_BRANCH HEAD `dev@bdc0bfb`): 0
+- Final validation command (multi-stack): `cargo check --manifest-path src-tauri/Cargo.toml && cargo test --test transcript_adapter_contract --manifest-path src-tauri/Cargo.toml && npx tsc --noEmit`
+- Final exit: 0
+- Auto-fix attempts used: **0 / 3** — clean compile on first pass
+- cargo check tail:
+  ```
+  warning: `canvas-terminal` (lib) generated 11 warnings
+      Finished `dev` profile target(s) in 3.11s
+  ```
+  (11 warnings — **massive drop from session 5's 46** because adding the `watch_transcript` / `unwatch_transcript` IPC handlers gave Rust's dead-code analysis a reachable runtime call chain through the entire `TranscriptWatcher` → `subscribe_fsevents` → `on_fs_event` → tailer/adapter pipeline. Remaining warnings are on internal helpers without callers (e.g. `handle_inode_change` — the inode-rotation path is wired through `poll_new_bytes` returning an error rather than a direct call; a separate follow-up could route through it explicitly).)
+- tsc --noEmit: exit 0 (silent)
+- Test fixture: `1 passed; 0 failed`
 
 ### Session 5 (Cluster C+D — TranscriptWatcher + watcher.rs + lib.rs)
 - Baseline exit (BASE_BRANCH HEAD `dev@c6925e2`): 0
@@ -212,7 +269,16 @@ land before the feature is merge-ready:
 
 ## Commits
 
-### Session 5 — `implementer/peer-context-mirror-06370-89723-28300` (this run)
+### Session 6 — `implementer/peer-context-mirror-07319-95503-10159` (this run)
+
+```
+27e5644 feat(implementer): items 32-44 — frontend Clusters E+F+G + Rust IPC bridge (closes Rust+TS pipeline)
+```
+
+Branched off `dev@bdc0bfb`. Closes Clusters E + F + G + Rust IPC
+wrappers in one merge. Cluster H deferred (TS lifecycle refactor).
+
+### Session 5 — `implementer/peer-context-mirror-06370-89723-28300` (merged at bdc0bfb)
 
 ```
 1aabafa feat(implementer): items 22-31 — TranscriptWatcher + watcher.rs + lib.rs wiring (Cluster C+D)

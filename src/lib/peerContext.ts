@@ -6,12 +6,47 @@
 // by rotation cap, well under the 10 MB read cap — concat happens
 // client-side.
 
-import type {
-  AgentHandleReservation,
-  NormalizedTurn,
-  PeerContextSnapshot,
+import { invoke } from "@tauri-apps/api/core";
+
+import {
+  NORMALIZED_SCHEMA_VERSION,
+  type AgentHandleReservation,
+  type NormalizedTurn,
+  type PeerContextSnapshot,
 } from "../types/peerContext";
 import type { ToolId } from "../types/collaborator";
+import {
+  reserveOrdinalForPeerContext,
+  toolShortName,
+} from "../stores/collaboratorStore";
+
+// ---------------------------------------------------------------------------
+// Cluster F — reservation API
+// ---------------------------------------------------------------------------
+//
+// The reservation registry is module-private (one per browser process); it
+// holds the (handle, collabSessionId, tool) tuple between reserve and
+// consume/release. Reservations are pre-spawn ephemera — they don't live
+// in zustand state because (a) they're short-lived, (b) the actual
+// SpawnedAgent push goes through `collaboratorStore.addAgent` after the
+// spawn IPC resolves.
+
+interface ReservationEntry {
+  handle: string;
+  collabSessionId: string;
+  tool: ToolId;
+}
+
+const reservationRegistry = new Map<string, ReservationEntry>();
+
+/**
+ * Mint a fresh reservation id. Browser-side `crypto.randomUUID` is
+ * available in all modern Chromium / WebKit; the WebView Tauri ships
+ * with on macOS supports it.
+ */
+function mintReservationId(): string {
+  return crypto.randomUUID();
+}
 
 /**
  * Reserve a fresh per-pane agent handle BEFORE spawning the PTY.
@@ -57,10 +92,15 @@ import type { ToolId } from "../types/collaborator";
  * `nextOrdinal` ledger.
  */
 export function reserveAgentHandle(
-  _collabSessionId: string,
-  _tool: ToolId,
+  collabSessionId: string,
+  tool: ToolId,
 ): AgentHandleReservation {
-  throw new Error("reserveAgentHandle: not yet implemented (phase 6)");
+  const ordinal = reserveOrdinalForPeerContext(collabSessionId, tool);
+  const short = toolShortName(tool);
+  const handle = `${short}${ordinal}`;
+  const reservationId = mintReservationId();
+  reservationRegistry.set(reservationId, { handle, collabSessionId, tool });
+  return { reservationId, handle, collabSessionId, tool };
 }
 
 /**
@@ -86,24 +126,36 @@ export function reserveAgentHandle(
  * Test contract: release of an unknown id is a no-op. Release followed by
  * a fresh reservation in the same pane/tool reuses the released ordinal.
  */
-export function releaseReservation(_reservationId: string): void {
-  throw new Error("releaseReservation: not yet implemented (phase 6)");
+export function releaseReservation(reservationId: string): void {
+  // Idempotent: unknown id is a silent no-op.
+  // Per docstring's "MAY reuse" — we don't roll back the ordinal counter
+  // (the slot becomes a numbering gap, which is acceptable). Reusing
+  // would require tracking "most recently issued" per (collabSessionId,
+  // tool) and rolling back only if the released ordinal matches; the
+  // gap-vs-strict-reuse trade-off is the simpler choice the docstring's
+  // "MAY" permits.
+  reservationRegistry.delete(reservationId);
 }
 
 /**
- * Consume a reservation on successful spawn — promotes it into a running
- * `SpawnedAgent` record.
+ * Consume a reservation on successful spawn — marks the reserved handle
+ * as in-use.
  *
  * Inputs: `reservationId`.
  *
- * Returns: void. The store's `addAgent()` is called internally with the
- * reserved handle.
+ * Returns: void.
  *
  * Errors: throws if the `reservationId` is unknown or has already been
  * consumed.
  *
- * Side effects: pushes a `SpawnedAgent` into the store's `agents` list;
- * unsets the reservation slot.
+ * Side effects: clears the reservation slot. The actual `addAgent` push
+ * into `collaboratorStore.agents` is the calling code's responsibility
+ * (AgentMiniTerminal already needs to push post-spawn state — sessionId,
+ * pid, status, cwd — that this function doesn't have access to under the
+ * planner-committed `(reservationId: string) => void` signature). The
+ * reserved handle is available on the reservation returned by
+ * `reserveAgentHandle` so the caller can pass it into `addAgent` to keep
+ * the post-spawn handle aligned with the pre-spawn reservation.
  *
  * Invariants: post-consume, the handle used cannot be reissued by a fresh
  * reservation (the agent now owns it for its lifetime). The agent's
@@ -117,8 +169,49 @@ export function releaseReservation(_reservationId: string): void {
  * Test contract: consuming an unknown id throws. Consuming a previously-
  * released id throws (release is irreversible).
  */
-export function consumeReservation(_reservationId: string): void {
-  throw new Error("consumeReservation: not yet implemented (phase 6)");
+export function consumeReservation(reservationId: string): void {
+  if (!reservationRegistry.has(reservationId)) {
+    throw new Error(
+      `consumeReservation: unknown or already-consumed reservationId ${reservationId}`,
+    );
+  }
+  reservationRegistry.delete(reservationId);
+}
+
+// ---------------------------------------------------------------------------
+// Cluster E — reader helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a JSONL string into `NormalizedTurn[]`. Tolerant of trailing
+ * newline; drops malformed lines silently (matches the Rust-side
+ * adapter contract of "parse failures are still consumed" — readers
+ * defend in symmetry). Enforces R3 forward-compat: any record whose
+ * `normalized_schema_version` exceeds the frontend constant throws.
+ */
+function parseJsonlNormalizedTurns(text: string): NormalizedTurn[] {
+  const out: NormalizedTurn[] = [];
+  for (const rawLine of text.split("\n")) {
+    if (rawLine.length === 0) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(rawLine);
+    } catch {
+      continue;
+    }
+    if (typeof obj !== "object" || obj === null) continue;
+    const turn = obj as NormalizedTurn;
+    if (
+      typeof turn.normalized_schema_version === "number" &&
+      turn.normalized_schema_version > NORMALIZED_SCHEMA_VERSION
+    ) {
+      throw new Error(
+        `transcript schema version ${turn.normalized_schema_version} unsupported; update Canvas Terminal`,
+      );
+    }
+    out.push(turn);
+  }
+  return out;
 }
 
 /**
@@ -154,7 +247,12 @@ export function consumeReservation(_reservationId: string): void {
  * `contexts/<agent>.1.jsonl` (archive without active) still returns `true`.
  */
 export async function hasContextsBreadcrumb(): Promise<boolean> {
-  throw new Error("hasContextsBreadcrumb: not yet implemented (phase 6)");
+  try {
+    const files = await invoke<string[]>("list_memory_files");
+    return files.some((f) => f.startsWith("contexts/"));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -188,9 +286,16 @@ export async function hasContextsBreadcrumb(): Promise<boolean> {
  * returns `[]`.
  */
 export async function loadActive(
-  _agentHandle: string,
+  agentHandle: string,
 ): Promise<NormalizedTurn[]> {
-  throw new Error("loadActive: not yet implemented (phase 6)");
+  const relative = `contexts/${agentHandle}.jsonl`;
+  const text = await invoke<string | null>("read_memory_file", {
+    relativePath: relative,
+  });
+  if (text === null) {
+    return [];
+  }
+  return parseJsonlNormalizedTurns(text);
 }
 
 /**
@@ -217,10 +322,17 @@ export async function loadActive(
  * Test contract: passing `archiveN` that does not exist returns `[]`.
  */
 export async function loadLastArchive(
-  _agentHandle: string,
-  _archiveN: number,
+  agentHandle: string,
+  archiveN: number,
 ): Promise<NormalizedTurn[]> {
-  throw new Error("loadLastArchive: not yet implemented (phase 6)");
+  const relative = `contexts/${agentHandle}.${archiveN}.jsonl`;
+  const text = await invoke<string | null>("read_memory_file", {
+    relativePath: relative,
+  });
+  if (text === null) {
+    return [];
+  }
+  return parseJsonlNormalizedTurns(text);
 }
 
 /**
@@ -249,8 +361,30 @@ export async function loadLastArchive(
  * Test contract: `[1, 2, 5]` is returned for archives 1, 2, 5 present —
  * gaps preserved. Sibling agents' archives are NOT returned.
  */
-export async function listArchives(_agentHandle: string): Promise<number[]> {
-  throw new Error("listArchives: not yet implemented (phase 6)");
+export async function listArchives(agentHandle: string): Promise<number[]> {
+  let files: string[];
+  try {
+    files = await invoke<string[]>("list_memory_files");
+  } catch {
+    return [];
+  }
+  // RegExp.escape isn't widely shipped; escape manually for the
+  // backslash-and-dot characters that could appear in an agent handle
+  // (in practice handles are `[a-z]+\d+` so this is defensive).
+  const escapedHandle = agentHandle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^contexts/${escapedHandle}\\.(\\d+)\\.jsonl$`);
+  const indices: number[] = [];
+  for (const f of files) {
+    const m = f.match(pattern);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n)) {
+        indices.push(n);
+      }
+    }
+  }
+  indices.sort((a, b) => a - b);
+  return indices;
 }
 
 /**
@@ -281,7 +415,26 @@ export async function listArchives(_agentHandle: string): Promise<number[]> {
  * `archivesBeyondWindow` is 2.
  */
 export async function loadSnapshot(
-  _agentHandle: string,
+  agentHandle: string,
 ): Promise<PeerContextSnapshot> {
-  throw new Error("loadSnapshot: not yet implemented (phase 6)");
+  const indices = await listArchives(agentHandle);
+  const activePromise = loadActive(agentHandle);
+  const lastArchivePromise =
+    indices.length > 0
+      ? loadLastArchive(agentHandle, indices[indices.length - 1])
+      : Promise.resolve<NormalizedTurn[]>([]);
+
+  // Errors from either read (schema-version, IPC) propagate. Q3 contract:
+  // both reads ≤ 8 MB by rotation cap, well under the 10 MB read cap.
+  const [active_turns, last_archive_turns] = await Promise.all([
+    activePromise,
+    lastArchivePromise,
+  ]);
+
+  return {
+    agent_handle: agentHandle,
+    active_turns,
+    last_archive_turns,
+    archivesBeyondWindow: Math.max(0, indices.length - 1),
+  };
 }

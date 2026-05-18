@@ -183,6 +183,8 @@ pub fn run() {
             commands::browser::destroy_browser_tab,
             commands::browser::destroy_all_browser_tabs,
             commands::localfile::mint_localfile_token,
+            commands::transcripts::watch_transcript,
+            commands::transcripts::unwatch_transcript,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

@@ -1031,3 +1031,50 @@ impl TranscriptWatcher {
         g.watcher = None;
     }
 }
+
+// =====================================================================
+// Tauri IPC wrappers
+// =====================================================================
+//
+// Thin `#[tauri::command]` adapters that expose `TranscriptWatcher::watch`
+// and `unwatch` to the frontend. The frontend cluster (`peerContext.ts` +
+// `AgentMiniTerminal.tsx`) invokes these via `invoke()`. Returning
+// `WatchToken`'s inner `u64` directly produces a cleaner JSON shape than
+// serializing the tuple-struct.
+//
+// Architecture-implied; the planner's `architecture.html` IPC surface
+// committed `TranscriptWatcher::watch` / `unwatch` as the public methods
+// but didn't explicitly enumerate Tauri commands. These are the natural
+// frontend-facing exposure. See lib.rs's `tauri::generate_handler!`
+// invocation for handler registration.
+
+/// Tauri IPC: resolve a (PID, tool, agent_handle) tuple to a running
+/// transcript watch. Wraps `TranscriptAdapter::discover_session` +
+/// `TranscriptWatcher::watch` for the frontend's `useEffect` on
+/// `AgentMiniTerminal` mount.
+#[tauri::command]
+pub fn watch_transcript(
+    state: tauri::State<'_, TranscriptWatcher>,
+    agent_handle: String,
+    pid: i32,
+    tool: String,
+    spawned_at_unix_ms: i64,
+) -> Result<u64, String> {
+    let adapter = adapters::adapter_for(tool.as_str())
+        .ok_or_else(|| format!("unknown tool: {}", tool))?;
+    let handle = adapter
+        .discover_session(&agent_handle, pid, spawned_at_unix_ms)
+        .map_err(|e| format!("discover_session: {:?}", e))?;
+    let token = state
+        .watch(handle)
+        .map_err(|e| format!("watch: {:?}", e))?;
+    Ok(token.0)
+}
+
+/// Tauri IPC: release a previously-issued watch token. Idempotent —
+/// unknown tokens are silent no-ops per `TranscriptWatcher::unwatch`'s
+/// Q6 contract.
+#[tauri::command]
+pub fn unwatch_transcript(state: tauri::State<'_, TranscriptWatcher>, token: u64) {
+    state.unwatch(WatchToken(token));
+}
