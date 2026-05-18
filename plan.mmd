@@ -1,0 +1,16 @@
+graph LR
+  TranscriptHandle["TranscriptHandle<br/>(A: +memory_dir field)<br/>(C: source_inode docstring)"]
+  TranscriptAdapter_parse["TranscriptAdapter::parse_native_lines<br/>(D: chunk-relative offset docstring)"]
+  RawTurn["RawTurn.source_offset<br/>(D: chunk-relative docstring)"]
+  spawn_shell["spawn_shell<br/>(B: +extra_env arg)"]
+
+  TranscriptWatcher_watch["TranscriptWatcher::watch<br/>(future impl: populates memory_dir)"]
+  Tailer_state_io["Tailer::resume_from_state<br/>Tailer::persist_offset<br/>Tailer::handle_inode_change<br/>(future impl: consumes memory_dir)"]
+  AgentMiniTerminal["AgentMiniTerminal<br/>(future impl: passes extra_env)"]
+  TailState_inode["TailState.inode<br/>(live inode lives here, not on Handle)"]
+
+  TranscriptWatcher_watch -->|fills memory_dir| TranscriptHandle
+  Tailer_state_io -->|reads memory_dir| TranscriptHandle
+  TranscriptAdapter_parse -->|emits with chunk-relative| RawTurn
+  AgentMiniTerminal -.future call.-> spawn_shell
+  TailState_inode -.tracks rotation.-> TranscriptHandle
