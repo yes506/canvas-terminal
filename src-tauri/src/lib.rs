@@ -95,6 +95,11 @@ pub fn run() {
         .manage(AppState::new())
         .manage(DashboardInfo::new())
         .manage(state::BrowserTabsState::<tauri::Wry>::new())
+        .manage(state::LocalFileTokenRegistry::new())
+        .register_asynchronous_uri_scheme_protocol(
+            "localfile",
+            commands::localfile::localfile_protocol_handler,
+        )
         .setup(|app| {
             let menu = build_menu(app)?;
             app.set_menu(menu)?;
@@ -160,6 +165,7 @@ pub fn run() {
             commands::browser::browser_tab_stop,
             commands::browser::destroy_browser_tab,
             commands::browser::destroy_all_browser_tabs,
+            commands::localfile::mint_localfile_token,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -198,11 +204,17 @@ pub fn run() {
                 // macOS, the red traffic-light close fires
                 // WindowEvent::Destroyed but NOT RunEvent::Exit (app
                 // stays alive in the dock). Without this, BrowserTabsState
-                // would hold dead webview handles until app-quit.
-                if let Some(browser_state) =
-                    window.try_state::<state::BrowserTabsState<tauri::Wry>>()
-                {
-                    let _ = commands::browser::destroy_all_browser_tabs_impl(&browser_state);
+                // would hold dead webview handles until app-quit. F8
+                // requires the localfile registry be cleared at the same
+                // point so no stale token-to-path mappings survive.
+                if let (Some(browser_state), Some(localfile_registry)) = (
+                    window.try_state::<state::BrowserTabsState<tauri::Wry>>(),
+                    window.try_state::<state::LocalFileTokenRegistry>(),
+                ) {
+                    let _ = commands::browser::destroy_all_browser_tabs_impl(
+                        &browser_state,
+                        &localfile_registry,
+                    );
                 }
                 // Clean up temporary canvas files
                 let _ = commands::canvas::cleanup_snapshot();
@@ -216,10 +228,17 @@ pub fn run() {
         .run(|app_handle, event| {
             if let RunEvent::Exit = event {
                 // App-quit cleanup: destroy every browser tab webview that
-                // may still be open. JS useEffect cleanup isn't reliable on
-                // hard quit; this is the Rust-side tear-down.
-                let state = app_handle.state::<state::BrowserTabsState<tauri::Wry>>();
-                let _ = commands::browser::destroy_all_browser_tabs_impl(&state);
+                // may still be open + clear the localfile token registry
+                // (F8). JS useEffect cleanup isn't reliable on hard quit;
+                // this is the Rust-side tear-down.
+                let browser_state =
+                    app_handle.state::<state::BrowserTabsState<tauri::Wry>>();
+                let localfile_registry =
+                    app_handle.state::<state::LocalFileTokenRegistry>();
+                let _ = commands::browser::destroy_all_browser_tabs_impl(
+                    &browser_state,
+                    &localfile_registry,
+                );
             }
         });
 }

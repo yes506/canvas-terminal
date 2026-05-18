@@ -60,3 +60,21 @@ export function destroyAllBrowserTabs(): Promise<void> {
 export function setBrowserSettings(patch: BrowserSettingsPatch): Promise<void> {
   return invoke<void>("set_browser_settings", { patch });
 }
+
+/**
+ * Mint a localfile token bound to (tabId, picked path). Returns a
+ * 22-char URL-safe-base64 token the caller embeds in a
+ * `localfile://localhost/<token>` URL (C9 path-based shape) and passes
+ * to `navigateBrowserTab`.
+ *
+ * Rejects with the Err string from Rust on any validation failure
+ * (`"symlinks rejected"`, `"path under deny-prefix: <prefix>"`,
+ * `"canonicalize failed: ..."`, etc.). Callers should catch and
+ * surface via the per-tab error field on BrowserStore.
+ */
+export function mintLocalFileToken(
+  tabId: string,
+  path: string,
+): Promise<string> {
+  return invoke<string>("mint_localfile_token", { tabId, path });
+}

@@ -44,15 +44,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::{Runtime, UriSchemeContext, UriSchemeResponder};
 
-// `LocalFileTokenStore` (the trait on `LocalFileTokenRegistry`) is
-// referenced only by docstring text in Phase 5 because every body
-// is `todo!()`. The trait import is held with `#[allow(unused_imports)]`
-// so Phase 6 `cargo check` stays clean; the codebase-implementer
-// removes the attribute once method bodies actually call the trait.
-#[allow(unused_imports)]
-use crate::state::LocalFileTokenStore;
-
-use crate::state::{LocalFileTokenRegistry, TabId, Token};
+use crate::state::{LocalFileTokenRegistry, LocalFileTokenStore, TabId, Token};
 
 /// Maximum file size served by the protocol handler in v1. Larger
 /// files receive HTTP 413. v1 reads whole files into memory;
@@ -105,11 +97,63 @@ pub const LOCALFILE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 ///      starts with an entry in the deny list (see v1 default list
 ///      in plan constraint C7).
 /// **Collaborators:** None. (terminal validation step.)
-pub(crate) fn validate_picked_path(_path: &Path) -> Result<PathBuf, String> {
-    todo!(
-        "Phase-5 skeleton — body delegated to codebase-implementer. \
-         Canonicalize, reject non-regular/symlink, check deny-prefix list."
-    )
+pub(crate) fn validate_picked_path(path: &Path) -> Result<PathBuf, String> {
+    // Step 1: symlink_metadata on INPUT — BEFORE canonicalize. canonicalize()
+    // resolves symlinks, so a check on its result cannot detect that the
+    // user-picked path itself was a symlink. See plan C9 / module doc.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err("symlinks rejected".to_string());
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("symlink_metadata failed: {}", e)),
+    }
+
+    // Step 2: canonicalize.
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("canonicalize failed: {}", e))?;
+
+    // Step 3: regular-file check on canonical.
+    if !canonical.is_file() {
+        return Err("not a regular file".to_string());
+    }
+
+    // Step 4: deny-prefix check (plan C7).
+    for prefix in build_deny_prefixes() {
+        if !canonical.starts_with(&prefix) {
+            continue;
+        }
+        // Exception: /usr/local is allowed even though /usr is denied
+        // (developer-machine common case — brew, /usr/local/share/doc).
+        if prefix == Path::new("/usr") && canonical.starts_with("/usr/local") {
+            continue;
+        }
+        return Err(format!("path under deny-prefix: {}", prefix.display()));
+    }
+
+    Ok(canonical)
+}
+
+/// v1 default deny-prefix list (plan constraint C7). Implementer may
+/// ADD entries with rationale but MUST NOT remove. Path-prefix match
+/// is against the CANONICAL path after symlink resolution.
+fn build_deny_prefixes() -> Vec<PathBuf> {
+    let mut prefixes: Vec<PathBuf> = vec![
+        PathBuf::from("/System"),
+        PathBuf::from("/private/var/db"),
+        PathBuf::from("/Library/Keychains"),
+        PathBuf::from("/etc"),
+        PathBuf::from("/var"),
+        // /usr is in the list with /usr/local excepted in validate_picked_path.
+        PathBuf::from("/usr"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        prefixes.push(home.join("Library/Keychains"));
+        prefixes.push(home.join(".ssh"));
+        prefixes.push(home.join("Library/Application Support"));
+        prefixes.push(home.join("Library/Cookies"));
+    }
+    prefixes
 }
 
 /// Determine the MIME type from the canonical path's extension.
@@ -137,11 +181,10 @@ pub(crate) fn validate_picked_path(_path: &Path) -> Result<PathBuf, String> {
 /// returns the fallback rather than erroring.)
 /// **Collaborators:** `mime_guess` crate (added at implementation
 /// time; not part of the skeleton's dep surface).
-pub(crate) fn classify_mime(_canonical: &Path) -> String {
-    todo!(
-        "Phase-5 skeleton — body delegated to codebase-implementer. \
-         Use `mime_guess::from_path` with octet-stream fallback."
-    )
+pub(crate) fn classify_mime(canonical: &Path) -> String {
+    mime_guess::from_path(canonical)
+        .first_or_octet_stream()
+        .to_string()
 }
 
 // Token generation (16 bytes getrandom -> URL-safe-base64) is an
@@ -192,14 +235,46 @@ pub(crate) fn classify_mime(_canonical: &Path) -> String {
 /// on invalid header bytes, ruled out by `mime` precondition.)
 /// **Collaborators:** None.
 pub(crate) fn build_localfile_response(
-    _bytes: Vec<u8>,
-    _mime: &str,
-    _path: &Path,
+    bytes: Vec<u8>,
+    mime: &str,
+    path: &Path,
 ) -> tauri::http::Response<Vec<u8>> {
-    todo!(
-        "Phase-5 skeleton — body delegated to codebase-implementer. \
-         Build response with status 200 and the v1 security-header set."
-    )
+    let len_str = bytes.len().to_string();
+    let disposition = disposition_for_mime(mime, path);
+    let csp = "default-src 'none'; img-src 'self' data:; \
+               style-src 'self' 'unsafe-inline'; script-src 'self'; sandbox";
+
+    tauri::http::Response::builder()
+        .status(200)
+        .header("Content-Type", mime)
+        .header("Content-Length", len_str)
+        .header("Content-Security-Policy", csp)
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Referrer-Policy", "no-referrer")
+        .header("Content-Disposition", disposition)
+        .body(bytes)
+        .expect("response builder cannot fail on validated inputs")
+}
+
+/// MIME-class-driven `Content-Disposition`. Inline for `text/*`,
+/// `image/*`, and `application/pdf`; attachment for everything else.
+/// Filename is taken from the canonical path's basename, with `"`
+/// replaced by `_` for minimal HTTP header safety (full RFC 6266
+/// filename* encoding is a v2 concern).
+fn disposition_for_mime(mime: &str, path: &Path) -> String {
+    let inline = mime.starts_with("text/")
+        || mime.starts_with("image/")
+        || mime == "application/pdf";
+    if inline {
+        "inline".to_string()
+    } else {
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download")
+            .replace('"', "_");
+        format!("attachment; filename=\"{}\"", filename)
+    }
 }
 
 /// Validate that an arbitrary string is a well-formed
@@ -235,12 +310,22 @@ pub(crate) fn build_localfile_response(
 ///   wrong length, invalid alphabet, extra path segments beyond
 ///   the single token, query string, fragment).
 /// **Collaborators:** None.
-pub(crate) fn validate_localfile_url_shape(_input: &str) -> Result<Token, String> {
-    todo!(
-        "Phase-5 skeleton — body delegated to codebase-implementer. \
-         Strict shape check; accept ONLY `localfile://localhost/<22 \
-         url-safe-base64 chars>`, reject everything else."
-    )
+pub(crate) fn validate_localfile_url_shape(input: &str) -> Result<Token, String> {
+    const PREFIX: &str = "localfile://localhost/";
+    if !input.starts_with(PREFIX) {
+        return Err("filter: localfile shape mismatch".to_string());
+    }
+    let tail = &input[PREFIX.len()..];
+    if tail.len() != 22 {
+        return Err("filter: localfile shape mismatch".to_string());
+    }
+    if !tail
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("filter: localfile shape mismatch".to_string());
+    }
+    Ok(tail.to_string())
 }
 
 /// Tauri command — orchestrates the mint pipeline. Frontend calls
@@ -297,12 +382,20 @@ pub fn mint_localfile_token(
     path: String,
     registry: tauri::State<'_, LocalFileTokenRegistry>,
 ) -> Result<String, String> {
-    // Phase-5 skeleton — body delegated to codebase-implementer.
-    let _ = (tabId, path, registry);
-    todo!(
-        "Phase-5 skeleton — orchestrate validate_picked_path -> classify_mime \
-         -> LocalFileTokenStore::mint; map errors to user-friendly strings."
-    )
+    use crate::state::RegistryError;
+
+    let path_buf = PathBuf::from(&path);
+    let canonical = validate_picked_path(&path_buf)?;
+    let mime = classify_mime(&canonical);
+
+    registry
+        .mint(tabId, canonical, mime)
+        .map_err(|e| match e {
+            RegistryError::LockPoisoned => "registry lock poisoned".to_string(),
+            RegistryError::TokenSpaceExhausted => {
+                "token generator exhausted (broken RNG?)".to_string()
+            }
+        })
 }
 
 /// Async URI-scheme protocol handler for `localfile://localhost/<token>` (per C9).
@@ -366,16 +459,79 @@ pub fn mint_localfile_token(
 /// `tauri::Manager::state` (to fetch the managed registry from
 /// `ctx.app_handle()`).
 pub fn localfile_protocol_handler<R: Runtime>(
-    _ctx: UriSchemeContext<'_, R>,
-    _request: tauri::http::Request<Vec<u8>>,
-    _responder: UriSchemeResponder,
+    ctx: UriSchemeContext<'_, R>,
+    request: tauri::http::Request<Vec<u8>>,
+    responder: UriSchemeResponder,
 ) {
-    // Phase-5 skeleton — body delegated to codebase-implementer.
-    todo!(
-        "Phase-5 skeleton — parse token from URI, derive owning_tab_id from \
-         webview_label, LocalFileTokenStore::lookup (tab-scoped), \
-         tokio::fs::read canonical_path, build_localfile_response, \
-         responder.respond. Refer to LocalFileTokenStore trait and \
-         build_localfile_response docstring for header/size invariants."
-    )
+    use tauri::Manager;
+
+    // Step 1: derive owning_tab_id from webview_label.
+    // Browser tabs have label "browser-tab-<tab_id>". Any other webview
+    // (the main window) hits 404 because no registry entry will match.
+    let owning_tab_id = match ctx.webview_label().strip_prefix("browser-tab-") {
+        Some(id) => id.to_string(),
+        None => {
+            responder.respond(empty_response(404));
+            return;
+        }
+    };
+
+    // Step 2: token from URL path (per C9 path-based shape).
+    let path = request.uri().path();
+    let token = path.trim_start_matches('/').to_string();
+    if token.is_empty() {
+        responder.respond(empty_response(404));
+        return;
+    }
+
+    // Step 3: tab-scoped lookup. The registry returns None on miss OR
+    // tab-mismatch — both surface as 404 to avoid leaking existence.
+    let registry = ctx.app_handle().state::<LocalFileTokenRegistry>();
+    let entry = match registry.lookup(&token, &owning_tab_id) {
+        Some(e) => e,
+        None => {
+            responder.respond(empty_response(404));
+            return;
+        }
+    };
+
+    // Step 4: spawn async I/O off the protocol thread (per C8).
+    let canonical_path = entry.canonical_path.clone();
+    let mime = entry.mime.clone();
+    tauri::async_runtime::spawn(async move {
+        // Size cap before read — refuse oversize files with 413 rather
+        // than allocating into memory and then rejecting.
+        let size = match tokio::fs::metadata(&canonical_path).await {
+            Ok(m) => m.len(),
+            Err(_) => {
+                responder.respond(empty_response(500));
+                return;
+            }
+        };
+        if size > LOCALFILE_MAX_BYTES {
+            responder.respond(empty_response(413));
+            return;
+        }
+
+        let bytes = match tokio::fs::read(&canonical_path).await {
+            Ok(b) => b,
+            Err(_) => {
+                responder.respond(empty_response(500));
+                return;
+            }
+        };
+
+        let response = build_localfile_response(bytes, &mime, &canonical_path);
+        responder.respond(response);
+    });
+}
+
+/// Helper — build an empty-body `http::Response` with the given status.
+/// Used by the protocol handler's error paths (404 / 413 / 500) so it
+/// can return a single typed response object to `responder.respond`.
+fn empty_response(status: u16) -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(status)
+        .body(Vec::new())
+        .expect("response builder cannot fail on empty body + valid status")
 }

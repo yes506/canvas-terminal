@@ -9,6 +9,7 @@ import {
   browserTabReload,
   browserTabStop,
 } from "../../lib/browserIpc";
+import { OpenFileButton } from "./OpenFileButton";
 
 /**
  * Back / forward / reload-or-stop + loading spinner — routed to the
@@ -46,6 +47,7 @@ export function NavControls() {
         flexShrink: 0,
       }}
     >
+      <OpenFileButton />
       <button
         type="button"
         style={btnStyle}

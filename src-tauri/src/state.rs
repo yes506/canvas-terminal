@@ -349,6 +349,12 @@ pub struct TokenEntry {
     pub tab_id: TabId,
     pub canonical_path: PathBuf,
     pub mime: String,
+    /// Wall-clock instant the token was minted. v1 has no TTL (plan C6
+    /// — tab-lifetime scoping is sufficient), so this is set by `mint`
+    /// but not yet read. Kept on the struct for future TTL,
+    /// instrumentation, or diagnostic dumps. Don't remove without
+    /// closing the C6 deferral.
+    #[allow(dead_code)]
     pub minted_at: Instant,
 }
 
@@ -573,22 +579,71 @@ impl Default for LocalFileTokenRegistry {
 impl LocalFileTokenStore for LocalFileTokenRegistry {
     fn mint(
         &self,
-        _tab_id: TabId,
-        _canonical_path: PathBuf,
-        _mime: String,
+        tab_id: TabId,
+        canonical_path: PathBuf,
+        mime: String,
     ) -> Result<Token, RegistryError> {
-        todo!("Phase-5 skeleton — body delegated to codebase-implementer; see trait docstring for the contract.")
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use rand::RngCore;
+
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| RegistryError::LockPoisoned)?;
+
+        // Token generation under-lock: 16 bytes from OsRng -> URL-safe-base64
+        // (no padding, yielding exactly 22 chars) -> collision check against
+        // current keys. Retry cap of 32 — a working OsRng cannot collide twice
+        // in a row, so anything past 32 signals broken entropy and we surface
+        // TokenSpaceExhausted instead of looping forever.
+        let mut buf = [0u8; 16];
+        for _ in 0..32 {
+            rand::rngs::OsRng.fill_bytes(&mut buf);
+            let token = URL_SAFE_NO_PAD.encode(buf);
+            if !entries.contains_key(&token) {
+                entries.insert(
+                    token.clone(),
+                    TokenEntry {
+                        tab_id,
+                        canonical_path,
+                        mime,
+                        minted_at: Instant::now(),
+                    },
+                );
+                return Ok(token);
+            }
+        }
+        Err(RegistryError::TokenSpaceExhausted)
     }
 
-    fn lookup(&self, _token: &str, _owning_tab_id: &str) -> Option<TokenEntry> {
-        todo!("Phase-5 skeleton — body delegated to codebase-implementer; see trait docstring for the contract.")
+    fn lookup(&self, token: &str, owning_tab_id: &str) -> Option<TokenEntry> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(token)?;
+        if entry.tab_id != owning_tab_id {
+            return None;
+        }
+        Some(entry.clone())
     }
 
-    fn revoke_for_tab(&self, _tab_id: &str) -> usize {
-        todo!("Phase-5 skeleton — body delegated to codebase-implementer; see trait docstring for the contract.")
+    fn revoke_for_tab(&self, tab_id: &str) -> usize {
+        match self.entries.lock() {
+            Ok(mut entries) => {
+                let before = entries.len();
+                entries.retain(|_, entry| entry.tab_id != tab_id);
+                before - entries.len()
+            }
+            Err(_) => 0,
+        }
     }
 
     fn clear(&self) -> usize {
-        todo!("Phase-5 skeleton — body delegated to codebase-implementer; see trait docstring for the contract.")
+        match self.entries.lock() {
+            Ok(mut entries) => {
+                let n = entries.len();
+                entries.clear();
+                n
+            }
+            Err(_) => 0,
+        }
     }
 }
