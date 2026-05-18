@@ -11,7 +11,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
+tauri = { version = "2", features = ["macos-private-api", "unstable"] }
 serde = { version = "1", features = ["derive"] }
 portable-pty = "0.8"
 libc = "0.2"
@@ -22,12 +22,13 @@ tauri-plugin-process = "2"
 base64 = "0.22"
 dirs = "6"
 serde_json = "1"
+mime_guess = "2"
 
 # Dashboard server (v4+v5 plan).
 # tokio: net for TcpListener, sync for broadcast, time for interval timer.
 # rt-multi-thread/macros so the spawned async tasks compile against the same
 # tokio runtime tauri::async_runtime exposes.
-tokio = { version = "1", features = ["net", "sync", "time", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["net", "sync", "time", "rt-multi-thread", "macros", "fs"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
 futures = "0.3"

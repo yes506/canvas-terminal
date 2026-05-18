@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use dashboard::DashboardInfo;
 use state::AppState;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, RunEvent};
 
 /// Build a custom app menu that maps Cmd+W to "Close Tab" instead of the
 /// default "Close Window".  This prevents the native menu from closing the
@@ -62,6 +62,13 @@ fn build_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, tauri::Error> {
         true,
         Some("CmdOrCtrl+Shift+D"),
     )?;
+    let toggle_browser = MenuItem::with_id(
+        app,
+        "toggle_browser",
+        "Toggle Browser",
+        true,
+        Some("CmdOrCtrl+Shift+B"),
+    )?;
     let window_menu = Submenu::with_items(
         app,
         "Window",
@@ -71,6 +78,7 @@ fn build_menu(app: &tauri::App) -> Result<Menu<tauri::Wry>, tauri::Error> {
             &PredefinedMenuItem::maximize(app, None)?,
             &PredefinedMenuItem::separator(app)?,
             &open_dashboard,
+            &toggle_browser,
         ],
     )?;
 
@@ -86,6 +94,12 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .manage(DashboardInfo::new())
+        .manage(state::BrowserTabsState::<tauri::Wry>::new())
+        .manage(state::LocalFileTokenRegistry::new())
+        .register_asynchronous_uri_scheme_protocol(
+            "localfile",
+            commands::localfile::localfile_protocol_handler,
+        )
         .setup(|app| {
             let menu = build_menu(app)?;
             app.set_menu(menu)?;
@@ -103,6 +117,9 @@ pub fn run() {
             } else if event.id() == "open_dashboard" {
                 // Frontend listens and calls invoke('open_dashboard')
                 let _ = app.emit("menu-open-dashboard", ());
+            } else if event.id() == "toggle_browser" {
+                // Frontend listens and calls browserStore.toggle()
+                let _ = app.emit("menu-toggle-browser", ());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -134,10 +151,21 @@ pub fn run() {
             commands::memory::get_memory_file_mtime,
             commands::settings::get_settings,
             commands::settings::set_settings,
+            commands::settings::set_browser_settings,
             commands::settings::open_external_url,
             commands::dashboard::open_dashboard,
             commands::dashboard::get_dashboard_info,
             commands::dashboard::copy_dashboard_url_with_token,
+            commands::browser::create_browser_tab,
+            commands::browser::set_browser_tab_bounds,
+            commands::browser::navigate_browser_tab,
+            commands::browser::browser_tab_go_back,
+            commands::browser::browser_tab_go_forward,
+            commands::browser::browser_tab_reload,
+            commands::browser::browser_tab_stop,
+            commands::browser::destroy_browser_tab,
+            commands::browser::destroy_all_browser_tabs,
+            commands::localfile::mint_localfile_token,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -172,6 +200,22 @@ pub fn run() {
                         sessions.clear();
                     }
                 }
+                // Browser tabs: defensive cleanup on window-destroy. On
+                // macOS, the red traffic-light close fires
+                // WindowEvent::Destroyed but NOT RunEvent::Exit (app
+                // stays alive in the dock). Without this, BrowserTabsState
+                // would hold dead webview handles until app-quit. F8
+                // requires the localfile registry be cleared at the same
+                // point so no stale token-to-path mappings survive.
+                if let (Some(browser_state), Some(localfile_registry)) = (
+                    window.try_state::<state::BrowserTabsState<tauri::Wry>>(),
+                    window.try_state::<state::LocalFileTokenRegistry>(),
+                ) {
+                    let _ = commands::browser::destroy_all_browser_tabs_impl(
+                        &browser_state,
+                        &localfile_registry,
+                    );
+                }
                 // Clean up temporary canvas files
                 let _ = commands::canvas::cleanup_snapshot();
                 let _ = commands::canvas::cleanup_import_file(None);
@@ -179,6 +223,22 @@ pub fn run() {
                 let _ = commands::memory::clear_memory_dir();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let RunEvent::Exit = event {
+                // App-quit cleanup: destroy every browser tab webview that
+                // may still be open + clear the localfile token registry
+                // (F8). JS useEffect cleanup isn't reliable on hard quit;
+                // this is the Rust-side tear-down.
+                let browser_state =
+                    app_handle.state::<state::BrowserTabsState<tauri::Wry>>();
+                let localfile_registry =
+                    app_handle.state::<state::LocalFileTokenRegistry>();
+                let _ = commands::browser::destroy_all_browser_tabs_impl(
+                    &browser_state,
+                    &localfile_registry,
+                );
+            }
+        });
 }

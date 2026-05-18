@@ -39,3 +39,6 @@ CODEX.md
 # Logs
 *.log
 npm-debug.log*
+.worktrees/
+.planner-state.json
+.implementer-state.json

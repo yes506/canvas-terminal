@@ -2,10 +2,10 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useTerminalStore, findCollaboratorLeaf } from "../../stores/terminalStore";
 import type { Tab } from "../../types/terminal";
 import { useCanvasStore } from "../../stores/canvasStore";
+import { useBrowserStore } from "../../stores/browserStore";
 import { PaneTree } from "./PaneTree";
 import { TerminalSearch } from "./TerminalSearch";
-import { ThemeSelector } from "../settings/ThemeSelector";
-import { Plus, X, PanelLeftOpen, PanelLeftClose, Copy, Pencil, Zap } from "lucide-react";
+import { Plus, X, PanelLeftOpen, PanelLeftClose, PanelRightOpen, PanelRightClose, Copy, Pencil, Zap } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 interface ContextMenu {
@@ -303,8 +303,8 @@ export function TerminalTabs() {
 
         <div className="flex-1" />
 
-        <ThemeSelector />
         <CollaboratorButton />
+        <BrowserToggleButton />
 
         {/* Floating drag preview */}
         {drag && tabRefsRef.current[drag.tabIndex] && (() => {
@@ -393,6 +393,21 @@ function CanvasToggleButton() {
       title={drawerOpen ? "Close Canvas" : "Open Canvas"}
     >
       {drawerOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
+    </button>
+  );
+}
+
+function BrowserToggleButton() {
+  const drawerOpen = useBrowserStore((s) => s.drawerOpen);
+  const toggle = useBrowserStore((s) => s.toggle);
+
+  return (
+    <button
+      className="px-2 h-full text-text-muted hover:text-text hover:bg-surface border-l border-surface-lighter transition-colors"
+      onClick={toggle}
+      title={drawerOpen ? "Close Browser (Cmd+Shift+B)" : "Open Browser (Cmd+Shift+B)"}
+    >
+      {drawerOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
     </button>
   );
 }
