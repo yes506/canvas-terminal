@@ -66,6 +66,25 @@ implicitly.
 - **C and D are docstring-only** — no shape change. The 9-field structure
   is preserved on `parse_native_lines`; we add to the existing fields,
   do not invent new ones.
+- **Implementer-side fixes already in flight** on
+  `.worktrees/implementer-peer-context-mirror-98411-57153-16414` at
+  `be335f1` are independent of this touch-up and the next implementer
+  cycle MUST preserve them — folded per @claude3 task-2 N1:
+  - (i) `src-tauri/src/lib.rs` re-exports `TranscriptAdapter` contract
+    so `src-tauri/tests/transcript_adapter_contract.rs` compiles
+    (closes claude3 I1 — the prior cycle's E0603 private-module
+    blocker).
+  - (ii) `src-tauri/src/commands/transcripts/mod.rs` +
+    `src-tauri/src/commands/transcripts/adapters/mod.rs` doc-comments
+    reworded + `src/types/peerContext.ts`'s `source_tool` type
+    restricted to `ToolId` (production-type stays closed; test
+    fixture's `"aider"` identifier doesn't leak) — so
+    `git grep -l -i aider -- 'src-tauri/src/**' 'src/**'` returns 0
+    (closes claude3 I2).
+  These two items are NOT this touch-up's responsibility — they were
+  already body-implementation-level fixes the implementer was allowed
+  to ship under its own scope discipline. They are mentioned here only
+  so a fresh-session reader doesn't conclude they're still owed.
 
 ## Success criteria
 
@@ -148,8 +167,16 @@ skeletons; no new interfaces were introduced.
 - Marker: `(plan-feature, human-confirmed)` (set by Phase 8 merge).
 - Artifacts on `dev` after merge: `plan.md`, `plan.mmd`, plus the
   modified Rust skeleton files committed in `99086e5`.
-- The next `/codebase-implementer` run targeting either this touch-up
-  marker OR the original `(interfaces only, human-confirmed)` marker
-  (`e3a132e`) should consume the updated `TranscriptHandle` shape +
-  `spawn_shell` signature when wiring the remaining 28 stubs + 3
-  reverted Tailer items.
+- **Preferred resumption target**: the next `/codebase-implementer`
+  run should target **this touch-up marker** — `(plan-feature,
+  human-confirmed)` for `peer-context-mirror-touchup` — when wiring
+  the remaining 28 stubs + 3 reverted Tailer items + the K6
+  shell-fallback env-propagation glue. Folded per @claude3 task-2 N2.
+- The original `(interfaces only, human-confirmed)` marker at `e3a132e`
+  remains valid for historical reference but is **not** the preferred
+  resumption target — the three reverted Tailer items
+  (`resume_from_state` / `persist_offset` / `handle_inode_change`)
+  cannot be re-implemented without `TranscriptHandle::memory_dir`
+  (delta A), and the K6 shell-fallback wiring cannot be implemented
+  without `spawn_shell::extra_env` (delta B). Only this touch-up
+  exposes both.
