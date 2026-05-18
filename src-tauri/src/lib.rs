@@ -2,6 +2,16 @@ mod commands;
 mod dashboard;
 mod state;
 
+// Re-export the TranscriptAdapter contract surface so external tests
+// (e.g. `tests/transcript_adapter_contract.rs`) can implement the trait
+// without needing `commands` itself to be `pub`. Per claude3 r4 I1
+// recommendation (c): minimal visibility surface change — only the named
+// types become public to the crate's external API.
+pub use commands::transcripts::{
+    ContentBlockTable, DiscoveryError, NormalizeContext, NormalizedTurn, RawTurn,
+    TranscriptAdapter, TranscriptHandle,
+};
+
 use std::sync::atomic::Ordering;
 
 use dashboard::DashboardInfo;

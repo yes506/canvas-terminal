@@ -28,7 +28,11 @@ export type TurnRole = "user" | "assistant";
  */
 export interface NormalizedTurn {
   normalized_schema_version: number;
-  source_tool: ToolId | "aider"; // "aider" present only in tests
+  // Production source_tool is one of the registered ToolIds. The Rust
+  // trait-extensibility test fixture uses a sentinel identifier that
+  // appears only inside `src-tauri/tests/` — kept out of this production
+  // type so CI's grep stays clean (Q2 SUCCESS CRITERION).
+  source_tool: ToolId;
   source_tool_version: string | null;
   adapter_version: string;
   /** Bare handle: "claude3", "codex2". `@` prefix is display-layer only (W4). */

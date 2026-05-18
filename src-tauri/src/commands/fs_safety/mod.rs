@@ -20,7 +20,14 @@ pub fn canonicalize_no_symlinks(path: &Path) -> Result<PathBuf, FsSafetyError> {
             "canonicalize_no_symlinks requires an absolute path",
         )));
     }
+    // Walk the ORIGINAL path first — `std::fs::canonicalize` follows symlinks
+    // and would resolve them away before we get a chance to reject them.
+    // Then canonicalize to handle `.`/`..` normalization for the caller.
+    reject_symlink_in_walk(path)?;
     let canonical = std::fs::canonicalize(path).map_err(FsSafetyError::Canonicalize)?;
+    // Belt + suspenders: re-check the canonical form too, in case the
+    // canonicalize step exposed a symlink the per-component walk missed
+    // (e.g. due to TOCTOU between the walk and the canonicalize call).
     reject_symlink_in_walk(&canonical)?;
     Ok(canonical)
 }

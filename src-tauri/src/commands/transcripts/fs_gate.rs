@@ -98,7 +98,19 @@ pub fn check_transcript_root(
     }
 
     let resolved = fs_safety::canonicalize_no_symlinks(candidate)?;
-    let root_variants = fs_safety::add_private_alias(&root);
+
+    // Canonicalize the root too (P1 fix from codex3 review) — if `~` resolves
+    // through a symlink (some macOS network-home setups), comparing a
+    // canonical candidate against a non-canonical root spuriously rejects
+    // legitimate paths. We also accept the case where the root directory
+    // does not exist yet (newer tool, fresh user): fall back to the raw
+    // home-joined root in that case.
+    let root_canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let mut root_variants = fs_safety::add_private_alias(&root_canonical);
+    // Also accept the raw (uncanonicalized) form for the symlink-free case.
+    if root_canonical != root {
+        root_variants.extend(fs_safety::add_private_alias(&root));
+    }
 
     let inside = root_variants.iter().any(|r| resolved.starts_with(r));
     if !inside {
