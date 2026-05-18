@@ -36,6 +36,20 @@ export function classifyScheme(input: string): SchemeClassification {
   if (lower.startsWith("file:")) {
     return { action: "deny", reason: "file: URLs disabled in v1" };
   }
+  if (lower.startsWith("localfile:")) {
+    // C1 THREE-way invariant — mirrors
+    // src-tauri/src/commands/localfile.rs::validate_localfile_url_shape.
+    // v1 shape is `localfile://localhost/<22 url-safe-base64>` (C9).
+    const PREFIX = "localfile://localhost/";
+    if (!trimmed.startsWith(PREFIX)) {
+      return { action: "filter", reason: "localfile shape mismatch" };
+    }
+    const token = trimmed.slice(PREFIX.length);
+    if (token.length !== 22 || !/^[A-Za-z0-9_-]{22}$/.test(token)) {
+      return { action: "filter", reason: "localfile shape mismatch" };
+    }
+    return { action: "allow", normalizedUrl: trimmed };
+  }
   if (lower === "about:blank") {
     return { action: "allow", normalizedUrl: "about:blank" };
   }

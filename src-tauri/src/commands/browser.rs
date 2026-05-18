@@ -152,6 +152,15 @@ pub fn validate_browser_url(input: &str) -> Result<tauri::Url, String> {
     if lower.starts_with("file:") {
         return Err("deny: file: URLs disabled in v1".to_string());
     }
+    if lower.starts_with("localfile:") {
+        // Defense-in-depth at the IPC boundary (plan C1 THREE-way invariant).
+        // The single source of truth for the strict shape lives in
+        // commands::localfile::validate_localfile_url_shape; dispatch to it,
+        // then parse for the navigate machinery on shape-OK.
+        crate::commands::localfile::validate_localfile_url_shape(trimmed)?;
+        return tauri::Url::parse(trimmed)
+            .map_err(|e| format!("filter: cannot parse localfile URL: {}", e));
+    }
     if lower == "about:blank" {
         return tauri::Url::parse("about:blank")
             .map_err(|e| format!("filter: cannot parse about:blank: {}", e));
@@ -401,8 +410,20 @@ pub fn navigate_browser_tab(
     #[allow(non_snake_case)] tabId: TabId,
     url: String,
     state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
+    localfile_registry: tauri::State<'_, crate::state::LocalFileTokenRegistry>,
 ) -> Result<(), String> {
+    use crate::state::LocalFileTokenStore;
+
     let parsed = validate_browser_url(&url)?;
+
+    // F8: navigating to a non-localfile destination revokes this tab's
+    // localfile tokens. Tokens are tab-lifetime-scoped; once the tab
+    // leaves the localfile URL, the entry is purged. Back/Forward to
+    // a purged URL returns 404 — the documented v1 design choice.
+    if !url.trim_start().to_lowercase().starts_with("localfile:") {
+        localfile_registry.revoke_for_tab(&tabId);
+    }
+
     let webview = state
         .clone_tab(&tabId)
         .ok_or_else(|| format!("browser tab '{}' not created", tabId))?;
@@ -467,16 +488,27 @@ pub fn browser_tab_stop(
 pub fn destroy_browser_tab(
     #[allow(non_snake_case)] tabId: TabId,
     state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
+    localfile_registry: tauri::State<'_, crate::state::LocalFileTokenRegistry>,
 ) -> Result<(), String> {
-    destroy_browser_tab_impl(&tabId, &state)
+    destroy_browser_tab_impl(&tabId, &state, &localfile_registry)
 }
 
 /// Pure-Rust destroy helper for a single tab. Idempotent: calling on a
-/// missing/Empty slot is a no-op `Ok`.
+/// missing/Empty slot is a no-op `Ok`. Per F8, all `localfile_registry`
+/// entries for this tab are revoked synchronously before the webview
+/// itself is closed so no in-flight protocol-fetch can still resolve
+/// against a dying tab's token.
 pub fn destroy_browser_tab_impl(
     tab_id: &str,
     state: &BrowserTabsState<tauri::Wry>,
+    localfile_registry: &crate::state::LocalFileTokenRegistry,
 ) -> Result<(), String> {
+    use crate::state::LocalFileTokenStore;
+
+    // F8: revoke this tab's localfile tokens BEFORE closing the
+    // webview. Best-effort: revoke_for_tab swallows Mutex poison.
+    localfile_registry.revoke_for_tab(tab_id);
+
     let webview = match state.take_tab(tab_id) {
         Some(w) => w,
         None => return Ok(()),
@@ -492,15 +524,24 @@ pub fn destroy_browser_tab_impl(
 #[tauri::command]
 pub fn destroy_all_browser_tabs(
     state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
+    localfile_registry: tauri::State<'_, crate::state::LocalFileTokenRegistry>,
 ) -> Result<(), String> {
-    destroy_all_browser_tabs_impl(&state)
+    destroy_all_browser_tabs_impl(&state, &localfile_registry)
 }
 
 /// Pure-Rust destroy-all helper. Called from the IPC command and from
-/// `lib.rs::run()`'s `RunEvent::Exit` handler.
+/// `lib.rs::run()`'s `RunEvent::Exit` and `WindowEvent::Destroyed`
+/// handlers. Per F8, the entire localfile registry is cleared before
+/// tab webviews are closed.
 pub fn destroy_all_browser_tabs_impl(
     state: &BrowserTabsState<tauri::Wry>,
+    localfile_registry: &crate::state::LocalFileTokenRegistry,
 ) -> Result<(), String> {
+    use crate::state::LocalFileTokenStore;
+
+    // F8: clear the entire registry at app/window teardown.
+    localfile_registry.clear();
+
     for webview in state.take_all_tabs() {
         let _ = webview.close();
     }
@@ -554,5 +595,59 @@ mod tests {
         assert!(validate_browser_url("ftp://example.com")
             .unwrap_err()
             .starts_with("filter:"));
+    }
+
+    // --- C9 localfile shape (plan THREE-way invariant) ---------------------
+
+    #[test]
+    fn allow_well_formed_localfile_shape() {
+        // 22 url-safe-base64 chars after localfile://localhost/
+        let url = "localfile://localhost/0123456789abcdefghijkl";
+        assert_eq!(
+            url.len() - "localfile://localhost/".len(),
+            22,
+            "test fixture must use exactly 22 token chars"
+        );
+        assert!(validate_browser_url(url).is_ok());
+    }
+
+    #[test]
+    fn deny_malformed_localfile_variants() {
+        // Wrong host (not 'localhost')
+        assert!(validate_browser_url("localfile://foo/0123456789abcdefghijkl")
+            .unwrap_err()
+            .starts_with("filter:"));
+        // Missing host entirely
+        assert!(
+            validate_browser_url("localfile:///0123456789abcdefghijkl")
+                .unwrap_err()
+                .starts_with("filter:")
+        );
+        // Authority-only (no path)
+        assert!(
+            validate_browser_url("localfile://0123456789abcdefghijkl")
+                .unwrap_err()
+                .starts_with("filter:")
+        );
+        // Wrong token length (21 chars — one short of the required 22)
+        assert!(validate_browser_url("localfile://localhost/0123456789abcdefghijk")
+            .unwrap_err()
+            .starts_with("filter:"));
+        // Invalid alphabet (slash inside token, total tail still 22 chars)
+        assert!(validate_browser_url("localfile://localhost/0123456789a/cdefghijkl")
+            .unwrap_err()
+            .starts_with("filter:"));
+        // Query string present
+        assert!(validate_browser_url(
+            "localfile://localhost/0123456789abcdefghijkl?evil=1"
+        )
+        .unwrap_err()
+        .starts_with("filter:"));
+        // Fragment present
+        assert!(validate_browser_url(
+            "localfile://localhost/0123456789abcdefghijkl#frag"
+        )
+        .unwrap_err()
+        .starts_with("filter:"));
     }
 }
