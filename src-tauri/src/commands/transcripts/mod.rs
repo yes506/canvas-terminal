@@ -1,0 +1,653 @@
+// Cross-tool agent context surfacing — feature root.
+//
+// Mirrors each collaborator agent's tool-persisted transcript (Claude Code
+// JSONL / Codex rollout / Gemini chat) into the shared collab-memory layer,
+// normalized to a tool-agnostic `NormalizedTurn` record. Real-time tailing
+// via notify/fsevents; one-way (tool → shared memory). Adapter trait is the
+// system-lane deliverable; per K3 the production adapter set is fixed
+// (Claude Code + Codex CLI + Gemini CLI). Aider lives only as a test fixture
+// at `src-tauri/tests/transcript_adapter_contract.rs`.
+
+pub mod adapters;
+pub mod fs_gate;
+pub mod tailer;
+pub mod watcher;
+
+use std::path::PathBuf;
+
+/// Canonical form version emitted in every `NormalizedTurn`. Bump on any
+/// breaking field change. Frontend refuses to render records with a higher
+/// version than it knows (forward-compat insurance per R3).
+pub const NORMALIZED_SCHEMA_VERSION: u32 = 1;
+
+/// Soft cap on the active mirror file before rotation fires.
+/// Sits comfortably under `memory.rs::MAX_MEMORY_FILE_SIZE` (10 MB) so the
+/// reader IPC can always single-call.
+pub const ACTIVE_FILE_BYTE_CAP: u64 = 8 * 1024 * 1024;
+
+/// Stable across-restart identifier for a (PID, transcript file) binding.
+/// Returned by `TranscriptAdapter::discover_session`.
+pub struct TranscriptHandle {
+    /// Bare CT handle — e.g. "claude3". Display layer adds `@` (W4).
+    pub agent_handle: String,
+    /// Adapter `tool_id()` value — `"claude_code"` / `"codex"` / `"gemini"`.
+    pub adapter_id: &'static str,
+    /// Absolute path to the tool's native JSONL.
+    pub source_path: PathBuf,
+    /// `lstat` inode at discovery; compared on resume to detect rotation
+    /// at the source (Claude Code `/clear`, Codex rollout switch).
+    pub source_inode: u64,
+    /// CLI process id — discovered via `lsof -p` (macOS) / `/proc/<pid>/fd`
+    /// (Linux) one-time at session-bind (M8).
+    pub pid: i32,
+}
+
+/// Opaque registration token returned by `TranscriptWatcher::watch`. Passed
+/// back to `unwatch` to release the registration.
+pub struct WatchToken(pub u64);
+
+/// Canonical mirrored record format. One per accepted turn in
+/// `session-<pid>/contexts/<agent>.jsonl`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct NormalizedTurn {
+    pub normalized_schema_version: u32,
+    pub source_tool: String,
+    pub source_tool_version: Option<String>,
+    pub adapter_version: String,
+    pub agent_handle: String,
+    pub ts_iso8601: String,
+    pub ts_source: TsSource,
+    pub role: TurnRole,
+    pub text_visible: String,
+    pub turn_index: u64,
+    pub source_offset: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum TsSource {
+    /// Timestamp lifted from the source tool's own JSONL field.
+    Tool,
+    /// Timestamp captured by Canvas Terminal at normalize-time because the
+    /// source line carried no usable timestamp.
+    Ct,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum TurnRole {
+    User,
+    Assistant,
+}
+
+/// Per-adapter native-block inclusion policy. R4 default: include only
+/// definitively user-or-assistant visible text; exclude `thinking`,
+/// `tool_use`, `tool_result`, `image`, `redacted_thinking`, `system`.
+pub struct ContentBlockTable {
+    pub include: &'static [&'static str],
+    pub exclude: &'static [&'static str],
+}
+
+/// One raw turn parsed from the native JSONL; pre-normalize.
+pub struct RawTurn {
+    pub raw_payload: serde_json::Value,
+    pub source_offset: u64,
+}
+
+/// Context injected into `normalize()` by the watcher; carries the CT-side
+/// identity that source transcripts cannot know (M4).
+pub struct NormalizeContext<'a> {
+    pub agent_handle: &'a str,
+    pub adapter_version: &'a str,
+    pub turn_index: u64,
+}
+
+/// Errors during `discover_session`.
+#[derive(Debug)]
+pub enum DiscoveryError {
+    /// fs_gate rejected the candidate path (escape, symlink, wrong root).
+    Gated(String),
+    /// `lsof -p` / `/proc/<pid>/fd` returned no open file matching this
+    /// adapter's path pattern.
+    NoMatchingFd,
+    /// IO error invoking lsof or walking /proc.
+    Io(std::io::Error),
+}
+
+/// Errors during watcher operations.
+#[derive(Debug)]
+pub enum WatcherError {
+    GateRejected(String),
+    Io(std::io::Error),
+    StateCorrupted(String),
+    NotStarted,
+}
+
+/// Contract for mirroring one CLI tool's persisted transcripts.
+///
+/// SUCCESS CRITERION: adding a transcript adapter for an EXISTING registered
+/// tool requires zero changes outside the new `adapters/<tool>.rs` file.
+/// Watching, rotation, and IPC live on `TranscriptWatcher`; adapters carry
+/// only per-tool source-format concerns (Q5 layering).
+pub trait TranscriptAdapter: Send + Sync {
+    /// Stable identifier for this adapter.
+    ///
+    /// # Returns
+    /// `&'static str` such as `"claude_code"`. Used as the path key in
+    /// `fs_gate.rs` allow-list and as `TranscriptHandle::adapter_id`.
+    ///
+    /// # Errors
+    /// Cannot fail.
+    ///
+    /// # Side effects
+    /// None.
+    ///
+    /// # Invariants
+    /// Value is unique across all registered adapters; never collides with
+    /// `ToolId` from `src/types/collaborator.ts`. Match-by-equality on this
+    /// value is safe across processes.
+    ///
+    /// # Concurrency
+    /// Pure; thread-safe.
+    ///
+    /// # Lifecycle
+    /// Called by `TranscriptWatcher::watch` and `fs_gate::check_transcript_root`.
+    ///
+    /// # Test contract
+    /// Returns the same value across calls within one process. Distinct from
+    /// the same trait method on every other adapter.
+    fn tool_id(&self) -> &'static str;
+
+    /// Adapter implementation version. Independent of `source_tool_version`.
+    ///
+    /// # Returns
+    /// `&'static str` matching the adapter file's `ADAPTER_VERSION` constant.
+    /// Bumped when normalization rules / inclusion table / discovery
+    /// behavior changes (T3).
+    ///
+    /// # Errors
+    /// Cannot fail.
+    ///
+    /// # Side effects
+    /// None.
+    ///
+    /// # Invariants
+    /// Semver-like string; never `null` (per X4, source_tool_version may be
+    /// null but adapter_version is always present).
+    ///
+    /// # Concurrency
+    /// Pure; thread-safe.
+    ///
+    /// # Lifecycle
+    /// Stamped into every `NormalizedTurn` produced by `normalize()`.
+    ///
+    /// # Test contract
+    /// Same value across all calls in one process; format parseable as
+    /// `MAJOR.MINOR.PATCH`.
+    fn adapter_version(&self) -> &'static str;
+
+    /// Locate which transcript file the given child PID has open.
+    ///
+    /// # Inputs
+    /// - `agent_handle`: bare CT handle (`"claude3"`); never the `@`-prefixed
+    ///   display form.
+    /// - `pid`: child PID returned by the PTY spawn. For shell-fallback
+    ///   launches this is already the CLI (the typed command uses `exec`,
+    ///   K6) so a direct fd lookup is sufficient.
+    /// - `spawned_at_unix_ms`: tiebreaker for the rare race where two
+    ///   simultaneous sessions in the same project dir create JSONLs of
+    ///   the same inode bucket.
+    ///
+    /// # Returns
+    /// `TranscriptHandle` carrying the resolved path + inode + adapter id.
+    ///
+    /// # Errors
+    /// - `DiscoveryError::NoMatchingFd` if the PID has no open file matching
+    ///   the adapter's pattern (e.g. CLI hasn't created a session yet).
+    /// - `DiscoveryError::Gated` if the resolved path is outside the
+    ///   adapter's allow-root.
+    /// - `DiscoveryError::Io` for OS-layer failures.
+    ///
+    /// # Side effects
+    /// One-time call to `lsof -p` (macOS) / read of `/proc/<pid>/fd` (Linux)
+    /// per binding. Result is cached by `TranscriptWatcher::watch` — must
+    /// NEVER be called inside the tailer loop (M8).
+    ///
+    /// # Invariants
+    /// The returned `source_path` is canonicalized via `fs_safety` and
+    /// inside the adapter's allow-list root.
+    ///
+    /// # Concurrency
+    /// Forks a subprocess on macOS; expensive. Callers that hold locks
+    /// should drop them before calling.
+    ///
+    /// # Lifecycle
+    /// Called once at agent opt-in publish (or on explicit re-bind). NEVER
+    /// inside the tailer poll loop.
+    ///
+    /// # Test contract
+    /// Given a PID with no open fds matching the pattern, returns
+    /// `NoMatchingFd` rather than guessing by mtime. Returned `source_inode`
+    /// matches `lstat(source_path)` at call time.
+    fn discover_session(
+        &self,
+        agent_handle: &str,
+        pid: i32,
+        spawned_at_unix_ms: i64,
+    ) -> Result<TranscriptHandle, DiscoveryError>;
+
+    /// Static table describing which native content blocks propagate.
+    ///
+    /// # Returns
+    /// Reference to a `'static` table. Default per R4: include only
+    /// definitively user-or-assistant visible text blocks; exclude
+    /// `thinking`, `tool_use`, `tool_result`, `image`, `redacted_thinking`,
+    /// `system`. Adapters MAY tighten the include set but MUST NOT relax
+    /// the exclude set (the listed types are policy, not adapter choice).
+    ///
+    /// # Errors
+    /// Cannot fail.
+    ///
+    /// # Side effects
+    /// None.
+    ///
+    /// # Invariants
+    /// Returned reference outlives the adapter instance (`'static`).
+    ///
+    /// # Concurrency
+    /// Pure; thread-safe.
+    ///
+    /// # Lifecycle
+    /// Consulted by `normalize()` for every raw turn.
+    ///
+    /// # Test contract
+    /// Returned `exclude` slice CONTAINS `"thinking"`, `"tool_use"`,
+    /// `"tool_result"`, `"image"`, `"redacted_thinking"`, `"system"`.
+    /// Adapter-specific include set is documented in the adapter's
+    /// module-level docstring.
+    fn inclusion_table(&self) -> &ContentBlockTable;
+
+    /// Parse new bytes from a JSONL append, partial-line aware.
+    ///
+    /// # Inputs
+    /// `bytes`: raw bytes since the last successful parse (may end mid-line).
+    ///
+    /// # Returns
+    /// Tuple `(turns, consumed_bytes)`. `turns` is every fully-parsed line
+    /// (one `RawTurn` per JSONL line that succeeded). `consumed_bytes` is the
+    /// number of bytes the caller should advance the read offset by — partial
+    /// trailing lines are NOT consumed and will be re-presented on the next
+    /// poll.
+    ///
+    /// # Errors
+    /// Per-line parse failures are silent: malformed lines are skipped and
+    /// their bytes are still marked consumed (otherwise we'd loop forever on
+    /// a poisoned line). Adapter implementations MAY emit a tracing event;
+    /// they MUST NOT propagate the error.
+    ///
+    /// # Side effects
+    /// None (pure parsing).
+    ///
+    /// # Invariants
+    /// `consumed_bytes <= bytes.len()`. If `bytes` ends with a complete line
+    /// (newline terminator), `consumed_bytes == bytes.len()`. If `bytes` is
+    /// empty, returns `(vec![], 0)`.
+    ///
+    /// # Concurrency
+    /// Pure; thread-safe.
+    ///
+    /// # Lifecycle
+    /// Called by the Tailer after each `poll_new_bytes` returns non-empty.
+    ///
+    /// # Test contract
+    /// Input ending with `"...partial` (no newline) MUST result in
+    /// `consumed_bytes < bytes.len()` so the next poll re-reads. Malformed
+    /// JSON on line N MUST NOT prevent line N+1 from being parsed.
+    fn parse_native_lines(&self, bytes: &[u8]) -> (Vec<RawTurn>, usize);
+
+    /// Convert a raw turn into a `NormalizedTurn` ready for mirroring.
+    ///
+    /// # Inputs
+    /// - `raw`: one parsed JSONL line from this adapter's source.
+    /// - `ctx`: CT-injected identity (agent_handle, adapter_version,
+    ///   turn_index). M4: source transcripts don't know CT's handle layer.
+    ///
+    /// # Returns
+    /// `Some(NormalizedTurn)` when the raw turn produces non-empty
+    /// `text_visible` after applying the inclusion table.
+    /// `None` (M6 SKIP) when the turn's content was entirely in the
+    /// exclude set (e.g. a Claude turn whose only block was `tool_use`).
+    /// `turn_index` still increments per-call regardless of return value
+    /// so consumers can detect gaps.
+    ///
+    /// # Errors
+    /// Adapter implementations choose whether to be lenient on missing
+    /// fields. The contract is: never panic; either return `None` or a
+    /// best-effort `NormalizedTurn` with `ts_source = Ct` and a synthesized
+    /// timestamp.
+    ///
+    /// # Side effects
+    /// None (pure transformation).
+    ///
+    /// # Invariants
+    /// Returned `NormalizedTurn::normalized_schema_version` equals
+    /// `NORMALIZED_SCHEMA_VERSION`. `text_visible` is non-empty if returned.
+    /// `agent_handle` equals `ctx.agent_handle`.
+    ///
+    /// # Concurrency
+    /// Pure; thread-safe.
+    ///
+    /// # Lifecycle
+    /// Called per `RawTurn` produced by `parse_native_lines`.
+    ///
+    /// # Test contract
+    /// A raw turn whose content is exclusively `thinking` blocks returns
+    /// `None`. A raw turn with `text` blocks returns `Some` whose
+    /// `text_visible` is the concatenation of those text blocks.
+    fn normalize(&self, raw: RawTurn, ctx: NormalizeContext<'_>) -> Option<NormalizedTurn>;
+}
+
+/// Centralized watcher owning the lifecycle of every active mirror stream.
+///
+/// Per Q5: lifecycle is on this struct, not on `TranscriptAdapter`. Adapters
+/// supply per-tool normalization; the watcher owns FSEvents subscriptions,
+/// rotation, `.state.json`, and the unwatch teardown path. Stored in
+/// Tauri `State<>`; single instance per app.
+pub struct TranscriptWatcher {
+    // intentionally opaque; populated at Phase 6 implementation
+}
+
+impl TranscriptWatcher {
+    /// Construct a new instance. Does NOT start FSEvents — `start_if_needed`
+    /// does that lazily.
+    ///
+    /// # Inputs
+    /// None.
+    ///
+    /// # Returns
+    /// A `TranscriptWatcher` in the dormant state.
+    ///
+    /// # Errors
+    /// Cannot fail at construction.
+    ///
+    /// # Side effects
+    /// Allocates internal collections but performs no IO and starts no
+    /// background threads.
+    ///
+    /// # Invariants
+    /// Initial ref-count is 0; no FSEvents handles registered.
+    ///
+    /// # Concurrency
+    /// Construction is synchronous and single-threaded by definition.
+    ///
+    /// # Lifecycle
+    /// Called from `lib.rs::setup` and stored in Tauri `State<>`.
+    ///
+    /// # Test contract
+    /// Calling `shutdown()` immediately after `new()` is a no-op.
+    pub fn new() -> Self {
+        todo!()
+    }
+
+    /// Lazy-start the FSEvents thread on first opt-in publish. Idempotent.
+    ///
+    /// # Inputs
+    /// None.
+    ///
+    /// # Returns
+    /// `Ok(())` whether already started or just started.
+    ///
+    /// # Errors
+    /// `WatcherError::Io` if FSEvents/inotify init fails.
+    ///
+    /// # Side effects
+    /// On first call only: spawns the FSEvents subscription thread and
+    /// allocates the notify crate's `RecommendedWatcher`.
+    ///
+    /// # Invariants
+    /// After `Ok` returns, the FSEvents thread is running and ready to
+    /// receive `watch()` registrations. Calling again is a no-op.
+    ///
+    /// # Concurrency
+    /// Internally synchronized; safe to call from multiple Tauri IPC
+    /// handlers concurrently.
+    ///
+    /// # Lifecycle
+    /// Called by `watch()`. Frontend never calls this directly.
+    ///
+    /// # Test contract
+    /// Two concurrent first-time calls result in exactly one FSEvents
+    /// thread (test by inspecting thread-name count).
+    pub fn start_if_needed(&self) -> Result<(), WatcherError> {
+        todo!()
+    }
+
+    /// Register a new (agent, transcript) binding. Increments ref-count.
+    ///
+    /// # Inputs
+    /// `handle`: result of `TranscriptAdapter::discover_session`.
+    ///
+    /// # Returns
+    /// `WatchToken` to pass to `unwatch` for teardown.
+    ///
+    /// # Errors
+    /// - `WatcherError::GateRejected` if the handle's path no longer passes
+    ///   `fs_gate::check_transcript_root` (e.g. file removed between
+    ///   discovery and watch).
+    /// - `WatcherError::Io` on FSEvents subscribe failure.
+    ///
+    /// # Side effects
+    /// Calls `subscribe_fsevents`; increments internal ref-count; allocates
+    /// per-handle tailer state under `session-<pid>/contexts/.state.json`.
+    ///
+    /// # Invariants
+    /// After `Ok(token)`, the watcher is monitoring `handle.source_path` and
+    /// will route file events through the Tailer + Adapter pipeline.
+    ///
+    /// # Concurrency
+    /// Safe to call concurrently; internally serialized at the ref-count
+    /// and FSEvents-registry critical sections.
+    ///
+    /// # Lifecycle
+    /// One call per agent-opt-in-publish event. Token is owned by the
+    /// frontend (via Tauri IPC) and returned on unwatch.
+    ///
+    /// # Test contract
+    /// Two `watch` calls on the same `source_path` produce distinct
+    /// `WatchToken`s. Each token's `unwatch` decrements ref-count
+    /// independently.
+    pub fn watch(&self, handle: TranscriptHandle) -> Result<WatchToken, WatcherError> {
+        let _ = handle;
+        todo!()
+    }
+
+    /// Unregister a previously-issued token. Decrements ref-count.
+    ///
+    /// # Inputs
+    /// `token`: value returned by a prior `watch()`.
+    ///
+    /// # Returns
+    /// Unit. Unknown tokens are silently ignored (idempotent — Q6).
+    ///
+    /// # Errors
+    /// Cannot fail.
+    ///
+    /// # Side effects
+    /// Unsubscribes the FSEvents handle for the bound path if no other token
+    /// references it. Does NOT delete the mirror file in `contexts/`.
+    /// Does NOT drop the watcher instance even when ref-count hits zero
+    /// (per W1 + claude2 Q5 — the instance lives until `shutdown()`).
+    ///
+    /// # Invariants
+    /// After return, the token is invalid; passing it again is a no-op.
+    ///
+    /// # Concurrency
+    /// Safe to call concurrently with `watch`; internally serialized.
+    ///
+    /// # Lifecycle
+    /// Called from `AgentMiniTerminal`'s `useEffect` cleanup automatically
+    /// when the agent unmounts, irrespective of whether the user toggled
+    /// publish OFF first (Q6 — ref-count must auto-decrement on teardown).
+    ///
+    /// # Test contract
+    /// Calling `unwatch` twice with the same token is a no-op the second
+    /// time. After the last `unwatch` for a path, no further FSEvents
+    /// callbacks fire for that path.
+    pub fn unwatch(&self, token: WatchToken) {
+        let _ = token;
+        todo!()
+    }
+
+    /// Persist one normalized turn to `contexts/<agent>.jsonl`.
+    ///
+    /// # Inputs
+    /// - `token`: identifies which agent stream this turn belongs to.
+    /// - `turn`: the normalized record produced by an adapter.
+    ///
+    /// # Returns
+    /// `Ok(())` when the line is durable on disk.
+    ///
+    /// # Errors
+    /// - `WatcherError::Io` if write fails.
+    /// - `WatcherError::NotStarted` if the watcher has not been
+    ///   `start_if_needed`-ed.
+    ///
+    /// # Side effects
+    /// Atomic append: writes line via `memory.rs::write_memory_file_atomic`
+    /// pattern. May trigger `rotate_if_needed` if the active file crosses
+    /// the 8 MB cap after the append.
+    ///
+    /// # Invariants
+    /// Each line is one complete JSON record terminated by `\n`. Readers
+    /// never see a partial line.
+    ///
+    /// # Concurrency
+    /// One in-flight write per token; concurrent writes on the same token
+    /// are serialized internally.
+    ///
+    /// # Lifecycle
+    /// Called once per `Some(NormalizedTurn)` returned by `normalize`.
+    ///
+    /// # Test contract
+    /// Crash between writing the line and fsync MUST leave either the full
+    /// line or no line — never a partial line.
+    pub fn append_normalized_turn(
+        &self,
+        token: &WatchToken,
+        turn: NormalizedTurn,
+    ) -> Result<(), WatcherError> {
+        let _ = (token, turn);
+        todo!()
+    }
+
+    /// Rotate `contexts/<agent>.jsonl` if it exceeds the active-file cap.
+    ///
+    /// # Inputs
+    /// `token`: stream to check.
+    ///
+    /// # Returns
+    /// `Ok(())` whether rotation happened or not.
+    ///
+    /// # Errors
+    /// `WatcherError::Io` on rename/fsync failure.
+    ///
+    /// # Side effects
+    /// On rotation (size > `ACTIVE_FILE_BYTE_CAP`):
+    /// 1. Compute next N via `scan_archive_indices` (dir-listing — state
+    ///    cache is NOT authoritative for N, per T1).
+    /// 2. `fsync` current active.
+    /// 3. `rename` active → `<agent>.<N>.jsonl` (POSIX atomic).
+    /// 4. Create `<agent>.jsonl.tmp` empty; fsync; `rename` to active.
+    ///
+    /// # Invariants
+    /// After rotation, no reader sees a missing active file (atomic-rename
+    /// pattern from M2). The crash recovery rule: if active is absent on
+    /// startup but archives exist, do NOT auto-promote — next write creates
+    /// a fresh active. The brief read-side gap is accepted over double-rename
+    /// risk.
+    ///
+    /// # Concurrency
+    /// Rotation is mutually exclusive with appends on the same token.
+    ///
+    /// # Lifecycle
+    /// Called automatically by `append_normalized_turn` after each append.
+    /// Never called directly by frontend.
+    ///
+    /// # Test contract
+    /// Inducing a crash between step (3) and (4) above MUST leave the
+    /// archive present and the active missing — the recovery path's
+    /// "no auto-promote" rule MUST then create a fresh active on the
+    /// next write.
+    pub fn rotate_if_needed(&self, token: &WatchToken) -> Result<(), WatcherError> {
+        let _ = token;
+        todo!()
+    }
+
+    /// List the archive indices currently on disk for `agent_handle`.
+    ///
+    /// # Inputs
+    /// `agent_handle`: bare CT handle.
+    ///
+    /// # Returns
+    /// Sorted ascending vector of integer N values from existing
+    /// `contexts/<agent>.<N>.jsonl` files. Empty if no archives yet.
+    ///
+    /// # Errors
+    /// Cannot fail (returns empty vec on directory missing or read errors).
+    ///
+    /// # Side effects
+    /// One `readdir` on the contexts directory.
+    ///
+    /// # Invariants
+    /// AUTHORITATIVE for "next archive N" — must not be substituted by a
+    /// state-file cache (T1: state cache can lag a successful rename).
+    ///
+    /// # Concurrency
+    /// Thread-safe but subject to filesystem TOCTOU; callers performing
+    /// rotation hold the rotation lock for the full sequence.
+    ///
+    /// # Lifecycle
+    /// Called by `rotate_if_needed` immediately before the rename.
+    ///
+    /// # Test contract
+    /// Returns `[]` when no archives exist. Returns `[1, 2, 5]` when
+    /// `<agent>.{1,2,5}.jsonl` exist — gaps are preserved, not filled.
+    pub fn scan_archive_indices(&self, agent_handle: &str) -> Vec<u32> {
+        let _ = agent_handle;
+        todo!()
+    }
+
+    /// Drop the watcher: unsubscribe every FSEvents handle, stop the thread.
+    ///
+    /// # Inputs
+    /// None.
+    ///
+    /// # Returns
+    /// Unit.
+    ///
+    /// # Errors
+    /// Cannot fail (cleanup is best-effort; FSEvents un-subscribe errors
+    /// are logged and swallowed).
+    ///
+    /// # Side effects
+    /// Stops the notify thread, drops the watcher's internal collections,
+    /// invalidates all outstanding `WatchToken`s.
+    ///
+    /// # Invariants
+    /// After return, no further FSEvents callbacks fire. Outstanding tokens
+    /// passed to `unwatch` become silent no-ops.
+    ///
+    /// # Concurrency
+    /// Idempotent; safe to call multiple times.
+    ///
+    /// # Lifecycle
+    /// Hooked into Tauri's `RunEvent::Exit` (lib.rs:229 — defensive) and
+    /// `WindowEvent::Destroyed` (primary). NOT called from
+    /// `clear_stale_sessions` — that runs at app startup BEFORE the
+    /// watcher exists (W1 corrects M1 wording).
+    ///
+    /// # Test contract
+    /// Calling `shutdown()` then issuing a new `watch()` call returns
+    /// `WatcherError::NotStarted` until `start_if_needed` is called again.
+    pub fn shutdown(&self) {
+        todo!()
+    }
+}

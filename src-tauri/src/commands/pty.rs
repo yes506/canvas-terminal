@@ -95,6 +95,56 @@ const BASELINE_ENV_KEYS: &[&str] = &[
     "GIT_TERMINAL_PROMPT", "SSH_ASKPASS", "GIT_ASKPASS", "HOME",
 ];
 
+/// Apply caller-provided extra env vars AFTER the baseline.
+///
+/// Per K1 (cumulative reviewer fold): the prior shape `apply_baseline_env(cmd)`
+/// had no per-agent inputs; the peer-context-mirror feature needs
+/// `CT_AGENT_ID` + `CT_COLLAB_SESSION_ID` flowing in at spawn time. Rather
+/// than mutating the baseline function, the planner agreed to add this
+/// shared helper that both `spawn_process` and `spawn_shell` call AFTER
+/// `apply_baseline_env`. Caller-provided keys override baseline if they
+/// collide (per U4 DRY note — `spawn_process` should also migrate to call
+/// this helper instead of its inline merge loop during Phase 6).
+///
+/// # Inputs
+/// - `cmd`: builder to mutate.
+/// - `extra_env`: caller-provided merge set; `None` is a no-op.
+///
+/// # Returns
+/// Unit — mutation only.
+///
+/// # Errors
+/// Cannot fail.
+///
+/// # Side effects
+/// Sets each key on the builder. Empty map is a no-op.
+///
+/// # Invariants
+/// Caller-provided keys override baseline values when collisions occur
+/// (last-write wins; this helper runs AFTER apply_baseline_env per the
+/// call-site contract).
+///
+/// # Concurrency
+/// Mutates `cmd` only; thread-safe so long as `cmd` is not aliased.
+///
+/// # Lifecycle
+/// Called immediately after `apply_baseline_env` and before `apply_cwd`
+/// at each spawn site (`spawn_process`, `spawn_shell` — the latter after
+/// the Phase 6 signature change).
+///
+/// # Test contract
+/// Passing `Some({"FOO": "1"})` results in `cmd` having `FOO=1`. Passing
+/// `None` is observationally equivalent to not calling this function.
+/// Passing `Some({})` is a no-op.
+#[allow(dead_code)]
+fn apply_extra_env(
+    cmd: &mut CommandBuilder,
+    extra_env: Option<&std::collections::HashMap<String, String>>,
+) {
+    let _ = (cmd, extra_env);
+    todo!()
+}
+
 /// Apply CWD to a CommandBuilder if valid.
 fn apply_cwd(cmd: &mut CommandBuilder, cwd: &Option<String>) {
     if let Some(ref dir) = cwd {
