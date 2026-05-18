@@ -27,6 +27,11 @@ pub const ACTIVE_FILE_BYTE_CAP: u64 = 8 * 1024 * 1024;
 
 /// Stable across-restart identifier for a (PID, transcript file) binding.
 /// Returned by `TranscriptAdapter::discover_session`.
+///
+/// All fields are filed at binding-time and are immutable for the life of the
+/// handle. Mutable per-stream state that evolves with the source file (live
+/// inode after rotation, current byte offset) lives in `Tailer::TailState`,
+/// NOT here. See `source_inode` invariant below.
 pub struct TranscriptHandle {
     /// Bare CT handle — e.g. "claude3". Display layer adds `@` (W4).
     pub agent_handle: String,
@@ -34,12 +39,28 @@ pub struct TranscriptHandle {
     pub adapter_id: &'static str,
     /// Absolute path to the tool's native JSONL.
     pub source_path: PathBuf,
-    /// `lstat` inode at discovery; compared on resume to detect rotation
-    /// at the source (Claude Code `/clear`, Codex rollout switch).
+    /// `lstat` inode at discovery — **FROZEN at binding-time**. Compared
+    /// on resume to detect rotation at the source (Claude Code `/clear`,
+    /// Codex rollout switch). The LIVE inode after rotation is tracked by
+    /// `Tailer::TailState::inode`; post-bind callers MUST NOT re-read this
+    /// field. Resolves codex2 Major 6: rotation mutability lives in
+    /// TailState, not on the Handle.
     pub source_inode: u64,
     /// CLI process id — discovered via `lsof -p` (macOS) / `/proc/<pid>/fd`
     /// (Linux) one-time at session-bind (M8).
     pub pid: i32,
+    /// Session memory directory the Tailer writes its `.state.json` into.
+    /// Populated by `TranscriptWatcher::watch` from `memory::get_memory_dir()`
+    /// at watch-registration time — e.g.
+    /// `~/.cache/canvas-terminal/collab-memory/session-<pid>`.
+    ///
+    /// Invariant: Tailer state I/O (`resume_from_state`, `persist_offset`,
+    /// `handle_inode_change`) MUST write inside this directory, NEVER inside
+    /// `source_path`'s parent (the external transcript root is read-only by
+    /// the peer-context-mirror "one-way mirror" rule). Resolves claude2 B1 /
+    /// codex2 B2 / codex3 P0 — the prior implementer cycle reverted three
+    /// Tailer items because the trait offered no in-bounds writable path.
+    pub memory_dir: PathBuf,
 }
 
 /// Opaque registration token returned by `TranscriptWatcher::watch`. Passed
@@ -89,6 +110,13 @@ pub struct ContentBlockTable {
 /// One raw turn parsed from the native JSONL; pre-normalize.
 pub struct RawTurn {
     pub raw_payload: serde_json::Value,
+    /// **CHUNK-RELATIVE** offset — measured from the start of the `bytes`
+    /// slice that `TranscriptAdapter::parse_native_lines` was called with.
+    /// Callers (`Tailer` / `TranscriptWatcher`) MUST add their current
+    /// `TailState::byte_offset` to translate to an absolute file offset.
+    /// Adapters are stateless about their caller's accumulated file
+    /// position; the absolute-offset translation lives one layer up.
+    /// Resolves codex2 B4 / codex3 P1.
     pub source_offset: u64,
 }
 
@@ -277,6 +305,16 @@ pub trait TranscriptAdapter: Send + Sync {
     /// trailing lines are NOT consumed and will be re-presented on the next
     /// poll.
     ///
+    /// **`RawTurn.source_offset` is CHUNK-RELATIVE** — measured from the start
+    /// of the `bytes` slice passed in this call (not from the start of the
+    /// source file). Callers (`Tailer` / `TranscriptWatcher`) MUST add their
+    /// current `TailState::byte_offset` to obtain the absolute file offset
+    /// when persisting to `NormalizedTurn::source_offset`. The trait keeps
+    /// adapters stateless about their caller's accumulated file position;
+    /// the absolute-offset translation lives one layer up. Resolves codex2
+    /// B4 / codex3 P1 (chunk-relative-vs-absolute ambiguity that the prior
+    /// implementer cycle implemented but did not document).
+    ///
     /// # Errors
     /// Per-line parse failures are silent: malformed lines are skipped and
     /// their bytes are still marked consumed (otherwise we'd loop forever on
@@ -289,18 +327,26 @@ pub trait TranscriptAdapter: Send + Sync {
     /// # Invariants
     /// `consumed_bytes <= bytes.len()`. If `bytes` ends with a complete line
     /// (newline terminator), `consumed_bytes == bytes.len()`. If `bytes` is
-    /// empty, returns `(vec![], 0)`.
+    /// empty, returns `(vec![], 0)`. Each `RawTurn::source_offset` lies in
+    /// the half-open range `[0, consumed_bytes)` (chunk-relative; see
+    /// Returns).
     ///
     /// # Concurrency
     /// Pure; thread-safe.
     ///
     /// # Lifecycle
     /// Called by the Tailer after each `poll_new_bytes` returns non-empty.
+    /// The Tailer is responsible for adding its `byte_offset` to each
+    /// `RawTurn::source_offset` before forwarding to `normalize` /
+    /// `append_normalized_turn`.
     ///
     /// # Test contract
     /// Input ending with `"...partial` (no newline) MUST result in
     /// `consumed_bytes < bytes.len()` so the next poll re-reads. Malformed
-    /// JSON on line N MUST NOT prevent line N+1 from being parsed.
+    /// JSON on line N MUST NOT prevent line N+1 from being parsed. For a
+    /// two-line input where line 1 ends at byte 50 and line 2 ends at byte
+    /// 100, `RawTurn[0].source_offset` is 0 and `RawTurn[1].source_offset`
+    /// is 51 (chunk-start of each line) — NOT the absolute file offset.
     fn parse_native_lines(&self, bytes: &[u8]) -> (Vec<RawTurn>, usize);
 
     /// Convert a raw turn into a `NormalizedTurn` ready for mirroring.
