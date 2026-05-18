@@ -100,8 +100,25 @@ impl TranscriptAdapter for GeminiAdapter {
     /// dropped silently; the adapter still produces a `RawTurn` for the
     /// known fields.
     fn parse_native_lines(&self, bytes: &[u8]) -> (Vec<RawTurn>, usize) {
-        let _ = bytes;
-        todo!()
+        let mut turns = Vec::new();
+        let mut consumed: usize = 0;
+        let mut line_start: usize = 0;
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'\n' {
+                let line = &bytes[line_start..i];
+                if !line.is_empty() {
+                    if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(line) {
+                        turns.push(RawTurn {
+                            raw_payload: payload,
+                            source_offset: line_start as u64,
+                        });
+                    }
+                }
+                consumed = i + 1;
+                line_start = i + 1;
+            }
+        }
+        (turns, consumed)
     }
 
     /// Normalize one Gemini turn.
