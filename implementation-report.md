@@ -1,5 +1,18 @@
 # Implementation report — browser-localfile
 
+> **r2 update (commit `87f7179`)**: this report originally described
+> the merged impl at `439828d`. A post-merge review round caught
+> three convergent findings (one MEDIUM-HIGH security: macOS
+> canonicalize bypass of the C7 deny-prefix; one MEDIUM
+> defense-in-depth 4-way convergent: protocol handler not enforcing
+> strict C9 shape; one LOW robustness: filename CR/LF could panic
+> the spawned task). All three were fixed in `87f7179`. See the
+> "Post-merge fix round (`87f7179`)" section below for the diff,
+> tests, and updated validation snapshot. The "Validation" section
+> below still shows the original 14-test baseline; the post-fix
+> total is **20 cargo tests** (12 baseline + 2 from `91d0285` + 6
+> new from `87f7179`).
+
 ## Source
 
 - Planner marker: `system` from commit `d41d8cb` on `feat/browser-integration`
@@ -95,4 +108,133 @@ npm run build:      app:        ✓ built in 3.53s
 - Implementer worktree: `.worktrees/implementer-browser-localfile-61906-77933-24294`
 - Implementer branch: `implementer/browser-localfile-61906-77933-24294`
 - Impl commit: `91d0285`
-- Will land on `feat/browser-integration` as a merge commit with subject `(impl-system, human-confirmed)` on user `confirm merge`.
+- Impl-self-verification commit: `89bee49`
+- Merged to `feat/browser-integration` at `439828d` with marker `(impl-system, human-confirmed)`
+- **Post-merge fix commit: `87f7179`** (closes 3 reviewer findings — see next section)
+
+## Post-merge fix round (`87f7179`)
+
+After the merge, a 4-reviewer round produced three convergent
+findings — two security/defense-in-depth, one robustness. All
+were fixed in `87f7179` on top of `439828d` on
+`feat/browser-integration`. The audit trail is preserved in the
+fix commit's body; this section summarizes what changed.
+
+### Fix #1 — C7 deny-prefix bypass on macOS (MEDIUM-HIGH, security)
+
+**Findings**: codex2 r1 #1, codex3 r1 #1 (2-way convergent).
+claude2 and claude3 missed this in r1 (mea culpa documented in
+their r2 review files).
+
+**Bug**: `/etc` is a symlink to `/private/etc` and `/var` to
+`/private/var` on macOS. After `validate_picked_path`
+canonicalizes, a file under `/etc` becomes `/private/etc/...`,
+which **does not** match the raw `/etc` deny-prefix string. The
+pre-fix C7 enforcement was bypassable for the two most sensitive
+system roots on the only platform v1 supports.
+
+**Fix** (`src-tauri/src/commands/localfile.rs:build_deny_prefixes`):
+canonicalize each raw entry at runtime and append the canonical
+form alongside, skipping non-existent paths gracefully (Linux
+boxes where `/Library/Keychains` doesn't exist just keep the
+raw form). On macOS this adds `/private/etc`, `/private/var`,
+etc. The deny check now matches the canonical form of any
+picked path under those roots.
+
+**Tests added**:
+- `deny_prefix_list_includes_canonical_macos_symlinks` —
+  cross-platform-gated; asserts raw forms always present, and
+  on macOS asserts canonical forms also present.
+- `macos_etc_hosts_blocked_by_canonical_deny_prefix` —
+  end-to-end reject path; accepts either `"symlinks rejected"`
+  OR `"deny-prefix"` as a valid rejection reason.
+
+### Fix #2 — Protocol handler missing strict C9 shape check (MEDIUM, 4-way convergent)
+
+**Findings**: claude2 r1 M1, claude3 r1 O1, codex2 r1 #2,
+codex3 r1 #2 — strongest convergent signal in the cycle.
+
+**Bug**: `localfile_protocol_handler` only checked
+`token.is_empty()` after `trim_start_matches('/')`. A
+WebKit-initiated sub-resource fetch with shape
+`localfile://localhost/<valid-token>?evil=1` would have served
+(path matches, query ignored, registry lookup hit on the token).
+The handler docstring claimed strict shape enforcement; the
+code did not. The navigate IPC gate was the only enforcement
+point, and sub-resource fetches inside a loaded localfile page
+bypass it.
+
+**Fix** (`src-tauri/src/commands/localfile.rs:extract_localfile_token`,
+new helper called from `localfile_protocol_handler`):
+URI-level shape gate that requires host = `localhost`, no query,
+path = exactly `/<22-base64url-token>`. Symmetric with
+`validate_localfile_url_shape` (str-based, IPC-level) — both
+enforce C9 independently at their respective entry points.
+
+**Tests added**:
+- `extract_localfile_token_strict_shape` — 6 cases: allowed
+  shape; wrong host; query present; short token; multi-segment
+  path; empty token. All correctly return `None`.
+
+### Fix #3 — Content-Disposition CR/LF panic (LOW, robustness)
+
+**Finding**: codex3 r1 #3 (1-way).
+
+**Bug**: `disposition_for_mime` only replaced `"` with `_`. If
+a filename contained CR/LF/control bytes (rare but legal on
+Unix-like FS), `http::Response::builder().header(...)` would
+return `Err` and the `.expect()` in `build_localfile_response`
+would panic inside the spawned async task — crashing the
+protocol-handler task without surfacing an error.
+
+**Fix** (`src-tauri/src/commands/localfile.rs:disposition_for_mime`):
+filename sanitizer now replaces both `"` AND any `c.is_control()`
+char with `_` before formatting. Full RFC 5987 percent-encoding
+for non-ASCII names remains a v2 concern; this is
+panic-prevention only.
+
+**Tests added**:
+- `disposition_for_mime_sanitizes_control_chars` — verifies
+  CR/LF stripped AND resulting header value accepted by builder.
+- `disposition_for_mime_inline_classes` — covers the inline
+  path for text/image/pdf.
+- `validate_localfile_url_shape_basic` — symmetric coverage
+  with the new URI-level test.
+
+### Findings NOT addressed in this fix round (rationale)
+
+- **claude2 r1 M2** (greedy `trim_start_matches`) — unreachable
+  after Fix #2 (`extract_localfile_token` does strict path
+  validation).
+- **claude2 r1 M3** (case sensitivity of `localfile://localhost/`
+  prefix) — correct as-is; tokens are case-sensitive base64-url
+  and the scheme/host is canonical lowercase.
+- **claude3 r1 O2** (same-tab orphan tokens) — intentional per
+  F8 design (supports Back navigation within a localfile
+  sequence).
+- **claude3 r1 O3** (FS-gate integration tests) — partial close
+  via the 6 new unit tests; full integration coverage is a v2
+  follow-up.
+
+### Updated validation snapshot (post-`87f7179`)
+
+```
+cargo test --lib:   20/20 pass (was 14: 12 baseline + 2 from 91d0285
+                    + 6 new from 87f7179)
+npm test:           216/216 pass (unchanged)
+npm run build:      app + dashboard both clean
+git diff --check:   clean
+cargo check:        zero warnings (down from 13 unused-pub-item in
+                    the planner skeleton; cleared by .manage / .register
+                    / invoke_handler wiring)
+```
+
+### Reviewer convergence summary
+
+- Fix #1 (deny-prefix bypass): 2-way (codex2 + codex3) BLOCK
+  → resolved.
+- Fix #2 (handler shape): 4-way (claude2 + claude3 + codex2 +
+  codex3) → resolved.
+- Fix #3 (filename panic): 1-way (codex3) → resolved.
+- r2 of reviews: 4-way unanimous APPROVE. claude2 wrote
+  `task-31.done.json` with verdict `approve` and `round: 2`.
