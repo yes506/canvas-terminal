@@ -106,6 +106,13 @@ pub fn run() {
         .manage(DashboardInfo::new())
         .manage(state::BrowserTabsState::<tauri::Wry>::new())
         .manage(state::LocalFileTokenRegistry::new())
+        // Peer-context-mirror: TranscriptWatcher is single-instance per app
+        // per Q5; constructed dormant. start_if_needed lazily promotes it
+        // (first opt-in publish) so no FSEvents thread spins up on cold
+        // launches that don't use the feature. Shutdown lives in
+        // WindowEvent::Destroyed (primary) + RunEvent::Exit (defensive)
+        // below, matching the W1 lifecycle wording.
+        .manage(commands::transcripts::TranscriptWatcher::new())
         .register_asynchronous_uri_scheme_protocol(
             "localfile",
             commands::localfile::localfile_protocol_handler,
@@ -229,6 +236,13 @@ pub fn run() {
                 // Clean up temporary canvas files
                 let _ = commands::canvas::cleanup_snapshot();
                 let _ = commands::canvas::cleanup_import_file(None);
+                // Peer-context-mirror: tear down the transcript watcher
+                // (drop notify::RecommendedWatcher → stops FSEvents thread;
+                // invalidate outstanding WatchTokens; clear entries +
+                // parent_dir_refs). Primary teardown site per W1.
+                if let Some(tw) = window.try_state::<commands::transcripts::TranscriptWatcher>() {
+                    tw.shutdown();
+                }
                 // Wipe shared collaborator memory on window close
                 let _ = commands::memory::clear_memory_dir();
             }
@@ -249,6 +263,13 @@ pub fn run() {
                     &browser_state,
                     &localfile_registry,
                 );
+                // Peer-context-mirror: defensive shutdown for hard-quit
+                // paths where WindowEvent::Destroyed didn't fire (e.g.
+                // macOS Cmd-Q without traffic-light close first).
+                // shutdown() is idempotent so the double-call from both
+                // teardown hooks is safe.
+                let tw = app_handle.state::<commands::transcripts::TranscriptWatcher>();
+                tw.shutdown();
             }
         });
 }
