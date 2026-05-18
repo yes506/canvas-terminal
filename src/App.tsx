@@ -1,11 +1,14 @@
-import { useRef, useCallback, useEffect } from "react";
+import { useRef, useCallback, useEffect, useState } from "react";
 import { DrawingBoard } from "./components/canvas/DrawingBoard";
 import { Toolbar } from "./components/canvas/Toolbar";
 import { TerminalTabs } from "./components/terminal/TerminalTabs";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { BrowserDrawer } from "./components/browser/BrowserDrawer";
 import { useCanvasIntegration } from "./components/canvas/CanvasIntegration";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useCanvasStore } from "./stores/canvasStore";
+import { useBrowserStore } from "./stores/browserStore";
+import { clampDrawerWidth } from "./lib/drawerLayout";
 import { checkForUpdates } from "./lib/updater";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -15,7 +18,12 @@ import { invoke } from "@tauri-apps/api/core";
 export default function App() {
   const { exportToTerminal, importIntoCanvas, isWaitingForImport } = useCanvasIntegration();
   const drawerOpen = useCanvasStore((s) => s.drawerOpen);
+  const browserDrawerOpen = useBrowserStore((s) => s.drawerOpen);
+  const browserDrawerWidth = useBrowserStore((s) => s.drawerWidth);
   useKeyboardShortcuts();
+
+  const [containerWidth, setContainerWidth] = useState(0);
+  const [canvasWidth, setCanvasWidth] = useState(0);
 
   useEffect(() => {
     getVersion().then((version) => {
@@ -66,10 +74,17 @@ export default function App() {
 
     const onMouseMove = (ev: MouseEvent) => {
       if (!dragging.current || !containerRef.current || !canvasPanelRef.current) return;
-      const containerWidth = containerRef.current.getBoundingClientRect().width;
-      // Allow canvas to expand up to full width (minus 48px minimum for terminal visibility)
-      const newWidth = Math.max(280, Math.min(ev.clientX, containerWidth - 48));
+      const cw = containerRef.current.getBoundingClientRect().width;
+      const browserW = browserDrawerOpen ? browserDrawerWidth : 0;
+      // Shared two-drawer clamp (Phase-1 in-scope #10): reserve space for
+      // the right-side browser drawer + 48px terminal minimum.
+      const newWidth = clampDrawerWidth({
+        proposedWidth: ev.clientX,
+        containerWidth: cw,
+        siblingDrawerWidth: browserW,
+      });
       canvasPanelRef.current.style.width = `${newWidth}px`;
+      setCanvasWidth(newWidth);
     };
 
     const onMouseUp = () => {
@@ -80,7 +95,25 @@ export default function App() {
 
     document.addEventListener("mousemove", onMouseMove);
     document.addEventListener("mouseup", onMouseUp);
-  }, []);
+  }, [browserDrawerOpen, browserDrawerWidth]);
+
+  // Track container width + canvas panel width so the browser drawer's
+  // clamp math has accurate sibling-width info.
+  useEffect(() => {
+    const updateMeasurements = () => {
+      if (containerRef.current) {
+        setContainerWidth(containerRef.current.getBoundingClientRect().width);
+      }
+      if (canvasPanelRef.current && drawerOpen) {
+        setCanvasWidth(canvasPanelRef.current.getBoundingClientRect().width);
+      } else if (!drawerOpen) {
+        setCanvasWidth(0);
+      }
+    };
+    updateMeasurements();
+    window.addEventListener("resize", updateMeasurements);
+    return () => window.removeEventListener("resize", updateMeasurements);
+  }, [drawerOpen]);
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden" style={{ background: "transparent" }}>
@@ -119,6 +152,12 @@ export default function App() {
       <div className="flex-1 h-full min-w-0 bg-surface">
         <TerminalTabs />
       </div>
+
+      {/* Right-side browser drawer + its drag handle */}
+      <BrowserDrawer
+        canvasDrawerWidth={drawerOpen ? canvasWidth : 0}
+        containerWidth={containerWidth}
+      />
       </div>
     </div>
   );
