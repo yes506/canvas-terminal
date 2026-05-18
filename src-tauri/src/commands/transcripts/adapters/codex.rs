@@ -15,7 +15,7 @@
 
 use super::super::{
     ContentBlockTable, DiscoveryError, NormalizeContext, NormalizedTurn, RawTurn,
-    TranscriptAdapter, TranscriptHandle,
+    TranscriptAdapter, TranscriptHandle, TsSource, TurnRole, NORMALIZED_SCHEMA_VERSION,
 };
 
 pub const ADAPTER_VERSION: &str = "0.1.0";
@@ -135,7 +135,84 @@ impl TranscriptAdapter for CodexAdapter {
     /// `payload.text == "hello"` returns `Some` with `text_visible ==
     /// "hello"` and `role == User`.
     fn normalize(&self, raw: RawTurn, ctx: NormalizeContext<'_>) -> Option<NormalizedTurn> {
-        let _ = (raw, ctx);
-        todo!()
+        let v = &raw.raw_payload;
+
+        // Codex rollout lines are `{ timestamp, type, payload }`. The inner
+        // `payload.type` discriminates which conversational role/content
+        // this turn carries. Anything not in the visible-text set returns
+        // None (filtered per the inclusion table's exclude list:
+        // session_meta, reasoning_text, function_call, function_call_output,
+        // tool_call, tool_result, system_message).
+        let payload = v.get("payload")?;
+        let payload_type = payload.get("type").and_then(|t| t.as_str())?;
+
+        let (role, text_visible) = match payload_type {
+            "user_input" => {
+                // Per docstring test-contract: `payload.text == "hello"` →
+                // text_visible "hello", role User.
+                let text = payload.get("text").and_then(|x| x.as_str())?;
+                (TurnRole::User, text.to_string())
+            }
+            "response_item" => {
+                // Assistant response. The visible text lives at
+                // `payload.message.content[*]` where each entry is a
+                // typed block (the include path "response_item.message.text"
+                // names this nested shape). Block types other than `text`
+                // are excluded.
+                let content = payload
+                    .get("message")
+                    .and_then(|m| m.get("content"))?;
+                let mut out = String::new();
+                if let Some(arr) = content.as_array() {
+                    for block in arr {
+                        let btype = match block.get("type").and_then(|t| t.as_str()) {
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        if btype == "text" {
+                            if let Some(text) = block.get("text").and_then(|x| x.as_str()) {
+                                out.push_str(text);
+                            }
+                        }
+                    }
+                } else if let Some(s) = content.as_str() {
+                    // Some schema versions emit assistant text as a plain
+                    // string when the message contains only one text block.
+                    // Defensive (D2: best-effort field tolerance).
+                    out.push_str(s);
+                }
+                (TurnRole::Assistant, out)
+            }
+            // session_meta, reasoning_text, function_call, function_call_output,
+            // tool_call, tool_result, system_message — all explicitly excluded.
+            _ => return None,
+        };
+
+        if text_visible.is_empty() {
+            return None;
+        }
+
+        // Codex line format puts the timestamp at the TOP level (not inside
+        // payload). Per docstring: `ts_iso8601` from `v.timestamp` (ts_source
+        // = Tool), else CT-side fallback.
+        let (ts_iso8601, ts_source) = match v.get("timestamp").and_then(|t| t.as_str()) {
+            Some(t) => (t.to_string(), TsSource::Tool),
+            None => (super::synth_iso8601_now(), TsSource::Ct),
+        };
+
+        Some(NormalizedTurn {
+            normalized_schema_version: NORMALIZED_SCHEMA_VERSION,
+            source_tool: self.tool_id().to_string(),
+            source_tool_version: None,
+            adapter_version: ADAPTER_VERSION.to_string(),
+            agent_handle: ctx.agent_handle.to_string(),
+            ts_iso8601,
+            ts_source,
+            role,
+            text_visible,
+            turn_index: ctx.turn_index,
+            // Chunk-relative per the trait's touch-up D contract.
+            source_offset: raw.source_offset,
+        })
     }
 }

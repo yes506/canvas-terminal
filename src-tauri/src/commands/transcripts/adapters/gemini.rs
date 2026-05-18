@@ -16,7 +16,7 @@
 
 use super::super::{
     ContentBlockTable, DiscoveryError, NormalizeContext, NormalizedTurn, RawTurn,
-    TranscriptAdapter, TranscriptHandle,
+    TranscriptAdapter, TranscriptHandle, TsSource, TurnRole, NORMALIZED_SCHEMA_VERSION,
 };
 
 pub const ADAPTER_VERSION: &str = "0.1.0";
@@ -139,7 +139,70 @@ impl TranscriptAdapter for GeminiAdapter {
     /// `text` returns `Some` with `text_visible` containing ONLY the
     /// `text` parts (thoughts dropped).
     fn normalize(&self, raw: RawTurn, ctx: NormalizeContext<'_>) -> Option<NormalizedTurn> {
-        let _ = (raw, ctx);
-        todo!()
+        let v = &raw.raw_payload;
+
+        // First-line session header: `{ sessionId, projectHash, startTime,
+        // lastUpdated, kind }` — no `role`/`parts`. Per docstring test
+        // contract: first-line header turn returns None. The simplest
+        // discriminator is "missing `role` field" — header lines have none.
+        let role_str = v.get("role").and_then(|r| r.as_str())?;
+        let role = match role_str {
+            "user" => TurnRole::User,
+            "model" => TurnRole::Assistant,
+            // Future Gemini versions may add new roles (e.g. "function" for
+            // tool invocations). Per D2 (best-effort field tolerance), unknown
+            // roles return None rather than panic — the watcher's
+            // turn_index still increments, so consumers detect gaps via
+            // non-contiguous indices.
+            _ => return None,
+        };
+
+        // Per-turn shape: `parts: [{ text: "..." }, { thoughts: "..." }, ...]`.
+        // Each part has a single typed key. Filter to `text` only; drop
+        // `thoughts` (Gemini's reasoning-trace equivalent of Claude's
+        // `thinking`) and function_call / function_response / tool blocks.
+        let parts = v.get("parts").and_then(|p| p.as_array())?;
+        let mut text_visible = String::new();
+        for part in parts {
+            // A part with `.text` is the visible-text variant. Inspect for
+            // the key, ignore other variants per the inclusion table.
+            if let Some(text) = part.get("text").and_then(|x| x.as_str()) {
+                text_visible.push_str(text);
+            }
+            // Future-tolerant: any other top-level key on a part (thought,
+            // functionCall, functionResponse, ...) is silently skipped per
+            // D2's "schema-version drift: unknown fields dropped".
+        }
+
+        if text_visible.is_empty() {
+            return None;
+        }
+
+        // Gemini schema: timestamp may live at `timestamp` (per-turn) OR
+        // `startTime` (some schema versions emit only on session header but
+        // others repeat per turn). Check both, in that order.
+        let (ts_iso8601, ts_source) = match v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .or_else(|| v.get("startTime").and_then(|t| t.as_str()))
+        {
+            Some(t) => (t.to_string(), TsSource::Tool),
+            None => (super::synth_iso8601_now(), TsSource::Ct),
+        };
+
+        Some(NormalizedTurn {
+            normalized_schema_version: NORMALIZED_SCHEMA_VERSION,
+            source_tool: self.tool_id().to_string(),
+            source_tool_version: None,
+            adapter_version: ADAPTER_VERSION.to_string(),
+            agent_handle: ctx.agent_handle.to_string(),
+            ts_iso8601,
+            ts_source,
+            role,
+            text_visible,
+            turn_index: ctx.turn_index,
+            // Chunk-relative per the trait's touch-up D contract.
+            source_offset: raw.source_offset,
+        })
     }
 }

@@ -13,7 +13,7 @@
 
 use super::super::{
     ContentBlockTable, DiscoveryError, NormalizeContext, NormalizedTurn, RawTurn,
-    TranscriptAdapter, TranscriptHandle,
+    TranscriptAdapter, TranscriptHandle, TsSource, TurnRole, NORMALIZED_SCHEMA_VERSION,
 };
 
 /// Bumped when normalization rules or the inclusion table change. Independent
@@ -168,7 +168,69 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
     /// `role` is set from the top-level `type` field (`"user"` → User,
     /// `"assistant"` → Assistant).
     fn normalize(&self, raw: RawTurn, ctx: NormalizeContext<'_>) -> Option<NormalizedTurn> {
-        let _ = (raw, ctx);
-        todo!()
+        let v = &raw.raw_payload;
+
+        // Top-level `type` discriminates the turn role. Anything that isn't
+        // "user"/"assistant" (e.g. "summary") is filtered — those carry no
+        // mirror-able conversational content.
+        let role = match v.get("type").and_then(|t| t.as_str())? {
+            "user" => TurnRole::User,
+            "assistant" => TurnRole::Assistant,
+            _ => return None,
+        };
+
+        // Extract text content. User turns often arrive as `message.content:
+        // "<plain text>"`; assistant turns use the block-array form. Both
+        // shapes coexist in the same JSONL stream so we handle both.
+        let content = v.get("message").and_then(|m| m.get("content"))?;
+        let text_visible = if let Some(s) = content.as_str() {
+            s.to_string()
+        } else if let Some(arr) = content.as_array() {
+            let mut out = String::new();
+            for block in arr {
+                let btype = match block.get("type").and_then(|t| t.as_str()) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                // Apply the inclusion table — only `text` blocks propagate
+                // per R4. Excluded types (`thinking`, `tool_use`, etc.) are
+                // skipped silently; M6 says empty-after-filter turns return
+                // None (the trait contract).
+                if INCLUSION_TABLE.include.iter().any(|t| *t == btype) {
+                    if let Some(text) = block.get(btype).and_then(|x| x.as_str()) {
+                        out.push_str(text);
+                    }
+                }
+            }
+            out
+        } else {
+            return None;
+        };
+
+        if text_visible.is_empty() {
+            return None;
+        }
+
+        let (ts_iso8601, ts_source) = match v.get("timestamp").and_then(|t| t.as_str()) {
+            Some(t) => (t.to_string(), TsSource::Tool),
+            None => (super::synth_iso8601_now(), TsSource::Ct),
+        };
+
+        Some(NormalizedTurn {
+            normalized_schema_version: NORMALIZED_SCHEMA_VERSION,
+            source_tool: self.tool_id().to_string(),
+            source_tool_version: None,
+            adapter_version: ADAPTER_VERSION.to_string(),
+            agent_handle: ctx.agent_handle.to_string(),
+            ts_iso8601,
+            ts_source,
+            role,
+            text_visible,
+            turn_index: ctx.turn_index,
+            // Chunk-relative per the trait's touch-up D contract; the
+            // caller (TranscriptWatcher / Tailer) adds the current
+            // TailState.byte_offset to obtain the absolute file offset.
+            source_offset: raw.source_offset,
+        })
     }
 }
