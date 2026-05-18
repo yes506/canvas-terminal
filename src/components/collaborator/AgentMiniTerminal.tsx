@@ -97,6 +97,16 @@ export function AgentMiniTerminal({
   const imeOverlayRef = useRef<HTMLSpanElement | null>(null);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disposed = useRef(false);
+  // Monotonic per-effect-run counter. Each useEffect entry bumps this and
+  // captures the new value in a closure-local `runId`; async paths inside
+  // that effect verify `initRunRef.current === runId` (via `isCurrentRun()`)
+  // before touching shared state. Defeats the React.StrictMode double-mount
+  // race that, without this guard, lets Mount #1's stale async closures
+  // run their post-await side effects (notably `addAgent`) AFTER Mount #2
+  // has reset `disposed.current = false` for its own run — producing
+  // duplicate SpawnedAgent records under the same `sessionId`. Restores
+  // the pattern collaterally removed by 69ca18b ("Revert worktree feature").
+  const initRunRef = useRef(0);
   const [focused, setFocused] = useState(false);
   // Inline-rename state for the header label. `editing === false` shows the
   // <span>; `editing === true` shows an <input value={draft}>. The store action
@@ -107,7 +117,13 @@ export function AgentMiniTerminal({
   const renameInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
+    // Bump-and-capture the per-run id BEFORE resetting `disposed.current`.
+    // Order matters: if cleanup #1 fires before this effect run starts,
+    // Mount #1's closures (captured against the prior runId) see the bumped
+    // value and bail; the disposed-flag reset below only affects new closures.
+    const runId = ++initRunRef.current;
     disposed.current = false;
+    const isCurrentRun = () => !disposed.current && initRunRef.current === runId;
 
     const initTerminal = async () => {
       if (!termRef.current || terminalRef.current) return;
@@ -162,12 +178,12 @@ export function AgentMiniTerminal({
           buf.baseY - buf.viewportY <= 2 ||
           document.activeElement === terminal.textarea;
         terminal.write(payload, () => {
-          if (disposed.current) return;
+          if (!isCurrentRun()) return;
           if (shouldFollow) terminal.scrollToBottom();
         });
       };
 
-      if (disposed.current) {
+      if (!isCurrentRun()) {
         terminal.dispose();
         return;
       }
@@ -205,14 +221,14 @@ export function AgentMiniTerminal({
       unlistenDataRef.current = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
           }
         },
       );
 
-      if (disposed.current) {
+      if (!isCurrentRun()) {
         unlistenDataRef.current?.();
         observer.disconnect();
         terminal.dispose();
@@ -227,7 +243,9 @@ export function AgentMiniTerminal({
         `pty-exit-${sessionId}`,
         () => {
           void handlePtyExit({
-            disposed: disposed.current,
+            // Use !isCurrentRun() so Mount #1's stale pty-exit listener bails
+            // when it fires after Mount #2 has reset disposed.current = false.
+            disposed: !isCurrentRun(),
             capture: captureRef.current,
             writeProcessExitedLine: () =>
               writeWithFollowBottom("\r\n\x1b[33m[Process exited]\x1b[0m\r\n"),
@@ -237,7 +255,7 @@ export function AgentMiniTerminal({
         },
       );
 
-      if (disposed.current) {
+      if (!isCurrentRun()) {
         unlistenDataRef.current?.();
         unlistenExitRef.current?.();
         observer.disconnect();
@@ -271,7 +289,7 @@ export function AgentMiniTerminal({
             login: !isEnvBootstrapped(),
           });
         } catch (shellErr) {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             writeWithFollowBottom(
               `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
             );
@@ -280,7 +298,7 @@ export function AgentMiniTerminal({
         }
       }
 
-      if (disposed.current) return;
+      if (!isCurrentRun()) return;
 
       // Let app-level shortcuts bubble past xterm
       terminal.attachCustomKeyEventHandler((e) => {
@@ -560,7 +578,7 @@ export function AgentMiniTerminal({
 
       // Forward user keystrokes to PTY
       terminal.onData((data) => {
-        if (disposed.current) return;
+        if (!isCurrentRun()) return;
         invoke("write_to_pty", { sessionId, data }).catch(() => {});
         // S2 fix: user typing is explicit "I want to see the prompt" intent.
         // Always snap to bottom on input — prevents the case where the user
@@ -577,7 +595,7 @@ export function AgentMiniTerminal({
       terminal.textarea?.addEventListener("focus", () => {
         setFocused(true);
         requestAnimationFrame(() => {
-          if (!disposed.current && document.activeElement === terminal.textarea) {
+          if (isCurrentRun() && document.activeElement === terminal.textarea) {
             terminal.scrollToBottom();
           }
         });
@@ -599,6 +617,15 @@ export function AgentMiniTerminal({
       // Register in store as "spawning" — not ready for messages yet.
       // The readiness detector below will set status to "running" and flush
       // any queued messages once the CLI tool's prompt appears.
+      //
+      // CRITICAL guard: only the current effect-run may push the agent
+      // record. Without this check, Mount #1's stale async closure (still
+      // mid-await on its spawn IPC when StrictMode unmounts) reaches this
+      // line AFTER Mount #2 has reset disposed.current = false, and both
+      // mounts' addAgent calls land — producing two SpawnedAgent records
+      // with the same sessionId. The 69ca18b revert collaterally removed
+      // this guard; this is its restoration.
+      if (!isCurrentRun()) return;
       useCollaboratorStore.getState().addAgent({
         sessionId,
         tool: tool.id,
@@ -621,7 +648,7 @@ export function AgentMiniTerminal({
       const READY_BUF_MAX = 200;
       // Also use a fallback timer in case prompt pattern isn't matched
       readyTimeoutRef.current = setTimeout(() => {
-        if (!readyDetected && !disposed.current) {
+        if (!readyDetected && isCurrentRun()) {
           readyDetected = true;
           const store = useCollaboratorStore.getState();
           store.setAgentStatus(sessionId, "running");
@@ -650,7 +677,7 @@ export function AgentMiniTerminal({
       unlistenDataRef.current = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
             checkReady(event.payload);
@@ -663,10 +690,10 @@ export function AgentMiniTerminal({
       // Handle resize
       let resizeTimer: ReturnType<typeof setTimeout> | null = null;
       terminal.onResize(({ cols, rows }) => {
-        if (disposed.current) return;
+        if (!isCurrentRun()) return;
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             invoke("resize_pty", { sessionId, cols, rows }).catch(() => {});
           }
         }, 80);

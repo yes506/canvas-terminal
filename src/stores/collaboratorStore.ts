@@ -1269,6 +1269,19 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   // -- Agent lifecycle ----------------------------------------------------
 
   addAgent: (raw) => {
+    // Idempotent on sessionId. Defense in depth against any caller that
+    // double-fires `addAgent` for the same sessionId — most notably the
+    // React.StrictMode double-mount race in AgentMiniTerminal, which the
+    // component's runId guard now catches directly (see AgentMiniTerminal
+    // `isCurrentRun()`). This early-return is a belt-and-suspenders so a
+    // future re-entrant caller can't slip past the component-level guard
+    // and corrupt the store. sessionId is mint-once per spawn at the
+    // parent (CollaboratorPanel); legitimate re-adds don't occur in the
+    // current call graph. Skipping the duplicate also avoids burning an
+    // extra `nextOrdinal` slot, which would create a numbering gap.
+    if (get().agents.some((a) => a.sessionId === raw.sessionId)) {
+      return;
+    }
     const ordinal = nextOrdinal(raw.collabSessionId, raw.tool);
     const short = toolShortName(raw.tool);
     const initialNickname = `${toolLabel(raw.tool)} #${ordinal}`;
