@@ -114,10 +114,11 @@ pub fn poll_new_bytes(handle: &TranscriptHandle, offset: u64) -> Result<Vec<u8>,
     let lstat = file.metadata().map_err(WatcherError::Io)?;
     let current_inode = lstat.ino();
     if current_inode != handle.source_inode {
-        return Err(WatcherError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "inode mismatch — caller must handle_inode_change",
-        )));
+        // R2: source-file rotation. Return the typed SourceRotation
+        // variant so `watcher::on_fs_event` can distinguish this from
+        // other I/O errors and route into `handle_inode_change` for
+        // rebind-and-retry instead of the catch-all swallow-and-wait.
+        return Err(WatcherError::SourceRotation);
     }
     let size = lstat.len();
     if offset >= size {
