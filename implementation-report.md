@@ -1,39 +1,43 @@
-# Implementation report — peer-context-mirror (post-review revision)
+# Implementation report — peer-context-mirror (session 2 — post-touchup)
 
 ## Source
-- Planner marker: `system` from commit `e3a132e`
-- Planner artifacts: `architecture.html` + `architecture.mmd` (both on `dev`)
+- Planner marker (original): `system` from commit `e3a132e` (interfaces only, human-confirmed)
+- Planner marker (touch-up): `feature` from commit `bffb828` (plan-feature, human-confirmed) — merged into this implementer branch via `cb6...` chore commit so `TranscriptHandle.memory_dir` (delta A) and `spawn_shell::extra_env` (delta B) are now visible to the implementer
+- Planner artifacts: `architecture.html` + `architecture.mmd` (system) + `plan.md` + `plan.mmd` (touch-up) — all on `dev`
 - Plan ingestion: `~/.cache/canvas-terminal/collab-memory/session-2103/task-24-claude1-context-sharing-plan.md` (56-delta fold-in matrix, 4 review rounds × 4 reviewers)
-- Peer reviews folded this revision: claude2 B1+B2+B3, claude3 I1+I2, codex2 Blockers 2-3, codex3 P0×2 + P1×2
+- Peer reviews folded across the planner+implementer cycles: claude2 B1+B2+B3, claude3 I1+I2, codex2 Blockers 2-3 + Major 6 + B4, codex3 P0×2 + P1×2, claude3 task-2 N1+N2 (touch-up)
 
-## Status: **partial completion — recommend `keep`**
+## Status: **partial completion (session 2) — recommend `keep`**
 
-Validation passes (cargo check + tsc --noEmit + test fixture all green),
-but only 9 of 37 methods carry real bodies. Earlier pass claimed 12,
-but post-review revealed 3 of those (Tailer state I/O) had a critical
-correctness bug (B1/P0: wrote `.state.json` into external transcript
-dirs). Those 3 were reverted to `todo!()` with a planner-gap note.
+Validation passes (`cargo check` + test fixture both green), now with
+**12 of 37 methods carrying real bodies** (up from 9 in session 1).
+The 3 Tailer state-I/O items the prior cycle reverted are now
+re-implemented using `TranscriptHandle::memory_dir` from the planner
+touch-up. 25 items remain stubbed across non-Tailer clusters.
 
 ## Work queue summary
 
 - Total items: 37
-- **Completed (real bodies, post-review-verified)**: 9
-- **Stubbed (`todo!()` / `throw`)**: 28
-- **Reverted post-review**: 3 (Tailer state I/O — needs planner gap fix before re-impl)
+- **Completed (real bodies, post-review-verified)**: 12 (was 9 in session 1; +3 this session)
+- **Stubbed (`todo!()` / `throw`)**: 25 (was 28 in session 1)
+- **Reverted post-review**: 0 (was 3 in session 1 — all 3 re-implemented post-touch-up)
 
-## Items completed (9)
+## Items completed (12)
 
 | # | Method | File | Post-review state |
 |---|---|---|---|
 | 1 | `canonicalize_no_symlinks` | `commands/fs_safety/mod.rs` | **P0 fix** — walks original path before canonicalize |
 | 2 | `add_private_alias` | `commands/fs_safety/mod.rs` | clean |
 | 3 | `reject_symlink_in_walk` | `commands/fs_safety/mod.rs` | clean |
-| 4 | `pty::apply_extra_env` | `commands/pty.rs` | helper exists; not yet wired to callers (B3/I3 deferred) |
+| 4 | `pty::apply_extra_env` | `commands/pty.rs` | helper exists; `spawn_shell` body wiring is the next item-type owner (now unblocked by touch-up delta B) |
 | 5 | `check_transcript_root` | `commands/transcripts/fs_gate.rs` | **P1 fix** — root canonicalized before comparison |
 | 6 | `Tailer::poll_new_bytes` | `commands/transcripts/tailer.rs` | kept (no state I/O — operates on source path only) |
-| 7 | `ClaudeCodeAdapter::parse_native_lines` | `adapters/claude_code.rs` | chunk-relative offsets (callers add base — see note B4 below) |
+| 7 | `ClaudeCodeAdapter::parse_native_lines` | `adapters/claude_code.rs` | chunk-relative offsets per touch-up D contract |
 | 8 | `CodexAdapter::parse_native_lines` | `adapters/codex.rs` | same |
 | 9 | `GeminiAdapter::parse_native_lines` | `adapters/gemini.rs` | same |
+| 10 | `Tailer::resume_from_state` | `commands/transcripts/tailer.rs` | **NEW (session 2)** — uses `handle.memory_dir` (touch-up A); fresh state on missing source / inode mismatch |
+| 11 | `Tailer::persist_offset` | `commands/transcripts/tailer.rs` | **NEW (session 2)** — atomic-rename via `memory::write_memory_file_atomic`; map keyed by `state.path` per docstring |
+| 12 | `Tailer::handle_inode_change` | `commands/transcripts/tailer.rs` | **NEW (session 2)** — re-stat, fresh TailState, persist immediately to defend resume across crash |
 
 ## Post-review fixes applied this revision
 
@@ -82,7 +86,7 @@ change). Test fixture now compiles and **passes (1/1)**.
 - All comments still mention the test fixture by file path
 **CI grep now returns 0 matches.**
 
-## Items NOT implemented (28) — grouped by integration surface
+## Items NOT implemented (25) — grouped by integration surface
 
 ### Cluster A — adapter `discover_session` × 3 (requires lsof / `/proc/<pid>/fd`)
 ### Cluster B — adapter `normalize` × 3 (schema-specific filtering)
@@ -92,7 +96,7 @@ change). Test fixture now compiles and **passes (1/1)**.
 ### Cluster F — frontend reservation API × 3 (`collaboratorStore` integration)
 ### Cluster G — React component × 3 (hooks, useEffect, lifecycle)
 ### Cluster H — `AgentMiniTerminal` useEffect cleanup × 1
-### Cluster X — Tailer state I/O × 3 (reverted; awaits planner touch-up)
+### Cluster X — Tailer state I/O × 3 — ✅ **CLOSED in session 2 (b484621)**
 
 ## Items deferred to follow-up implementer cycle
 
@@ -112,18 +116,24 @@ land before the feature is merge-ready:
 
 ## Validation
 
-- Baseline exit (BASE_BRANCH HEAD): 0
-- Final validation command: `cargo check --manifest-path src-tauri/Cargo.toml && cargo test --test transcript_adapter_contract --manifest-path src-tauri/Cargo.toml && npx tsc --noEmit`
+### Session 2 (post-touch-up)
+- Baseline exit (BASE_BRANCH HEAD post-touchup `bffb828`): 0
+- Final validation command: `cargo check --manifest-path src-tauri/Cargo.toml && cargo test --test transcript_adapter_contract --manifest-path src-tauri/Cargo.toml`
 - Final exit: 0
 - Auto-fix attempts used: 0 / 3
 - cargo check tail:
   ```
-  warning: `canvas-terminal` (lib) generated 32 warnings
-      Finished `dev` profile target(s) in 7.66s
+  warning: `canvas-terminal` (lib) generated 36 warnings
+      Finished `dev` profile target(s) in 2.36s
   ```
-  (32 dead-code warnings — down from 42 after Tailer revert; expected.)
-- Test fixture: `1 passed; 0 failed`
-- `git grep -l -i aider -- 'src-tauri/src/**' 'src/**'` → 0 lines
+  (36 dead-code warnings — down from 41 because the 3 Tailer items are no longer dead-code; expected.)
+- Test fixture: `1 passed; 0 failed` (`transcript_adapter_contract::fixture_implements_trait`)
+- `git grep -l -i aider -- 'src-tauri/src/**' 'src/**'` → 0 lines (unchanged from session 1)
+
+### Session 1 (pre-touch-up, historical)
+- Final exit: 0
+- 32 dead-code warnings — down from 42 after Tailer revert
+- Test fixture: 1 passed
 
 ## Scope-discipline self-check
 
@@ -140,21 +150,74 @@ land before the feature is merge-ready:
 ## Commits on `implementer/peer-context-mirror-98411-57153-16414`
 
 ```
+b484621 feat(implementer): items 13-15 — Tailer state I/O (peer-context-mirror)  ← SESSION 2
+<merge> chore(implementer): merge planner touch-up bffb828 into branch          ← SESSION 2
+8f3f760 docs(implementer): post-review report revision (9 real / 28 stubbed / 3 reverted)
 be335f1 fix(implementer): fold post-review P0/P1 corrections from peer reviews
 d2803c4 docs(implementer): self-verification report — partial (12/37 items)
 7870575 feat(implementer): items 10-12 — TranscriptAdapter::parse_native_lines for claude_code/codex/gemini
 6d8aaf7 feat(implementer): items 1-9 for peer-context-mirror
 ```
 
+## Session 2 — touch-up consumption + Tailer cluster (this revision)
+
+The four-reviewer peer review of session 1 (claude2 B1+B2, claude3 I1+I2,
+codex2 Blockers 2-3 + Major 6 + B4, codex3 P0×2 + P1×2) surfaced four
+**planner-skeleton** gaps that no body-implementation could close under
+scope discipline:
+
+- Tailer state I/O had no in-bounds writable path (needed `memory_dir`)
+- `spawn_shell` couldn't propagate `extra_env` at PTY spawn (no parameter)
+- `TranscriptHandle::source_inode` mutability for rotation was unclear
+- `RawTurn::source_offset` chunk-relative semantics were undocumented
+
+The user ran `/codebase-planner` for a touch-up that landed all four
+deltas on `dev` at `bffb828` with marker `(plan-feature, human-confirmed)`.
+This session (2) then:
+
+1. Merged the touch-up into this implementer branch (no conflicts — touch-up
+   is additive on `TranscriptHandle` shape + `spawn_shell` signature; the
+   9 session-1 real items don't reference either changed surface).
+2. Re-implemented the 3 reverted Tailer items using `handle.memory_dir`:
+   - `resume_from_state` reads the multi-agent map from
+     `<memory_dir>/contexts/.state.json`, validates stored inode against
+     current `lstat`, resets to a fresh state on mismatch or on
+     source-file-not-yet-created (Codex creates the rollout JSONL only on
+     first model call, not at session-bind).
+   - `persist_offset` does read-modify-write of the map, atomic-rename via
+     `memory::write_memory_file_atomic` (which already carries
+     `O_NOFOLLOW` + TOCTOU re-check + fsync from session 1's review).
+   - `handle_inode_change` re-stats the source, builds a fresh `TailState`
+     with the new inode + `byte_offset: 0`, persists immediately so a
+     crash before the next poll can't mis-resume from stale state.
+3. Recorded the partial work-queue state in `.implementer-state.json`
+   (which the prior cycle had not populated to spec) so a future session
+   can extract the remaining 25-item queue cleanly.
+
+### What this session did NOT do
+
+- The remaining 25 items across clusters A–H stay stubbed. The user
+  selected option 2 ("phase by subsystem") so subsequent
+  `/codebase-implementer` cycles will pick them up.
+- No body-wiring of `spawn_shell::extra_env` — that's item-type
+  "non-Tailer cluster" and belongs to a subsequent session.
+- No frontend changes — TS clusters E/F/G/H are deferred.
+- No merge to `dev`. Phase 6 should resolve to `keep` again until the
+  remaining clusters land (or the user makes a different call).
+
 ## Recommended response at Phase 6
 
-**`keep`** — still the right call.
+**`keep`** — still the right call for session 2.
 
-Reviewers' consensus (4/4): do NOT merge.
-- 9 real implementations are now post-review-verified (P0 symlink order + P1 fs_gate root canonicalization both folded).
-- Test fixture proves trait extensibility (compile + pass).
-- 28 stubs panic at runtime (acceptable as long as runtime callers don't exercise them; not wired to call sites yet).
-- 3 Tailer methods explicitly blocked on a **planner gap** (memory_dir access) — re-implementing requires the planner to land an additive `memory_dir` field on `TranscriptHandle` first.
+Updated reasoning (session 2):
+- **12 real implementations** are now post-review-verified — session 1's 9 plus session 2's 3 Tailer state-I/O items, all unblocked by the touch-up at `bffb828`.
+- Test fixture continues to prove trait extensibility (compile + pass).
+- **25 stubs** panic at runtime — acceptable as long as runtime callers don't exercise them; the runtime call graph (frontend → TranscriptWatcher::watch → adapter.discover_session → tailer poll loop) does not yet have a call site that reaches the stubs.
+- **0 reverted items** — the planner touch-up's `memory_dir` field closed the prior blocker cleanly.
+
+Why still `keep` and not `confirm merge`:
+- Merging now would land 12-of-37 items on `dev` with `(impl-system, human-confirmed)`; that's incomplete per the marker contract (which signals "the whole planner handoff is implemented"). Better to phase: subsequent sessions add clusters A–H, then a single merge lands the full system implementation.
+- Each cluster has its own complexity (notify-crate threading, lsof PID→fd cross-platform, Tauri State<>, React hooks) that warrants its own peer-review cycle.
 
 A follow-up implementer cycle should:
 1. **First** run `/codebase-planner` for a small touch-up: add
