@@ -4,7 +4,7 @@
 
 **A canvas-first terminal where you and multiple AI CLIs think together as one collective.**
 
-Canvas Terminal is built around a single idea: **collective intelligence**. Sketch a diagram once and route the same picture to one agent or every agent in the workspace. Spawn Claude Code, Codex CLI, Gemini CLI, and Copilot CLI side by side, route tasks between them, and let them share memory through a common workspace — so what would be four separate chat windows becomes one coordinated system. Drop an image or `.md` file directly to insert it; PDF, DOCX, XLSX, CSV, and HWP files come in via the toolbar's Insert File button. Open the Collaborator pane to launch multiple agent terminals and coordinate them with shared task and memory files — no copy-paste, no file juggling.
+Canvas Terminal is built around a single idea: **collective intelligence**. Sketch a diagram once and route the same picture to one agent or every agent in the workspace. Spawn Claude Code, Codex CLI, Gemini CLI, and Copilot CLI side by side, route tasks between them, and let them share memory through a common workspace — so what would be four separate chat windows becomes one coordinated system. Drop an image or `.md` file directly to insert it; PDF, DOCX, XLSX, CSV, and HWP files come in via the toolbar's Insert File button. Open the Collaborator pane to launch multiple agent terminals, or open the built-in browser drawer to keep web pages and local reference files beside the terminal and canvas — no copy-paste, no file juggling.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
@@ -175,6 +175,11 @@ The human stays the conductor. Canvas Terminal does not replace human judgment �
 - **Canvas routing for agents** — `/canvas-export` and `/canvas-import` work directly with spawned collaborators
 - **Document round-trip** — Markdown, SVG, HTML, PNG/JPEG, and plain text render back onto the canvas
 
+**Built-in browsing**
+- **Right-side browser drawer** — keep web references beside the terminal and canvas without leaving the app
+- **Browser tabs** — create, switch, close, and preserve up to 10 independent browser tabs
+- **Local file viewing** — open files through a native picker with tab-scoped `localfile://` URLs instead of raw `file://` access
+
 ---
 
 ## Canvas-to-Terminal Integration
@@ -236,6 +241,19 @@ The collaborator is the runtime of Collective Intelligence — a PTY-backed mult
 - **Agent output capture** — strips ANSI sequences and appends readable output to the collaboration log
 - **Canvas-aware commands** — export the current drawing to one or many agents and import an agent-generated response back into the canvas
 - **Prompt ergonomics** — history navigation, multi-line input with `Shift+Enter`, `@mention` autocomplete, and a target selector for untargeted prompts
+
+### Built-in Browser
+
+The browser is a right-side drawer for web and local-file reference material. It is built on Tauri child webviews, so pages sit beside the terminal and canvas instead of opening in an external app.
+
+- **Quick toggle** — open or close the browser from the tab bar, native menu, or **Cmd+Shift+B**
+- **Resizable drawer** — drag the divider; the app remembers the drawer width
+- **Chrome-like tabs** — create, close, and switch between up to 10 independent browser tabs
+- **Address bar** — accepts `http://`, `https://`, `about:blank`, and scheme-less inputs that normalize to HTTPS
+- **Navigation controls** — open local file, back, forward, reload, stop, loading indicator, page title, and per-tab error display
+- **State preservation** — inactive tabs and closed drawers hide webviews off-screen so tab state is preserved while the app is running
+- **Session restore** — remembers the last browser URL and seeds it when the drawer opens again
+- **Safer local files** — local files open through a native picker and tab-scoped `localfile://localhost/<token>` URLs; direct `file://` navigation is blocked
 
 ### Canvas
 
@@ -358,6 +376,7 @@ These files are designed for agent-to-agent handoff and are protected by path va
 | Cmd+= / Cmd+- | Font zoom in / out |
 | Cmd+0 | Reset font size |
 | Cmd+E | Toggle collaborator split |
+| Cmd+Shift+B | Toggle browser drawer |
 | Cmd+Enter | Toggle fullscreen |
 | Type `collaborator` + Enter | Open collaborator from the shell |
 
@@ -411,6 +430,7 @@ All file operations are restricted to your home directory or the app-managed col
 - **Magic byte validation** — PNG and JPEG verified by header bytes before processing
 - **Input size limit** — terminal writes capped at 65 KB per call
 - **Collaboration memory guardrails** — shared memory files reject traversal, absolute paths, oversized reads, and symlink writes
+- **Browser scheme filtering** — browser navigation allows HTTP(S), `about:blank`, and scoped local-file tokens while blocking `javascript:`, `data:`, `tauri:`, `vbscript:`, and raw `file://` URLs
 - **SVG exclusion** — SVG not loaded as raw images to prevent XSS vectors
 - **IME-aware input** — East Asian composition events handled correctly to prevent double input
 - **No GUI credential dialogs** — git/SSH prompts forced to terminal to prevent hangs in Tauri context
