@@ -151,6 +151,15 @@ pub enum WatcherError {
     Io(std::io::Error),
     StateCorrupted(String),
     NotStarted,
+    /// Source-file rotation detected mid-poll (the inode of
+    /// `source_path` no longer matches the inode the `TranscriptHandle`
+    /// was bound to at discovery time). R2 recovery: the caller should
+    /// invoke `tailer::handle_inode_change` to re-stat the source,
+    /// rebind to the new inode, reset `byte_offset` to 0, and persist
+    /// the fresh `TailState`. Distinct from `Io` because the receiver
+    /// (`watcher::on_fs_event`) takes a different code path for rotation
+    /// — rebind-and-retry rather than swallow-and-wait.
+    SourceRotation,
 }
 
 /// Contract for mirroring one CLI tool's persisted transcripts.

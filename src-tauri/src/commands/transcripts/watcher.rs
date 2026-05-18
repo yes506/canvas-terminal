@@ -239,6 +239,27 @@ pub fn on_fs_event(subscription: &Subscription, event_path: &PathBuf) {
     // Phase 2 (lock-released): poll + parse + normalize.
     let new_bytes = match super::tailer::poll_new_bytes(&handle, offset) {
         Ok(b) => b,
+        Err(super::WatcherError::SourceRotation) => {
+            // R2 recovery: source rotated under us (CLI /clear, Codex
+            // rollout switch, plain mv). Re-stat the source via
+            // handle_inode_change — it returns a fresh TailState with
+            // the new inode + byte_offset=0 AND persists it to
+            // .state.json for crash resume. Update the in-memory entry
+            // so the next event polls from the new file at the right
+            // offset; without this update, the next event reads the
+            // stale tail_state from entries and the fix is silently
+            // undone. handle_inode_change failures (e.g. source genuinely
+            // gone) leave the entry untouched and the next event will
+            // retry through the same path.
+            if let Ok(new_state) = super::tailer::handle_inode_change(&handle) {
+                if let Ok(mut g) = inner.lock() {
+                    if let Some(entry) = g.entries.get_mut(&token_id) {
+                        entry.tail_state = new_state;
+                    }
+                }
+            }
+            return;
+        }
         Err(_) => return, // tailer poll-failure: retry on next event.
     };
     if new_bytes.is_empty() {
