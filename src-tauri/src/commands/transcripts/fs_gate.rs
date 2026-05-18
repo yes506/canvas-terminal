@@ -73,9 +73,41 @@ pub fn check_transcript_root(
     adapter_id: &str,
     candidate: &Path,
 ) -> Result<PathBuf, GateError> {
-    let _ = (adapter_id, candidate);
-    let _ = fs_safety::canonicalize_no_symlinks; // silence unused-import on todo build
-    todo!()
+    let allow = ALLOWED_ROOTS
+        .iter()
+        .find(|r| r.adapter_id == adapter_id)
+        .ok_or_else(|| GateError::UnknownAdapter(adapter_id.to_string()))?;
+
+    let home = match std::env::var_os("HOME") {
+        Some(h) => PathBuf::from(h),
+        None => {
+            return Err(GateError::FsSafety(fs_safety::FsSafetyError::Canonicalize(
+                std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set"),
+            )));
+        }
+    };
+    let root = home.join(allow.home_relative);
+
+    // Bail early on NUL bytes (`Path::components` will not surface them
+    // cleanly).
+    if candidate.to_string_lossy().contains('\u{0}') {
+        return Err(GateError::OutsideRoot {
+            adapter_id: allow.adapter_id,
+            candidate: candidate.to_path_buf(),
+        });
+    }
+
+    let resolved = fs_safety::canonicalize_no_symlinks(candidate)?;
+    let root_variants = fs_safety::add_private_alias(&root);
+
+    let inside = root_variants.iter().any(|r| resolved.starts_with(r));
+    if !inside {
+        return Err(GateError::OutsideRoot {
+            adapter_id: allow.adapter_id,
+            candidate: resolved,
+        });
+    }
+    Ok(resolved)
 }
 
 /// Allowed-root descriptor compiled-in per adapter.

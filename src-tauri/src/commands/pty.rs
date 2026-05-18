@@ -141,8 +141,11 @@ fn apply_extra_env(
     cmd: &mut CommandBuilder,
     extra_env: Option<&std::collections::HashMap<String, String>>,
 ) {
-    let _ = (cmd, extra_env);
-    todo!()
+    if let Some(map) = extra_env {
+        for (key, val) in map {
+            cmd.env(key, val);
+        }
+    }
 }
 
 /// Apply CWD to a CommandBuilder if valid.
