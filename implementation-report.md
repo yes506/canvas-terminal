@@ -1,4 +1,4 @@
-# Implementation report — peer-context-mirror (session 3 — Cluster B: adapter normalize)
+# Implementation report — peer-context-mirror (session 4 — Cluster A: adapter discover_session)
 
 ## Source
 - Planner marker (original): `system` from commit `e3a132e` (interfaces only, human-confirmed)
@@ -7,22 +7,22 @@
 - Plan ingestion: `~/.cache/canvas-terminal/collab-memory/session-2103/task-24-claude1-context-sharing-plan.md` (56-delta fold-in matrix, 4 review rounds × 4 reviewers)
 - Peer reviews folded across the planner+implementer cycles: claude2 B1+B2+B3, claude3 I1+I2, codex2 Blockers 2-3 + Major 6 + B4, codex3 P0×2 + P1×2, claude3 task-2 N1+N2 (touch-up)
 
-## Status: **partial completion (session 3) — recommend `keep`**
+## Status: **partial completion (session 4) — recommend `keep`**
 
 Validation passes (`cargo check` + test fixture both green), now with
-**15 of 37 methods carrying real bodies** (up from 12 in session 2).
-The 3 adapter `normalize` items in Cluster B are now implemented,
-closing the per-adapter transcript pipeline (parse + normalize)
-across Claude Code / Codex / Gemini. 22 items remain stubbed.
+**18 of 37 methods carrying real bodies** (up from 15 in session 3).
+The 3 adapter `discover_session` items in Cluster A are now
+implemented, closing the per-adapter discovery layer (PID→open-FD →
+fs_gate → TranscriptHandle). 19 items remain stubbed.
 
 ## Work queue summary
 
 - Total items: 37
-- **Completed (real bodies)**: 15 (was 12 after session 2; +3 this session)
-- **Stubbed (`todo!()` / `throw`)**: 22 (was 25 after session 2)
+- **Completed (real bodies)**: 18 (was 15 after session 3; +3 this session)
+- **Stubbed (`todo!()` / `throw`)**: 19 (was 22 after session 3)
 - **Reverted post-review**: 0 (unchanged)
 
-## Items completed (15)
+## Items completed (18)
 
 | # | Method | File | Post-review state |
 |---|---|---|---|
@@ -41,6 +41,9 @@ across Claude Code / Codex / Gemini. 22 items remain stubbed.
 | 13 | `ClaudeCodeAdapter::normalize` | `adapters/claude_code.rs` | **NEW (session 3)** — top-level `type` discriminates role; `message.content` handles string or block-array; `text` blocks only |
 | 14 | `CodexAdapter::normalize` | `adapters/codex.rs` | **NEW (session 3)** — dispatches `payload.type`: `user_input` → role=User + `payload.text`; `response_item` → role=Assistant + drill into `payload.message.content[*].text` |
 | 15 | `GeminiAdapter::normalize` | `adapters/gemini.rs` | **NEW (session 3)** — header (no `role`) → None; role from `role` field; parts filtered to `.text` only (D2 future-tolerance for unknown part types) |
+| 16 | `ClaudeCodeAdapter::discover_session` | `adapters/claude_code.rs` | **NEW (session 4)** — root `~/.claude/projects`, extension `.jsonl`; cross-platform open-FD scan via shared helper |
+| 17 | `CodexAdapter::discover_session` | `adapters/codex.rs` | **NEW (session 4)** — root `~/.codex/sessions`, basename `rollout-*.jsonl`; expected NoMatchingFd before first model call (CLI creates file on first prompt) |
+| 18 | `GeminiAdapter::discover_session` | `adapters/gemini.rs` | **NEW (session 4)** — root `~/.gemini/tmp`, has `chats` path-component, basename `session-*.jsonl`; missing `~/.gemini/tmp` → NoMatchingFd per docstring fail-soft contract |
 
 ## Post-review fixes applied this revision
 
@@ -89,9 +92,9 @@ change). Test fixture now compiles and **passes (1/1)**.
 - All comments still mention the test fixture by file path
 **CI grep now returns 0 matches.**
 
-## Items NOT implemented (22) — grouped by integration surface
+## Items NOT implemented (19) — grouped by integration surface
 
-### Cluster A — adapter `discover_session` × 3 (requires lsof / `/proc/<pid>/fd`)
+### Cluster A — adapter `discover_session` × 3 — ✅ **CLOSED in session 4 (89bd4e8)**
 ### Cluster B — adapter `normalize` × 3 — ✅ **CLOSED in session 3 (c99a04f)**
 ### Cluster C — `TranscriptWatcher` × 8 (notify crate + Tauri `State<>`)
 ### Cluster D — `watcher.rs` × 2 (`notify::RecommendedWatcher` wiring + debounce)
@@ -118,6 +121,19 @@ land before the feature is merge-ready:
 | codex2 Major 7 | `fsync` after tmp-write in `persist_offset` | Crash-safety polish; relevant once persist_offset is re-implemented |
 
 ## Validation
+
+### Session 4 (Cluster A — adapter discover_session)
+- Baseline exit (BASE_BRANCH HEAD `dev@347ab58`): 0
+- Final validation command: `cargo check --manifest-path src-tauri/Cargo.toml && cargo test --test transcript_adapter_contract --manifest-path src-tauri/Cargo.toml`
+- Final exit: 0
+- Auto-fix attempts used: 0 / 3
+- cargo check tail:
+  ```
+  warning: `canvas-terminal` (lib) generated 39 warnings
+      Finished `dev` profile target(s) in 1.84s
+  ```
+  (39 warnings — `discover_session` × 3 now real per adapter, removing their stub-time dead-code; net change reflects how the dead-code graph propagates through `TranscriptWatcher` callers that are themselves still stubbed. Expected.)
+- Test fixture: `1 passed; 0 failed`
 
 ### Session 3 (Cluster B — adapter normalize)
 - Baseline exit (BASE_BRANCH HEAD `dev@9b8b463`): 0
@@ -156,7 +172,15 @@ land before the feature is merge-ready:
 
 ## Commits
 
-### Session 3 — `implementer/peer-context-mirror-04730-77334-9982` (this run)
+### Session 4 — `implementer/peer-context-mirror-05575-83074-29365` (this run)
+
+```
+89bd4e8 feat(implementer): items 19-21 — TranscriptAdapter::discover_session for claude_code/codex/gemini
+```
+
+Branched off `dev@347ab58` (the session-3 partial impl-system merge).
+
+### Session 3 — `implementer/peer-context-mirror-04730-77334-9982` (merged at 347ab58)
 
 ```
 c99a04f feat(implementer): items 16-18 — TranscriptAdapter::normalize for claude_code/codex/gemini
@@ -176,7 +200,62 @@ d2803c4 docs(implementer): self-verification report — partial (12/37 items)
 6d8aaf7 feat(implementer): items 1-9 for peer-context-mirror
 ```
 
-## Session 3 — Cluster B (adapter normalize × 3) — this revision
+## Session 4 — Cluster A (adapter discover_session × 3) — this revision
+
+Session 3's partial impl-system merge at `347ab58` left 22 stubs. This
+session picks Cluster A (3 × `discover_session`), branching off
+`dev@347ab58`.
+
+### Cluster A implementation
+
+Each adapter's `discover_session` resolves a child PID to its open
+transcript JSONL via cross-platform open-FD discovery, gated through
+`fs_gate::check_transcript_root`.
+
+**Shared helpers** added to `adapters/mod.rs`:
+
+- `discover_pid_fd<F>(pid, predicate)` — cross-platform PID→open-FD
+  scan. macOS shells `lsof -p <pid> -F n` and filters `n<path>` lines
+  through the predicate; Linux walks `/proc/<pid>/fd` and readlinks
+  each entry. Other OSes return `Ok(None)` (no release artifact today
+  per CLAUDE.md). Errors only on genuine OS faults; missing/dead PID
+  surfaces as `Ok(None)` → `NoMatchingFd` at the adapter layer.
+- `discover_handle(adapter_id, agent_handle, pid, predicate)` —
+  orchestrates the common path: PID→FD discovery →
+  `fs_gate::check_transcript_root` (canonicalize + symlink-reject +
+  adapter-allow-root) → `lstat` for binding-time inode →
+  `memory::get_memory_dir()` → `TranscriptHandle` construction.
+
+**Per-adapter wrappers** (one predicate each):
+
+- **Claude Code**: root `~/.claude/projects`, extension `.jsonl`.
+- **Codex**: root `~/.codex/sessions`, basename starts with `rollout-`,
+  extension `.jsonl`. The CLI creates the rollout JSONL on first
+  model call (not at launch); `NoMatchingFd` before the user's first
+  prompt is the expected pre-bind state.
+- **Gemini**: root `~/.gemini/tmp`, has `chats` path-component,
+  basename starts with `session-`, extension `.jsonl`. Per docstring
+  test-contract: hosts where `~/.gemini/tmp` does not exist produce
+  `NoMatchingFd` (not a panic / filesystem error) — `discover_pid_fd`
+  fail-softs.
+
+All three honor M8: `lsof` subprocess (or `/proc/<pid>/fd` walk) fires
+exactly once at session-bind, never inside the tailer poll loop.
+
+The `spawned_at_unix_ms` parameter is accepted into each adapter's
+signature (it's in the trait) but is currently unused — lsof's
+open-FD info is authoritative for the three adapters today. The
+parameter remains in the signature for future adapters that need
+same-cwd-race tiebreaking.
+
+### What this session did NOT do
+
+- The remaining 19 items across clusters C (8), D (2), E (5), F (3),
+  G (3), H (1) stay stubbed.
+- No frontend changes — TS clusters deferred.
+- No merge to `dev` recommended — see Phase 6 below.
+
+## Session 3 — Cluster B (adapter normalize × 3) — historical, merged
 
 The session-2 partial impl-system merge at `9b8b463` left 25 items
 stubbed. This session picks the bounded Cluster B (3 × adapter
@@ -290,11 +369,15 @@ This session (2) then:
 overridden with `confirm merge` despite this recommendation, which is
 acceptable; documenting the recommendation for the record).
 
-Updated reasoning (session 3):
-- **15 real implementations** post-review-verifiable — session 2's 12 plus this session's 3 Cluster B (adapter normalize) items.
+Updated reasoning (session 4):
+- **18 real implementations** post-review-verifiable — session 3's 15 plus this session's 3 Cluster A (adapter discover_session) items.
 - Test fixture continues to prove trait extensibility (compile + pass).
-- **22 stubs** panic at runtime — acceptable as long as runtime callers don't exercise them; the runtime call graph still lacks a call site that reaches the stubs (TranscriptWatcher::watch is itself stubbed).
+- **19 stubs** panic at runtime — acceptable as long as runtime callers don't exercise them; the runtime call graph still lacks a call site that reaches the stubs.
 - **0 reverted items**.
+- Cluster A's cross-platform discovery has natural integration-test targets in a follow-up cycle (e.g. spawn a real CLI process, open a known JSONL, assert discover_session returns the right path + non-zero inode).
+
+Updated reasoning (session 3):
+- **15 real implementations** post-review-verifiable — session 2's 12 plus session 3's 3 Cluster B (adapter normalize) items.
 - Cluster B's three impls have natural unit-test targets in a follow-up review cycle (e.g. inject a `RawTurn` with `content: [{type: "thinking"}]` and assert `None`).
 
 Why still `keep`:
