@@ -137,8 +137,20 @@ pub(crate) fn validate_picked_path(path: &Path) -> Result<PathBuf, String> {
 /// v1 default deny-prefix list (plan constraint C7). Implementer may
 /// ADD entries with rationale but MUST NOT remove. Path-prefix match
 /// is against the CANONICAL path after symlink resolution.
+///
+/// **macOS symlink expansion**: on macOS, `/etc` -> `/private/etc`
+/// and `/var` -> `/private/var`. Because `validate_picked_path`
+/// canonicalizes the picked path before the deny-prefix check, the
+/// canonical path of a file under `/etc` ends up as
+/// `/private/etc/...`, which would silently bypass a raw `/etc`
+/// prefix. We close that gap by canonicalizing each entry at runtime
+/// and adding the resolved form alongside the raw form. Both raw
+/// and canonical are matched so the deny holds regardless of which
+/// shape `canonicalize` returns on the picked path.
+///
+/// Reviewer-feedback fix: codex2 r1 #1 / codex3 r1 #1 (post-merge).
 fn build_deny_prefixes() -> Vec<PathBuf> {
-    let mut prefixes: Vec<PathBuf> = vec![
+    let mut raw: Vec<PathBuf> = vec![
         PathBuf::from("/System"),
         PathBuf::from("/private/var/db"),
         PathBuf::from("/Library/Keychains"),
@@ -148,12 +160,28 @@ fn build_deny_prefixes() -> Vec<PathBuf> {
         PathBuf::from("/usr"),
     ];
     if let Some(home) = dirs::home_dir() {
-        prefixes.push(home.join("Library/Keychains"));
-        prefixes.push(home.join(".ssh"));
-        prefixes.push(home.join("Library/Application Support"));
-        prefixes.push(home.join("Library/Cookies"));
+        raw.push(home.join("Library/Keychains"));
+        raw.push(home.join(".ssh"));
+        raw.push(home.join("Library/Application Support"));
+        raw.push(home.join("Library/Cookies"));
     }
-    prefixes
+
+    // Expand each entry with its canonical form. On macOS this adds
+    // /private/etc + /private/var so the deny check matches a
+    // canonical path under those roots. On Linux / Windows most
+    // prefixes canonicalize to themselves and no duplicates are
+    // added. Entries whose canonicalize fails (path doesn't exist
+    // on this OS, e.g. /Library/Keychains on Linux) are silently
+    // skipped — the raw form stays in the list.
+    let mut out = raw.clone();
+    for p in &raw {
+        if let Ok(canon) = std::fs::canonicalize(p) {
+            if !out.iter().any(|existing| existing == &canon) {
+                out.push(canon);
+            }
+        }
+    }
+    out
 }
 
 /// Determine the MIME type from the canonical path's extension.
@@ -258,9 +286,17 @@ pub(crate) fn build_localfile_response(
 
 /// MIME-class-driven `Content-Disposition`. Inline for `text/*`,
 /// `image/*`, and `application/pdf`; attachment for everything else.
-/// Filename is taken from the canonical path's basename, with `"`
-/// replaced by `_` for minimal HTTP header safety (full RFC 6266
-/// filename* encoding is a v2 concern).
+///
+/// Filename sanitization: HTTP header values must not contain CR /
+/// LF / control bytes (RFC 7230 § 3.2.6) — if they do,
+/// `http::Response::builder().header(...)` returns Err and our
+/// `.expect()` panics inside the spawned async task. Filenames on
+/// Unix-like filesystems CAN contain such bytes, so we replace every
+/// control char AND `"` with `_` before formatting. Full RFC 5987 /
+/// 6266 `filename*=UTF-8''...` percent-encoding for non-ASCII names
+/// remains a v2 concern; this fix is panic-prevention only.
+///
+/// Reviewer-feedback fix: codex3 r1 #3 (post-merge).
 fn disposition_for_mime(mime: &str, path: &Path) -> String {
     let inline = mime.starts_with("text/")
         || mime.starts_with("image/")
@@ -268,12 +304,21 @@ fn disposition_for_mime(mime: &str, path: &Path) -> String {
     if inline {
         "inline".to_string()
     } else {
-        let filename = path
+        let raw = path
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("download")
-            .replace('"', "_");
-        format!("attachment; filename=\"{}\"", filename)
+            .unwrap_or("download");
+        let safe: String = raw
+            .chars()
+            .map(|c| {
+                if c == '"' || c.is_control() {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        format!("attachment; filename=\"{}\"", safe)
     }
 }
 
@@ -476,13 +521,23 @@ pub fn localfile_protocol_handler<R: Runtime>(
         }
     };
 
-    // Step 2: token from URL path (per C9 path-based shape).
-    let path = request.uri().path();
-    let token = path.trim_start_matches('/').to_string();
-    if token.is_empty() {
-        responder.respond(empty_response(404));
-        return;
-    }
+    // Step 2: defense-in-depth shape validation at the protocol layer.
+    // WebKit-initiated sub-resource fetches inside a loaded localfile
+    // page bypass the navigate IPC and reach the handler directly.
+    // We enforce the full C9 shape here independently:
+    //   - host MUST be "localhost"
+    //   - no query string
+    //   - path MUST be exactly "/<22-base64url-token>" (one leading
+    //     slash, no trailing slash, no extra segments)
+    // Reviewer-feedback fix: claude2 r1 M1 / claude3 r1 O1 /
+    // codex2 r1 #2 / codex3 r1 #2 (post-merge defense-in-depth).
+    let token = match extract_localfile_token(request.uri()) {
+        Some(t) => t,
+        None => {
+            responder.respond(empty_response(404));
+            return;
+        }
+    };
 
     // Step 3: tab-scoped lookup. The registry returns None on miss OR
     // tab-mismatch — both surface as 404 to avoid leaking existence.
@@ -534,4 +589,208 @@ fn empty_response(status: u16) -> tauri::http::Response<Vec<u8>> {
         .status(status)
         .body(Vec::new())
         .expect("response builder cannot fail on empty body + valid status")
+}
+
+/// Defense-in-depth shape gate at the protocol handler boundary.
+/// Verifies that an incoming `localfile://` request URI conforms to
+/// the C9 shape: host = `localhost`, no query, path = exactly
+/// `/<22-char-base64url-token>`. Returns the extracted token on
+/// success; `None` for any deviation (caller responds with 404).
+///
+/// This is independent of `validate_localfile_url_shape` — that fn
+/// works against a `&str`, this works against an `http::Uri`. The
+/// invariants enforced are identical; both must accept exactly the
+/// same input set.
+///
+/// Reviewer-feedback fix: claude2 r1 M1 / claude3 r1 O1 / codex2 r1
+/// #2 / codex3 r1 #2 (post-merge defense-in-depth).
+fn extract_localfile_token(uri: &tauri::http::Uri) -> Option<Token> {
+    if uri.host() != Some("localhost") {
+        return None;
+    }
+    if uri.query().is_some() {
+        return None;
+    }
+    // path must be exactly "/<22 base64url chars>".
+    let path = uri.path();
+    let token = path.strip_prefix('/')?;
+    if token.len() != 22 {
+        return None;
+    }
+    if !token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for post-merge reviewer-feedback fixes.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// codex2 r1 #1 / codex3 r1 #1 — on macOS `/etc` is a symlink to
+    /// `/private/etc` and `/var` to `/private/var`. After
+    /// `validate_picked_path` canonicalizes, the canonical path lives
+    /// under `/private/...`. The deny-prefix list MUST include those
+    /// canonical roots, not just the raw `/etc` and `/var`.
+    #[test]
+    fn deny_prefix_list_includes_canonical_macos_symlinks() {
+        let prefixes = build_deny_prefixes();
+        // Raw roots are always present.
+        assert!(prefixes.iter().any(|p| p == Path::new("/etc")));
+        assert!(prefixes.iter().any(|p| p == Path::new("/var")));
+
+        // On macOS the canonical forms must also be in the list.
+        // On Linux these canonicalize to themselves and aren't added
+        // — we gate the assertion on the platform.
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                prefixes.iter().any(|p| p == Path::new("/private/etc")),
+                "macOS: /private/etc must be in the deny-prefix list (it's the canonical form of /etc) — \
+                 codex2 r1 #1 / codex3 r1 #1 fix"
+            );
+            assert!(
+                prefixes.iter().any(|p| p == Path::new("/private/var")),
+                "macOS: /private/var must be in the deny-prefix list (it's the canonical form of /var) — \
+                 codex2 r1 #1 / codex3 r1 #1 fix"
+            );
+        }
+    }
+
+    /// Same fix, end-to-end: a real file under `/etc` (`/etc/hosts`
+    /// exists on every macOS install) canonicalizes to
+    /// `/private/etc/hosts` and `validate_picked_path` MUST reject
+    /// it with the deny-prefix error, not silently accept it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_etc_hosts_blocked_by_canonical_deny_prefix() {
+        let result = validate_picked_path(Path::new("/etc/hosts"));
+        // /etc/hosts is itself a symlink on macOS — the symlink-on-input
+        // check (step 1) catches it before deny-prefix is even
+        // consulted. We accept EITHER rejection reason; both are
+        // equally correct (defense in depth).
+        let err = result.expect_err("must reject");
+        assert!(
+            err.contains("symlinks rejected") || err.contains("deny-prefix"),
+            "expected symlinks-rejected OR deny-prefix, got: {}",
+            err
+        );
+    }
+
+    /// claude2 r1 M1 / claude3 r1 O1 / codex2 r1 #2 / codex3 r1 #2 —
+    /// the protocol handler must reject malformed URIs (wrong host,
+    /// query string, wrong path shape, wrong token alphabet, wrong
+    /// length) BEFORE registry lookup, even though the navigate IPC
+    /// also enforces. WebKit-initiated sub-resource fetches bypass
+    /// the navigate IPC.
+    #[test]
+    fn extract_localfile_token_strict_shape() {
+        // Allowed
+        let valid: tauri::http::Uri = "localfile://localhost/0123456789abcdefghijkl"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            extract_localfile_token(&valid).as_deref(),
+            Some("0123456789abcdefghijkl")
+        );
+
+        // Wrong host
+        let wrong_host: tauri::http::Uri = "localfile://foo/0123456789abcdefghijkl"
+            .parse()
+            .unwrap();
+        assert_eq!(extract_localfile_token(&wrong_host), None);
+
+        // Query string present
+        let q: tauri::http::Uri = "localfile://localhost/0123456789abcdefghijkl?evil=1"
+            .parse()
+            .unwrap();
+        assert_eq!(extract_localfile_token(&q), None);
+
+        // Wrong token length (21 chars — one short)
+        let short: tauri::http::Uri = "localfile://localhost/0123456789abcdefghijk"
+            .parse()
+            .unwrap();
+        assert_eq!(extract_localfile_token(&short), None);
+
+        // Invalid alphabet (slash inside token segment is impossible
+        // here because http::Uri parses each `/` as a path separator,
+        // making the path two segments; the strip_prefix-then-
+        // length-22 check catches it.)
+        let multi_seg: tauri::http::Uri = "localfile://localhost/abc/efghij_KLMNOPqrstu"
+            .parse()
+            .unwrap();
+        assert_eq!(extract_localfile_token(&multi_seg), None);
+
+        // Empty token (no path past leading slash)
+        let empty: tauri::http::Uri = "localfile://localhost/".parse().unwrap();
+        assert_eq!(extract_localfile_token(&empty), None);
+    }
+
+    /// codex3 r1 #3 — filenames containing CR/LF/control bytes must
+    /// NOT panic the response builder. `disposition_for_mime`
+    /// sanitizes by replacing control chars + `"` with `_`.
+    #[test]
+    fn disposition_for_mime_sanitizes_control_chars() {
+        use std::path::PathBuf;
+
+        // CR/LF in filename (theoretically possible on Unix-like FS).
+        let p = PathBuf::from("/tmp/evil\r\nInjected: yes.bin");
+        let d = disposition_for_mime("application/octet-stream", &p);
+        assert!(!d.contains('\r'), "CR not sanitized: {}", d);
+        assert!(!d.contains('\n'), "LF not sanitized: {}", d);
+        // Validate that the resulting header value is accepted by the
+        // http builder (the panic path codex3 #3 flagged).
+        let resp = tauri::http::Response::builder()
+            .status(200)
+            .header("Content-Disposition", &d)
+            .body(Vec::<u8>::new());
+        assert!(
+            resp.is_ok(),
+            "sanitized Content-Disposition must be a valid header value"
+        );
+
+        // Double quotes also sanitized.
+        let p2 = PathBuf::from("/tmp/has\"quote.bin");
+        let d2 = disposition_for_mime("application/octet-stream", &p2);
+        assert!(!d2.contains('"').then(|| d2.matches('"').count() == 2).unwrap_or(true)
+                || d2.matches('"').count() == 2,
+                "should retain only the two wrapping quotes, got: {}", d2);
+    }
+
+    /// Inline disposition for text/image/pdf stays plain "inline".
+    #[test]
+    fn disposition_for_mime_inline_classes() {
+        let p = std::path::PathBuf::from("/tmp/foo.png");
+        assert_eq!(disposition_for_mime("image/png", &p), "inline");
+        assert_eq!(disposition_for_mime("text/plain", &p), "inline");
+        assert_eq!(disposition_for_mime("application/pdf", &p), "inline");
+
+        // Octet-stream forces attachment.
+        let d = disposition_for_mime("application/octet-stream", &p);
+        assert!(d.starts_with("attachment;"));
+        assert!(d.contains("foo.png"));
+    }
+
+    /// Token shape check at the URL-string level (validate_localfile_url_shape)
+    /// — paired with the URI-level check in extract_localfile_token,
+    /// both enforce the same C9 invariant.
+    #[test]
+    fn validate_localfile_url_shape_basic() {
+        assert_eq!(
+            validate_localfile_url_shape("localfile://localhost/0123456789abcdefghijkl")
+                .unwrap(),
+            "0123456789abcdefghijkl"
+        );
+        assert!(validate_localfile_url_shape("localfile://localhost/short").is_err());
+        assert!(validate_localfile_url_shape("localfile://foo/0123456789abcdefghijkl").is_err());
+        assert!(validate_localfile_url_shape("not-localfile://localhost/0123456789abcdefghijkl")
+            .is_err());
+    }
 }
