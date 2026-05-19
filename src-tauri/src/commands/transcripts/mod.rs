@@ -648,25 +648,55 @@ impl TranscriptWatcher {
         // Entry so unwatch can decrement the parent_dir_refs ref-count.
         let subscription = watcher::subscribe_fsevents(&handle)?;
 
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| WatcherError::NotStarted)?;
-        if g.shutdown {
-            return Err(WatcherError::NotStarted);
-        }
-        g.next_id += 1;
-        let token_id = g.next_id;
-        g.entries.insert(
-            token_id,
-            Entry {
-                handle,
-                subscription_id: subscription.0,
-                tail_state,
-                adapter,
-                last_event_at: None,
-            },
-        );
+        // Clone source_path before the entry consumes `handle` — we need
+        // it after the lock drops to synthesize the initial-drain
+        // on_fs_event call.
+        let source_path_for_drain = handle.source_path.clone();
+
+        let token_id = {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| WatcherError::NotStarted)?;
+            if g.shutdown {
+                return Err(WatcherError::NotStarted);
+            }
+            g.next_id += 1;
+            let token_id = g.next_id;
+            g.entries.insert(
+                token_id,
+                Entry {
+                    handle,
+                    subscription_id: subscription.0,
+                    tail_state,
+                    adapter,
+                    last_event_at: None,
+                },
+            );
+            token_id
+        };
+
+        // Initial drain: synthesize one on_fs_event so any content
+        // already present in the source JSONL replays into
+        // contexts/<agent>.jsonl without waiting for the next FSEvents
+        // notification. Necessary because the user may click the
+        // publish toggle mid-conversation while the source file is
+        // idle; without this, the existing turns never surface and
+        // contexts/ stays absent until the next user turn.
+        //
+        // The synthesized event re-acquires the Inner lock from scratch
+        // (we released it via the scope above), finds the entry by
+        // matching event_path == handle.source_path, sees
+        // last_event_at = None so the debounce branch is bypassed, and
+        // runs the full poll + parse + normalize + persist pipeline.
+        // poll_new_bytes reads from byte_offset = 0 on first call (the
+        // tail_state created by resume_from_state above), so the entire
+        // existing file replays. Errors inside on_fs_event are logged-
+        // and-swallowed by design (the function returns ()), so a
+        // failure here does not poison watch() — the next genuine
+        // FSEvents notification will retry through the same path.
+        watcher::on_fs_event(&watcher::Subscription(0), &source_path_for_drain);
+
         Ok(WatchToken(token_id))
     }
 
