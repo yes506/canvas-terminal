@@ -46,7 +46,15 @@ pub(super) fn adapter_for(adapter_id: &str) -> Option<&'static dyn TranscriptAda
 /// (a misbehaving build script under the shell shouldn't stall discovery).
 /// Exceeding either cap falls through to `Ok(None)` — same behavior as the
 /// pre-walk single-PID lsof, never a panic.
+///
+/// Cycle E status: the lsof-based primitive is unused after the move to
+/// mtime-based discovery for Claude Code / Codex / Gemini (those CLIs use
+/// open-append-close per turn, so lsof never sees the JSONL). The constants
+/// and primitive are preserved for future adapters whose CLI does hold its
+/// transcript open continuously — see `discover_pid_fd` for the rationale.
+#[allow(dead_code)]
 const DESCENDANT_WALK_DEPTH_CAP: usize = 4;
+#[allow(dead_code)]
 const DESCENDANT_WALK_BREADTH_CAP: usize = 32;
 
 /// Locate which file open under `pid` (or any descendant) matches the
@@ -82,6 +90,7 @@ const DESCENDANT_WALK_BREADTH_CAP: usize = 32;
 /// one file per thread; union across threads).
 /// Other OSes: returns `Ok(None)` (no adapter discovers on them today —
 /// release artifact is `.dmg`-only per CLAUDE.md).
+#[allow(dead_code)]
 pub(super) fn discover_pid_fd<F>(pid: i32, predicate: F) -> std::io::Result<Option<PathBuf>>
 where
     F: Fn(&Path) -> bool,
@@ -123,6 +132,7 @@ where
 /// Scan a single PID for an open FD matching `predicate`. Same per-OS
 /// shape as the pre-walk single-PID logic — extracted so the BFS loop
 /// can reuse it per node.
+#[allow(dead_code)]
 fn scan_one_pid<F>(pid: i32, predicate: &F) -> std::io::Result<Option<PathBuf>>
 where
     F: Fn(&Path) -> bool,
@@ -187,6 +197,7 @@ where
 /// failure — the caller's BFS treats "no children visible" identically
 /// to "PID exists but is a leaf", which is the correct behavior when
 /// we can't see further.
+#[allow(dead_code)]
 fn list_children(pid: i32) -> Vec<i32> {
     #[cfg(target_os = "macos")]
     {
@@ -256,6 +267,7 @@ fn list_children(pid: i32) -> Vec<i32> {
 /// Adapters supply the `adapter_id` constant + a path predicate; all
 /// shared work lives here. Keeps the three impls down to a few lines
 /// each.
+#[allow(dead_code)]
 pub(super) fn discover_handle<F>(
     adapter_id: &'static str,
     agent_handle: &str,
@@ -340,4 +352,213 @@ pub(super) fn synth_iso8601_now() -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, d, h, m, s
     )
+}
+
+// ---------------------------------------------------------------------------
+// Cycle E — mtime-based discovery primitives
+// ---------------------------------------------------------------------------
+//
+// Replaces the lsof-based discover_pid_fd / discover_handle pipeline for
+// adapters whose CLI uses open-append-close per turn (Claude Code 2.1.x,
+// Codex, likely Gemini). Verification on Claude Code 2.1.133 showed the
+// session JSONL is NOT held open between turns: lsof on the agent PID and
+// every descendant returns no JSONL FD even when a 100+ KB JSONL exists on
+// disk. The mtime-scan primitive below works regardless of whether the file
+// is open — it relies only on filesystem metadata.
+
+/// Resolve a PID's current working directory.
+///
+/// Mirrors `commands/pty.rs::get_pty_cwd` (which resolves cwd for the PTY's
+/// child via lsof for the get_pty_cwd IPC) but lives in the adapters module
+/// and returns `PathBuf` for direct `.join()` use by adapter discover_session
+/// impls. Two separate sites are intentional: pty.rs returns `String` for
+/// the IPC contract and adds error formatting; this version returns the
+/// untouched `PathBuf` so the caller can join project-dir suffixes without
+/// re-parsing.
+///
+/// macOS: shells `/usr/sbin/lsof -a -p <pid> -d cwd -F n` and parses the
+/// single `n`-prefixed output line. The `-a` flag intersects `-p` and `-d`
+/// filters so only the cwd entry is reported.
+///
+/// Linux: reads `/proc/<pid>/cwd` as a symlink. Permission denied surfaces
+/// as `io::Error` (the agent process is owned by the same user as Canvas
+/// Terminal, so this should not occur in practice; defensive error path
+/// only).
+///
+/// Other OSes: returns `Err(Unsupported)` — no adapter discovers on them
+/// today (release artifact is `.dmg`-only per CLAUDE.md).
+///
+/// Errors: `Io` for genuine OS failures (lsof spawn, readlink, exit-non-zero
+/// from lsof); `NotFound` when lsof returns success but no `n`-line in
+/// output (should not occur on a live PID, but defended).
+pub(super) fn discover_pid_cwd(pid: i32) -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("lsof cwd exit {}", output.status.code().unwrap_or(-1)),
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix('n') {
+                return Ok(PathBuf::from(rest));
+            }
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no n-line in lsof cwd output",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let link = format!("/proc/{}/cwd", pid);
+        return std::fs::read_link(&link);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "discover_pid_cwd not implemented on this platform",
+        ))
+    }
+}
+
+/// Bounded retry parameters for `discover_by_mtime`. 5 iterations at 500 ms
+/// = 2.5 s total — long enough to cover the typical spawn-to-first-write
+/// window for a CLI that creates its session JSONL on the first model call,
+/// short enough that the watch_transcript IPC blocking on this is invisible
+/// behind the frontend's "spawning" indicator.
+const MTIME_DISCOVERY_MAX_ATTEMPTS: u32 = 5;
+const MTIME_DISCOVERY_RETRY_INTERVAL_MS: u64 = 500;
+
+/// Clock-skew slack subtracted from `spawned_at_unix_ms` when computing the
+/// mtime threshold. Defends against the frontend `Date.now()` reading a few
+/// milliseconds ahead of the CLI's actual filesystem write. 500 ms is a
+/// generous margin — typical clock drift between two threads of the same
+/// process is sub-millisecond, but we are crossing JS→Rust→syscall.
+const MTIME_THRESHOLD_SLACK_MS: i64 = 500;
+
+/// Locate the newest JSONL under `scan_roots` whose mtime is at or after
+/// `spawned_at_unix_ms`, retrying up to 5×500ms for the spawn-to-first-write
+/// race.
+///
+/// The mtime-based replacement for `discover_handle`. Used by adapters whose
+/// CLI uses open-append-close per turn. `scan_roots` is a slice so callers
+/// like Codex (which needs today + yesterday's date dirs) can pre-enumerate;
+/// callers like Claude Code pass a single-element slice.
+///
+/// Algorithm: each retry iteration `read_dir`s every root in turn, filters
+/// entries by `predicate(path) && mtime >= threshold`, and keeps the entry
+/// with the maximum mtime across all roots. If a candidate exists in any
+/// iteration, build the `TranscriptHandle` (via `fs_gate` + `lstat` +
+/// `memory_dir`) and return. After the configured attempt budget with no
+/// candidate, return `DiscoveryError::NoMatchingFd`.
+///
+/// `read_dir` failure on a single root is logged-equivalent (we simply
+/// continue with no candidates from that root) — other roots are still
+/// scanned in the same iteration. Matches the per-descendant skip policy
+/// in cycle D's `list_children`.
+///
+/// Total time bounded: `(MTIME_DISCOVERY_MAX_ATTEMPTS - 1) *
+/// MTIME_DISCOVERY_RETRY_INTERVAL_MS = 2000 ms` of pure sleeping plus the
+/// `read_dir` + `lstat` cost (millisecond-scale on a small project dir).
+/// The `watch_transcript` IPC blocks for this duration on a cold-spawn
+/// click-Eye flow.
+pub(super) fn discover_by_mtime<F>(
+    adapter_id: &'static str,
+    agent_handle: &str,
+    scan_roots: &[PathBuf],
+    spawned_at_unix_ms: i64,
+    predicate: F,
+) -> Result<TranscriptHandle, DiscoveryError>
+where
+    F: Fn(&Path) -> bool,
+{
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    // Threshold = spawned_at - slack. SystemTime arithmetic on the UNIX_EPOCH
+    // anchor avoids pulling chrono/time as a direct dep.
+    let threshold_ms = (spawned_at_unix_ms - MTIME_THRESHOLD_SLACK_MS).max(0);
+    let threshold = UNIX_EPOCH + Duration::from_millis(threshold_ms as u64);
+
+    for attempt in 0..MTIME_DISCOVERY_MAX_ATTEMPTS {
+        let mut best: Option<(PathBuf, SystemTime)> = None;
+
+        for root in scan_roots {
+            let entries = match std::fs::read_dir(root) {
+                Ok(e) => e,
+                Err(_) => continue, // root missing / unreadable; try others
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !predicate(&path) {
+                    continue;
+                }
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let mtime = match meta.modified() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if mtime < threshold {
+                    continue;
+                }
+                match &best {
+                    None => best = Some((path, mtime)),
+                    Some((_, current_mtime)) if mtime > *current_mtime => {
+                        best = Some((path, mtime));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some((candidate, _)) = best {
+            // Run the same fs_gate + lstat + memory_dir wiring as
+            // discover_handle. Inlined here so this primitive stays
+            // independent of the legacy helper (which is now dead code
+            // per cycle E).
+            let canonical = super::fs_gate::check_transcript_root(adapter_id, &candidate)
+                .map_err(|e| DiscoveryError::Gated(format!("{:?}", e)))?;
+
+            let lstat = std::fs::metadata(&canonical).map_err(DiscoveryError::Io)?;
+            let source_inode = lstat.ino();
+
+            let memory_dir = super::super::memory::get_memory_dir().map_err(|e| {
+                DiscoveryError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+            })?;
+
+            return Ok(TranscriptHandle {
+                agent_handle: agent_handle.to_string(),
+                adapter_id,
+                source_path: canonical,
+                source_inode,
+                // pid is no longer used for discovery routing under
+                // mtime-based discovery; keep it on the handle for the
+                // existing Tailer / fs_gate diagnostic logging. Callers
+                // pass it through unchanged.
+                pid: 0,
+                memory_dir,
+            });
+        }
+
+        // No candidate this attempt — sleep before next iteration, but not
+        // after the last attempt.
+        if attempt + 1 < MTIME_DISCOVERY_MAX_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(MTIME_DISCOVERY_RETRY_INTERVAL_MS));
+        }
+    }
+
+    Err(DiscoveryError::NoMatchingFd)
 }

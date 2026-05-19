@@ -70,11 +70,12 @@ impl TranscriptAdapter for CodexAdapter {
         pid: i32,
         spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
-        // Codex creates the rollout JSONL on first model call, not on CLI
-        // launch — `discover_pid_fd` will return `Ok(None)` and the helper
-        // surfaces `NoMatchingFd` until the user types their first prompt.
-        // The trait contract permits this (NoMatchingFd is documented).
-        let _ = spawned_at_unix_ms;
+        // Cycle E: lsof-based discovery never sees Codex's rollout JSONL
+        // (open-append-close per turn — same behavior as Claude Code 2.1.x).
+        // Scan today + yesterday's date dirs by mtime, gated by
+        // spawned_at_unix_ms. Codex is cwd-agnostic — the layout partitions
+        // by date, not by cwd — so `pid` is unused.
+        let _ = pid;
 
         let home = dirs::home_dir().ok_or_else(|| {
             DiscoveryError::Io(std::io::Error::new(
@@ -84,18 +85,35 @@ impl TranscriptAdapter for CodexAdapter {
         })?;
         let root = home.join(".codex").join("sessions");
 
-        super::discover_handle(self.tool_id(), agent_handle, pid, |p| {
-            // Codex layout: ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<...>.jsonl
-            // Filter by root + extension + basename prefix; the dated
-            // sub-directories are enforced by the predicate's `starts_with`
-            // (root) AND `rollout-` prefix on the filename.
-            if !p.starts_with(&root) || p.extension().map_or(true, |e| e != "jsonl") {
-                return false;
-            }
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map_or(false, |n| n.starts_with("rollout-"))
-        })
+        // Today + yesterday covers the spawn-near-midnight edge case. The
+        // spawn-to-first-write window is sub-second, so we don't need
+        // history beyond that.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let today = date_path_for_unix_secs(now_secs);
+        let yesterday = date_path_for_unix_secs(now_secs - 86_400);
+        let scan_roots = vec![root.join(&today), root.join(&yesterday)];
+
+        super::discover_by_mtime(
+            self.tool_id(),
+            agent_handle,
+            &scan_roots,
+            spawned_at_unix_ms,
+            |p| {
+                // Codex layout: ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<...>.jsonl
+                // The mtime helper scans only the date dirs above, so
+                // root-prefix check is implicit. Predicate filters to
+                // .jsonl with `rollout-` prefix.
+                if p.extension().map_or(true, |e| e != "jsonl") {
+                    return false;
+                }
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.starts_with("rollout-"))
+            },
+        )
     }
 
     /// # Returns `&INCLUSION_TABLE`. # Errors None. # Side effects None.
@@ -239,4 +257,28 @@ impl TranscriptAdapter for CodexAdapter {
             source_offset: raw.source_offset,
         })
     }
+}
+
+/// Format a UNIX-seconds value as Codex's date-dir path: `YYYY/MM/DD`.
+///
+/// Used by `discover_session` to enumerate the two date dirs Codex would
+/// have written rollouts into. Uses the same Howard Hinnant `civil_from_days`
+/// algorithm as `synth_iso8601_now` in `adapters/mod.rs`; inlined here
+/// rather than shared because (a) different return shape and (b) sharing
+/// would require lifting the civil-date math into a third helper, which is
+/// out of scope for cycle E per the plan.
+fn date_path_for_unix_secs(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{:04}/{:02}/{:02}", year, month, d)
 }

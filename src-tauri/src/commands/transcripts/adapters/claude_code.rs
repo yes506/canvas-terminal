@@ -89,25 +89,39 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
         pid: i32,
         spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
-        // M8: lsof gives authoritative open-fd info, so the
-        // spawned_at_unix_ms tiebreaker isn't needed for Claude Code (one
-        // JSONL open per CLI process). Kept in the trait signature for
-        // adapters that need it (Gemini's session-dir triangulation can
-        // use it for same-cwd-twice races).
-        let _ = spawned_at_unix_ms;
+        // Cycle E: Claude Code 2.1.x uses open-append-close per turn —
+        // verified by lsof showing zero JSONL FDs across the agent PID and
+        // its descendants even when 100+ KB of content exists on disk for
+        // that agent. The previous M8 rationale ("lsof gives authoritative
+        // open-fd info, one JSONL open per CLI process") no longer holds.
+        // Resolve the agent's cwd, build the project-dir encoding, and
+        // scan by mtime with a bounded retry for the spawn-to-first-write
+        // race.
 
+        let cwd = super::discover_pid_cwd(pid).map_err(DiscoveryError::Io)?;
         let home = dirs::home_dir().ok_or_else(|| {
             DiscoveryError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "home dir not resolvable",
             ))
         })?;
-        let root = home.join(".claude").join("projects");
 
-        super::discover_handle(self.tool_id(), agent_handle, pid, |p| {
-            p.starts_with(&root)
-                && p.extension().map_or(false, |e| e == "jsonl")
-        })
+        // Claude Code project-dir encoding: every '/' becomes '-' AND there
+        // is a leading '-'. For cwd = "/Users/donghyeon" the encoding is
+        // "-Users-donghyeon"; for cwd = "/" it is "-". Building via
+        // string-replace preserves this since "/Users/donghyeon".replace('/', "-")
+        // = "-Users-donghyeon" already includes the leading dash from the
+        // leading '/'.
+        let encoded = cwd.to_string_lossy().replace('/', "-");
+        let project_dir = home.join(".claude").join("projects").join(&encoded);
+
+        super::discover_by_mtime(
+            self.tool_id(),
+            agent_handle,
+            &[project_dir],
+            spawned_at_unix_ms,
+            |p| p.extension().map_or(false, |e| e == "jsonl"),
+        )
     }
 
     /// Per-adapter content-block inclusion table.
