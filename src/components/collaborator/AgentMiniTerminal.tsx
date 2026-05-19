@@ -17,6 +17,15 @@ import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture, stripAnsi, registerCapture, unregisterCapture } from "../../lib/agentOutputCapture";
 import { isEnvBootstrapped } from "../../lib/terminalManager";
 import type { ToolConfig } from "../../types/collaborator";
+import {
+  consumeReservation,
+  releaseReservation,
+  reserveAgentHandle,
+} from "../../lib/peerContext";
+import {
+  ENV_AGENT_ID,
+  ENV_COLLAB_SESSION_ID,
+} from "../../types/peerContext";
 import { X } from "lucide-react";
 
 interface AgentMiniTerminalProps {
@@ -96,6 +105,10 @@ export function AgentMiniTerminal({
   const docInputRef = useRef<((e: Event) => void) | null>(null);
   const imeOverlayRef = useRef<HTMLSpanElement | null>(null);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Holds the u64 token returned by `invoke('watch_transcript')` so the
+  // matching `invoke('unwatch_transcript')` can release it on unmount or
+  // when publishOptedIn flips false. null = no active watch.
+  const watchTokenRef = useRef<number | null>(null);
   const disposed = useRef(false);
   // Monotonic per-effect-run counter. Each useEffect entry bumps this and
   // captures the new value in a closure-local `runId`; async paths inside
@@ -263,16 +276,55 @@ export function AgentMiniTerminal({
         return;
       }
 
-      // Spawn the CLI tool — try direct process first, fall back to shell
+      // Spawn the CLI tool — try direct process first, fall back to shell.
+      //
+      // peer-context-mirror reservation lifecycle (L5+L6+L7+L8):
+      // 1. BEFORE the spawn IPC, reserveAgentHandle mints the bare CT
+      //    handle (e.g. "claude3") via collaboratorStore.nextOrdinal.
+      //    The same counter addAgent would use, so the post-spawn
+      //    record's ordinal/handle line up with the pre-spawn env.
+      // 2. The reserved handle is passed into the spawn IPC via
+      //    extra_env as CT_AGENT_ID + CT_COLLAB_SESSION_ID. Both
+      //    spawn_process and spawn_shell accept the parameter
+      //    (cycle A wired spawn_shell's body).
+      // 3. On spawn success: consumeReservation returns the reserved
+      //    data, and addAgent gets the pre-minted handle so it skips
+      //    its own nextOrdinal mint.
+      // 4. On spawn failure: releaseReservation rolls back the
+      //    registry entry so the slot can be reused.
       const [program, ...programArgs] = tool.command.split(/\s+/);
       let spawnedViaShell = false;
+
+      // L5: pre-spawn reservation. Synchronous — throws on unknown
+      // collabSessionId, which the outer initTerminal's React error
+      // boundary would catch; in practice collabSessionId always
+      // resolves from CollabSessionContext.
+      let reservation;
+      try {
+        reservation = reserveAgentHandle(collabSessionId, tool.id);
+      } catch (reserveErr) {
+        if (isCurrentRun()) {
+          writeWithFollowBottom(
+            `\r\n\x1b[31m[Failed to reserve handle: ${reserveErr}]\x1b[0m\r\n`,
+          );
+        }
+        return;
+      }
+
+      // L6: build extraEnv from the reservation. Using imported
+      // constants (not literal strings) so the keys stay aligned with
+      // the Rust adapter's expectations.
+      const extraEnv: Record<string, string> = {
+        [ENV_AGENT_ID]: reservation.handle,
+        [ENV_COLLAB_SESSION_ID]: collabSessionId,
+      };
 
       try {
         await invoke("spawn_process", {
           sessionId,
           program,
           args: programArgs.length > 0 ? programArgs : null,
-          extraEnv: null,
+          extraEnv,
           cwd: cwd ?? null,
           cols: terminal.cols,
           rows: terminal.rows,
@@ -287,8 +339,13 @@ export function AgentMiniTerminal({
             rows: terminal.rows,
             cwd: cwd ?? null,
             login: !isEnvBootstrapped(),
+            extraEnv,
           });
         } catch (shellErr) {
+          // L8: release reservation on spawn failure so the ordinal
+          // slot can be reused. Idempotent; safe to fire on either
+          // catch path.
+          releaseReservation(reservation.reservationId);
           if (isCurrentRun()) {
             writeWithFollowBottom(
               `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
@@ -298,7 +355,13 @@ export function AgentMiniTerminal({
         }
       }
 
-      if (!isCurrentRun()) return;
+      if (!isCurrentRun()) {
+        // StrictMode dispose between spawn-success and post-spawn
+        // setup: release the reservation so the next mount's fresh
+        // reserveAgentHandle doesn't see a leaked slot.
+        releaseReservation(reservation.reservationId);
+        return;
+      }
 
       // Let app-level shortcuts bubble past xterm
       terminal.attachCustomKeyEventHandler((e) => {
@@ -625,12 +688,24 @@ export function AgentMiniTerminal({
       // mounts' addAgent calls land — producing two SpawnedAgent records
       // with the same sessionId. The 69ca18b revert collaterally removed
       // this guard; this is its restoration.
-      if (!isCurrentRun()) return;
+      if (!isCurrentRun()) {
+        // Same StrictMode-dispose-mid-flight case as the spawn-success
+        // guard above: release the reservation so the next mount's
+        // fresh reserveAgentHandle doesn't see a leaked slot.
+        releaseReservation(reservation.reservationId);
+        return;
+      }
+      // L7: consume the reservation (returns reserved handle data) and
+      // pass the pre-minted handle into addAgent so the store record's
+      // handle matches the env-injected CT_AGENT_ID.
+      const claimed = consumeReservation(reservation.reservationId);
       useCollaboratorStore.getState().addAgent({
         sessionId,
         tool: tool.id,
         status: "spawning",
         collabSessionId,
+        handle: claimed.handle,
+        publishOptedIn: false,
       });
 
       // ---- CLI readiness detection ----
@@ -790,6 +865,68 @@ export function AgentMiniTerminal({
   const agent = useCollaboratorStore((s) =>
     s.agents.find((a) => a.sessionId === sessionId),
   );
+
+  // W9 + W10: peer-context-mirror watch lifecycle. Reactive on the
+  // (handle, publishOptedIn, status) triple. When status==='running' &&
+  // publishOptedIn===true, invoke('watch_transcript') and stash the
+  // returned u64 token in watchTokenRef. When the dependencies flip
+  // such that "should be watching" becomes false (publishOptedIn flipped
+  // off, status left 'running', or component unmounts), invoke
+  // ('unwatch_transcript') with the stashed token.
+  //
+  // The Rust side's TranscriptWatcher::unwatch is idempotent per its Q6
+  // contract — double-unwatching is safe; tokens that referred to a
+  // shutdown-cleared registry are silent no-ops. So we don't need to
+  // synchronize the catch handlers; .catch(() => {}) is sufficient.
+  //
+  // Why not gated by isCurrentRun(): this useEffect doesn't share a
+  // closure with the spawn useEffect's runId — it's a separate effect
+  // with its own per-mount lifecycle. React handles its own
+  // mount/unmount ordering; StrictMode's double-mount fires this
+  // effect's cleanup between renders, which calls unwatch before the
+  // next mount's watch fires. No race.
+  const agentHandle = agent?.handle;
+  const isRunning = agent?.status === "running";
+  const isPublishing = agent?.publishOptedIn === true;
+  const toolId = tool.id;
+  useEffect(() => {
+    if (!agentHandle || !isRunning || !isPublishing) {
+      return;
+    }
+    let unmounted = false;
+    invoke<number>("watch_transcript", {
+      sessionId,
+      agentHandle,
+      tool: toolId,
+      spawnedAtUnixMs: Date.now(),
+    })
+      .then((token) => {
+        if (unmounted) {
+          // Effect cleanup already ran — release the token immediately.
+          // Without this, a fast publish-toggle could leak a token whose
+          // cleanup ran before its watch_transcript Promise resolved.
+          invoke("unwatch_transcript", { token }).catch(() => {});
+          return;
+        }
+        watchTokenRef.current = token;
+      })
+      .catch(() => {
+        // watch_transcript failures (PTY died, fs_gate refused, etc.)
+        // are non-fatal — the watcher's idempotent contract means the
+        // next mount/toggle can retry cleanly. Don't surface a UI
+        // error; the agent's terminal pane already shows its own
+        // failure state.
+      });
+    return () => {
+      unmounted = true;
+      const token = watchTokenRef.current;
+      if (token !== null) {
+        watchTokenRef.current = null;
+        invoke("unwatch_transcript", { token }).catch(() => {});
+      }
+    };
+  }, [sessionId, agentHandle, isRunning, isPublishing, toolId]);
+
   const displayName = agent ? agentDisplayName(agent) : tool.label;
   const isExited = agent?.status === "exited";
   const isSpawning = agent?.status === "spawning";

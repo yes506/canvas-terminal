@@ -138,44 +138,61 @@ export function releaseReservation(reservationId: string): void {
 }
 
 /**
- * Consume a reservation on successful spawn — marks the reserved handle
- * as in-use.
+ * Consume a reservation on successful spawn — clears the reservation
+ * slot and returns the reserved (handle, collabSessionId, tool) so the
+ * caller can pass `handle` into `collaboratorStore.addAgent` (which
+ * skips the `nextOrdinal` mint when `raw.handle` is present, keeping
+ * the post-spawn store record aligned with the pre-spawn env-injected
+ * `CT_AGENT_ID`).
  *
  * Inputs: `reservationId`.
  *
- * Returns: void.
+ * Returns: the `AgentHandleReservation` shape that `reserveAgentHandle`
+ * originally returned. Cycle B widened this from `void` so the
+ * follow-on `addAgent` call site has the reserved handle without
+ * needing to thread it through component state separately.
  *
  * Errors: throws if the `reservationId` is unknown or has already been
- * consumed.
+ * consumed (release is irreversible).
  *
- * Side effects: clears the reservation slot. The actual `addAgent` push
- * into `collaboratorStore.agents` is the calling code's responsibility
- * (AgentMiniTerminal already needs to push post-spawn state — sessionId,
- * pid, status, cwd — that this function doesn't have access to under the
- * planner-committed `(reservationId: string) => void` signature). The
- * reserved handle is available on the reservation returned by
- * `reserveAgentHandle` so the caller can pass it into `addAgent` to keep
- * the post-spawn handle aligned with the pre-spawn reservation.
+ * Side effects: removes the reservation entry from the module-private
+ * registry. The actual `addAgent` push into `collaboratorStore.agents`
+ * is still the calling code's responsibility — `consumeReservation`
+ * doesn't have access to the post-spawn state (sessionId, status,
+ * cwd) under the planner-committed input shape. Returning the
+ * reservation data lets the caller build the SpawnedAgentInit with
+ * the reserved handle in one expression.
  *
- * Invariants: post-consume, the handle used cannot be reissued by a fresh
- * reservation (the agent now owns it for its lifetime). The agent's
- * `handle` field equals the reserved handle.
+ * Invariants: post-consume, the handle used cannot be reissued by a
+ * fresh reservation in the same pane/tool (the agent now owns it for
+ * its lifetime). The agent's `handle` field equals the reserved handle.
  *
- * Concurrency: serialized within `collaboratorStore`.
+ * Concurrency: serialized within the JS event loop.
  *
- * Lifecycle: called from `AgentMiniTerminal` after the spawn IPC resolves
- * successfully.
+ * Lifecycle: called from `AgentMiniTerminal` after the spawn IPC
+ * resolves successfully.
  *
  * Test contract: consuming an unknown id throws. Consuming a previously-
- * released id throws (release is irreversible).
+ * released id throws. The returned object equals the
+ * `AgentHandleReservation` value originally returned by
+ * `reserveAgentHandle`.
  */
-export function consumeReservation(reservationId: string): void {
-  if (!reservationRegistry.has(reservationId)) {
+export function consumeReservation(
+  reservationId: string,
+): AgentHandleReservation {
+  const entry = reservationRegistry.get(reservationId);
+  if (!entry) {
     throw new Error(
       `consumeReservation: unknown or already-consumed reservationId ${reservationId}`,
     );
   }
   reservationRegistry.delete(reservationId);
+  return {
+    reservationId,
+    handle: entry.handle,
+    collabSessionId: entry.collabSessionId,
+    tool: entry.tool,
+  };
 }
 
 // ---------------------------------------------------------------------------
