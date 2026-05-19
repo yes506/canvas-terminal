@@ -1,182 +1,214 @@
-# Feature plan — peer-context-mirror-touchup
+# Feature plan — cluster-h-agent-lifecycle
 
-Plans a four-delta touch-up to the `peer-context-mirror` planner output
-landed on `dev` at commit `e3a132e` (marker `(interfaces only, human-confirmed)`).
-The touch-up closes the four skeleton gaps the prior implementer cycle's
-four-reviewer peer-review surfaced (claude2 B1+B2, claude3 I1+I2, codex2
-B2+B3+B4+Major-6, codex3 P0×2+P1×2). See
-`.worktrees/implementer-peer-context-mirror-98411-57153-16414/implementation-report.md`
-for the source review.
+Wires AgentMiniTerminal's spawn-and-publish lifecycle to the
+peer-context-mirror infrastructure built in sessions 1-6 + cycle A.
+After this lands, an agent that flips `publishOptedIn=true` will
+have its CLI transcript actually mirrored into the
+`~/.cache/canvas-terminal/collab-memory/session-<pid>/contexts/<handle>.jsonl`
+path the Rust runtime already supports.
+
+This is **cycle B** of the Cluster H follow-up — pure TypeScript;
+no Rust changes. Cycle A (`854341b`) cleared the Rust prerequisites
+(`watch_transcript` takes `session_id`, `spawn_shell` body wires
+`extra_env`). Cycle C (publish-toggle UI + PeerContextPanel mount +
+breadcrumb wiring) is the final piece after this.
 
 ## Goal
 
-Make four additive changes to committed planner skeletons so a follow-on
-`/codebase-implementer` run can complete the **Tailer state I/O cluster**
-(3 reverted items), the **shell-fallback env propagation** (K1/C1
-reviewer-folded), and offer post-rotation inode tracking + chunk-relative
-offset contracts that the prior cycle's adapter bodies already assumed
-implicitly.
+Convert the existing peer-context-mirror infrastructure from "built
+but unwired" to "wired and exercised". Specifically: every
+AgentMiniTerminal spawn flows through the reservation lifecycle
+(`reserveAgentHandle` → spawn with `extra_env` → `consumeReservation`
+or `releaseReservation`), and every agent record carries a
+`publishOptedIn` flag that gates whether a transcript watch is active.
 
 ## In scope
 
-- **A.** Add `pub memory_dir: PathBuf` field to `TranscriptHandle`
-  (`src-tauri/src/commands/transcripts/mod.rs`). Populated by
-  `TranscriptWatcher::watch` from `memory::get_memory_dir()` so Tailer
-  state I/O writes `.state.json` inside `~/.cache/canvas-terminal/collab-memory/session-<pid>/`
-  — never inside the external transcript root.
-- **B.** Add `extra_env: Option<HashMap<String, String>>` parameter to
-  `spawn_shell` (`src-tauri/src/commands/pty.rs`). Matches
-  `spawn_process`'s existing shape. Body wiring (calling
-  `apply_extra_env`) is the implementer's job.
-- **C.** Tighten `TranscriptHandle.source_inode` docstring: "FROZEN at
-  binding-time; the LIVE inode lives in `Tailer::TailState::inode`.
-  Post-bind, never re-read source_inode." Resolves codex2 Major 6
-  without struct-shape change.
-- **D.** Tighten `TranscriptAdapter::parse_native_lines` + `RawTurn.source_offset`
-  docstrings: "CHUNK-RELATIVE — measured from the start of the `bytes`
-  slice passed in this call. Callers add `TailState::byte_offset` for
-  absolute." Resolves codex2 B4 / codex3 P1, matches the implementation
-  the prior cycle already shipped in all three adapters.
+- **types/collaborator.ts** — add `publishOptedIn: boolean` to
+  `SpawnedAgent`; add optional `handle?: string` to `SpawnedAgentInit`
+  (overrides the store's `nextOrdinal` mint when present, required
+  for reservation-pre-minted handles).
+- **collaboratorStore.ts** —
+  - `addAgent`: skip `nextOrdinal` when `raw.handle` is present; use
+    the supplied handle directly. Backward compatible for callers
+    that omit the field.
+  - New action `setPublishOptedIn(sessionId: string, value: boolean): void`
+    that flips the flag on the matching `SpawnedAgent` record. The
+    UI in cycle C consumes this; cycle B just provides the action.
+- **src/lib/peerContext.ts::consumeReservation** — change return type
+  from `void` to `AgentHandleReservation` (the same shape
+  `reserveAgentHandle` returned). Closes session 6's documented
+  "aspirational" deviation: the docstring's intent was for
+  consumeReservation to enable the agent push, and returning the
+  reservation data accomplishes that without coupling peerContext
+  directly to the store.
+- **AgentMiniTerminal.tsx** — spawn-lifecycle refactor:
+  - BEFORE invoke('spawn_process')/invoke('spawn_shell'):
+    `const reservation = reserveAgentHandle(collabSessionId, tool.id)`.
+  - Build `extraEnv = { [ENV_AGENT_ID]: reservation.handle,
+    [ENV_COLLAB_SESSION_ID]: collabSessionId }` (using the typed
+    constants from `types/peerContext.ts`) and pass to BOTH
+    spawn_process and spawn_shell invoke args. Both now accept
+    `extra_env` end-to-end (cycle A wired spawn_shell's body).
+  - On spawn success: `const claimed = consumeReservation(
+    reservation.reservationId)` → `addAgent({ sessionId, tool: tool.id,
+    status: "spawning", collabSessionId, handle: claimed.handle,
+    publishOptedIn: false })`. Wrap the addAgent call in the existing
+    `isCurrentRun()` guard (StrictMode race protection from
+    fix-strictmode-agent-dup).
+  - On spawn failure (caught Err from invoke):
+    `releaseReservation(reservation.reservationId)`. Two paths today:
+    the shell-fallback catch (`spawnedViaShell = true` then catch
+    `shellErr`) AND the upstream invoke('spawn_process') Err. Both
+    must call release before returning.
+- **AgentMiniTerminal.tsx** — watch-lifecycle useEffect (new):
+  Reactive on `(sessionId, agent?.handle, agent?.publishOptedIn,
+  agent?.status)`. When `status === "running" && publishOptedIn ===
+  true` → `invoke('watch_transcript', { sessionId, agentHandle:
+  agent.handle, tool: tool.id, spawnedAtUnixMs: Date.now() })` →
+  store returned token (u64 number) in a `useRef<number | null>`.
+  On dependency change to "should not be watching" OR on unmount →
+  `invoke('unwatch_transcript', { token: storedToken })`. Both
+  invokes `.catch(() => {})` per the watcher's idempotent contract.
+  Guard with `isCurrentRun()` (the same per-effect-run pattern
+  fix-strictmode-agent-dup introduced).
 
 ## Out of scope
 
-- Implementation bodies for the remaining 28 stubbed methods + 3
-  reverted Tailer methods (next `/codebase-implementer` cycle).
-- `memory.rs` internal-helper delegation to `fs_safety/*` primitives
-  (claude2 B2 / claude3 I5 — M7/U3 design goal; not blocking).
-- `spawn_process` migration to call `apply_extra_env` (claude2 B3 / claude3
-  I3 — DRY refactor; not blocking).
-- `O_NOFOLLOW` on `poll_new_bytes` `open()` (claude2 L1 — TOCTOU polish).
-- Shared `parse_jsonl_lines` helper extraction (claude2 L2 — DRY refactor).
-- `fsync` after tmp-write in `persist_offset` (codex2 Major 7 — folds
-  into the Tailer body when the implementer re-tackles those items).
-- Frontend changes (no TS files touched in this run).
+- **Publish-toggle UI** — the visual control that calls
+  `setPublishOptedIn`. Cycle C decides UX placement (header? menu?
+  hover?).
+- **PeerContextPanel mount point** — where in the UI peers' contexts
+  surface. Cycle C.
+- **`hasContextsBreadcrumb` wiring** into the prompt-header builder.
+  Cycle C.
+- **Migration of existing `addAgent` callers in tests
+  (`collaboratorStore.test.ts`)** — they currently omit `handle`,
+  which becomes the no-op default behavior; tests pass unchanged.
+- **Rust changes** — already done in cycle A.
 
 ## Constraints
 
-- **Additive only.** No signature drift on the 9 already-real items in
-  `.worktrees/implementer-peer-context-mirror-98411-57153-16414`.
-- **`TranscriptHandle.memory_dir` is `pub`** — visible to Tailer
-  implementations in `tailer.rs`.
-- **`spawn_shell` new parameter is `Option<HashMap<...>>`** — TS callers
-  that omit the field receive `None` on the Rust side; backward-compatible
-  for both Tauri JS callers and the existing `apply_baseline_env` path.
-- **No body generation in this run.** Planner discipline: emit signatures
-  + 9-field docstrings (where applicable), defer wiring to implementer.
-- **C and D are docstring-only** — no shape change. The 9-field structure
-  is preserved on `parse_native_lines`; we add to the existing fields,
-  do not invent new ones.
-- **Implementer-side fixes already in flight** on
-  `.worktrees/implementer-peer-context-mirror-98411-57153-16414` at
-  `be335f1` are independent of this touch-up and the next implementer
-  cycle MUST preserve them — folded per @claude3 task-2 N1:
-  - (i) `src-tauri/src/lib.rs` re-exports `TranscriptAdapter` contract
-    so `src-tauri/tests/transcript_adapter_contract.rs` compiles
-    (closes claude3 I1 — the prior cycle's E0603 private-module
-    blocker).
-  - (ii) `src-tauri/src/commands/transcripts/mod.rs` +
-    `src-tauri/src/commands/transcripts/adapters/mod.rs` doc-comments
-    reworded + `src/types/peerContext.ts`'s `source_tool` type
-    restricted to `ToolId` (production-type stays closed; test
-    fixture's `"aider"` identifier doesn't leak) — so
-    `git grep -l -i aider -- 'src-tauri/src/**' 'src/**'` returns 0
-    (closes claude3 I2).
-  These two items are NOT this touch-up's responsibility — they were
-  already body-implementation-level fixes the implementer was allowed
-  to ship under its own scope discipline. They are mentioned here only
-  so a fresh-session reader doesn't conclude they're still owed.
+- `publishOptedIn` defaults to **false** per architecture success
+  criterion "Default visibility OFF on session start".
+- `extraEnv` keys use the EXACT constants from `types/peerContext.ts`
+  (`ENV_AGENT_ID = "CT_AGENT_ID"`, `ENV_COLLAB_SESSION_ID =
+  "CT_COLLAB_SESSION_ID"`). Don't hardcode the literals; import them.
+- The watch useEffect MUST be guarded by `isCurrentRun()` so
+  StrictMode's double-mount doesn't race on watch/unwatch calls
+  (would leak tokens or fire duplicate watches).
+- `reserveAgentHandle` is synchronous and runs BEFORE the spawn IPC.
+  On synchronous throw (e.g. unknown collabSessionId), spawn doesn't
+  fire and the existing "spawn failed" error path renders naturally.
+- `consumeReservation`'s new return type requires updating its own
+  internal docstring + the 1 call site (which doesn't exist yet —
+  this is the first caller).
+- `addAgent`'s new `handle?` optional field: when present, skip the
+  `nextOrdinal` mint. Don't fall back to `nextOrdinal` if the
+  caller's handle conflicts with an existing handle in the store —
+  surface as a no-op (sessionId idempotency from
+  fix-strictmode-agent-dup already prevents duplicate inserts) or
+  log a warning.
 
 ## Success criteria
 
-- `cargo check --manifest-path src-tauri/Cargo.toml` passes on the
-  modified skeletons. (**Met**: 0 errors, 41 dead-code warnings expected
-  on remaining planner stubs.)
-- `TranscriptHandle` exposes `memory_dir: PathBuf` — Tailer state I/O
-  in the next implementer cycle has a writable in-bounds path.
-- `spawn_shell` accepts `extra_env: Option<HashMap<String, String>>`
-  matching `spawn_process`.
-- `TranscriptHandle.source_inode` docstring explicitly forbids
-  post-bind re-reads; `TailState::inode` is named as the live-inode
-  authority.
-- `TranscriptAdapter::parse_native_lines` docstring explicitly states
-  `RawTurn::source_offset` is chunk-relative; `RawTurn`'s own field
-  docstring matches.
+- `tsc --noEmit` exits 0 after the implementer cycle lands.
+- `npm test` exits 0 with the existing **216-test suite passing
+  unchanged**. The new `addAgent.handle` optional field is
+  backward-compatible (existing tests omit it).
+- Manual smoke after cycle B + a temporary DevTools-driven toggle:
+  - Spawn a Claude agent in a collab pane. Observe
+    `useCollaboratorStore.getState().agents` — the new record has
+    `publishOptedIn: false, handle: "claudeN"` (handle minted by
+    `reserveAgentHandle` pre-spawn; matches what `nextOrdinal` would
+    have produced).
+  - From DevTools: `useCollaboratorStore.getState()
+    .setPublishOptedIn(<sessionId>, true)`. Observe a new file
+    appearing at
+    `~/.cache/canvas-terminal/collab-memory/session-<PID>/contexts/claudeN.jsonl`
+    within a few seconds of CLI activity.
+  - Flip back to `false`. Observe no further writes to that file.
+- Spawned CLI process inherits `CT_AGENT_ID=<handle>` and
+  `CT_COLLAB_SESSION_ID=<collabSessionId>` in its env (verifiable via
+  the CLI dumping env, or by `lsof -p <child_pid>` showing the env
+  vars).
+- Toggle works across React.StrictMode dev double-mount without
+  duplicate watch tokens or token leaks (`isCurrentRun` guard
+  catches stale closures).
 
 ## Open questions
 
-None remaining after Phase 1 confirmation. (All four deltas are named
-verbatim in the prior implementer cycle's reviewer-folded report.)
+None requiring user input. All design decisions are settled:
+- `publishOptedIn` default = false (architecture criterion)
+- `extraEnv` constants imported from `types/peerContext.ts`
+- `consumeReservation` return type change is the cleanest path to
+  close the session-6 docstring deviation
+- `addAgent` handle-skip-mint shape is backward compatible
 
 ## Package layout
 
-No new packages introduced — touch-up lives entirely in two existing
-files within `src-tauri/src/commands/`.
+No new packages introduced — feature lives entirely in existing
+files within `src/`.
 
 ```
-src-tauri/src/commands/
-├── transcripts/
-│   └── mod.rs       [MODIFIED] +1 field on TranscriptHandle (A)
-│                                + docstring tightening on
-│                                  TranscriptHandle.source_inode (C)
-│                                + docstring tightening on
-│                                  TranscriptAdapter::parse_native_lines (D)
-│                                + docstring tightening on
-│                                  RawTurn.source_offset (D)
-└── pty.rs           [MODIFIED] +1 parameter on spawn_shell (B)
-                                 + new 9-field docstring on spawn_shell
+src/
+├── types/collaborator.ts                   [MODIFIED] +2 fields (publishOptedIn, handle?)
+├── stores/collaboratorStore.ts             [MODIFIED] +setPublishOptedIn, addAgent handle branch
+├── lib/peerContext.ts                      [MODIFIED] consumeReservation return type
+└── components/collaborator/
+    └── AgentMiniTerminal.tsx               [MODIFIED] spawn-lifecycle refactor + watch useEffect
 ```
 
-Dependency direction is unchanged from `architecture.mmd` on `dev`:
-`TranscriptWatcher → TranscriptAdapter → TranscriptFsGate → FsSafety`.
-This touch-up adds no nodes, no edges.
+Dependency direction (already in shape; cycle B just adds usage edges):
+
+```
+AgentMiniTerminal.tsx → peerContext.ts (reserve / consume / release)
+                     → collaboratorStore.ts (addAgent, setPublishOptedIn)
+                     → tauri.invoke (watch_transcript / unwatch_transcript)
+peerContext.ts       → collaboratorStore.ts (reserveOrdinalForPeerContext)
+collaboratorStore.ts → types/collaborator.ts (SpawnedAgent, SpawnedAgentInit)
+```
+
+No new circular dependencies.
 
 ## Decomposition
 
-| Node # | Stage | Node | Method / Field | Belongs to package | Notes |
-|---|---|---|---|---|---|
-| 1 | Session-binding fact | `TranscriptHandle` | `memory_dir: PathBuf` (new field) | `commands/transcripts/` | A — additive `pub` field; populated by `TranscriptWatcher::watch` |
-| 2 | Session-binding fact | `TranscriptHandle` | `source_inode: u64` (existing field) | `commands/transcripts/` | C — docstring tightening; FROZEN contract surfaces |
-| 3 | Transcript parsing | `TranscriptAdapter::parse_native_lines` | trait method docstring | `commands/transcripts/` | D — chunk-relative offset semantics surfaced |
-| 4 | Transcript parsing | `RawTurn::source_offset` | field docstring | `commands/transcripts/` | D — matching chunk-relative contract on the field itself |
-| 5 | PTY spawn (shell-fallback) | `spawn_shell` | function signature | `commands/pty.rs` | B — additive `extra_env: Option<HashMap<String, String>>` parameter + new 9-field docstring |
+| Node # | Stage | Interface / Module | Method / Function / Action | Belongs to package |
+|---|---|---|---|---|
+| 1 | Type extension | `types/collaborator.ts` | `SpawnedAgent.publishOptedIn` + `SpawnedAgentInit.handle?` | `src/types/` |
+| 2 | Store action: opt-in flag setter | `collaboratorStore.ts` | `setPublishOptedIn(sessionId, value)` | `src/stores/` |
+| 3 | Store action: addAgent with pre-minted handle | `collaboratorStore.ts` | `addAgent` (modified — skip `nextOrdinal` when `raw.handle` present) | `src/stores/` |
+| 4 | Reservation consumer return shape | `src/lib/peerContext.ts` | `consumeReservation` (modified — return `AgentHandleReservation`) | `src/lib/` |
+| 5 | Spawn-lifecycle: pre-spawn reservation | `AgentMiniTerminal.tsx` spawn useEffect | `reserveAgentHandle(collabSessionId, tool.id)` BEFORE invoke('spawn_*') | `src/components/collaborator/` |
+| 6 | Spawn-lifecycle: extra_env injection | `AgentMiniTerminal.tsx` spawn useEffect | Build `extraEnv = { CT_AGENT_ID, CT_COLLAB_SESSION_ID }` and pass to both spawn_process and spawn_shell invokes | `src/components/collaborator/` |
+| 7 | Spawn-lifecycle: consume on success | `AgentMiniTerminal.tsx` spawn useEffect | `consumeReservation` → `addAgent({..., handle, publishOptedIn: false})` (guarded by `isCurrentRun()`) | `src/components/collaborator/` |
+| 8 | Spawn-lifecycle: release on failure | `AgentMiniTerminal.tsx` spawn useEffect catch blocks | `releaseReservation(reservation.reservationId)` in shell-fallback failure AND outer catch | `src/components/collaborator/` |
+| 9 | Watch-lifecycle: start | `AgentMiniTerminal.tsx` new useEffect | `invoke('watch_transcript', { sessionId, agentHandle, tool, spawnedAtUnixMs })` → store token in `useRef`; guarded by `isCurrentRun()` + `agent.publishOptedIn && agent.status==='running'` | `src/components/collaborator/` |
+| 10 | Watch-lifecycle: stop | `AgentMiniTerminal.tsx` new useEffect cleanup + on flag flip | `invoke('unwatch_transcript', { token })` on unmount, on `publishOptedIn` flip false, or on status leaving 'running' | `src/components/collaborator/` |
+
+See `plan.mmd` for the DAG visualization.
 
 ## Interfaces emitted
 
-This run modified four touch-up targets on **existing** committed
-skeletons; no new interfaces were introduced.
-
-| Target | File | Kind | Lines changed |
-|---|---|---|---|
-| `TranscriptHandle` (struct) | `src-tauri/src/commands/transcripts/mod.rs` | shape + docstring | +28 / -8 |
-| `RawTurn` (struct) | `src-tauri/src/commands/transcripts/mod.rs` | docstring | +9 / -1 |
-| `TranscriptAdapter::parse_native_lines` (trait method) | `src-tauri/src/commands/transcripts/mod.rs` | docstring | +21 / -1 |
-| `spawn_shell` (Tauri command) | `src-tauri/src/commands/pty.rs` | signature + docstring | +54 / -0 |
+This feature lane run does **not** emit interface skeletons (per the
+user's `confirm scale` without `emit skeletons`). The interface
+changes (additive field on `SpawnedAgent`/`SpawnedAgentInit`,
+additive action on store, return-type change on
+`consumeReservation`) are documented in the In-scope section above
+and implemented directly during the downstream `/codebase-implementer`
+run.
 
 ## Validation
 
-- Phase 6 command: `cargo check --manifest-path src-tauri/Cargo.toml`
-- Exit code: **0** — `Finished dev profile target(s) in 37.68s`
-- Warnings: 41 (all `unused`/`dead_code` on remaining planner stubs in
-  `transcripts/mod.rs`, `tailer.rs`, `watcher.rs`, and the three
-  adapters — expected; baseline was 32 before this touch-up's stubs
-  inherited additional dead-code visibility).
-- Errors: 0
+Phase 6 was skipped (no compile target for plan-only feature lane).
+Phase 7 smoke check:
 
-## Downstream contract
+- `plan.md` is non-empty and contains `## Goal`, `## Package layout`,
+  `## Decomposition` headers
+- `plan.mmd` first line is `graph LR` (valid Mermaid)
 
-- Marker: `(plan-feature, human-confirmed)` (set by Phase 8 merge).
-- Artifacts on `dev` after merge: `plan.md`, `plan.mmd`, plus the
-  modified Rust skeleton files committed in `99086e5`.
-- **Preferred resumption target**: the next `/codebase-implementer`
-  run should target **this touch-up marker** — `(plan-feature,
-  human-confirmed)` for `peer-context-mirror-touchup` — when wiring
-  the remaining 28 stubs + 3 reverted Tailer items + the K6
-  shell-fallback env-propagation glue. Folded per @claude3 task-2 N2.
-- The original `(interfaces only, human-confirmed)` marker at `e3a132e`
-  remains valid for historical reference but is **not** the preferred
-  resumption target — the three reverted Tailer items
-  (`resume_from_state` / `persist_offset` / `handle_inode_change`)
-  cannot be re-implemented without `TranscriptHandle::memory_dir`
-  (delta A), and the K6 shell-fallback wiring cannot be implemented
-  without `spawn_shell::extra_env` (delta B). Only this touch-up
-  exposes both.
+Both pass — see Phase 8 below.
+
+Downstream implementer validation command:
+`tsc --noEmit && npm test`
+Expected: exit 0, all 216 tests pass.
