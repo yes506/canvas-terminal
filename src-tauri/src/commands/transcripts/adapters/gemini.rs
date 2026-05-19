@@ -69,19 +69,21 @@ impl TranscriptAdapter for GeminiAdapter {
         &self,
         agent_handle: &str,
         pid: i32,
-        spawned_at_unix_ms: i64,
+        _spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
         // Cycle E: switch to mtime-based discovery (consistent with the
         // Claude / Codex rewrites). Gemini's project-slug encoding from cwd
         // is not yet known — the implementer uses a glob over all
         // ~/.gemini/tmp/<*>/chats/ as a fallback that still narrows
-        // correctly via mtime + spawned_at_unix_ms + predicate. If the slug
-        // encoding can be derived in a future cycle, this enumeration can
-        // be tightened.
+        // correctly via mtime + process-start-time threshold + predicate.
+        // If the slug encoding can be derived in a future cycle, this
+        // enumeration can be tightened.
         //
-        // `pid` is consumed only to read cwd if a future tightening uses
-        // it; today it's a no-op for the glob path.
-        let _ = pid;
+        // Cycle F: `pid` is used by `discover_by_mtime` for the
+        // server-side process-start-time threshold (one read of
+        // `/proc/<pid>/stat` on Linux, one `ps` call on macOS).
+        // `_spawned_at_unix_ms` is now ignored (trait param retained for
+        // backward compat per plan Out-of-scope).
 
         let home = dirs::home_dir().ok_or_else(|| {
             DiscoveryError::Io(std::io::Error::new(
@@ -93,7 +95,7 @@ impl TranscriptAdapter for GeminiAdapter {
 
         // Enumerate every <project-slug>/chats subdir under ~/.gemini/tmp/.
         // Cost is one read_dir on tmp_root + one read_dir per project (and
-        // discover_by_mtime adds one read_dir per scan_root per attempt).
+        // discover_by_mtime adds one read_dir per scan_root).
         // In practice, <10 project slugs per dev machine; well-bounded.
         let scan_roots = derive_gemini_scan_roots(&tmp_root);
         if scan_roots.is_empty() {
@@ -107,7 +109,7 @@ impl TranscriptAdapter for GeminiAdapter {
             self.tool_id(),
             agent_handle,
             &scan_roots,
-            spawned_at_unix_ms,
+            pid,
             |p| {
                 // Predicate: extension is .jsonl and basename starts with
                 // "session-". The scan_roots already constrain us to
@@ -260,8 +262,9 @@ impl TranscriptAdapter for GeminiAdapter {
 ///
 /// Used by `discover_session` as the fallback set of scan roots when the
 /// project-slug encoding from cwd is not directly derivable. The
-/// `discover_by_mtime` retry + mtime + spawned_at_unix_ms filter narrows
-/// candidates down to the right session even with the wider scan set.
+/// `discover_by_mtime` single-shot scan + mtime + process-start-time
+/// threshold (from `pid`) narrows candidates down to the right session
+/// even with the wider scan set.
 ///
 /// Returns an empty `Vec` when `<tmp_root>` does not exist or contains no
 /// project subdirs — caller surfaces this as `NoMatchingFd` per the

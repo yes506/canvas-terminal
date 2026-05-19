@@ -63,9 +63,10 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
     /// PID→fd discovery for Claude Code.
     ///
     /// # Inputs `agent_handle`: bare collab handle. `pid`: child PID (post-K6,
-    /// this is the actual CLI even for shell-fallback launches).
-    /// `spawned_at_unix_ms`: tiebreaker (rarely needed because lsof gives
-    /// authoritative open-fd info).
+    /// this is the actual CLI even for shell-fallback launches); cycle F
+    /// also threads it through to `discover_by_mtime` as the source of the
+    /// process-start-time threshold. `_spawned_at_unix_ms`: ignored
+    /// (see trait docstring).
     /// # Returns `TranscriptHandle` with `source_path` resolved to one of
     /// `~/.claude/projects/<project-slug>/*.jsonl`, `source_inode` from
     /// `lstat`, `adapter_id == "claude_code"`.
@@ -87,7 +88,7 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
         &self,
         agent_handle: &str,
         pid: i32,
-        spawned_at_unix_ms: i64,
+        _spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
         // Cycle E: Claude Code 2.1.x uses open-append-close per turn —
         // verified by lsof showing zero JSONL FDs across the agent PID and
@@ -95,8 +96,9 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
         // that agent. The previous M8 rationale ("lsof gives authoritative
         // open-fd info, one JSONL open per CLI process") no longer holds.
         // Resolve the agent's cwd, build the project-dir encoding, and
-        // scan by mtime with a bounded retry for the spawn-to-first-write
-        // race.
+        // scan by mtime. Cycle F: `_spawned_at_unix_ms` is ignored — the
+        // threshold is resolved server-side by `discover_by_mtime` from
+        // the process-start time of `pid`.
 
         let cwd = super::discover_pid_cwd(pid).map_err(DiscoveryError::Io)?;
         let home = dirs::home_dir().ok_or_else(|| {
@@ -119,7 +121,7 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
             self.tool_id(),
             agent_handle,
             &[project_dir],
-            spawned_at_unix_ms,
+            pid,
             |p| p.extension().map_or(false, |e| e == "jsonl"),
         )
     }

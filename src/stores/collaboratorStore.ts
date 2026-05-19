@@ -1344,11 +1344,13 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       nickname: initialNickname,
       nicknameSlug: slugify(initialNickname),
       nameHistory: [{ nickname: initialNickname, setAt, setBy: "system" }],
-      // Default publishOptedIn=false per architecture success criterion
-      // "Default visibility OFF on session start". `raw.publishOptedIn`
-      // takes precedence if the caller explicitly sets it (e.g. for
-      // tests verifying the watch-lifecycle's on-state).
-      publishOptedIn: raw.publishOptedIn ?? false,
+      // Default publishOptedIn=true per cycle F: peer-context-mirror is
+      // always-on; the Eye toggle remains as a per-agent opt-out. The
+      // prior "Default visibility OFF on session start" criterion was
+      // dropped in favor of frictionless cross-agent context surfacing.
+      // `raw.publishOptedIn` takes precedence if the caller explicitly
+      // sets it (e.g. for tests verifying the watch-lifecycle's off-state).
+      publishOptedIn: raw.publishOptedIn ?? true,
     };
     set((s) => ({ agents: [...s.agents, agent] }));
   },

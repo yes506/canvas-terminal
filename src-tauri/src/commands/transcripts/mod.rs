@@ -233,9 +233,15 @@ pub trait TranscriptAdapter: Send + Sync {
     /// - `pid`: child PID returned by the PTY spawn. For shell-fallback
     ///   launches this is already the CLI (the typed command uses `exec`,
     ///   K6) so a direct fd lookup is sufficient.
-    /// - `spawned_at_unix_ms`: tiebreaker for the rare race where two
-    ///   simultaneous sessions in the same project dir create JSONLs of
-    ///   the same inode bucket.
+    /// - `spawned_at_unix_ms`: **ignored as of cycle F.** All three
+    ///   production adapters resolve the spawn-time threshold server-side
+    ///   from `pid` via `discover_pid_start_time` (process-start time
+    ///   from `ps -o etime=` on macOS or `/proc/<pid>/stat` field 22 on
+    ///   Linux). The trait parameter is retained for backward
+    ///   compatibility with the `watch_transcript` IPC contract; adapters
+    ///   conventionally bind it to `_spawned_at_unix_ms`. Future
+    ///   adapters MAY consult it but should prefer `discover_by_mtime`'s
+    ///   server-side threshold for cross-provider correctness.
     ///
     /// # Returns
     /// `TranscriptHandle` carrying the resolved path + inode + adapter id.
@@ -408,11 +414,29 @@ pub trait TranscriptAdapter: Send + Sync {
 /// Lives behind `Inner`'s `Mutex`; mutability is at the entry level
 /// (e.g. `tail_state.byte_offset` advances on each successful poll;
 /// `last_event_at` updates on each fired notification for debounce).
+///
+/// Cycle F lifecycle: `watch()` inserts a PENDING entry (handle /
+/// subscription_id / tail_state all `None`, `discovery_task = Some(...)`).
+/// The discovery task asynchronously calls `discover_session`; on success
+/// it populates the trio and clears `discovery_task`. `on_fs_event` skips
+/// entries with `handle == None` so pending entries never get polled.
 pub(in crate::commands::transcripts) struct Entry {
-    pub(in crate::commands::transcripts) handle: TranscriptHandle,
-    pub(in crate::commands::transcripts) subscription_id: u64,
-    pub(in crate::commands::transcripts) tail_state: tailer::TailState,
+    /// Resolved transcript binding. `None` until `discovery_loop` succeeds.
+    pub(in crate::commands::transcripts) handle: Option<TranscriptHandle>,
+    /// FSEvents subscription id (parent-dir scope). `None` until the
+    /// discovery task subscribes during populate.
+    pub(in crate::commands::transcripts) subscription_id: Option<u64>,
+    /// Tailer resume state. `None` until populate.
+    pub(in crate::commands::transcripts) tail_state: Option<tailer::TailState>,
+    /// Adapter trait object — known immediately from `watch()` inputs and
+    /// safe to populate at entry-insert time (no IO required).
     pub(in crate::commands::transcripts) adapter: &'static dyn TranscriptAdapter,
+    /// Abort handle for the async discovery task. `Some` while the task
+    /// is in flight; cleared once the task completes (success or abort).
+    /// `unwatch` (F7) aborts via this handle whether or not the task has
+    /// already populated the entry — abort on an already-completed task
+    /// is a no-op.
+    pub(in crate::commands::transcripts) discovery_task: Option<tokio::task::AbortHandle>,
     /// Last-fired debounce timestamp. None until the first event arrives;
     /// after that, on_fs_event refuses to re-poll within 100ms of this
     /// stamp (coalesces FSEvents under macOS's ~250-1000ms floor — see
@@ -588,71 +612,70 @@ impl TranscriptWatcher {
         Ok(())
     }
 
-    /// Register a new (agent, transcript) binding. Increments ref-count.
+    /// Register a new (agent, transcript) binding. Cycle F: discovery is
+    /// async; this call inserts a PENDING entry and returns immediately.
     ///
     /// # Inputs
-    /// `handle`: result of `TranscriptAdapter::discover_session`.
+    /// - `adapter`: trait object for the agent's tool (cycle F pre-resolves
+    ///   it at the IPC boundary so the watcher never re-looks-up by id).
+    /// - `agent_handle`: bare collab handle (e.g. `"claude3"`).
+    /// - `pid`: child PID returned by the PTY spawn.
+    /// - `spawned_at_unix_ms`: legacy IPC threshold; ignored by all three
+    ///   production adapters per cycle F's process-start-time pivot but
+    ///   threaded through verbatim for trait-signature backward compat.
     ///
     /// # Returns
-    /// `WatchToken` to pass to `unwatch` for teardown.
+    /// `WatchToken` to pass to `unwatch` for teardown. The token is valid
+    /// IMMEDIATELY (before discovery completes); `unwatch` works correctly
+    /// in both pending and populated states.
     ///
     /// # Errors
-    /// - `WatcherError::GateRejected` if the handle's path no longer passes
-    ///   `fs_gate::check_transcript_root` (e.g. file removed between
-    ///   discovery and watch).
-    /// - `WatcherError::Io` on FSEvents subscribe failure.
+    /// - `WatcherError::NotStarted` if `shutdown()` has been called or the
+    ///   FSEvents subsystem cannot initialize. Errors that happen INSIDE
+    ///   the async discovery loop (`NoMatchingFd`, `Io`, etc.) are logged
+    ///   and retried every 5s until `unwatch` aborts the task.
     ///
     /// # Side effects
-    /// Calls `subscribe_fsevents`; increments internal ref-count; allocates
-    /// per-handle tailer state under `session-<pid>/contexts/.state.json`.
+    /// Reserves a token id under the Inner mutex. Spawns one tokio task
+    /// per call (long-lived, until `unwatch` or successful population).
+    /// FSEvents subscription + tail-state resumption happen INSIDE the
+    /// task, only on successful discovery.
     ///
     /// # Invariants
-    /// After `Ok(token)`, the watcher is monitoring `handle.source_path` and
-    /// will route file events through the Tailer + Adapter pipeline.
+    /// After `Ok(token)`, the watcher is committed to surfacing the
+    /// agent's transcript as soon as the CLI tool writes its first
+    /// session JSONL. The token's `unwatch` is idempotent and aborts
+    /// the discovery task whether or not population has completed.
     ///
     /// # Concurrency
-    /// Safe to call concurrently; internally serialized at the ref-count
-    /// and FSEvents-registry critical sections.
+    /// Safe to call concurrently. The async discovery task uses
+    /// `tokio::time::sleep` so it never holds the Inner mutex across an
+    /// await point. The Inner mutex remains a `std::sync::Mutex` — the
+    /// async task acquires it synchronously between sleeps.
     ///
     /// # Lifecycle
-    /// One call per agent-opt-in-publish event. Token is owned by the
-    /// frontend (via Tauri IPC) and returned on unwatch.
+    /// One call per agent-opt-in-publish event. Cycle F always-on:
+    /// publishOptedIn defaults to `true`, so this fires automatically at
+    /// agent spawn time. The discovery task survives arbitrary
+    /// spawn-to-first-write delays via 5s polling.
     ///
     /// # Test contract
-    /// Two `watch` calls on the same `source_path` produce distinct
-    /// `WatchToken`s. Each token's `unwatch` decrements ref-count
+    /// Two `watch` calls on the same `pid` produce distinct
+    /// `WatchToken`s. Each token's `unwatch` aborts its own discovery
+    /// task and (if populated) decrements its own ref-count
     /// independently.
-    pub fn watch(&self, handle: TranscriptHandle) -> Result<WatchToken, WatcherError> {
+    pub fn watch(
+        &self,
+        adapter: &'static dyn TranscriptAdapter,
+        agent_handle: String,
+        pid: i32,
+        spawned_at_unix_ms: i64,
+    ) -> Result<WatchToken, WatcherError> {
         // Lazily start FSEvents on first watch().
         self.start_if_needed()?;
 
-        // Re-verify the path through fs_gate (handle was issued earlier by
-        // discover_session; the file may have been removed between
-        // discovery and this watch call — gate spec X1 calls this out).
-        let _canonical = fs_gate::check_transcript_root(handle.adapter_id, &handle.source_path)
-            .map_err(|e| WatcherError::GateRejected(format!("{:?}", e)))?;
-
-        // Resolve adapter_id → trait object. Unknown id is GateRejected
-        // (rather than Io) — caller's adapter registry has drifted from
-        // the production trio.
-        let adapter = adapters::adapter_for(handle.adapter_id).ok_or_else(|| {
-            WatcherError::GateRejected(format!("unknown adapter_id: {}", handle.adapter_id))
-        })?;
-
-        // Resume TailState (touch-up A: uses handle.memory_dir for the
-        // .state.json read; inode mismatch resets byte_offset to 0).
-        let tail_state = tailer::resume_from_state(&handle)?;
-
-        // Register the parent dir on the RecommendedWatcher via
-        // subscribe_fsevents. The Subscription's id is stored on the
-        // Entry so unwatch can decrement the parent_dir_refs ref-count.
-        let subscription = watcher::subscribe_fsevents(&handle)?;
-
-        // Clone source_path before the entry consumes `handle` — we need
-        // it after the lock drops to synthesize the initial-drain
-        // on_fs_event call.
-        let source_path_for_drain = handle.source_path.clone();
-
+        // Reserve token id and insert PENDING entry. Subscription /
+        // tail_state / handle stay None until the async task populates.
         let token_id = {
             let mut g = self
                 .inner
@@ -666,38 +689,241 @@ impl TranscriptWatcher {
             g.entries.insert(
                 token_id,
                 Entry {
-                    handle,
-                    subscription_id: subscription.0,
-                    tail_state,
+                    handle: None,
+                    subscription_id: None,
+                    tail_state: None,
                     adapter,
+                    discovery_task: None,
                     last_event_at: None,
                 },
             );
             token_id
         };
 
+        // Spawn the discovery polling task. The task owns its own Arc
+        // clone of Inner so it can re-acquire the lock between sleeps
+        // without touching the Tauri State<>.
+        let inner_for_task = self.inner.clone();
+        let agent_handle_for_task = agent_handle.clone();
+        let join = tokio::spawn(async move {
+            Self::discovery_loop(
+                inner_for_task,
+                token_id,
+                adapter,
+                agent_handle_for_task,
+                pid,
+                spawned_at_unix_ms,
+            )
+            .await;
+        });
+
+        // Store the abort handle on the entry. If `unwatch` has already
+        // raced ahead of this lock (removing the entry), abort the
+        // freshly-spawned task immediately so it doesn't run.
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| WatcherError::NotStarted)?;
+            if let Some(entry) = g.entries.get_mut(&token_id) {
+                entry.discovery_task = Some(join.abort_handle());
+            } else {
+                join.abort();
+            }
+        }
+
+        Ok(WatchToken(token_id))
+    }
+
+    /// Async polling loop for `watch`'s discovery task. Calls the adapter's
+    /// `discover_session` every 5s until success, abort, or watcher
+    /// shutdown.
+    ///
+    /// On success: invokes `populate_entry` which acquires the fs_gate +
+    /// tail_state + FSEvents subscription and stores them on the entry.
+    /// The initial-drain `on_fs_event` synthesize-call also lives in
+    /// `populate_entry` so any content already on disk replays as soon
+    /// as discovery resolves.
+    ///
+    /// On `NoMatchingFd`: sleeps 5s and retries. This is the common case
+    /// for the cold-spawn flow — the CLI tool has not yet created its
+    /// session JSONL.
+    ///
+    /// On other errors (`Io`, `Gated`, `Unsupported`): logs to stderr and
+    /// retries the same way. Genuinely-permanent errors (a `Gated` from
+    /// a misconfigured root) will retry every 5s indefinitely but the
+    /// CPU cost is negligible (one syscall per retry).
+    ///
+    /// Exits cleanly when:
+    /// - the entry has been removed (via `unwatch`)
+    /// - the watcher has been shut down (`shutdown()`)
+    /// - the task is aborted (`AbortHandle::abort()`)
+    async fn discovery_loop(
+        inner: std::sync::Arc<std::sync::Mutex<Inner>>,
+        token_id: u64,
+        adapter: &'static dyn TranscriptAdapter,
+        agent_handle: String,
+        pid: i32,
+        spawned_at_unix_ms: i64,
+    ) {
+        const POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+        loop {
+            // Exit-condition check before each discover_session attempt.
+            {
+                let g = match inner.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                if g.shutdown || !g.entries.contains_key(&token_id) {
+                    return;
+                }
+            }
+
+            let result = adapter.discover_session(&agent_handle, pid, spawned_at_unix_ms);
+            match result {
+                Ok(handle) => {
+                    // Populate is a sync helper that re-checks entry
+                    // presence under the lock and releases before the
+                    // initial-drain on_fs_event call. Errors inside
+                    // populate are logged-and-dropped (the task exits
+                    // either way once we have a successful discovery).
+                    Self::populate_entry(&inner, token_id, handle);
+                    return;
+                }
+                Err(DiscoveryError::NoMatchingFd) => {
+                    // Common path: tool hasn't created its JSONL yet.
+                    // Silent retry.
+                }
+                Err(e) => {
+                    // Less-common path: an Io / Gated / Unsupported.
+                    // Log so the user can debug, then retry — most
+                    // such errors are transient (CLI subprocess race,
+                    // /proc read of a momentarily-gone pid, etc).
+                    eprintln!(
+                        "transcripts: discovery error for token {} ({}): {:?}",
+                        token_id, agent_handle, e
+                    );
+                }
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Apply a successful `discover_session` result to a PENDING entry.
+    ///
+    /// Two-phase commit:
+    /// - Phase A: under the lock, verify the entry still exists. If
+    ///   `unwatch` has raced ahead, exit silently.
+    /// - Phase B: outside the lock, perform fs_gate + resume_from_state
+    ///   + subscribe_fsevents. These are IO-bound and we don't want to
+    ///   serialize them behind the watcher mutex.
+    /// - Phase C: re-acquire the lock. Re-check entry presence. If gone,
+    ///   undo the FSEvents subscription (decrement ref-count). If
+    ///   present, populate the trio.
+    /// - Initial drain (outside the lock): synthesize an on_fs_event so
+    ///   any content already on disk replays into `contexts/<agent>.jsonl`
+    ///   without waiting for the next FSEvents notification.
+    fn populate_entry(
+        inner: &std::sync::Arc<std::sync::Mutex<Inner>>,
+        token_id: u64,
+        handle: TranscriptHandle,
+    ) {
+        // Phase A: cheap presence check.
+        {
+            let g = match inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if g.shutdown || !g.entries.contains_key(&token_id) {
+                return;
+            }
+        }
+
+        // Phase B: outside-lock IO.
+        let canonical_result =
+            fs_gate::check_transcript_root(handle.adapter_id, &handle.source_path);
+        if let Err(e) = canonical_result {
+            eprintln!(
+                "transcripts: fs_gate rejected populated handle for token {}: {:?}",
+                token_id, e
+            );
+            return;
+        }
+
+        let tail_state = match tailer::resume_from_state(&handle) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "transcripts: tail_state resume failed for token {}: {:?}",
+                    token_id, e
+                );
+                return;
+            }
+        };
+
+        let subscription = match watcher::subscribe_fsevents(&handle) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "transcripts: FSEvents subscribe failed for token {}: {:?}",
+                    token_id, e
+                );
+                return;
+            }
+        };
+
+        let source_path_for_drain = handle.source_path.clone();
+        let parent_for_rollback = handle.source_path.parent().map(|p| p.to_path_buf());
+
+        // Phase C: re-acquire lock + populate or roll back.
+        let populated = match inner.lock() {
+            Ok(mut g) => {
+                if let Some(entry) = g.entries.get_mut(&token_id) {
+                    entry.handle = Some(handle);
+                    entry.subscription_id = Some(subscription.0);
+                    entry.tail_state = Some(tail_state);
+                    entry.discovery_task = None;
+                    true
+                } else {
+                    // Entry vanished between Phase A and Phase C —
+                    // `unwatch` raced. Roll back the FSEvents
+                    // subscription so parent_dir_refs doesn't leak.
+                    if let Some(parent) = &parent_for_rollback {
+                        let cur = g.parent_dir_refs.get(parent).copied().unwrap_or(0);
+                        let next = cur.saturating_sub(1);
+                        if next == 0 {
+                            g.parent_dir_refs.remove(parent);
+                            if let Some(w) = g.watcher.as_mut() {
+                                use notify::Watcher;
+                                let _ = w.unwatch(parent);
+                            }
+                        } else {
+                            g.parent_dir_refs.insert(parent.clone(), next);
+                        }
+                    }
+                    false
+                }
+            }
+            Err(_) => {
+                // Lock-poisoning: best-effort no-op. Subscription leaks
+                // until shutdown(); acceptable because lock-poison means
+                // we already panicked somewhere and are in a degraded
+                // process state.
+                false
+            }
+        };
+
+        if !populated {
+            return;
+        }
+
         // Initial drain: synthesize one on_fs_event so any content
         // already present in the source JSONL replays into
         // contexts/<agent>.jsonl without waiting for the next FSEvents
-        // notification. Necessary because the user may click the
-        // publish toggle mid-conversation while the source file is
-        // idle; without this, the existing turns never surface and
-        // contexts/ stays absent until the next user turn.
-        //
-        // The synthesized event re-acquires the Inner lock from scratch
-        // (we released it via the scope above), finds the entry by
-        // matching event_path == handle.source_path, sees
-        // last_event_at = None so the debounce branch is bypassed, and
-        // runs the full poll + parse + normalize + persist pipeline.
-        // poll_new_bytes reads from byte_offset = 0 on first call (the
-        // tail_state created by resume_from_state above), so the entire
-        // existing file replays. Errors inside on_fs_event are logged-
-        // and-swallowed by design (the function returns ()), so a
-        // failure here does not poison watch() — the next genuine
-        // FSEvents notification will retry through the same path.
+        // notification. Outside-lock: on_fs_event re-acquires the lock
+        // internally.
         watcher::on_fs_event(&watcher::Subscription(0), &source_path_for_drain);
-
-        Ok(WatchToken(token_id))
     }
 
     /// Unregister a previously-issued token. Decrements ref-count.
@@ -745,30 +971,40 @@ impl TranscriptWatcher {
             None => return,
         };
 
-        // Decrement parent_dir_refs. When the count hits zero, no other
-        // agent shares this parent dir — unregister the FSEvents
-        // subscription. The mirror file in `contexts/<agent>.jsonl`
-        // stays on disk (clean-up is the user's call; matches the
-        // session-lifetime retention default).
-        if let Some(parent) = entry.handle.source_path.parent() {
-            let parent_path = parent.to_path_buf();
-            let prev = g
-                .parent_dir_refs
-                .get(&parent_path)
-                .copied()
-                .unwrap_or(0);
-            let next = prev.saturating_sub(1);
-            if next == 0 {
-                g.parent_dir_refs.remove(&parent_path);
-                if let Some(w) = g.watcher.as_mut() {
-                    use notify::Watcher;
-                    // Best-effort: errors are swallowed (the path may
-                    // already be unwatched if FSEvents detected the dir
-                    // disappear).
-                    let _ = w.unwatch(&parent_path);
+        // Cycle F (F7): abort the discovery task whether or not the entry
+        // ever populated. `AbortHandle::abort` is a no-op for tasks that
+        // have already completed, so this is safe regardless of state.
+        if let Some(task) = entry.discovery_task {
+            task.abort();
+        }
+
+        // Decrement parent_dir_refs only for POPULATED entries. Pending
+        // entries (handle == None) never subscribed to FSEvents — there
+        // is no ref-count to decrement. The mirror file in
+        // `contexts/<agent>.jsonl` (if any) stays on disk; clean-up is
+        // the user's call, matching the session-lifetime retention
+        // default.
+        if let Some(handle) = entry.handle.as_ref() {
+            if let Some(parent) = handle.source_path.parent() {
+                let parent_path = parent.to_path_buf();
+                let prev = g
+                    .parent_dir_refs
+                    .get(&parent_path)
+                    .copied()
+                    .unwrap_or(0);
+                let next = prev.saturating_sub(1);
+                if next == 0 {
+                    g.parent_dir_refs.remove(&parent_path);
+                    if let Some(w) = g.watcher.as_mut() {
+                        use notify::Watcher;
+                        // Best-effort: errors are swallowed (the path may
+                        // already be unwatched if FSEvents detected the dir
+                        // disappear).
+                        let _ = w.unwatch(&parent_path);
+                    }
+                } else {
+                    g.parent_dir_refs.insert(parent_path, next);
                 }
-            } else {
-                g.parent_dir_refs.insert(parent_path, next);
             }
         }
     }
@@ -827,7 +1063,16 @@ impl TranscriptWatcher {
                     "unknown WatchToken",
                 ))
             })?;
-            entry.handle.agent_handle.clone()
+            // Cycle F: pending entries (handle == None) never reach here —
+            // on_fs_event filters them out before the pipeline. If we do
+            // arrive without a handle, fail loudly so the bug surfaces.
+            let handle = entry.handle.as_ref().ok_or_else(|| {
+                WatcherError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "append_normalized_turn called on pending entry",
+                ))
+            })?;
+            handle.agent_handle.clone()
         };
 
         // Serialize to one line, terminated by \n. Readers split on '\n';
@@ -915,7 +1160,14 @@ impl TranscriptWatcher {
                 Some(e) => e,
                 None => return Ok(()),
             };
-            entry.handle.agent_handle.clone()
+            // Cycle F: pending entries have nothing to rotate (no
+            // mirror file exists yet). Silent no-op matches the
+            // docstring's "rotation happens or not" semantic.
+            let handle = match entry.handle.as_ref() {
+                Some(h) => h,
+                None => return Ok(()),
+            };
+            handle.agent_handle.clone()
         };
 
         let dir = super::memory::get_memory_dir().map_err(|e| {
@@ -1059,6 +1311,16 @@ impl TranscriptWatcher {
             Err(_) => return,
         };
         g.shutdown = true;
+        // Cycle F (F6/F7): abort every pending discovery task before
+        // dropping the entries map. Dropping an AbortHandle without
+        // calling .abort() does NOT cancel the task — it would keep
+        // polling against the Inner Arc (which survives shutdown via the
+        // OnceLock) and would log retry errors forever.
+        for entry in g.entries.values_mut() {
+            if let Some(task) = entry.discovery_task.take() {
+                task.abort();
+            }
+        }
         g.entries.clear();
         g.parent_dir_refs.clear();
         // Drop the notify::RecommendedWatcher — its Drop impl stops the
@@ -1126,11 +1388,13 @@ pub fn watch_transcript(
 
     let adapter = adapters::adapter_for(tool.as_str())
         .ok_or_else(|| format!("unknown tool: {}", tool))?;
-    let handle = adapter
-        .discover_session(&agent_handle, pid, spawned_at_unix_ms)
-        .map_err(|e| format!("discover_session: {:?}", e))?;
+    // Cycle F: discovery is no longer sync at the IPC boundary. `watch`
+    // inserts a PENDING entry and spawns the polling task; the token is
+    // valid immediately and unwatch is idempotent in both pending and
+    // populated states. spawned_at_unix_ms is passed through so the
+    // trait signature stays stable (adapters ignore it under cycle F).
     let token = transcript
-        .watch(handle)
+        .watch(adapter, agent_handle, pid, spawned_at_unix_ms)
         .map_err(|e| format!("watch: {:?}", e))?;
     Ok(token.0)
 }

@@ -203,7 +203,13 @@ pub fn on_fs_event(subscription: &Subscription, event_path: &PathBuf) {
         let now = std::time::Instant::now();
         let mut hit: Option<u64> = None;
         for (token_id, entry) in g.entries.iter_mut() {
-            if &entry.handle.source_path == event_path {
+            // Cycle F: pending entries have no source_path to match
+            // against — skip them. Events fired against the parent
+            // dir before discovery completes are not relevant.
+            let Some(handle) = entry.handle.as_ref() else {
+                continue;
+            };
+            if &handle.source_path == event_path {
                 let should_process = match entry.last_event_at {
                     Some(prev) if now.duration_since(prev).as_millis() < DEBOUNCE_MS => false,
                     _ => true,
@@ -220,18 +226,28 @@ pub fn on_fs_event(subscription: &Subscription, event_path: &PathBuf) {
             None => return, // sibling-file event or debounced — drop.
         };
         let entry = g.entries.get(&token_id).expect("entry just located");
+        // The `hit` filter only fires on populated entries, so handle
+        // and tail_state are guaranteed Some here.
+        let handle_ref = entry
+            .handle
+            .as_ref()
+            .expect("populated entry has handle (filtered above)");
+        let tail_state_ref = entry
+            .tail_state
+            .as_ref()
+            .expect("populated entry has tail_state (filtered above)");
         (
             token_id,
             TranscriptHandle {
-                agent_handle: entry.handle.agent_handle.clone(),
-                adapter_id: entry.handle.adapter_id,
-                source_path: entry.handle.source_path.clone(),
-                source_inode: entry.handle.source_inode,
-                pid: entry.handle.pid,
-                memory_dir: entry.handle.memory_dir.clone(),
+                agent_handle: handle_ref.agent_handle.clone(),
+                adapter_id: handle_ref.adapter_id,
+                source_path: handle_ref.source_path.clone(),
+                source_inode: handle_ref.source_inode,
+                pid: handle_ref.pid,
+                memory_dir: handle_ref.memory_dir.clone(),
             },
-            entry.tail_state.byte_offset,
-            entry.tail_state.last_normalized_turn_index,
+            tail_state_ref.byte_offset,
+            tail_state_ref.last_normalized_turn_index,
             entry.adapter,
         )
     };
@@ -254,7 +270,7 @@ pub fn on_fs_event(subscription: &Subscription, event_path: &PathBuf) {
             if let Ok(new_state) = super::tailer::handle_inode_change(&handle) {
                 if let Ok(mut g) = inner.lock() {
                     if let Some(entry) = g.entries.get_mut(&token_id) {
-                        entry.tail_state = new_state;
+                        entry.tail_state = Some(new_state);
                     }
                 }
             }
@@ -308,7 +324,7 @@ pub fn on_fs_event(subscription: &Subscription, event_path: &PathBuf) {
     let _ = super::tailer::persist_offset(&new_state);
     if let Ok(mut g) = inner.lock() {
         if let Some(entry) = g.entries.get_mut(&token_id) {
-            entry.tail_state = new_state;
+            entry.tail_state = Some(new_state);
         }
     }
 }

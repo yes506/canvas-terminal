@@ -39,10 +39,11 @@ export interface SpawnedAgentInit {
   handle?: string;
   /**
    * Cross-tool agent context surfacing opt-in (peer-context-mirror feature).
-   * Optional on init; `addAgent` defaults to `false` when omitted, per
-   * architecture success criterion "Default visibility OFF on session
-   * start". Backward-compatible for pre-peer-context-mirror callers
-   * (tests, future code) that haven't been migrated.
+   * Optional on init; `addAgent` defaults to `true` when omitted (cycle F
+   * always-on). The Eye toggle in `AgentMiniTerminal.tsx` remains as a
+   * per-agent opt-out via `setPublishOptedIn`. Backward-compatible for
+   * pre-peer-context-mirror callers (tests, future code) that haven't
+   * been migrated.
    *
    * The UI (cycle C) flips this via `setPublishOptedIn`; the watch
    * lifecycle in `AgentMiniTerminal.tsx` gates `invoke('watch_transcript')`
@@ -84,14 +85,14 @@ export interface SpawnedAgent extends SpawnedAgentInit {
   nameHistory: AgentNameRecord[];
   /**
    * Cross-tool agent context surfacing opt-in. `addAgent` defaults this
-   * to `false` (per architecture "Default visibility OFF on session
-   * start") when omitted from `SpawnedAgentInit`. Optional on the
-   * materialized record too so pre-peer-context-mirror test fixtures
-   * (which construct `SpawnedAgent` literals directly, bypassing
-   * `addAgent`) continue to compile without `publishOptedIn: false`
+   * to `true` (cycle F: peer-context-mirror is always-on; Eye toggle
+   * remains the per-agent opt-out) when omitted from `SpawnedAgentInit`.
+   * Optional on the materialized record too so pre-peer-context-mirror
+   * test fixtures (which construct `SpawnedAgent` literals directly,
+   * bypassing `addAgent`) continue to compile without `publishOptedIn`
    * boilerplate. Readers MUST check `=== true` (not truthy or `!== false`)
-   * so `undefined` reads as "not publishing" — matches the
-   * `publishOptedIn ?? false` semantic everywhere.
+   * so `undefined` (only produced by direct-construction test fixtures)
+   * reads as "not publishing".
    */
   publishOptedIn?: boolean;
 }
