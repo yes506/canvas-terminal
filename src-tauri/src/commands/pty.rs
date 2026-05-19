@@ -136,7 +136,6 @@ const BASELINE_ENV_KEYS: &[&str] = &[
 /// Passing `Some({"FOO": "1"})` results in `cmd` having `FOO=1`. Passing
 /// `None` is observationally equivalent to not calling this function.
 /// Passing `Some({})` is a no-op.
-#[allow(dead_code)]
 fn apply_extra_env(
     cmd: &mut CommandBuilder,
     extra_env: Option<&std::collections::HashMap<String, String>>,
@@ -397,9 +396,6 @@ pub fn spawn_shell(
     login: Option<bool>,
     extra_env: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
-    // Signature-only addition — wiring to `apply_extra_env` is the implementer's
-    // job. Silence the unused-param warning until then.
-    let _ = &extra_env;
     let pty_system = native_pty_system();
 
     let pair = pty_system
@@ -427,6 +423,11 @@ pub fn spawn_shell(
 
     apply_cwd(&mut cmd, &cwd);
     apply_baseline_env(&mut cmd);
+    // Caller-provided env merged AFTER baseline so collision keys
+    // override baseline values (per apply_extra_env's docstring
+    // contract). Used by AgentMiniTerminal once Cluster H lands to
+    // pass CT_AGENT_ID / CT_COLLAB_SESSION_ID at PTY spawn-time.
+    apply_extra_env(&mut cmd, extra_env.as_ref());
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);

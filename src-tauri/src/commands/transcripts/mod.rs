@@ -1057,24 +1057,49 @@ impl TranscriptWatcher {
 // frontend-facing exposure. See lib.rs's `tauri::generate_handler!`
 // invocation for handler registration.
 
-/// Tauri IPC: resolve a (PID, tool, agent_handle) tuple to a running
-/// transcript watch. Wraps `TranscriptAdapter::discover_session` +
-/// `TranscriptWatcher::watch` for the frontend's `useEffect` on
-/// `AgentMiniTerminal` mount.
+/// Tauri IPC: resolve a (session_id, tool, agent_handle) tuple to a
+/// running transcript watch. The frontend (AgentMiniTerminal) doesn't
+/// have direct access to the child PID — PTY spawning happens entirely
+/// inside Rust and the PID is only on `PtySession.child`. So this
+/// command takes `session_id` (which the frontend already has) and
+/// resolves the PID server-side via `AppState.sessions`, then runs
+/// the standard `adapter.discover_session` + `TranscriptWatcher::watch`
+/// pipeline.
+///
+/// Single-call design (vs. a separate `get_pty_pid` IPC followed by
+/// this one): avoids a TOCTOU window where the PTY could die between
+/// PID resolution and watch registration. Both happen under one
+/// command invocation; if the PTY dies mid-flight, `discover_session`
+/// or `watch` surfaces the failure as a single error to the frontend.
 #[tauri::command]
 pub fn watch_transcript(
-    state: tauri::State<'_, TranscriptWatcher>,
+    transcript: tauri::State<'_, TranscriptWatcher>,
+    app: tauri::State<'_, crate::state::AppState>,
+    session_id: String,
     agent_handle: String,
-    pid: i32,
     tool: String,
     spawned_at_unix_ms: i64,
 ) -> Result<u64, String> {
+    // Extract PID under a minimal lock scope so downstream lsof /
+    // fs_gate / etc. don't gate behind the sessions mutex. Mirrors
+    // the pattern in `pty.rs::get_pty_cwd`.
+    let pid: i32 = {
+        let sessions = app.sessions.lock().map_err(|e| e.to_string())?;
+        let session = sessions
+            .get(&session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id))?;
+        session
+            .child
+            .process_id()
+            .ok_or("Cannot get child PID")? as i32
+    };
+
     let adapter = adapters::adapter_for(tool.as_str())
         .ok_or_else(|| format!("unknown tool: {}", tool))?;
     let handle = adapter
         .discover_session(&agent_handle, pid, spawned_at_unix_ms)
         .map_err(|e| format!("discover_session: {:?}", e))?;
-    let token = state
+    let token = transcript
         .watch(handle)
         .map_err(|e| format!("watch: {:?}", e))?;
     Ok(token.0)
