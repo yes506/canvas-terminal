@@ -1,214 +1,296 @@
-# Feature plan — cluster-h-agent-lifecycle
+# Cycle E — peer-context-mirror discovery rewrite (mtime-based)
 
-Wires AgentMiniTerminal's spawn-and-publish lifecycle to the
-peer-context-mirror infrastructure built in sessions 1-6 + cycle A.
-After this lands, an agent that flips `publishOptedIn=true` will
-have its CLI transcript actually mirrored into the
-`~/.cache/canvas-terminal/collab-memory/session-<pid>/contexts/<handle>.jsonl`
-path the Rust runtime already supports.
+`scale: feature   marker on merge: (plan-feature, human-confirmed)`
 
-This is **cycle B** of the Cluster H follow-up — pure TypeScript;
-no Rust changes. Cycle A (`854341b`) cleared the Rust prerequisites
-(`watch_transcript` takes `session_id`, `spawn_shell` body wires
-`extra_env`). Cycle C (publish-toggle UI + PeerContextPanel mount +
-breadcrumb wiring) is the final piece after this.
+(Prior `plan.md` on `dev` documented cycle B `cluster-h-agent-lifecycle`.
+Overwritten with this cycle E plan; historical content reachable via
+`git log -- plan.md`.)
 
 ## Goal
 
-Convert the existing peer-context-mirror infrastructure from "built
-but unwired" to "wired and exercised". Specifically: every
-AgentMiniTerminal spawn flows through the reservation lifecycle
-(`reserveAgentHandle` → spawn with `extra_env` → `consumeReservation`
-or `releaseReservation`), and every agent record carries a
-`publishOptedIn` flag that gates whether a transcript watch is active.
+Replace the lsof-based `discover_session` primitive in all three
+adapters (Claude Code, Codex, Gemini) with an mtime-based scan of each
+adapter's project directory, gated by `spawned_at_unix_ms`. Required
+because Claude Code 2.1.133 (and likely Codex) uses **open-append-close
+per turn** — they do NOT hold the session JSONL open between turns, so
+`lsof -p <pid>` finds nothing even when the JSONL exists on disk and
+has substantial content. Cycle B's discovery model is broken for this
+class of CLI.
 
-## In scope
+## Background (evidence from cycle C+D verification)
 
-- **types/collaborator.ts** — add `publishOptedIn: boolean` to
-  `SpawnedAgent`; add optional `handle?: string` to `SpawnedAgentInit`
-  (overrides the store's `nextOrdinal` mint when present, required
-  for reservation-pre-minted handles).
-- **collaboratorStore.ts** —
-  - `addAgent`: skip `nextOrdinal` when `raw.handle` is present; use
-    the supplied handle directly. Backward compatible for callers
-    that omit the field.
-  - New action `setPublishOptedIn(sessionId: string, value: boolean): void`
-    that flips the flag on the matching `SpawnedAgent` record. The
-    UI in cycle C consumes this; cycle B just provides the action.
-- **src/lib/peerContext.ts::consumeReservation** — change return type
-  from `void` to `AgentHandleReservation` (the same shape
-  `reserveAgentHandle` returned). Closes session 6's documented
-  "aspirational" deviation: the docstring's intent was for
-  consumeReservation to enable the agent push, and returning the
-  reservation data accomplishes that without coupling peerContext
-  directly to the store.
-- **AgentMiniTerminal.tsx** — spawn-lifecycle refactor:
-  - BEFORE invoke('spawn_process')/invoke('spawn_shell'):
-    `const reservation = reserveAgentHandle(collabSessionId, tool.id)`.
-  - Build `extraEnv = { [ENV_AGENT_ID]: reservation.handle,
-    [ENV_COLLAB_SESSION_ID]: collabSessionId }` (using the typed
-    constants from `types/peerContext.ts`) and pass to BOTH
-    spawn_process and spawn_shell invoke args. Both now accept
-    `extra_env` end-to-end (cycle A wired spawn_shell's body).
-  - On spawn success: `const claimed = consumeReservation(
-    reservation.reservationId)` → `addAgent({ sessionId, tool: tool.id,
-    status: "spawning", collabSessionId, handle: claimed.handle,
-    publishOptedIn: false })`. Wrap the addAgent call in the existing
-    `isCurrentRun()` guard (StrictMode race protection from
-    fix-strictmode-agent-dup).
-  - On spawn failure (caught Err from invoke):
-    `releaseReservation(reservation.reservationId)`. Two paths today:
-    the shell-fallback catch (`spawnedViaShell = true` then catch
-    `shellErr`) AND the upstream invoke('spawn_process') Err. Both
-    must call release before returning.
-- **AgentMiniTerminal.tsx** — watch-lifecycle useEffect (new):
-  Reactive on `(sessionId, agent?.handle, agent?.publishOptedIn,
-  agent?.status)`. When `status === "running" && publishOptedIn ===
-  true` → `invoke('watch_transcript', { sessionId, agentHandle:
-  agent.handle, tool: tool.id, spawnedAtUnixMs: Date.now() })` →
-  store returned token (u64 number) in a `useRef<number | null>`.
-  On dependency change to "should not be watching" OR on unmount →
-  `invoke('unwatch_transcript', { token: storedToken })`. Both
-  invokes `.catch(() => {})` per the watcher's idempotent contract.
-  Guard with `isCurrentRun()` (the same per-effect-run pattern
-  fix-strictmode-agent-dup introduced).
+- Spawned a Claude Code agent (PID 43953, cwd `/Users/donghyeon`).
+- Sent it a message; the agent processed it and wrote 117 KB to
+  `~/.claude/projects/-Users-donghyeon/7f8461bd-c0e3-4e47-820b-5084669389ae.jsonl`.
+- `lsof -p 43953 | grep jsonl` → empty.
+- `lsof` on all four direct children (43967, 43970, 43986, 43996) and
+  one observed grandchild (43968) → all empty.
+- 3-second observation post-write shows the file is closed (size
+  stable, mtime not advancing).
+- Cycle D's descendant-walk fix is therefore irrelevant for this class
+  of CLI — there's nothing to discover regardless of how deep the
+  walk goes.
 
-## Out of scope
+The cycle B docstring at `adapters/mod.rs::discover_pid_fd` rationale
+("M8: lsof gives authoritative open-fd info ... one JSONL open per CLI
+process") is invalidated by this evidence. Cycle E moves all three
+adapters off that primitive.
 
-- **Publish-toggle UI** — the visual control that calls
-  `setPublishOptedIn`. Cycle C decides UX placement (header? menu?
-  hover?).
-- **PeerContextPanel mount point** — where in the UI peers' contexts
-  surface. Cycle C.
-- **`hasContextsBreadcrumb` wiring** into the prompt-header builder.
-  Cycle C.
-- **Migration of existing `addAgent` callers in tests
-  (`collaboratorStore.test.ts`)** — they currently omit `handle`,
-  which becomes the no-op default behavior; tests pass unchanged.
-- **Rust changes** — already done in cycle A.
+## In-scope
+
+### N1 — `discover_pid_cwd(pid: i32) -> io::Result<PathBuf>`
+
+New private helper in `adapters/mod.rs`. Mirrors the lsof-d-cwd pattern
+already in `commands/pty.rs::get_pty_cwd` (line 514) but returns
+`PathBuf` (not `String`) for direct `.join()` use by adapter code.
+
+- macOS: `/usr/sbin/lsof -a -p <pid> -d cwd -F n`, parse the single
+  `n`-prefixed line.
+- Linux: `std::fs::read_link("/proc/<pid>/cwd")`.
+- Other OSes: `Err(io::ErrorKind::Unsupported)`.
+
+Error semantics mirror existing helpers: `Io` for genuine OS failures
+(lsof spawn, readlink permission denied); a missing `n` line surfaces
+as `Io` with `NotFound`.
+
+### N2 — `discover_by_mtime(adapter_id, agent_handle, scan_roots, spawned_at_unix_ms, predicate) -> Result<TranscriptHandle, DiscoveryError>`
+
+New private helper in `adapters/mod.rs`. The mtime-based discovery
+primitive. Replaces `discover_handle`'s call to `discover_pid_fd` with
+a `readdir` + mtime-filter loop.
+
+Signature:
+
+```rust
+pub(super) fn discover_by_mtime<F>(
+    adapter_id: &'static str,
+    agent_handle: &str,
+    scan_roots: &[PathBuf],
+    spawned_at_unix_ms: i64,
+    predicate: F,
+) -> Result<TranscriptHandle, DiscoveryError>
+where
+    F: Fn(&Path) -> bool;
+```
+
+Algorithm:
+1. Convert `spawned_at_unix_ms` to a `SystemTime` threshold. Subtract a
+   small slack (500ms) to defend against clock-skew between the
+   frontend's `Date.now()` and the agent's filesystem write — the JS
+   timestamp may be a few ms behind the actual CLI process spawn.
+2. Retry loop: up to **5 iterations** with **500ms sleep** between
+   attempts (per Phase 0.5 Q3 decision — 2.5s total window).
+3. Each iteration:
+   - For each `root` in `scan_roots`:
+     - `read_dir(root)` (non-recursive; callers pre-enumerate the
+       directories they want scanned — Codex passes today + yesterday).
+     - For each entry: `lstat`, apply `predicate(entry.path())`, filter
+       by `mtime >= threshold`.
+     - Keep the entry with the **maximum mtime** across all roots in
+       this iteration.
+   - If a candidate exists: run `fs_gate::check_transcript_root`,
+     re-lstat the canonical path for source_inode, fetch `memory_dir`,
+     return the `TranscriptHandle`. Stop retrying.
+   - If no candidate: sleep 500ms, try again.
+4. After 5 failed iterations: return `DiscoveryError::NoMatchingFd`.
+
+Error handling:
+- `read_dir` failure on a single root is logged (best-effort) and
+  treated as "no candidates from this root"; other roots still
+  scanned. This matches the existing `list_children` policy in cycle D.
+- `fs_gate::check_transcript_root` failure surfaces as
+  `DiscoveryError::Gated` (existing variant).
+- Total time bounded at ~2.5s; the watch_transcript IPC will block
+  for at most that long. Frontend `AgentMiniTerminal` already shows a
+  "spawning" indicator that doesn't update during this window, so the
+  delay is invisible to the user.
+
+The legacy `discover_handle` helper is preserved as-is for N6 (dead
+code), so this is purely additive.
+
+### N3 — `ClaudeCodeAdapter::discover_session` rewrite
+
+```
+fn discover_session(&self, agent_handle, pid, spawned_at_unix_ms) {
+    let cwd = discover_pid_cwd(pid).map_err(DiscoveryError::Io)?;
+    let home = dirs::home_dir().ok_or(...)?;
+    // Claude Code project-dir encoding: leading "-" + every "/" -> "-"
+    let encoded = format!("-{}", cwd.to_string_lossy().replace('/', "-"));
+    let project_dir = home.join(".claude").join("projects").join(encoded);
+    discover_by_mtime(
+        self.tool_id(),
+        agent_handle,
+        &[project_dir],
+        spawned_at_unix_ms,
+        |p| p.extension().map_or(false, |e| e == "jsonl"),
+    )
+}
+```
+
+Notes:
+- `cwd.to_string_lossy()` is acceptable: cwd here is the canonical
+  cwd of the spawned CLI; non-UTF-8 paths don't occur on macOS/Linux
+  in practice (Claude Code itself wouldn't function with a non-UTF-8
+  cwd).
+- Predicate filters by extension only — the directory listing is
+  already partitioned by cwd, so any `.jsonl` here belongs to a
+  session for that cwd. The mtime + spawned_at_unix_ms gate
+  distinguishes the agent's session from older sessions for the same
+  cwd.
+
+### N4 — `CodexAdapter::discover_session` rewrite
+
+Codex doesn't partition by cwd — `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<...>.jsonl`.
+The spawn window is sub-second, so two date dirs (today + yesterday)
+cover the spawn-near-midnight edge case.
+
+```
+fn discover_session(&self, agent_handle, _pid, spawned_at_unix_ms) {
+    let home = dirs::home_dir().ok_or(...)?;
+    let root = home.join(".codex").join("sessions");
+    let now = SystemTime::now();
+    let today = date_path_for(now);                     // YYYY/MM/DD
+    let yesterday = date_path_for(now - 24h);
+    let scan_roots = [root.join(&today), root.join(&yesterday)];
+    discover_by_mtime(
+        self.tool_id(),
+        agent_handle,
+        &scan_roots,
+        spawned_at_unix_ms,
+        |p| p.extension().map_or(false, |e| e == "jsonl")
+            && p.file_name().and_then(|n| n.to_str())
+               .map_or(false, |n| n.starts_with("rollout-")),
+    )
+}
+```
+
+The `date_path_for` helper is private to `codex.rs` (small enough not
+to warrant adapters/mod.rs placement). Uses the same Howard Hinnant
+`civil_from_days` algorithm as `synth_iso8601_now` (already in
+adapters/mod.rs) to convert UNIX seconds → Y/M/D without a new crate.
+**Note:** the existing `synth_iso8601_now` could be refactored to share
+the civil_from_days math with a new `civil_date_for_unix_secs` helper,
+but that's a Codex-internal refactor — not in cycle E scope. Inline
+the date math in `codex.rs` for now.
+
+`pid` parameter is unused (Codex is cwd-agnostic). Suppressed via
+`let _ = pid;` like the existing `let _ = spawned_at_unix_ms;` in the
+current implementation.
+
+### N5 — `GeminiAdapter::discover_session` rewrite
+
+Gemini's layout per existing code: `~/.gemini/tmp/<project-slug>/chats/session-<...>.jsonl`.
+The `<project-slug>` encoding is **not yet known**. Plan:
+
+```
+fn discover_session(&self, agent_handle, pid, spawned_at_unix_ms) {
+    let cwd = discover_pid_cwd(pid).map_err(DiscoveryError::Io)?;
+    let home = dirs::home_dir().ok_or(...)?;
+    let tmp_root = home.join(".gemini").join("tmp");
+    // Investigation needed at impl time: derive Gemini's project-slug
+    // from cwd. Fallback if encoding is non-trivial: glob over all
+    // ~/.gemini/tmp/<*>/chats/ and filter by mtime + cwd-similarity.
+    // The simpler-first path is to test what Gemini actually puts on
+    // disk by running it once and reading the dir listing.
+    let scan_roots = derive_gemini_scan_roots(&tmp_root, &cwd)?;
+    discover_by_mtime(
+        self.tool_id(),
+        agent_handle,
+        &scan_roots,
+        spawned_at_unix_ms,
+        |p| p.extension().map_or(false, |e| e == "jsonl")
+            && p.file_name().and_then(|n| n.to_str())
+               .map_or(false, |n| n.starts_with("session-")),
+    )
+}
+```
+
+`derive_gemini_scan_roots` is a private helper inside `gemini.rs`:
+- **Primary**: if `~/.gemini/tmp/<encoded-cwd-or-similar>/chats/`
+  exists, return `[that path]`.
+- **Fallback**: glob `~/.gemini/tmp/*/chats/` and return all matching
+  paths; the predicate + mtime + spawned_at_unix_ms still narrows to
+  the right session.
+
+The implementer phase investigates Gemini's actual encoding before
+committing to primary or fallback. If primary works, the fallback can
+be dropped. If primary doesn't, fallback is the implementation.
+
+### N6 — `#[allow(dead_code)]` on legacy lsof primitives
+
+After N3–N5 land, the following symbols in `adapters/mod.rs` have no
+in-tree callers:
+
+- `DESCENDANT_WALK_DEPTH_CAP`, `DESCENDANT_WALK_BREADTH_CAP` (consts)
+- `discover_pid_fd`, `scan_one_pid`, `list_children` (helpers)
+- `discover_handle` (orchestrator)
+
+Annotate each with `#[allow(dead_code)]`. **Do not delete** — the
+primitives remain useful for any future adapter whose CLI does hold
+its JSONL open. The annotation is a one-line addition per symbol.
+
+## Out-of-scope (deferred)
+
+- Removing `discover_pid_fd` / `discover_handle` entirely (cleanup
+  cycle, after we're sure no adapter wants to come back).
+- Frontend changes — `watch_transcript` IPC contract is unchanged.
+- Modifying `TranscriptAdapter` trait signature — kept stable per cycle
+  B's commitment.
+- `fs_gate`, `tailer`, `watcher` — all unchanged.
+- Refactoring `synth_iso8601_now` into a shared `civil_from_days`
+  helper that Codex's `date_path_for` could reuse — separate cleanup.
 
 ## Constraints
 
-- `publishOptedIn` defaults to **false** per architecture success
-  criterion "Default visibility OFF on session start".
-- `extraEnv` keys use the EXACT constants from `types/peerContext.ts`
-  (`ENV_AGENT_ID = "CT_AGENT_ID"`, `ENV_COLLAB_SESSION_ID =
-  "CT_COLLAB_SESSION_ID"`). Don't hardcode the literals; import them.
-- The watch useEffect MUST be guarded by `isCurrentRun()` so
-  StrictMode's double-mount doesn't race on watch/unwatch calls
-  (would leak tokens or fire duplicate watches).
-- `reserveAgentHandle` is synchronous and runs BEFORE the spawn IPC.
-  On synchronous throw (e.g. unknown collabSessionId), spawn doesn't
-  fire and the existing "spawn failed" error path renders naturally.
-- `consumeReservation`'s new return type requires updating its own
-  internal docstring + the 1 call site (which doesn't exist yet —
-  this is the first caller).
-- `addAgent`'s new `handle?` optional field: when present, skip the
-  `nextOrdinal` mint. Don't fall back to `nextOrdinal` if the
-  caller's handle conflicts with an existing handle in the store —
-  surface as a no-op (sessionId idempotency from
-  fix-strictmode-agent-dup already prevents duplicate inserts) or
-  log a warning.
+- **No trait signature change** on `TranscriptAdapter::discover_session`.
+- **No new `DiscoveryError` variants** — cycle B committed `Io`,
+  `Gated(String)`, `NoMatchingFd`.
+- **`cargo check` + `tsc --noEmit` + `vitest 216/216`** all pass.
+- **No deletion** of cycle D code — strictly additive plus annotation.
 
 ## Success criteria
 
-- `tsc --noEmit` exits 0 after the implementer cycle lands.
-- `npm test` exits 0 with the existing **216-test suite passing
-  unchanged**. The new `addAgent.handle` optional field is
-  backward-compatible (existing tests omit it).
-- Manual smoke after cycle B + a temporary DevTools-driven toggle:
-  - Spawn a Claude agent in a collab pane. Observe
-    `useCollaboratorStore.getState().agents` — the new record has
-    `publishOptedIn: false, handle: "claudeN"` (handle minted by
-    `reserveAgentHandle` pre-spawn; matches what `nextOrdinal` would
-    have produced).
-  - From DevTools: `useCollaboratorStore.getState()
-    .setPublishOptedIn(<sessionId>, true)`. Observe a new file
-    appearing at
-    `~/.cache/canvas-terminal/collab-memory/session-<PID>/contexts/claudeN.jsonl`
-    within a few seconds of CLI activity.
-  - Flip back to `false`. Observe no further writes to that file.
-- Spawned CLI process inherits `CT_AGENT_ID=<handle>` and
-  `CT_COLLAB_SESSION_ID=<collabSessionId>` in its env (verifiable via
-  the CLI dumping env, or by `lsof -p <child_pid>` showing the env
-  vars).
-- Toggle works across React.StrictMode dev double-mount without
-  duplicate watch tokens or token leaks (`isCurrentRun` guard
-  catches stale closures).
+1. After implementer merge, spawning a Claude Code agent, sending one
+   message, and clicking Eye yields a non-empty
+   `~/.cache/canvas-terminal/collab-memory/session-<APP_PID>/contexts/<handle>.jsonl`
+   within ~3s of the Eye click.
+2. Same flow works for Codex agents.
+3. Same flow works for Gemini agents (or Gemini-specific quirks are
+   documented in the implementation report).
+4. No regressions: TS + Rust + vitest all green.
+5. The 5×500ms retry inside `discover_by_mtime` means clicking Eye
+   immediately at spawn (before the first agent reply) still works —
+   the helper waits for the first JSONL to appear.
 
-## Open questions
+## Validation plan
 
-None requiring user input. All design decisions are settled:
-- `publishOptedIn` default = false (architecture criterion)
-- `extraEnv` constants imported from `types/peerContext.ts`
-- `consumeReservation` return type change is the cleanest path to
-  close the session-6 docstring deviation
-- `addAgent` handle-skip-mint shape is backward compatible
+- **Compile (planner phase)**: `cd src-tauri && cargo check` —
+  baseline-green on dev@13a68a9 verified.
+- **Implementer-phase validation**:
+  `cd src-tauri && cargo check && cd .. && npx tsc --noEmit && npm test`
+- **Smoke (post-merge, user-driven)**: per "Success criteria" 1–3.
 
-## Package layout
+## Risks
 
-No new packages introduced — feature lives entirely in existing
-files within `src/`.
+- **Multi-agent same-cwd race**: two Claude Code agents spawned in the
+  same cwd within milliseconds — both scan the same project dir, both
+  may match the same JSONL. `spawned_at_unix_ms` tiebreaker mitigates
+  (the JSONL's first turn timestamp must be ≥ the spawn time of the
+  agent that owns it). In practice, the user spawns agents one at a
+  time, so the race window is unlikely. Documented but not specially
+  handled in cycle E.
+- **Gemini encoding unknown**: handled by the primary/fallback split
+  in N5. Worst case is a wider glob, not failure.
+- **Clock skew**: `Date.now()` from the frontend vs. filesystem mtime
+  may differ by tens to hundreds of milliseconds. Mitigated by the
+  500ms slack subtracted from the threshold in N2.
+- **`~/.codex/sessions/` deep tree**: today's dir has at most a few
+  JSONLs (one per session); listing is cheap. Cap at top-level
+  `read_dir` of the two date dirs.
 
-```
-src/
-├── types/collaborator.ts                   [MODIFIED] +2 fields (publishOptedIn, handle?)
-├── stores/collaboratorStore.ts             [MODIFIED] +setPublishOptedIn, addAgent handle branch
-├── lib/peerContext.ts                      [MODIFIED] consumeReservation return type
-└── components/collaborator/
-    └── AgentMiniTerminal.tsx               [MODIFIED] spawn-lifecycle refactor + watch useEffect
-```
+## Decomposition graph
 
-Dependency direction (already in shape; cycle B just adds usage edges):
+See `plan.mmd` for the Mermaid DAG. Topological order:
+**N1 → N2 → (N3, N4, N5 in any order) → N6**.
 
-```
-AgentMiniTerminal.tsx → peerContext.ts (reserve / consume / release)
-                     → collaboratorStore.ts (addAgent, setPublishOptedIn)
-                     → tauri.invoke (watch_transcript / unwatch_transcript)
-peerContext.ts       → collaboratorStore.ts (reserveOrdinalForPeerContext)
-collaboratorStore.ts → types/collaborator.ts (SpawnedAgent, SpawnedAgentInit)
-```
-
-No new circular dependencies.
-
-## Decomposition
-
-| Node # | Stage | Interface / Module | Method / Function / Action | Belongs to package |
-|---|---|---|---|---|
-| 1 | Type extension | `types/collaborator.ts` | `SpawnedAgent.publishOptedIn` + `SpawnedAgentInit.handle?` | `src/types/` |
-| 2 | Store action: opt-in flag setter | `collaboratorStore.ts` | `setPublishOptedIn(sessionId, value)` | `src/stores/` |
-| 3 | Store action: addAgent with pre-minted handle | `collaboratorStore.ts` | `addAgent` (modified — skip `nextOrdinal` when `raw.handle` present) | `src/stores/` |
-| 4 | Reservation consumer return shape | `src/lib/peerContext.ts` | `consumeReservation` (modified — return `AgentHandleReservation`) | `src/lib/` |
-| 5 | Spawn-lifecycle: pre-spawn reservation | `AgentMiniTerminal.tsx` spawn useEffect | `reserveAgentHandle(collabSessionId, tool.id)` BEFORE invoke('spawn_*') | `src/components/collaborator/` |
-| 6 | Spawn-lifecycle: extra_env injection | `AgentMiniTerminal.tsx` spawn useEffect | Build `extraEnv = { CT_AGENT_ID, CT_COLLAB_SESSION_ID }` and pass to both spawn_process and spawn_shell invokes | `src/components/collaborator/` |
-| 7 | Spawn-lifecycle: consume on success | `AgentMiniTerminal.tsx` spawn useEffect | `consumeReservation` → `addAgent({..., handle, publishOptedIn: false})` (guarded by `isCurrentRun()`) | `src/components/collaborator/` |
-| 8 | Spawn-lifecycle: release on failure | `AgentMiniTerminal.tsx` spawn useEffect catch blocks | `releaseReservation(reservation.reservationId)` in shell-fallback failure AND outer catch | `src/components/collaborator/` |
-| 9 | Watch-lifecycle: start | `AgentMiniTerminal.tsx` new useEffect | `invoke('watch_transcript', { sessionId, agentHandle, tool, spawnedAtUnixMs })` → store token in `useRef`; guarded by `isCurrentRun()` + `agent.publishOptedIn && agent.status==='running'` | `src/components/collaborator/` |
-| 10 | Watch-lifecycle: stop | `AgentMiniTerminal.tsx` new useEffect cleanup + on flag flip | `invoke('unwatch_transcript', { token })` on unmount, on `publishOptedIn` flip false, or on status leaving 'running' | `src/components/collaborator/` |
-
-See `plan.mmd` for the DAG visualization.
-
-## Interfaces emitted
-
-This feature lane run does **not** emit interface skeletons (per the
-user's `confirm scale` without `emit skeletons`). The interface
-changes (additive field on `SpawnedAgent`/`SpawnedAgentInit`,
-additive action on store, return-type change on
-`consumeReservation`) are documented in the In-scope section above
-and implemented directly during the downstream `/codebase-implementer`
-run.
-
-## Validation
-
-Phase 6 was skipped (no compile target for plan-only feature lane).
-Phase 7 smoke check:
-
-- `plan.md` is non-empty and contains `## Goal`, `## Package layout`,
-  `## Decomposition` headers
-- `plan.mmd` first line is `graph LR` (valid Mermaid)
-
-Both pass — see Phase 8 below.
-
-Downstream implementer validation command:
-`tsc --noEmit && npm test`
-Expected: exit 0, all 216 tests pass.
+N4 (Codex) does not depend on N1 (no cwd resolution needed).
