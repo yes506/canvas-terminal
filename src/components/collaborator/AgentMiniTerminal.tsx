@@ -705,7 +705,8 @@ export function AgentMiniTerminal({
         status: "spawning",
         collabSessionId,
         handle: claimed.handle,
-        publishOptedIn: false,
+        // publishOptedIn omitted — store defaults to `true` (cycle F
+        // always-on). Eye toggle remains the per-agent opt-out.
       });
 
       // ---- CLI readiness detection ----

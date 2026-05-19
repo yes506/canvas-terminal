@@ -703,9 +703,19 @@ impl TranscriptWatcher {
         // Spawn the discovery polling task. The task owns its own Arc
         // clone of Inner so it can re-acquire the lock between sleeps
         // without touching the Tauri State<>.
+        //
+        // Use `tauri::async_runtime::spawn` (not raw `tokio::spawn`):
+        // the Tauri wrapper enters the managed runtime
+        // (`let _guard = r.enter()`) before delegating to tokio.
+        // Sync `#[tauri::command]` handlers (like `watch_transcript`)
+        // run on a worker pool that does NOT have a tokio runtime in
+        // task-local context — bare `tokio::spawn` panics with "no
+        // reactor running" there. The codebase precedent
+        // (`localfile.rs::serve_localfile`, `dashboard/server.rs`) uses
+        // `tauri::async_runtime::spawn` for the same reason.
         let inner_for_task = self.inner.clone();
         let agent_handle_for_task = agent_handle.clone();
-        let join = tokio::spawn(async move {
+        let join = tauri::async_runtime::spawn(async move {
             Self::discovery_loop(
                 inner_for_task,
                 token_id,
@@ -720,13 +730,20 @@ impl TranscriptWatcher {
         // Store the abort handle on the entry. If `unwatch` has already
         // raced ahead of this lock (removing the entry), abort the
         // freshly-spawned task immediately so it doesn't run.
+        //
+        // `tauri::async_runtime::JoinHandle` wraps `tokio::task::JoinHandle`
+        // but does NOT expose `.abort_handle()` directly — only `.abort()`
+        // and `.inner()`. We call `.inner().abort_handle()` to get the raw
+        // `tokio::task::AbortHandle` that `Entry.discovery_task` is typed
+        // as. `.abort()` on the wrapper is still safe for the race-rollback
+        // path below (it delegates to the inner tokio handle).
         {
             let mut g = self
                 .inner
                 .lock()
                 .map_err(|_| WatcherError::NotStarted)?;
             if let Some(entry) = g.entries.get_mut(&token_id) {
-                entry.discovery_task = Some(join.abort_handle());
+                entry.discovery_task = Some(join.inner().abort_handle());
             } else {
                 join.abort();
             }
