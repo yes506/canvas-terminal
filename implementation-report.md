@@ -1,89 +1,132 @@
-# Implementation report — cluster-h-prep-rust-bridge
+# Implementation report — cluster-h-agent-lifecycle
 
 ## Source
 
-- Planner marker: `local` (chat-gate) — `(plan-local, human-confirmed)`
-  emitted by `/codebase-planner` in this session, followed by user
-  `confirm plan`.
-- Source: 2-bullet planner reflection block.
+- Planner marker: **feature** from commit `da578b2` (`(plan-feature, human-confirmed)`)
+- Planner artifacts: `plan.md` + `plan.mmd` on `dev`
+- Source hash: based on the 11486-byte `plan.md` + 721-byte `plan.mmd`
+  at `da578b2`; not re-extracted within this run
 
-(Prior `implementation-report.md` on `dev@eccb4aa` documented
-`wire-inode-rotation-recovery`. Overwritten with this session's report;
-historical content reachable via `git log` on the prior merge.)
+(Prior `implementation-report.md` on `dev@854341b` documented
+`cluster-h-prep-rust-bridge` cycle A. Overwritten with this cycle B
+report; historical content reachable via git log on the prior merge.)
 
 ## Work queue summary
 
-- Total items: 2 (chat bullets)
-- Completed: 2
+- Total items: 10 (decomposition table in `plan.md`)
+- Completed: 10
 - Blocked: 0
 
 ## Files changed
 
-- `src-tauri/src/commands/transcripts/mod.rs` (+30 / -10) — `watch_transcript` IPC signature refactor
-- `src-tauri/src/commands/pty.rs` (+7 / -4) — `spawn_shell` body wiring + `apply_extra_env` attribute cleanup
+- `src/types/collaborator.ts` (+25 / -1) — `SpawnedAgentInit.handle?`, `SpawnedAgentInit.publishOptedIn?`, `SpawnedAgent.publishOptedIn?` (matched optional)
+- `src/stores/collaboratorStore.ts` (+50 / -10) — `setPublishOptedIn` action interface + impl, `addAgent` handle-override + publishOptedIn-default branch
+- `src/lib/peerContext.ts` (+20 / -8) — `consumeReservation` return type widened from void → AgentHandleReservation, body returns the reservation data
+- `src/components/collaborator/AgentMiniTerminal.tsx` (+95 / -10) — reservation lifecycle + extraEnv injection + watch useEffect
 
 ## Validation
 
-- Baseline exit (BASE_BRANCH HEAD `dev@eccb4aa`): 0
-- Final validation command: `cargo check --manifest-path src-tauri/Cargo.toml && cargo test --test transcript_adapter_contract --manifest-path src-tauri/Cargo.toml`
+- Baseline exit (BASE_BRANCH HEAD `dev@da578b2`): 0
+- Final validation command: `npx tsc --noEmit && npm test`
 - Final exit: 0
-- Auto-fix attempts used: **0 / 3** (clean first pass)
-- cargo check tail:
-  ```
-  warning: `canvas-terminal` (lib) generated 10 warnings
-      Finished `dev` profile target(s) in 6.35s
-  ```
-  Warning count unchanged from baseline. The dropped `#[allow(dead_code)]` on `apply_extra_env` is offset by the now-real call from `spawn_shell` (net zero).
-- transcript_adapter_contract fixture: 1 passed; 0 failed
+- **Auto-fix attempts used: 1 / 3**
+  - Attempt 1: 20 TS type errors in `collaboratorStore.test.ts` —
+    test fixtures construct `SpawnedAgent` literals directly
+    (bypassing `addAgent`), so the initially-required
+    `publishOptedIn` on the materialized type broke them. Resolved
+    by relaxing `SpawnedAgent.publishOptedIn` to optional, with
+    reader-side `=== true` discipline (matches the
+    `publishOptedIn ?? false` semantic). Validation cleared on the
+    retry.
+- `tsc --noEmit`: exit 0, no errors
+- `npm test`: **216 / 216 pass** in 12 test files, 1.57s
+  - `collaboratorStore.test.ts`'s 15+ `SpawnedAgent`-literal fixtures
+    unchanged — the optional-on-materialized type lets them compile
+    without `publishOptedIn: false` boilerplate
 
 ## Per-item outcomes
 
 | item_id | status | files_touched | notes |
 |---|---|---|---|
-| bullet-1 | completed | `transcripts/mod.rs` | `watch_transcript(transcript_state, app_state, session_id, agent_handle, tool, spawned_at_unix_ms) → Result<u64, String>`. Resolves PID server-side via `app.sessions[session_id].child.process_id()` under a minimal lock scope (mirrors `pty.rs::get_pty_cwd` pattern). Single-call design avoids the TOCTOU race a two-step (`get_pty_pid` + `watch`) approach would introduce. Zero TS callers today (Cluster H deferred) so the breaking signature change has zero blast radius. |
-| bullet-2 | completed | `pty.rs` | Removed `let _ = &extra_env;` placeholder + comment from `spawn_shell` body. Added real `apply_extra_env(&mut cmd, extra_env.as_ref())` call AFTER `apply_baseline_env(&mut cmd)` per helper's docstring contract ("caller-provided keys override baseline values when collisions occur"). Removed `#[allow(dead_code)]` attribute from `apply_extra_env` since the helper now has a genuine caller. |
+| T1 | completed | `types/collaborator.ts` | Both `handle?` and `publishOptedIn?` are optional on init AND on materialized record (auto-fix attempt 1 made the latter optional too). Reader-side discipline: check `=== true` for opt-in. |
+| S2 | completed | `collaboratorStore.ts` | `setPublishOptedIn` action with reference-equality preservation (skip set when value matches) to avoid React rerenders on idempotent writes. |
+| S3 | completed | `collaboratorStore.ts` | `addAgent` extracts ordinal from trailing digits of `raw.handle` when present (defensive fallback to `nextOrdinal` if handle doesn't end in digits); defaults `publishOptedIn` to `false` when omitted from init. |
+| P4 | completed | `lib/peerContext.ts` | `consumeReservation` return type void → `AgentHandleReservation`; body returns the entry's data after removing from registry. |
+| L5 | completed | `AgentMiniTerminal.tsx` | `reserveAgentHandle(collabSessionId, tool.id)` called BEFORE the spawn IPC; synchronous-throw path renders the existing "Failed to reserve handle" message. |
+| L6 | completed | `AgentMiniTerminal.tsx` | `extraEnv = { [ENV_AGENT_ID]: reservation.handle, [ENV_COLLAB_SESSION_ID]: collabSessionId }` using imported constants; passed to both `spawn_process` and `spawn_shell` invokes. |
+| L7 | completed | `AgentMiniTerminal.tsx` | `consumeReservation(reservation.reservationId)` returns the reserved data; `addAgent` called with `handle: claimed.handle, publishOptedIn: false`. Guarded by the existing `isCurrentRun()` pattern; on StrictMode-dispose-mid-flight, calls `releaseReservation` before bailing. |
+| L8 | completed | `AgentMiniTerminal.tsx` | `releaseReservation(reservation.reservationId)` in two places: shell-fallback catch block AND the `isCurrentRun()`-false bail after spawn-success. |
+| W9 | completed | `AgentMiniTerminal.tsx` | New useEffect reactive on `(sessionId, agentHandle, isRunning, isPublishing, toolId)`. When all conditions hold, `invoke('watch_transcript', { sessionId, agentHandle, tool: toolId, spawnedAtUnixMs: Date.now() })` and stash returned token in `watchTokenRef`. |
+| W10 | completed | `AgentMiniTerminal.tsx` | Same useEffect's cleanup unwatches stashed token. Handles the promise-resolves-after-cleanup race via an `unmounted` flag in the `.then()` callback (releases the late-arriving token immediately). |
 
 ## Scope-discipline self-check
 
-- [x] No new interfaces / files outside hints — touched only the 2 files named in planner bullets
-- [x] No renames of committed public names — `watch_transcript` is an architecture-implied addition from session 6 (not a planner-committed skeleton); its signature change is permitted under local lane and has zero callers
-- [x] No signature changes on planner-committed methods — `apply_extra_env` body unchanged; `spawn_shell` signature unchanged (only its body now uses the previously-inert `extra_env` parameter)
-- [x] No edits to `validation_command` configuration — `Cargo.toml` / `tsconfig.json` untouched
-- [x] No edits to files outside the work queue's hint set — diff stat confirms exactly 2 files
+- [x] No new interfaces / files outside hints — touched only the 4 files the planner-decomposition table named
+- [x] No renames of committed public names — all changes are additive (`handle?`, `publishOptedIn?` on init/agent types; new `setPublishOptedIn` action; `consumeReservation` return-type WIDENING — backward compatible for callers that ignored the previous `void` return)
+- [x] No signature changes on planner-committed methods — `consumeReservation` signature change WAS planner-committed in `plan.md`'s In-scope section (item P4)
+- [x] No edits to `validation_command` configuration — `package.json`/`tsconfig.json` untouched
+- [x] No edits to files outside the work queue's hint set — diff stat confirms exactly 4 files
+- [x] Test fixture migration via type-relax (vs. mass test-edit) honors the planner's "tests pass unchanged" promise
+
+## Architecture-pattern notes
+
+- **isCurrentRun() guard everywhere a stale closure could mutate
+  shared state**: the spawn-lifecycle now has 3 guarded checkpoints
+  (pre-spawn after reserveAgentHandle, post-spawn before addAgent,
+  inside addAgent's own pre-flight). Cleanup of stale reservations
+  on dispose prevents the strictmode-fix's "dup agent" pattern from
+  also producing leaked reservation slots.
+- **Watch useEffect is a separate effect** (no `isCurrentRun()`
+  required). React's mount→cleanup→mount ordering for separate
+  effects with shared dependencies handles StrictMode correctly: the
+  cleanup fires unwatch_transcript before the remount's
+  watch_transcript fires. Idempotency of the Rust-side
+  TranscriptWatcher::unwatch (Q6 contract) makes any minor races
+  harmless.
+- **Reference-equality preservation in `setPublishOptedIn`** matters
+  for React performance: cycle C will wire a click handler that may
+  re-fire with the same value (e.g. user clicks "on" while already
+  "on"); without the early-return, every click would trigger a
+  re-render of every component reading the agents array.
 
 ## Bug history (for the audit trail)
 
-- **`watch_transcript` IPC**: added in session 6 (commit `1aabafa` per
-  the peer-context-mirror lineage) as an architecture-implied
-  `#[tauri::command]` wrapper. Took `pid: i32` because the original
-  rough plan assumed the frontend could supply the PID. Investigation
-  for cycle A revealed: the frontend doesn't have the PID (portable_pty
-  hides it inside `PtySession.child`); only the server can resolve it.
-  Hence the refactor.
-- **`spawn_shell::extra_env`**: parameter added in the planner touch-up
-  (commit `bffb828`, plan-feature). The implementer scope discipline at
-  the time forbade the body wiring (would have been "implementation in
-  a planner cycle"), so the body had `let _ = &extra_env;` as a
-  placeholder with a TODO comment naming this exact follow-up. This
-  cycle's bullet-2 cashes that TODO.
+- **Planner's "tests pass unchanged" promise**: held with one
+  modification — `SpawnedAgent.publishOptedIn` had to become
+  optional too (in addition to `SpawnedAgentInit.publishOptedIn`).
+  The planner reasoned that since `addAgent` would default the value,
+  no caller would need to specify it. The planner missed that 15+
+  test fixtures construct `SpawnedAgent` literals DIRECTLY (bypassing
+  `addAgent`), where the materialized-record type's required field
+  bites them. Auto-fix attempt 1 made the field optional on the
+  materialized record too — production paths still set it (false at
+  spawn; true/false via `setPublishOptedIn`), but the type allows
+  `undefined` for fixture flexibility.
+- **`reservation` variable scope**: the original spawn flow had
+  `spawnedViaShell` declared at function scope but I needed
+  `reservation` available across the success and failure code paths.
+  Used `let reservation: ... | undefined` with explicit
+  `reservation = ...` inside the try-block initializer per TS
+  flow-narrowing — works cleanly.
 
-## Commits on `implementer/cluster-h-prep-rust-bridge-48944-20836-25248`
+## Commits on `implementer/cluster-h-agent-lifecycle-50550-28068-9344`
 
 ```
-6167702 fix(implementer): cycle A — watch_transcript takes session_id + spawn_shell wires extra_env
+6a60d11 feat(implementer): items T1-W10 — cycle B AgentMiniTerminal lifecycle + reservation wiring
 ```
 
-Branched off `dev@eccb4aa`.
+Branched off `dev@da578b2`.
 
 ## Recommended response at Phase 6
 
-**`confirm merge`** — the fix is minimal (2 edits, ~30 lines net),
-restores the docstring-promised contract for both `spawn_shell::extra_env`
-and `watch_transcript`'s IPC shape, validates cleanly, and unblocks
-the next cycle (cycle B: TS-side AgentMiniTerminal useEffect lifecycle).
+**`confirm merge`** — the fix completes the cycle B plan, validates
+cleanly (216/216 tests pass), and unblocks cycle C (publish-toggle
+UI + PeerContextPanel mount + breadcrumb wiring — all pure UI work
+on top of the now-real lifecycle).
 
-After merge, downstream marker `(impl-local, human-confirmed)` lands.
-The Rust side of Cluster H's prerequisites is then complete; the
-remaining work is purely TypeScript (AgentMiniTerminal useEffect +
-publish-opt-in store flag + reservation lifecycle wiring + PeerContextPanel
-mount point + breadcrumb wiring).
+After merge, downstream marker `(impl-feature, human-confirmed)`
+lands. The peer-context-mirror feature is then **runtime-wired
+end-to-end** modulo only the missing UI affordance — a DevTools
+`setPublishOptedIn(sessionId, true)` call after spawn will trigger
+real transcript mirroring into
+`~/.cache/canvas-terminal/collab-memory/session-<PID>/contexts/<handle>.jsonl`.
