@@ -820,6 +820,16 @@ interface CollaboratorState {
   // Agent lifecycle
   addAgent: (agent: SpawnedAgentInit) => void;
   /**
+   * Flip the cross-tool agent context surfacing opt-in for a given agent
+   * (peer-context-mirror feature). The watch lifecycle in
+   * `AgentMiniTerminal.tsx` reactively reads `publishOptedIn` + `status`
+   * and invokes `watch_transcript` / `unwatch_transcript` accordingly.
+   * Idempotent: setting the same value is a no-op (preserves zustand
+   * reference equality so React doesn't re-render on identical writes).
+   * Unknown sessionId is a silent no-op.
+   */
+  setPublishOptedIn: (sessionId: string, value: boolean) => void;
+  /**
    * Rename an agent's nickname. Returns `RenameResult`; the store owns the
    * human-readable failure messages so all rename surfaces (inline UI, /rename
    * slash command) share one wording. The handle is IMMUTABLE — only `nickname`,
@@ -1282,19 +1292,68 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     if (get().agents.some((a) => a.sessionId === raw.sessionId)) {
       return;
     }
-    const ordinal = nextOrdinal(raw.collabSessionId, raw.tool);
+    // Handle override path (peer-context-mirror reservation lifecycle):
+    // when `raw.handle` is present, it was pre-minted by
+    // `peerContext.reserveAgentHandle` via `reserveOrdinalForPeerContext`
+    // — the SAME `nextOrdinal` counter this branch uses, so the ordinal
+    // baked into the handle's trailing digits matches what `nextOrdinal`
+    // would have produced here. We extract the trailing-digit ordinal
+    // rather than re-minting so the env-injected `CT_AGENT_ID` (set at
+    // spawn time) lines up with the store's record.
+    //
+    // Legacy mint-now path: when `raw.handle` is absent, call
+    // `nextOrdinal` and derive the handle locally. Pre-peer-context-mirror
+    // callers (and tests) take this branch unchanged.
     const short = toolShortName(raw.tool);
+    let ordinal: number;
+    let handle: string;
+    if (raw.handle !== undefined) {
+      handle = raw.handle;
+      // Extract trailing digits — `claude3` → 3, `codex12` → 12. If the
+      // handle doesn't end in digits (defensive; reservation API mints
+      // `${short}${ordinal}` so this shouldn't happen), fall back to
+      // nextOrdinal so the record stays internally consistent.
+      const match = handle.match(/(\d+)$/);
+      ordinal = match
+        ? parseInt(match[1], 10)
+        : nextOrdinal(raw.collabSessionId, raw.tool);
+    } else {
+      ordinal = nextOrdinal(raw.collabSessionId, raw.tool);
+      handle = `${short}${ordinal}`;
+    }
     const initialNickname = `${toolLabel(raw.tool)} #${ordinal}`;
     const setAt = new Date().toISOString();
     const agent: SpawnedAgent = {
       ...raw,
       ordinal,
-      handle: `${short}${ordinal}`,
+      handle,
       nickname: initialNickname,
       nicknameSlug: slugify(initialNickname),
       nameHistory: [{ nickname: initialNickname, setAt, setBy: "system" }],
+      // Default publishOptedIn=false per architecture success criterion
+      // "Default visibility OFF on session start". `raw.publishOptedIn`
+      // takes precedence if the caller explicitly sets it (e.g. for
+      // tests verifying the watch-lifecycle's on-state).
+      publishOptedIn: raw.publishOptedIn ?? false,
     };
     set((s) => ({ agents: [...s.agents, agent] }));
+  },
+
+  setPublishOptedIn: (sessionId, value) => {
+    set((s) => {
+      // Reference-equality preserve: scan first, only emit a new array
+      // when a real value change happens. Avoids React rerenders on
+      // idempotent writes (UI toggle that fires the same value twice).
+      const target = s.agents.find((a) => a.sessionId === sessionId);
+      if (!target || target.publishOptedIn === value) {
+        return s;
+      }
+      return {
+        agents: s.agents.map((a) =>
+          a.sessionId === sessionId ? { ...a, publishOptedIn: value } : a,
+        ),
+      };
+    });
   },
 
   renameAgent: (sessionId, rawNickname) => {
