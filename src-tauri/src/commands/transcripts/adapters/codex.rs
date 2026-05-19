@@ -68,14 +68,18 @@ impl TranscriptAdapter for CodexAdapter {
         &self,
         agent_handle: &str,
         pid: i32,
-        spawned_at_unix_ms: i64,
+        _spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
         // Cycle E: lsof-based discovery never sees Codex's rollout JSONL
         // (open-append-close per turn — same behavior as Claude Code 2.1.x).
-        // Scan today + yesterday's date dirs by mtime, gated by
-        // spawned_at_unix_ms. Codex is cwd-agnostic — the layout partitions
-        // by date, not by cwd — so `pid` is unused.
-        let _ = pid;
+        // Scan today + yesterday's date dirs by mtime, with the threshold
+        // resolved server-side from `pid`'s process-start time (cycle F).
+        // Codex is cwd-agnostic — the layout partitions by date, not by
+        // cwd — so `pid` is used ONLY for the start-time threshold, never
+        // for routing. The cwd-agnostic / date-partitioned layout is what
+        // previously caused parallel Codex agents to collide on the
+        // "newest matching" mtime under cycle E's click-time threshold;
+        // cycle F's process-start threshold disambiguates them.
 
         let home = dirs::home_dir().ok_or_else(|| {
             DiscoveryError::Io(std::io::Error::new(
@@ -100,7 +104,7 @@ impl TranscriptAdapter for CodexAdapter {
             self.tool_id(),
             agent_handle,
             &scan_roots,
-            spawned_at_unix_ms,
+            pid,
             |p| {
                 // Codex layout: ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<...>.jsonl
                 // The mtime helper scans only the date dirs above, so

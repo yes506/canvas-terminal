@@ -431,52 +431,206 @@ pub(super) fn discover_pid_cwd(pid: i32) -> std::io::Result<PathBuf> {
     }
 }
 
-/// Bounded retry parameters for `discover_by_mtime`. 5 iterations at 500 ms
-/// = 2.5 s total — long enough to cover the typical spawn-to-first-write
-/// window for a CLI that creates its session JSONL on the first model call,
-/// short enough that the watch_transcript IPC blocking on this is invisible
-/// behind the frontend's "spawning" indicator.
-const MTIME_DISCOVERY_MAX_ATTEMPTS: u32 = 5;
-const MTIME_DISCOVERY_RETRY_INTERVAL_MS: u64 = 500;
+/// Resolve a process's start time in unix seconds (cycle F).
+///
+/// The mtime-based discovery threshold (`discover_by_mtime`) needs a
+/// server-side, authoritative process-start time. The cycle E approach of
+/// reading `Date.now()` in the frontend at watch-effect-fire (click-Eye)
+/// time carried a "click-time-not-spawn-time" bug: if the user typed a
+/// message before clicking Eye, the JSONL mtime was already older than
+/// the click-time threshold → `NoMatchingFd`. Cycle F always-on makes
+/// this acute, so the threshold moves server-side.
+///
+/// - **macOS**: `ps -p <pid> -o etime=` returns elapsed time since
+///   process start in `[[DD-]HH:]MM:SS` format. Parsed to seconds and
+///   subtracted from `SystemTime::now()`. Avoids `ps -o lstart=` date
+///   parsing (locale-fragile).
+/// - **Linux**: `/proc/<pid>/stat` field 22 (process start time in
+///   clock ticks since boot) combined with `/proc/uptime` derives the
+///   unix-seconds anchor. Uses `libc::sysconf(_SC_CLK_TCK)` for the
+///   per-system clock-tick rate.
+/// - **Other OSes**: `Err(io::ErrorKind::Unsupported)` — the watcher
+///   degrades to the previous-cycle behaviour via the outer caller's
+///   error mapping.
+///
+/// Error semantics:
+/// - `io::ErrorKind::NotFound` — PID does not exist (process exited
+///   before discovery ran, or never existed). Caller treats as
+///   `NoMatchingFd` because there's no transcript to find.
+/// - `io::ErrorKind::InvalidData` — `ps` / `/proc` output failed to
+///   parse (PID exists but format is unexpected).
+/// - Other `io::Error` kinds — genuine OS failures (spawn `ps`, read
+///   `/proc`).
+pub(super) fn discover_pid_start_time(pid: i32) -> std::io::Result<i64> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Clock-skew slack subtracted from `spawned_at_unix_ms` when computing the
-/// mtime threshold. Defends against the frontend `Date.now()` reading a few
-/// milliseconds ahead of the CLI's actual filesystem write. 500 ms is a
-/// generous margin — typical clock drift between two threads of the same
-/// process is sub-millisecond, but we are crossing JS→Rust→syscall.
-const MTIME_THRESHOLD_SLACK_MS: i64 = 500;
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "etime="])
+            .output()?;
+
+        if !output.status.success() {
+            // ps prints nothing and returns non-zero when the PID has no
+            // matching process. Treat as NotFound so the caller can fold
+            // it into the existing "no transcript yet" path.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("ps exited {} for pid {}", output.status, pid),
+            ));
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let elapsed_secs = parse_ps_etime(raw.trim()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unparseable ps etime output: {:?}", raw),
+            )
+        })?;
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .as_secs() as i64;
+
+        Ok(now_secs - elapsed_secs as i64)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid))?;
+        // The `comm` field is enclosed in parens and may itself contain
+        // spaces or `)` characters. Splitting from the LAST `)` is the
+        // canonical way to skip it; everything after is whitespace-
+        // separated fields starting at field 3 (state).
+        let after = stat
+            .rfind(')')
+            .map(|i| &stat[i + 1..])
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing ')' in /proc/<pid>/stat",
+                )
+            })?;
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        // Field 22 (1-indexed in stat layout: pid=1, comm=2, state=3, ...,
+        // starttime=22). After dropping pid+comm via the rfind split,
+        // fields[0] is state — so starttime is fields[19].
+        if fields.len() < 20 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "/proc/<pid>/stat too short for field 22",
+            ));
+        }
+        let start_ticks: u64 = fields[19].parse().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("starttime parse: {}", e))
+        })?;
+
+        let uptime_raw = std::fs::read_to_string("/proc/uptime")?;
+        let uptime_secs: f64 = uptime_raw
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "empty /proc/uptime")
+            })?
+            .parse()
+            .map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("uptime parse: {}", e))
+            })?;
+
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if clk_tck <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "sysconf(_SC_CLK_TCK) returned non-positive value",
+            ));
+        }
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .as_secs() as f64;
+        let boot_unix_secs = now_secs - uptime_secs;
+        let process_uptime_secs = start_ticks as f64 / clk_tck as f64;
+        Ok((boot_unix_secs + process_uptime_secs) as i64)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "discover_pid_start_time not implemented on this platform",
+        ))
+    }
+}
+
+/// Parse `ps -o etime=` output. Format is `[[DD-]HH:]MM:SS`:
+///   - `MM:SS`        — minutes:seconds (process < 1h old)
+///   - `HH:MM:SS`     — hours:minutes:seconds (< 1d old)
+///   - `DD-HH:MM:SS`  — days-hours:minutes:seconds
+///
+/// Returns total elapsed seconds, or `None` on parse failure.
+#[cfg(target_os = "macos")]
+fn parse_ps_etime(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0u64, s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (hours, mins, secs) = match parts.as_slice() {
+        [m, s] => (0u64, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        [h, m, s] => (
+            h.parse::<u64>().ok()?,
+            m.parse::<u64>().ok()?,
+            s.parse::<u64>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(days * 86_400 + hours * 3_600 + mins * 60 + secs)
+}
 
 /// Locate the newest JSONL under `scan_roots` whose mtime is at or after
-/// `spawned_at_unix_ms`, retrying up to 5×500ms for the spawn-to-first-write
-/// race.
+/// the resolved process-start time of `pid` (cycle F).
 ///
 /// The mtime-based replacement for `discover_handle`. Used by adapters whose
 /// CLI uses open-append-close per turn. `scan_roots` is a slice so callers
 /// like Codex (which needs today + yesterday's date dirs) can pre-enumerate;
 /// callers like Claude Code pass a single-element slice.
 ///
-/// Algorithm: each retry iteration `read_dir`s every root in turn, filters
-/// entries by `predicate(path) && mtime >= threshold`, and keeps the entry
-/// with the maximum mtime across all roots. If a candidate exists in any
-/// iteration, build the `TranscriptHandle` (via `fs_gate` + `lstat` +
-/// `memory_dir`) and return. After the configured attempt budget with no
-/// candidate, return `DiscoveryError::NoMatchingFd`.
+/// Algorithm: resolve `pid`'s start time via `discover_pid_start_time` to
+/// produce an authoritative threshold (no slack — process start time is
+/// definitive). Then `read_dir` every root in turn, filter entries by
+/// `predicate(path) && mtime >= threshold`, and keep the entry with the
+/// maximum mtime across all roots. If a candidate exists, build the
+/// `TranscriptHandle` (via `fs_gate` + `lstat` + `memory_dir`) and return.
+/// Otherwise `DiscoveryError::NoMatchingFd`.
+///
+/// Single-shot scan — the retry-until-unwatch loop has moved up one layer
+/// into `TranscriptWatcher::watch`'s async task (cycle F F6). Cycle E's
+/// internal 5×500ms loop is gone.
 ///
 /// `read_dir` failure on a single root is logged-equivalent (we simply
 /// continue with no candidates from that root) — other roots are still
-/// scanned in the same iteration. Matches the per-descendant skip policy
-/// in cycle D's `list_children`.
+/// scanned. Matches the per-descendant skip policy in cycle D's
+/// `list_children`.
 ///
-/// Total time bounded: `(MTIME_DISCOVERY_MAX_ATTEMPTS - 1) *
-/// MTIME_DISCOVERY_RETRY_INTERVAL_MS = 2000 ms` of pure sleeping plus the
-/// `read_dir` + `lstat` cost (millisecond-scale on a small project dir).
-/// The `watch_transcript` IPC blocks for this duration on a cold-spawn
-/// click-Eye flow.
+/// PID-resolution failures map as:
+/// - `io::ErrorKind::NotFound` → `DiscoveryError::NoMatchingFd` (no
+///   process means no transcript to look for; the outer async loop will
+///   tear the watch down on the next unwatch).
+/// - Other `io::Error` → `DiscoveryError::Io` (propagated for diagnosis).
 pub(super) fn discover_by_mtime<F>(
     adapter_id: &'static str,
     agent_handle: &str,
     scan_roots: &[PathBuf],
-    spawned_at_unix_ms: i64,
+    pid: i32,
     predicate: F,
 ) -> Result<TranscriptHandle, DiscoveryError>
 where
@@ -485,79 +639,77 @@ where
     use std::os::unix::fs::MetadataExt;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    // Threshold = spawned_at - slack. SystemTime arithmetic on the UNIX_EPOCH
-    // anchor avoids pulling chrono/time as a direct dep.
-    let threshold_ms = (spawned_at_unix_ms - MTIME_THRESHOLD_SLACK_MS).max(0);
+    // Threshold = process-start time (server-side, authoritative). No
+    // slack — `discover_pid_start_time` returns seconds, multiplied to ms
+    // for SystemTime arithmetic.
+    let start_unix_secs = match discover_pid_start_time(pid) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DiscoveryError::NoMatchingFd);
+        }
+        Err(e) => return Err(DiscoveryError::Io(e)),
+    };
+    let threshold_ms = start_unix_secs.saturating_mul(1000).max(0);
     let threshold = UNIX_EPOCH + Duration::from_millis(threshold_ms as u64);
 
-    for attempt in 0..MTIME_DISCOVERY_MAX_ATTEMPTS {
-        let mut best: Option<(PathBuf, SystemTime)> = None;
+    let mut best: Option<(PathBuf, SystemTime)> = None;
 
-        for root in scan_roots {
-            let entries = match std::fs::read_dir(root) {
-                Ok(e) => e,
-                Err(_) => continue, // root missing / unreadable; try others
+    for root in scan_roots {
+        let entries = match std::fs::read_dir(root) {
+            Ok(e) => e,
+            Err(_) => continue, // root missing / unreadable; try others
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !predicate(&path) {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !predicate(&path) {
-                    continue;
+            let mtime = match meta.modified() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if mtime < threshold {
+                continue;
+            }
+            match &best {
+                None => best = Some((path, mtime)),
+                Some((_, current_mtime)) if mtime > *current_mtime => {
+                    best = Some((path, mtime));
                 }
-                let meta = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let mtime = match meta.modified() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if mtime < threshold {
-                    continue;
-                }
-                match &best {
-                    None => best = Some((path, mtime)),
-                    Some((_, current_mtime)) if mtime > *current_mtime => {
-                        best = Some((path, mtime));
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
         }
+    }
 
-        if let Some((candidate, _)) = best {
-            // Run the same fs_gate + lstat + memory_dir wiring as
-            // discover_handle. Inlined here so this primitive stays
-            // independent of the legacy helper (which is now dead code
-            // per cycle E).
-            let canonical = super::fs_gate::check_transcript_root(adapter_id, &candidate)
-                .map_err(|e| DiscoveryError::Gated(format!("{:?}", e)))?;
+    if let Some((candidate, _)) = best {
+        // Run the same fs_gate + lstat + memory_dir wiring as
+        // discover_handle. Inlined here so this primitive stays
+        // independent of the legacy helper (now dead code since cycle E).
+        let canonical = super::fs_gate::check_transcript_root(adapter_id, &candidate)
+            .map_err(|e| DiscoveryError::Gated(format!("{:?}", e)))?;
 
-            let lstat = std::fs::metadata(&canonical).map_err(DiscoveryError::Io)?;
-            let source_inode = lstat.ino();
+        let lstat = std::fs::metadata(&canonical).map_err(DiscoveryError::Io)?;
+        let source_inode = lstat.ino();
 
-            let memory_dir = super::super::memory::get_memory_dir().map_err(|e| {
-                DiscoveryError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
-            })?;
+        let memory_dir = super::super::memory::get_memory_dir().map_err(|e| {
+            DiscoveryError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+        })?;
 
-            return Ok(TranscriptHandle {
-                agent_handle: agent_handle.to_string(),
-                adapter_id,
-                source_path: canonical,
-                source_inode,
-                // pid is no longer used for discovery routing under
-                // mtime-based discovery; keep it on the handle for the
-                // existing Tailer / fs_gate diagnostic logging. Callers
-                // pass it through unchanged.
-                pid: 0,
-                memory_dir,
-            });
-        }
-
-        // No candidate this attempt — sleep before next iteration, but not
-        // after the last attempt.
-        if attempt + 1 < MTIME_DISCOVERY_MAX_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(MTIME_DISCOVERY_RETRY_INTERVAL_MS));
-        }
+        return Ok(TranscriptHandle {
+            agent_handle: agent_handle.to_string(),
+            adapter_id,
+            source_path: canonical,
+            source_inode,
+            // pid is pass-through state on the handle (not used for
+            // discovery routing post-population, but kept for the
+            // existing Tailer / fs_gate diagnostic logging).
+            pid,
+            memory_dir,
+        });
     }
 
     Err(DiscoveryError::NoMatchingFd)

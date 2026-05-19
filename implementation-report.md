@@ -1,105 +1,112 @@
-# Implementation report — cycle-e-mtime-discovery
+# Implementation report — cycle-f-always-on-rearm
 
-(Prior `implementation-report.md` on `dev` documented cycle D
-`cycle-d-discover-walk-and-drain`. Overwritten with this cycle E report;
+(Prior `implementation-report.md` on `dev` documented cycle E
+`cycle-e-mtime-discovery`. Overwritten with this cycle F report;
 historical content reachable via `git log -- implementation-report.md`.)
 
 ## Source
-- Planner marker: `feature` from commit `1f060df` (`(plan-feature, human-confirmed)`)
-- Planner artifacts: `plan.md` + `plan.mmd` on `dev`
-- Source hash: based on `1f060df`'s plan.md (12.6 KB) and plan.mmd
-  (48-byte placeholder; the planner state file held the real
-  decomposition graph)
+
+- Planner marker: `feature` from commit `b035a9c` —
+  `feat(planner): merge cycle-f-always-on-rearm (plan-feature, human-confirmed)`
+- Planner artifacts: `plan.md`, `plan.mmd`
+- Source hash: `d800a648d30d`
 
 ## Work queue summary
-- Total items: 6 (N1, N2, N3, N4, N5, N6)
-- Completed: 6
+
+- Total items: 7 (F1, F2, F3, F4, F5, F6, F7)
+- Completed: 7
 - Blocked: 0
-- Auto-fix attempts used: 0/3
 
 ## Files changed
-- `src-tauri/src/commands/transcripts/adapters/mod.rs` (+221 / -0; new helpers + N6 annotations)
-- `src-tauri/src/commands/transcripts/adapters/claude_code.rs` (+30 / -23; rewrite)
-- `src-tauri/src/commands/transcripts/adapters/codex.rs` (+58 / -18; rewrite + date helper)
-- `src-tauri/src/commands/transcripts/adapters/gemini.rs` (+66 / -15; rewrite + scan-roots helper)
+
+| File | Lines (Δ) |
+|---|---|
+| `src-tauri/src/commands/transcripts/adapters/claude_code.rs` | +9 / -7 |
+| `src-tauri/src/commands/transcripts/adapters/codex.rs` | +12 / -8 |
+| `src-tauri/src/commands/transcripts/adapters/gemini.rs` | +17 / -10 |
+| `src-tauri/src/commands/transcripts/adapters/mod.rs` | +252 / -90 |
+| `src-tauri/src/commands/transcripts/mod.rs` | +345 / -121 |
+| `src-tauri/src/commands/transcripts/watcher.rs` | +24 / -6 |
+| `src/stores/collaboratorStore.ts` | +7 / -5 |
+| `src/types/collaborator.ts` | +12 / -11 |
+| **Total** | **+691 / -247** |
 
 ## Validation
-- Baseline exit (`dev@1f060df`): 0
+
+- Baseline exit (`dev@b035a9c`): 0 (cargo + tsc + vitest all green)
 - Final validation command: `cd src-tauri && cargo check && cd .. && npx tsc --noEmit && npm test`
 - Final exit: 0
-- Auto-fix attempts: 0/3
-- `cargo check`: **10 warnings**, identical to baseline (the long-standing FsSafety/Debug warning + 9 others — none introduced by cycle E)
-- `tsc --noEmit`: exit 0, no errors
-- `npm test`: **216/216 pass** in 12 test files, 1.56s
+- Auto-fix attempts used: 0 / 3
+
+Tail of last vitest run:
+
+```
+ Test Files  12 passed (12)
+      Tests  216 passed (216)
+   Start at  17:04:26
+   Duration  1.57s
+```
+
+Cargo: 9 warnings (one fewer than baseline — `WatcherError::GateRejected`
+is now never constructed because `populate_entry` logs+returns instead of
+bubbling up; the variant is retained for future code).
 
 ## Per-item outcomes
 
-| item_id | status | files_touched | notes |
+| Item | Status | Files touched | Notes |
 |---|---|---|---|
-| N1 | completed | `adapters/mod.rs` | `discover_pid_cwd(pid)` → `PathBuf`. macOS: `lsof -a -p <pid> -d cwd -Fn`. Linux: `read_link("/proc/<pid>/cwd")`. Other OSes: `Err(Unsupported)`. NotFound surfaced when lsof returns success but no `n`-line. |
-| N2 | completed | `adapters/mod.rs` | `discover_by_mtime(adapter_id, agent_handle, scan_roots, spawned_at_unix_ms, predicate) -> Result<TranscriptHandle, DiscoveryError>`. 5×500 ms retry with 500 ms clock-skew slack. Per-iteration scans all roots, keeps max-mtime candidate, runs fs_gate + lstat + memory_dir wiring inline (mirrors legacy `discover_handle`). `handle.pid` set to 0 — the value is no longer meaningful under mtime discovery and is only pass-through in `watcher::on_fs_event:230`. Bounded total time ≈ 2 s sleep + read_dir cost. |
-| N3 | completed | `adapters/claude_code.rs` | Body rewrite. `discover_pid_cwd(pid)` → encode cwd via `replace('/', "-")` (preserves Claude's leading-dash convention since a leading `/` becomes a leading `-`) → `~/.claude/projects/<encoded>/` → `discover_by_mtime` with `.jsonl` predicate. |
-| N4 | completed | `adapters/codex.rs` | Body rewrite + new `date_path_for_unix_secs` helper (private; inlined civil_from_days math, sharing-with-`synth_iso8601_now` deferred to a later cleanup per plan). `scan_roots = [today_date_dir, yesterday_date_dir]`. Predicate filters to `.jsonl` with `rollout-` basename prefix. `pid` parameter no longer used (Codex is cwd-agnostic). |
-| N5 | completed | `adapters/gemini.rs` | Body rewrite + new `derive_gemini_scan_roots(tmp_root)` helper (private). Glob enumeration of `~/.gemini/tmp/*/chats/` since the cwd → project-slug encoding is not yet known; mtime + predicate inside `discover_by_mtime` narrows reliably. `~/.gemini/tmp` absent → `NoMatchingFd` (matches docstring test-contract verbatim). |
-| N6 | completed | `adapters/mod.rs` | `#[allow(dead_code)]` on `DESCENDANT_WALK_DEPTH_CAP`, `DESCENDANT_WALK_BREADTH_CAP`, `discover_pid_fd`, `scan_one_pid`, `list_children`, `discover_handle`. Bodies preserved verbatim — no deletion (legacy primitives remain available for any future adapter whose CLI does hold its transcript open). |
+| F1 | completed | `src/stores/collaboratorStore.ts` | `publishOptedIn` default flipped `false → true` at `addAgent` (line ~1351); inline comment rewritten from "Default visibility OFF on session start" → "Default visibility ON; Eye toggle remains as per-agent opt-out". |
+| F2 | completed | `src/types/collaborator.ts` | Both `SpawnedAgentInit.publishOptedIn` and `SpawnedAgent.publishOptedIn` docstrings reflect always-on default. Reader contract preserved — `=== true` strict check still safe; only direct-construction test fixtures get `undefined`. |
+| F3 | completed | `src-tauri/src/commands/transcripts/adapters/mod.rs` | New `discover_pid_start_time(pid) -> io::Result<i64>` with three cfg branches (macOS `ps -o etime=`, Linux `/proc/<pid>/stat` field 22 + `/proc/uptime` + `libc::sysconf(_SC_CLK_TCK)`, other = `Unsupported`). `parse_ps_etime` helper handles all three etime formats (`MM:SS`, `HH:MM:SS`, `DD-HH:MM:SS`). |
+| F4 | completed | `src-tauri/src/commands/transcripts/adapters/mod.rs` | `discover_by_mtime` signature changes `spawned_at_unix_ms → pid`. Threshold = `start_unix_secs * 1000` (no slack). 5×500ms retry loop removed → single-shot scan. `MTIME_DISCOVERY_MAX_ATTEMPTS`, `MTIME_DISCOVERY_RETRY_INTERVAL_MS`, `MTIME_THRESHOLD_SLACK_MS` deleted. Returned handle now has `pid: pid` (was `pid: 0`) — pass-through aligned with docstring intent. |
+| F5 | completed | `claude_code.rs`, `codex.rs`, `gemini.rs`, `mod.rs` (trait docstring) | All three adapters now pass `pid` to `discover_by_mtime`. The `spawned_at_unix_ms` parameter is bound to `_spawned_at_unix_ms` (still in the trait signature for backward compat). Codex's `let _ = pid;` removed. Trait docstring on `TranscriptAdapter::discover_session` annotated: "ignored as of cycle F." |
+| F6 | completed | `src-tauri/src/commands/transcripts/mod.rs`, `watcher.rs` | New `watch` signature: `(adapter, agent_handle, pid, spawned_at_unix_ms)`. Inserts PENDING `Entry` (handle/subscription_id/tail_state Optional), spawns `discovery_loop` tokio task. `discovery_loop` polls `adapter.discover_session` every 5s with shutdown / unwatch exit checks. `populate_entry` runs fs_gate + resume_from_state + subscribe_fsevents under two-phase commit with rollback on `unwatch` race. `on_fs_event` skips entries with `handle == None`. IPC `watch_transcript` rewritten to the new call shape — discovery moves inside `watch`. |
+| F7 | completed | `src-tauri/src/commands/transcripts/mod.rs` | `unwatch` aborts `entry.discovery_task` before the existing ref-count decrement. Idempotent — abort on completed task is a no-op. Pending entries skip the FSEvents ref-count decrement because they never subscribed. `shutdown()` also iterates `entries.values_mut()` and aborts every `discovery_task` before clearing — required because `Drop` on `AbortHandle` does NOT cancel the task. |
 
 ## Scope-discipline self-check
 
-- [x] No new interfaces / files — touched only the 4 files in the planner-decomposition table
-- [x] No renames of committed public names — adapter struct names, `TranscriptAdapter` trait, `TranscriptHandle` fields, `DiscoveryError` variants all unchanged
-- [x] No signature changes on planner-committed methods — `discover_session(agent_handle, pid, spawned_at_unix_ms)` keeps its exact shape; the cycle B trait contract is preserved
-- [x] No edits to validation_command configuration — `Cargo.toml`, `package.json`, `tsconfig.json` untouched
-- [x] No edits to files outside the work queue's hint set — diff stat confirms exactly 4 files
-- [x] No new `DiscoveryError` variants — cycle B's `Io` / `Gated(String)` / `NoMatchingFd` set preserved
+- [x] No new interfaces / files outside hints (all changes are to files listed in the plan's IN-SCOPE block)
+- [x] No renames of committed public names (`watch` / `unwatch` / `TranscriptWatcher` / `Entry` / `TranscriptHandle` / `TranscriptAdapter` all unchanged)
+- [x] No signature changes on planner-committed methods (trait `TranscriptAdapter::discover_session` signature unchanged; `TranscriptWatcher::watch` signature changed per plan F6's explicit redesign)
+- [x] No edits to validation_command configuration
+- [x] No edits to files outside the work queue's hint set
+- [x] No `git push`, force-push, reset --hard, or other destructive ops
+- [x] No `--no-verify` or hook bypass
 
-## Architecture-pattern notes
+## Notes for reviewer
 
-- **`handle.pid = 0` under mtime discovery**: the previous lsof model used `pid` as the originating proof ("this is the process whose FD points at this file"). That semantic is gone — mtime discovery binds by filesystem timestamp, not by process. Setting `pid = 0` is honest about that; `TranscriptHandle.pid` remains as a field only because removing it would change a cycle B-committed struct shape. The only reader (`watcher::on_fs_event:230`) just copies it through.
-- **Bounded retry inside the IPC handler**: `discover_by_mtime` blocks `watch_transcript` for up to ~2.5 s on cold-spawn click-Eye flows. The frontend's `spawning` indicator already covers this latency; no additional user-facing state is needed. If the CLI is wedged and never writes, the user sees the same "no contexts/" outcome they'd see today — just 2.5 s later.
-- **Clock-skew slack**: 500 ms subtracted from `spawned_at_unix_ms` to defend against the JS→Rust→syscall path. Negligible cost (one Duration arithmetic), real benefit on slow VMs where filesystem mtime can lag Date.now() by tens of ms.
-- **Codex date math inlined rather than shared**: extracting a `civil_date_for_unix_secs` helper into `adapters/mod.rs` would force `synth_iso8601_now` to refactor too — out of scope. The math is small (~10 lines) and identical in shape to `synth_iso8601_now`'s already-present version. Future cleanup cycle can consolidate.
-- **Gemini cwd-encoding deferred**: rather than reverse-engineer Gemini's project-slug naming, we glob all chats subdirs. The 5-poll retry + spawned_at_unix_ms + basename predicate narrows reliably. Investigating the slug-encoding in a future cycle can tighten this to a single scan root.
-- **Cycle D primitives kept**: rather than delete `discover_pid_fd` / `discover_handle` / friends, we annotated them dead_code. They remain useful primitives for any future adapter whose CLI holds its transcript open continuously. The annotations are one-line additions; deletion can happen in a dedicated cleanup cycle once cycle E is settled in production.
+1. **Cycle F's IPC threshold parameter is intentionally kept.** Plan
+   Out-of-scope: "Removing the `spawned_at_unix_ms` IPC parameter — kept
+   for backward compatibility per cycle B's commitment." `watch_transcript`
+   IPC still accepts it and threads it through; all three adapters
+   ignore it under cycle F.
 
-## Commits on `implementer/cycle-e-mtime-discovery-71976-60876-24546`
+2. **`TranscriptHandle.pid` now flows the actual PID** (was hardcoded to
+   `0` under cycle E). The cycle E code-comment claimed pass-through but
+   the implementation hardcoded `0`. Cycle F's F4 uses `pid` for the
+   threshold and naturally aligns the handle's `pid` field with the
+   docstring intent. This is body-generation polish within F4's scope.
 
-```
-d9ab2d3 feat(implementer): cycle E — mtime-based transcript discovery (N1-N6)
-```
+3. **Async runtime resolution**: `tokio::spawn` is called from inside the
+   synchronous `watch_transcript` Tauri command. Tauri v2's command pool
+   runs on the tokio runtime, so `tokio::spawn` succeeds. If a future
+   refactor moves the command outside a tokio runtime context, the
+   spawn would panic — convert `watch_transcript` to `async fn` at that
+   point.
 
-Branched off `dev@1f060df`.
+4. **`WatcherError::GateRejected` is now dead code** (1 of 9 dead-code
+   warnings). The cycle E `watch` constructed it on fs_gate failure;
+   cycle F's `populate_entry` logs + returns instead. Variant retained
+   in the enum for future use — removing it is out-of-scope for cycle F
+   per "no scope expansion" rule.
 
-## Smoke-test plan (post-merge, user-driven)
+5. **Async / sync mutex**: the `Inner` mutex remains a `std::sync::Mutex`.
+   The `discovery_loop` async task acquires it synchronously between
+   sleeps — never across an `.await` point — so the std mutex is safe.
+   Switching to `tokio::sync::Mutex` would ripple through all callers
+   and is out-of-scope.
 
-The cycle E fixes target a runtime path that has no Rust unit-test
-coverage (the transcripts module has no `#[cfg(test)]` hits).
-Verification is by manual smoke:
-
-1. **Stop** the running `npm run tauri dev`; **start** it fresh so cargo
-   rebuilds the binary with cycle E code.
-2. **Claude Code path** — primary smoke:
-   - Spawn a Claude Code agent in the Canvas Terminal mini-terminal.
-   - Click the mini-terminal pane to focus it.
-   - Type `hello` and press Enter; wait for the agent's reply.
-   - Click the Eye toggle on that agent's header.
-   - Within ~3 s, `~/.cache/canvas-terminal/collab-memory/session-<APP_PID>/contexts/<handle>.jsonl` should appear (where `<handle>` is e.g. `claude1`).
-   - Cycle continues to grow on subsequent turns (notify-driven appends).
-3. **Codex path** — secondary smoke:
-   - Spawn a Codex agent, type a prompt, send, click Eye. Same expectation.
-4. **Gemini path** — secondary smoke:
-   - Spawn a Gemini agent, send a prompt, click Eye. Same expectation. If the wide glob over `~/.gemini/tmp/*/chats/` proves too slow or matches the wrong file, follow-up cycle can derive the slug encoding.
-5. **Pre-message edge** — click Eye **before** sending the first message:
-   - Should still work — `discover_by_mtime`'s 5×500ms retry catches the first JSONL within 2.5 s of the agent writing it.
-
-## Recommended response at Phase 6
-
-**`confirm merge`** — cycle E completes the discovery rewrite that
-unblocks peer-context-mirror for the current generation of CLIs.
-Validation is green without auto-fix intervention. All planner
-constraints honored (no trait change, no new DiscoveryError variants,
-all three adapters covered per Phase 0.5 Q1).
-
-After merge, downstream marker `(impl-feature, human-confirmed)`
-lands on `dev`. The peer-context-mirror feature should then surface
-context for Claude Code and Codex via the Eye toggle alone — no
-DevTools, no manual file inspection, no per-version CLI workarounds.
+6. **Always-on UX**: per plan Risks section, users who don't read release
+   notes may not realize transcripts now propagate. The Eye icon
+   (Eye/EyeOff) is the visible opt-out affordance. CLAUDE.md docs
+   follow-up explicitly deferred per plan.
