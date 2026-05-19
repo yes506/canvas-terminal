@@ -1,24 +1,2 @@
 graph LR
-  T1["SpawnedAgent.publishOptedIn<br/>+ SpawnedAgentInit.handle?"]
-  S2["setPublishOptedIn action"]
-  S3["addAgent skips mint<br/>when raw.handle present"]
-  P4["consumeReservation<br/>returns AgentHandleReservation"]
-
-  L5["reserveAgentHandle<br/>BEFORE spawn IPC"]
-  L6["extraEnv injection<br/>into spawn_process/spawn_shell"]
-  L7["consumeReservation +<br/>addAgent with reserved handle"]
-  L8["releaseReservation<br/>on spawn failure"]
-
-  W9["watch_transcript start<br/>publishOptedIn && running"]
-  W10["unwatch_transcript stop<br/>unmount or flag flip"]
-
-  T1 --> S3
-  T1 --> S2
-  P4 --> L7
-  L5 --> L6
-  L6 --> L7
-  L7 --> S3
-  L8 -.failure path.-> L5
-  S2 -.future cycle C.-> W9
-  S3 --> W9
-  W9 --> W10
+  empty["(no interfaces emitted yet)"]
