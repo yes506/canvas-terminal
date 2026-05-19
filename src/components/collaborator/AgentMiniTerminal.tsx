@@ -26,7 +26,7 @@ import {
   ENV_AGENT_ID,
   ENV_COLLAB_SESSION_ID,
 } from "../../types/peerContext";
-import { X } from "lucide-react";
+import { Eye, EyeOff, X } from "lucide-react";
 
 interface AgentMiniTerminalProps {
   sessionId: string;
@@ -1052,6 +1052,31 @@ export function AgentMiniTerminal({
         >
           {indicator.label}
         </span>
+        {agent && (
+          <button
+            className="text-text-dim hover:text-cyan-400 transition-colors p-0.5 shrink-0"
+            onClick={() =>
+              useCollaboratorStore
+                .getState()
+                .setPublishOptedIn(
+                  sessionId,
+                  !(agent.publishOptedIn === true),
+                )
+            }
+            aria-pressed={agent.publishOptedIn === true}
+            title={
+              agent.publishOptedIn === true
+                ? "Publishing peer context (click to stop)"
+                : "Not publishing peer context (click to publish)"
+            }
+          >
+            {agent.publishOptedIn === true ? (
+              <Eye size={12} />
+            ) : (
+              <EyeOff size={12} />
+            )}
+          </button>
+        )}
         <button
           className="text-text-dim hover:text-red-400 transition-colors p-0.5 shrink-0"
           onClick={() => onClose(sessionId)}

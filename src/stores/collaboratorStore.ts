@@ -10,6 +10,7 @@ import type {
 } from "../types/collaborator";
 import { TOOL_CONFIGS } from "../types/collaborator";
 import { muteCapture } from "../lib/agentOutputCapture";
+import { hasContextsBreadcrumb } from "../lib/peerContext";
 import { useTerminalStore } from "./terminalStore";
 
 // ---------------------------------------------------------------------------
@@ -1078,6 +1079,19 @@ async function prependContextHeader(
     }
   } catch {
     // No context file
+  }
+
+  // Peer-context-mirror breadcrumb (Q3-A wording): mirrors the
+  // context.md conditional above. Surfaces the contexts/ directory
+  // only when at least one peer agent is actively publishing — the
+  // agent can enumerate via list_memory_files. hasContextsBreadcrumb
+  // already silent-falses on IPC failure (see peerContext.ts).
+  try {
+    if (await hasContextsBreadcrumb()) {
+      parts.push(`[Peer contexts: ${dir}/contexts/]`);
+    }
+  } catch {
+    // No peer contexts available
   }
 
   parts.push(
