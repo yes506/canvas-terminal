@@ -1,95 +1,105 @@
-# Implementation report — cycle-d-discover-walk-and-drain
+# Implementation report — cycle-e-mtime-discovery
 
-(Prior `implementation-report.md` on `dev` documented cycle C
-`cycle-c-publish-toggle`. Overwritten with this cycle D report;
+(Prior `implementation-report.md` on `dev` documented cycle D
+`cycle-d-discover-walk-and-drain`. Overwritten with this cycle E report;
 historical content reachable via `git log -- implementation-report.md`.)
 
 ## Source
-- Planner marker: `local` from chat-gate `(plan-local, human-confirmed)` (same-session)
-- Planner artifacts: chat-only (lightweight lane — no committed plan.md)
-- Source hash: n/a (chat-only handoff)
+- Planner marker: `feature` from commit `1f060df` (`(plan-feature, human-confirmed)`)
+- Planner artifacts: `plan.md` + `plan.mmd` on `dev`
+- Source hash: based on `1f060df`'s plan.md (12.6 KB) and plan.mmd
+  (48-byte placeholder; the planner state file held the real
+  decomposition graph)
 
 ## Work queue summary
-- Total items: 2
-- Completed: 2
+- Total items: 6 (N1, N2, N3, N4, N5, N6)
+- Completed: 6
 - Blocked: 0
+- Auto-fix attempts used: 0/3
 
 ## Files changed
-- `src-tauri/src/commands/transcripts/adapters/mod.rs` (+138 / -8)
-- `src-tauri/src/commands/transcripts/mod.rs` (+49 / -19)
+- `src-tauri/src/commands/transcripts/adapters/mod.rs` (+221 / -0; new helpers + N6 annotations)
+- `src-tauri/src/commands/transcripts/adapters/claude_code.rs` (+30 / -23; rewrite)
+- `src-tauri/src/commands/transcripts/adapters/codex.rs` (+58 / -18; rewrite + date helper)
+- `src-tauri/src/commands/transcripts/adapters/gemini.rs` (+66 / -15; rewrite + scan-roots helper)
 
 ## Validation
-- Baseline exit (BASE_BRANCH HEAD `dev@9992041`): 0
+- Baseline exit (`dev@1f060df`): 0
 - Final validation command: `cd src-tauri && cargo check && cd .. && npx tsc --noEmit && npm test`
 - Final exit: 0
-- Auto-fix attempts used: 0/3
-- `cargo check`: 10 warnings (all pre-existing — same set as baseline, no new ones)
+- Auto-fix attempts: 0/3
+- `cargo check`: **10 warnings**, identical to baseline (the long-standing FsSafety/Debug warning + 9 others — none introduced by cycle E)
 - `tsc --noEmit`: exit 0, no errors
-- `npm test`: **216 / 216 pass** in 12 test files, 1.64s
-  ```
-  Test Files  12 passed (12)
-       Tests  216 passed (216)
-    Duration  1.64s
-  ```
+- `npm test`: **216/216 pass** in 12 test files, 1.56s
 
 ## Per-item outcomes
 
-| item_id  | status    | files_touched                                              | notes |
-|----------|-----------|-----------------------------------------------------------|-------|
-| bullet-1 | completed | `src-tauri/src/commands/transcripts/adapters/mod.rs`     | Refactored `discover_pid_fd` into `discover_pid_fd` (BFS orchestrator) + `scan_one_pid` (single-PID lsof/proc walk, preserves original logic verbatim) + `list_children` (macOS pgrep / Linux /proc/<pid>/task/*/children union). BFS capped at depth=4 (const `DESCENDANT_WALK_DEPTH_CAP`), breadth=32 per level (const `DESCENDANT_WALK_BREADTH_CAP`). Error policy: input-PID scan failure propagates as `Err(io)`; per-descendant scan errors and `list_children` failures silently degrade to empty/skip. No signature change. |
-| bullet-2 | completed | `src-tauri/src/commands/transcripts/mod.rs`              | `TranscriptWatcher::watch` now clones `handle.source_path` before the entry consumes `handle`, scopes the lock acquire/insert/release into a `{ ... }` block, then calls `watcher::on_fs_event(&watcher::Subscription(0), &source_path_for_drain)` after the lock drops. The synthesized event re-acquires Inner, finds the entry by `event_path == handle.source_path`, bypasses the debounce (`last_event_at = None`), and runs the existing poll+parse+normalize+persist pipeline from `byte_offset = 0`. No new lock-ordering concern (the synthesized event uses the same code path notify uses). |
+| item_id | status | files_touched | notes |
+|---|---|---|---|
+| N1 | completed | `adapters/mod.rs` | `discover_pid_cwd(pid)` → `PathBuf`. macOS: `lsof -a -p <pid> -d cwd -Fn`. Linux: `read_link("/proc/<pid>/cwd")`. Other OSes: `Err(Unsupported)`. NotFound surfaced when lsof returns success but no `n`-line. |
+| N2 | completed | `adapters/mod.rs` | `discover_by_mtime(adapter_id, agent_handle, scan_roots, spawned_at_unix_ms, predicate) -> Result<TranscriptHandle, DiscoveryError>`. 5×500 ms retry with 500 ms clock-skew slack. Per-iteration scans all roots, keeps max-mtime candidate, runs fs_gate + lstat + memory_dir wiring inline (mirrors legacy `discover_handle`). `handle.pid` set to 0 — the value is no longer meaningful under mtime discovery and is only pass-through in `watcher::on_fs_event:230`. Bounded total time ≈ 2 s sleep + read_dir cost. |
+| N3 | completed | `adapters/claude_code.rs` | Body rewrite. `discover_pid_cwd(pid)` → encode cwd via `replace('/', "-")` (preserves Claude's leading-dash convention since a leading `/` becomes a leading `-`) → `~/.claude/projects/<encoded>/` → `discover_by_mtime` with `.jsonl` predicate. |
+| N4 | completed | `adapters/codex.rs` | Body rewrite + new `date_path_for_unix_secs` helper (private; inlined civil_from_days math, sharing-with-`synth_iso8601_now` deferred to a later cleanup per plan). `scan_roots = [today_date_dir, yesterday_date_dir]`. Predicate filters to `.jsonl` with `rollout-` basename prefix. `pid` parameter no longer used (Codex is cwd-agnostic). |
+| N5 | completed | `adapters/gemini.rs` | Body rewrite + new `derive_gemini_scan_roots(tmp_root)` helper (private). Glob enumeration of `~/.gemini/tmp/*/chats/` since the cwd → project-slug encoding is not yet known; mtime + predicate inside `discover_by_mtime` narrows reliably. `~/.gemini/tmp` absent → `NoMatchingFd` (matches docstring test-contract verbatim). |
+| N6 | completed | `adapters/mod.rs` | `#[allow(dead_code)]` on `DESCENDANT_WALK_DEPTH_CAP`, `DESCENDANT_WALK_BREADTH_CAP`, `discover_pid_fd`, `scan_one_pid`, `list_children`, `discover_handle`. Bodies preserved verbatim — no deletion (legacy primitives remain available for any future adapter whose CLI does hold its transcript open). |
 
 ## Scope-discipline self-check
-- [x] No new interfaces / files — touched only the 2 files the plan named
-- [x] No renames of committed public names — `discover_pid_fd` keeps its signature `(pid: i32, predicate: F) -> io::Result<Option<PathBuf>>`; `TranscriptWatcher::watch` unchanged
-- [x] No signature changes on planner-committed methods — the new helpers (`scan_one_pid`, `list_children`) are private to the module
-- [x] No edits to `validation_command` configuration — `Cargo.toml`/`package.json`/`tsconfig.json` untouched
-- [x] No edits to files outside the work queue's hint set — diff stat confirms exactly 2 files
-- [x] Existing public docstrings preserved; new doc comments only on the new helpers and the new BFS caps const block
+
+- [x] No new interfaces / files — touched only the 4 files in the planner-decomposition table
+- [x] No renames of committed public names — adapter struct names, `TranscriptAdapter` trait, `TranscriptHandle` fields, `DiscoveryError` variants all unchanged
+- [x] No signature changes on planner-committed methods — `discover_session(agent_handle, pid, spawned_at_unix_ms)` keeps its exact shape; the cycle B trait contract is preserved
+- [x] No edits to validation_command configuration — `Cargo.toml`, `package.json`, `tsconfig.json` untouched
+- [x] No edits to files outside the work queue's hint set — diff stat confirms exactly 4 files
+- [x] No new `DiscoveryError` variants — cycle B's `Io` / `Gated(String)` / `NoMatchingFd` set preserved
 
 ## Architecture-pattern notes
 
-- **BFS-from-input-PID instead of "lsof on all descendants in one shot"**: a single recursive `lsof -p <root>` doesn't exist; even `lsof -R` (repeated mode) doesn't walk descendants. BFS is the portable choice and keeps the per-PID scan logic reusable on each node. The depth/breadth caps mean discovery cost is bounded — at most 4 × 32 = 128 lsof invocations on a pathological tree, but typical 2-level shell→cli trees cost 2 invocations + 1 pgrep.
-- **Per-descendant error skip vs. fail-fast**: silently skipping per-descendant errors is the correct policy because the goal is "find any matching FD anywhere in the tree". A dead intermediate (zombie reaped between `list_children` and `scan_one_pid`) shouldn't poison sibling branches. Only the input-PID scan failure propagates — that's the bound PID and a real OS error there is the caller's problem.
-- **Initial drain reuses `on_fs_event`, doesn't duplicate poll-loop logic**: `on_fs_event` already does the full pipeline (lock → debounce → poll → parse → normalize → append → persist), and its return type `()` with internal error-swallowing matches what we want for a best-effort drain. The synthesized call observes the same invariants the production notify-thread call observes — including the debounce, which is correct: if a real FSEvent arrives between `entries.insert` and our synthesized call, whichever runs first sets `last_event_at`, and the other no-ops.
-- **`source_path_for_drain` clone**: necessary because `handle` is moved into the `Entry` inside the lock scope. The clone happens before the lock, costs one `Vec<u8>` allocation per `watch()` call (cheap), and lets the synthesized `on_fs_event` look the entry up by path without re-acquiring `handle` from the map.
+- **`handle.pid = 0` under mtime discovery**: the previous lsof model used `pid` as the originating proof ("this is the process whose FD points at this file"). That semantic is gone — mtime discovery binds by filesystem timestamp, not by process. Setting `pid = 0` is honest about that; `TranscriptHandle.pid` remains as a field only because removing it would change a cycle B-committed struct shape. The only reader (`watcher::on_fs_event:230`) just copies it through.
+- **Bounded retry inside the IPC handler**: `discover_by_mtime` blocks `watch_transcript` for up to ~2.5 s on cold-spawn click-Eye flows. The frontend's `spawning` indicator already covers this latency; no additional user-facing state is needed. If the CLI is wedged and never writes, the user sees the same "no contexts/" outcome they'd see today — just 2.5 s later.
+- **Clock-skew slack**: 500 ms subtracted from `spawned_at_unix_ms` to defend against the JS→Rust→syscall path. Negligible cost (one Duration arithmetic), real benefit on slow VMs where filesystem mtime can lag Date.now() by tens of ms.
+- **Codex date math inlined rather than shared**: extracting a `civil_date_for_unix_secs` helper into `adapters/mod.rs` would force `synth_iso8601_now` to refactor too — out of scope. The math is small (~10 lines) and identical in shape to `synth_iso8601_now`'s already-present version. Future cleanup cycle can consolidate.
+- **Gemini cwd-encoding deferred**: rather than reverse-engineer Gemini's project-slug naming, we glob all chats subdirs. The 5-poll retry + spawned_at_unix_ms + basename predicate narrows reliably. Investigating the slug-encoding in a future cycle can tighten this to a single scan root.
+- **Cycle D primitives kept**: rather than delete `discover_pid_fd` / `discover_handle` / friends, we annotated them dead_code. They remain useful primitives for any future adapter whose CLI holds its transcript open continuously. The annotations are one-line additions; deletion can happen in a dedicated cleanup cycle once cycle E is settled in production.
 
-## Commits on `implementer/cycle-d-discover-walk-and-drain-58122-38567-26207`
+## Commits on `implementer/cycle-e-mtime-discovery-71976-60876-24546`
 
 ```
-3818eec feat(implementer): cycle D — discover_pid_fd descendant walk + watch() initial drain
+d9ab2d3 feat(implementer): cycle E — mtime-based transcript discovery (N1-N6)
 ```
 
-Branched off `dev@9992041`.
+Branched off `dev@1f060df`.
 
 ## Smoke-test plan (post-merge, user-driven)
 
-The cycle D fixes target a runtime path that has no unit-test coverage
-(Rust transcripts module has no `#[cfg(test)]` hits). Verification is by
-manual smoke:
+The cycle E fixes target a runtime path that has no Rust unit-test
+coverage (the transcripts module has no `#[cfg(test)]` hits).
+Verification is by manual smoke:
 
-1. After merge: `npm run tauri dev` (forces cargo rebuild so the new
-   binary picks up the Rust changes).
-2. Spawn a Claude Code agent through the mini-terminal. The
-   `spawn_shell` fallback path is the most diagnostic — pick a tool
-   whose bare command isn't on Tauri's `spawn_process` PATH (the user
-   already confirmed this is the normal path for `claude` in their
-   environment).
-3. Send one or two chat turns to populate the source JSONL.
-4. Click the Eye toggle on the mini-terminal header.
-5. Immediately check `~/.cache/canvas-terminal/collab-memory/session-<APP_PID>/contexts/` — the directory should now appear with a `<handle>.jsonl` file containing the pre-existing turns (initial drain working).
-6. Send another chat turn; the `<handle>.jsonl` should grow within ~2s (FSEvents debounce + tailer poll — existing path, sanity-only).
-7. Edge case: click Eye BEFORE the agent has produced any output. After the agent's first reply, `contexts/<handle>.jsonl` should appear (descendant walk found the CLI PID for the post-spawn lsof retry that on_fs_event triggers).
+1. **Stop** the running `npm run tauri dev`; **start** it fresh so cargo
+   rebuilds the binary with cycle E code.
+2. **Claude Code path** — primary smoke:
+   - Spawn a Claude Code agent in the Canvas Terminal mini-terminal.
+   - Click the mini-terminal pane to focus it.
+   - Type `hello` and press Enter; wait for the agent's reply.
+   - Click the Eye toggle on that agent's header.
+   - Within ~3 s, `~/.cache/canvas-terminal/collab-memory/session-<APP_PID>/contexts/<handle>.jsonl` should appear (where `<handle>` is e.g. `claude1`).
+   - Cycle continues to grow on subsequent turns (notify-driven appends).
+3. **Codex path** — secondary smoke:
+   - Spawn a Codex agent, type a prompt, send, click Eye. Same expectation.
+4. **Gemini path** — secondary smoke:
+   - Spawn a Gemini agent, send a prompt, click Eye. Same expectation. If the wide glob over `~/.gemini/tmp/*/chats/` proves too slow or matches the wrong file, follow-up cycle can derive the slug encoding.
+5. **Pre-message edge** — click Eye **before** sending the first message:
+   - Should still work — `discover_by_mtime`'s 5×500ms retry catches the first JSONL within 2.5 s of the agent writing it.
 
 ## Recommended response at Phase 6
 
-**`confirm merge`** — cycle D closes the discovery + initial-drain gap
-the user surfaced during cycle C's verification. Both fixes are narrow,
-backwards-compatible (input-PID scan error policy preserved; existing
-public signatures unchanged), and validated without auto-fix
-intervention.
+**`confirm merge`** — cycle E completes the discovery rewrite that
+unblocks peer-context-mirror for the current generation of CLIs.
+Validation is green without auto-fix intervention. All planner
+constraints honored (no trait change, no new DiscoveryError variants,
+all three adapters covered per Phase 0.5 Q1).
 
-After merge, downstream marker `(impl-local, human-confirmed)` lands on
-`dev`. The peer-context-mirror feature should then be runtime-verifiable
-end-to-end without any DevTools workaround — Eye-toggle alone surfaces
-context.
+After merge, downstream marker `(impl-feature, human-confirmed)`
+lands on `dev`. The peer-context-mirror feature should then surface
+context for Claude Code and Codex via the Eye toggle alone — no
+DevTools, no manual file inspection, no per-version CLI workarounds.

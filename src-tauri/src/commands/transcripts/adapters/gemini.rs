@@ -71,12 +71,17 @@ impl TranscriptAdapter for GeminiAdapter {
         pid: i32,
         spawned_at_unix_ms: i64,
     ) -> Result<TranscriptHandle, DiscoveryError> {
-        // Per docstring test-contract: hosts where ~/.gemini/tmp does not
-        // exist MUST produce NoMatchingFd (not a panic / filesystem error).
-        // `discover_pid_fd` already fail-softs: if /proc/<pid>/fd has no
-        // link into ~/.gemini/tmp, OR if lsof reports no such file, the
-        // helper returns Ok(None) → NoMatchingFd from discover_handle.
-        let _ = spawned_at_unix_ms;
+        // Cycle E: switch to mtime-based discovery (consistent with the
+        // Claude / Codex rewrites). Gemini's project-slug encoding from cwd
+        // is not yet known — the implementer uses a glob over all
+        // ~/.gemini/tmp/<*>/chats/ as a fallback that still narrows
+        // correctly via mtime + spawned_at_unix_ms + predicate. If the slug
+        // encoding can be derived in a future cycle, this enumeration can
+        // be tightened.
+        //
+        // `pid` is consumed only to read cwd if a future tightening uses
+        // it; today it's a no-op for the glob path.
+        let _ = pid;
 
         let home = dirs::home_dir().ok_or_else(|| {
             DiscoveryError::Io(std::io::Error::new(
@@ -84,28 +89,38 @@ impl TranscriptAdapter for GeminiAdapter {
                 "home dir not resolvable",
             ))
         })?;
-        let root = home.join(".gemini").join("tmp");
+        let tmp_root = home.join(".gemini").join("tmp");
 
-        super::discover_handle(self.tool_id(), agent_handle, pid, |p| {
-            // Gemini layout: ~/.gemini/tmp/<project-slug>/chats/session-<...>.jsonl
-            // Predicate: under root + has `chats` as a path component +
-            // basename matches `session-*.jsonl`.
-            if !p.starts_with(&root) || p.extension().map_or(true, |e| e != "jsonl") {
-                return false;
-            }
-            // Find a `chats` segment in the path components. Using
-            // `components()` is safer than string-contains; defends against
-            // a project-slug literally named "chats".
-            let has_chats = p
-                .components()
-                .any(|c| c.as_os_str() == std::ffi::OsStr::new("chats"));
-            if !has_chats {
-                return false;
-            }
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map_or(false, |n| n.starts_with("session-"))
-        })
+        // Enumerate every <project-slug>/chats subdir under ~/.gemini/tmp/.
+        // Cost is one read_dir on tmp_root + one read_dir per project (and
+        // discover_by_mtime adds one read_dir per scan_root per attempt).
+        // In practice, <10 project slugs per dev machine; well-bounded.
+        let scan_roots = derive_gemini_scan_roots(&tmp_root);
+        if scan_roots.is_empty() {
+            // ~/.gemini/tmp does not exist or has no project subdirs —
+            // matches the docstring test-contract "MUST produce NoMatchingFd
+            // (not a panic / filesystem error)".
+            return Err(DiscoveryError::NoMatchingFd);
+        }
+
+        super::discover_by_mtime(
+            self.tool_id(),
+            agent_handle,
+            &scan_roots,
+            spawned_at_unix_ms,
+            |p| {
+                // Predicate: extension is .jsonl and basename starts with
+                // "session-". The scan_roots already constrain us to
+                // <slug>/chats/, so the components-check that the legacy
+                // code did is implicit.
+                if p.extension().map_or(true, |e| e != "jsonl") {
+                    return false;
+                }
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.starts_with("session-"))
+            },
+        )
     }
 
     /// # Returns `&INCLUSION_TABLE`. # Errors None. # Side effects None.
@@ -238,4 +253,31 @@ impl TranscriptAdapter for GeminiAdapter {
             source_offset: raw.source_offset,
         })
     }
+}
+
+/// Enumerate every `<tmp_root>/<project-slug>/chats/` directory that exists
+/// on disk.
+///
+/// Used by `discover_session` as the fallback set of scan roots when the
+/// project-slug encoding from cwd is not directly derivable. The
+/// `discover_by_mtime` retry + mtime + spawned_at_unix_ms filter narrows
+/// candidates down to the right session even with the wider scan set.
+///
+/// Returns an empty `Vec` when `<tmp_root>` does not exist or contains no
+/// project subdirs — caller surfaces this as `NoMatchingFd` per the
+/// adapter's docstring contract.
+fn derive_gemini_scan_roots(tmp_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let entries = match std::fs::read_dir(tmp_root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut roots = Vec::new();
+    for entry in entries.flatten() {
+        let project_dir = entry.path();
+        let chats_dir = project_dir.join("chats");
+        if chats_dir.is_dir() {
+            roots.push(chats_dir);
+        }
+    }
+    roots
 }
