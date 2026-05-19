@@ -40,7 +40,17 @@ pub(super) fn adapter_for(adapter_id: &str) -> Option<&'static dyn TranscriptAda
     }
 }
 
-/// Locate which file open under `pid` matches the caller-supplied predicate.
+/// BFS recursion caps for `discover_pid_fd`'s descendant walk. Typical
+/// shell→cli depth is 2 (bash → claude); 4 covers bash → wrapper → cli →
+/// tool-subprocess. Breadth 32 per level guards against runaway forks
+/// (a misbehaving build script under the shell shouldn't stall discovery).
+/// Exceeding either cap falls through to `Ok(None)` — same behavior as the
+/// pre-walk single-PID lsof, never a panic.
+const DESCENDANT_WALK_DEPTH_CAP: usize = 4;
+const DESCENDANT_WALK_BREADTH_CAP: usize = 32;
+
+/// Locate which file open under `pid` (or any descendant) matches the
+/// caller-supplied predicate.
 ///
 /// Cross-platform PID→open-FD scan used by all three adapter
 /// `discover_session` impls. Predicate decides "is this the JSONL I'm
@@ -48,17 +58,72 @@ pub(super) fn adapter_for(adapter_id: &str) -> Option<&'static dyn TranscriptAda
 ///
 /// Returns the first matching path (callers all have a one-FD predicate
 /// — only one transcript JSONL is open per CLI process at a time).
-/// `Ok(None)` means PID is alive but no FD satisfies the predicate
-/// (e.g. Codex has not yet created the rollout JSONL — happens before
-/// first model call). `Err(io)` is reserved for genuine OS errors
-/// (lsof spawn failure, permission denied walking /proc/<pid>/fd).
+/// `Ok(None)` means neither `pid` nor any descendant within the BFS caps
+/// has a matching open file (e.g. Codex has not yet created the rollout
+/// JSONL — happens before first model call). `Err(io)` is reserved for
+/// a genuine OS error scanning the input `pid` itself (lsof spawn
+/// failure, permission denied walking /proc/<pid>/fd); per-descendant
+/// scan errors are silently skipped so a single dead intermediate
+/// process can't poison the whole walk.
+///
+/// Descendant walk rationale: when the PTY child is the user's shell
+/// (the `spawn_shell` fallback in `AgentMiniTerminal.tsx`, exercised
+/// whenever direct `spawn_process` rejects the bare CLI command), the
+/// JSONL is opened by a descendant of bash — never bash itself. Without
+/// the BFS walk the discovery returns `Ok(None)` even when the JSONL is
+/// plainly open in the process tree.
 ///
 /// macOS: shells `lsof -p <pid> -F n` (NUL-terminator-free format: lines
 /// alternate `p<pid>`, `f<fd>`, `n<name>`; we filter to `n` lines).
-/// Linux: walks `/proc/<pid>/fd` and reads each link target. Other OSes:
-/// returns `Ok(None)` (no adapter discovers on them today — release
-/// artifact is `.dmg`-only per CLAUDE.md).
+/// Children enumerated via `pgrep -P <pid>` (same `/usr/bin` style as
+/// `/usr/sbin/lsof`).
+/// Linux: walks `/proc/<pid>/fd` and reads each link target. Children
+/// via `/proc/<pid>/task/<tid>/children` (whitespace-separated PID list,
+/// one file per thread; union across threads).
+/// Other OSes: returns `Ok(None)` (no adapter discovers on them today —
+/// release artifact is `.dmg`-only per CLAUDE.md).
 pub(super) fn discover_pid_fd<F>(pid: i32, predicate: F) -> std::io::Result<Option<PathBuf>>
+where
+    F: Fn(&Path) -> bool,
+{
+    // Step 1: try the input PID. Errors here propagate (genuine OS
+    // failure scanning the bound PID is a real problem the caller
+    // should see).
+    if let Some(found) = scan_one_pid(pid, &predicate)? {
+        return Ok(Some(found));
+    }
+
+    // Step 2: BFS over descendants. Per-PID scan errors are skipped
+    // (a single dead intermediate doesn't poison the walk).
+    let mut frontier: Vec<i32> = list_children(pid);
+    for _depth in 0..DESCENDANT_WALK_DEPTH_CAP {
+        if frontier.is_empty() {
+            break;
+        }
+        if frontier.len() > DESCENDANT_WALK_BREADTH_CAP {
+            frontier.truncate(DESCENDANT_WALK_BREADTH_CAP);
+        }
+        let mut next_frontier: Vec<i32> = Vec::new();
+        for child_pid in &frontier {
+            match scan_one_pid(*child_pid, &predicate) {
+                Ok(Some(found)) => return Ok(Some(found)),
+                Ok(None) => {}
+                Err(_) => {} // skip descendant on error
+            }
+            // Enumerate grandchildren regardless of this child's scan
+            // outcome — the matching FD may live in the next level even
+            // if a sibling at this level failed.
+            next_frontier.extend(list_children(*child_pid));
+        }
+        frontier = next_frontier;
+    }
+    Ok(None)
+}
+
+/// Scan a single PID for an open FD matching `predicate`. Same per-OS
+/// shape as the pre-walk single-PID logic — extracted so the BFS loop
+/// can reuse it per node.
+fn scan_one_pid<F>(pid: i32, predicate: &F) -> std::io::Result<Option<PathBuf>>
 where
     F: Fn(&Path) -> bool,
 {
@@ -115,6 +180,71 @@ where
     {
         let _ = (pid, predicate);
         Ok(None)
+    }
+}
+
+/// Enumerate direct child PIDs of `pid`. Returns an empty vec on any
+/// failure — the caller's BFS treats "no children visible" identically
+/// to "PID exists but is a leaf", which is the correct behavior when
+/// we can't see further.
+fn list_children(pid: i32) -> Vec<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        // `pgrep -P <ppid>` prints one child PID per line. Exit 1 = no
+        // matches (treat as empty children). Other failures: silent
+        // empty per the docstring contract.
+        let output = match std::process::Command::new("/usr/bin/pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        // pgrep exit 1 = no descendants; both cases yield no children.
+        // Exit codes >1 indicate pgrep itself failed; same outcome.
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Vec::new();
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut out = Vec::new();
+        for line in stdout.lines() {
+            if let Ok(p) = line.trim().parse::<i32>() {
+                out.push(p);
+            }
+        }
+        return out;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/<pid>/task/<tid>/children is a whitespace-separated PID
+        // list, one file per thread. Union across threads — a child of
+        // any thread is a child of the process.
+        let task_dir = format!("/proc/{}/task", pid);
+        let entries = match std::fs::read_dir(&task_dir) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        for entry in entries.flatten() {
+            let children_path = entry.path().join("children");
+            let contents = match std::fs::read_to_string(&children_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for tok in contents.split_whitespace() {
+                if let Ok(p) = tok.parse::<i32>() {
+                    seen.insert(p);
+                }
+            }
+        }
+        return seen.into_iter().collect();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        Vec::new()
     }
 }
 
