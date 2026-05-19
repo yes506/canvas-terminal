@@ -31,11 +31,21 @@ pub(super) static GEMINI_ADAPTER: gemini::GeminiAdapter = gemini::GeminiAdapter;
 /// back to the corresponding adapter trait object. Returns `None` when the
 /// id is unknown — defensive; in practice only the three production
 /// adapter ids are ever issued via `discover_session`.
+///
+/// Accepts BOTH the adapter's canonical `tool_id()` return value
+/// (`"claude_code"`, `"codex"`, `"gemini"`) AND the frontend
+/// `TOOL_CONFIGS` id (`"claude_code"`, `"codex_cli"`, `"gemini_cli"`).
+/// The `watch_transcript` IPC receives the frontend form; internal
+/// callers (`source_tool` serialization, `fs_gate::ALLOWED_ROOTS`,
+/// `TranscriptHandle.adapter_id`) use the canonical form. Both arms
+/// route to the same `'static` adapter — the on-disk schema's
+/// `source_tool` field stays the canonical form regardless of which
+/// alias the caller used.
 pub(super) fn adapter_for(adapter_id: &str) -> Option<&'static dyn TranscriptAdapter> {
     match adapter_id {
         "claude_code" => Some(&CLAUDE_CODE_ADAPTER),
-        "codex" => Some(&CODEX_ADAPTER),
-        "gemini" => Some(&GEMINI_ADAPTER),
+        "codex" | "codex_cli" => Some(&CODEX_ADAPTER),
+        "gemini" | "gemini_cli" => Some(&GEMINI_ADAPTER),
         _ => None,
     }
 }
