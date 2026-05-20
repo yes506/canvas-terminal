@@ -16,7 +16,24 @@ historical content reachable via `git log -- implementation-report.md`.)
 - Blocked: 0
 
 ## Files changed
-- `src/components/collaborator/InputPrompt.tsx` — +21 / −2
+- `src/components/collaborator/InputPrompt.tsx` — +31 / −5 across two commits
+  (initial fix + peer-feedback iteration)
+
+## Peer review iteration
+
+Three reviewers (@codex1, @codex2, @claude2) examined the initial commit
+`1c9008d`. codex1 and claude2 independently flagged that React state
+`value.length` can lag the DOM during IME composition (`onChange` does
+not fire mid-composition), and codex1 also suggested mirroring native
+selection-collapse behavior. Folded both into a follow-up commit
+`338dacf`:
+
+- ArrowLeft / ArrowRight inside the composing branch now collapse to
+  the relevant selection end (`selectionStart` for Left, `selectionEnd`
+  for Right) when a selection exists; otherwise step by 1. Matches
+  native textarea convention.
+- Upper bound for ArrowRight now reads `el.value.length` (DOM truth)
+  instead of React `value.length`.
 
 ## Validation
 - Baseline exit (BASE_BRANCH HEAD = `edc3cb1`): build 0, test 0 (216/216)
@@ -39,7 +56,7 @@ historical content reachable via `git log -- implementation-report.md`.)
 
 | item_id | status | files_touched | notes |
 |---|---|---|---|
-| 1 | completed | src/components/collaborator/InputPrompt.tsx | Added Arrow{Left,Right} cursor-step branch inside existing `isComposing` early-return. setSelectionRange clamped to `[0, value.length]`. |
+| 1 | completed | src/components/collaborator/InputPrompt.tsx | Added Arrow{Left,Right} cursor-step branch inside existing `isComposing` early-return. setSelectionRange clamped to `[0, el.value.length]`. Selection collapse mirrors native textarea convention. Folded peer feedback (codex1 + claude2 converged on DOM-truth length). |
 
 ## Scope-discipline self-check
 
