@@ -155,6 +155,7 @@ pub fn run() {
             commands::canvas::read_document_as_base64,
             commands::canvas::save_binary_file,
             commands::canvas::export_snapshot,
+            commands::capture::capture_main_window_png,
             commands::canvas::check_import_file,
             commands::canvas::read_import_file,
             commands::canvas::cleanup_import_file,
