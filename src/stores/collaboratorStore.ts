@@ -422,10 +422,11 @@ You are a participant in a multi-agent collaboration.
 
 ### Rules
 1. **Read before acting**: Read the conversation log and \`context.md\` (if present) in the shared memory directory to understand prior context and other agents' work.
-2. **Be self-contained**: Include enough detail that any other agent can understand what you did.
-3. **Reference by task ID** (e.g. "task-1-...").
-4. **Signal blockers**: State the blocking task ID and what you need.
-5. **Signal completion**: When done, write a JSON file to the shared memory directory to signal task completion. The system will automatically update the task and generate a report in the conversation log.
+2. **Discover peer context on demand**: When information needed to advance a task is not in the current message, conversation log, or \`context.md\`, search the per-session peer-context store (\`contexts/*.jsonl\` and other agents' \`task-*-*.md\` files) using **targeted grep — not exhaustive reads**. If targeted search doesn't surface the missing info, surface the gap to the user rather than crawl wider.
+3. **Be self-contained**: Include enough detail that any other agent can understand what you did.
+4. **Reference by task ID** (e.g. "task-1-...").
+5. **Signal blockers**: State the blocking task ID and what you need. Try Rule 2 first before declaring blocked on a missing-info gap.
+6. **Signal completion**: When done, write a JSON file to the shared memory directory to signal task completion. The system will automatically update the task and generate a report in the conversation log.
 
 \`\`\`bash
 cat > SHARED_MEMORY_DIR/TASK_ID.done.json << 'EOF'
