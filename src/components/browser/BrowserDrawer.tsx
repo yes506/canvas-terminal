@@ -13,22 +13,25 @@ import {
   useBrowserTabsLifecycle,
   useBrowserTabsSettings,
 } from "./useBrowserLifecycle";
-import { clampDrawerWidth } from "../../lib/drawerLayout";
-
 interface BrowserDrawerProps {
-  /** Width of the canvas drawer on the LEFT (0 when closed). Used by the
-   *  clamp math so dragging this drawer reserves space for canvas + terminal. */
-  canvasDrawerWidth: number;
-  /** Total container width (App.tsx ref). */
+  /** Effective rendered width of THIS drawer in px, computed by App.tsx's
+   *  call to `resolveDrawerWidths`. Cross-drawer / sibling-aware clamping
+   *  happens there (one source of truth); this component only renders. */
+  browserEffectiveWidth: number;
+  /** Total container width (App.tsx ref). Used by the local drag handler's
+   *  self-aware sanitizer to bound the persisted intent. */
   containerWidth: number;
 }
 
 export function BrowserDrawer({
-  canvasDrawerWidth,
+  browserEffectiveWidth,
   containerWidth,
 }: BrowserDrawerProps) {
   const drawerOpen = useBrowserStore((s) => s.drawerOpen);
-  const drawerWidth = useBrowserStore((s) => s.drawerWidth);
+  // `drawerWidth` (the user's intent) is no longer read here — the
+  // effective rendered width comes via `browserEffectiveWidth` prop
+  // (computed in App.tsx by `resolveDrawerWidths`). The setter is still
+  // used by the drag handler to persist intent.
   const setDrawerWidth = useBrowserStore((s) => s.setDrawerWidth);
   const toggle = useBrowserStore((s) => s.toggle);
   const activeTitle = useBrowserStore(selectActiveTitle);
@@ -44,6 +47,20 @@ export function BrowserDrawer({
   useBrowserTabsBounds(hostRef, drawerOpen);
 
   // Drag handle on the LEFT edge of the right-side drawer.
+  //
+  // The drag handler stores the user's INTENT (the value they dragged to)
+  // via `setDrawerWidth`. Cross-drawer / sibling-aware clamping is NOT
+  // done here — that's centralized in App.tsx's `resolveDrawerWidths`
+  // call at render time (so order-independence + intent-preservation
+  // across window resize both hold).
+  //
+  // We still do a SELF-AWARE sanitizer here — clamping the raw mouse-
+  // delta to [280, containerWidth] — to prevent absurd values from
+  // being persisted by `useBrowserTabsSettings`'s debounced settings
+  // write. The lower bound matches the drawer's own min-width (CSS
+  // `min-width: 280px` below); the upper bound prevents negative or
+  // larger-than-container values from leaking when the cursor exits the
+  // window mid-drag.
   const handleDragStart = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
@@ -51,12 +68,8 @@ export function BrowserDrawer({
       const onMouseMove = (ev: MouseEvent) => {
         if (!draggingRef.current) return;
         const proposed = containerWidth - ev.clientX;
-        const clamped = clampDrawerWidth({
-          proposedWidth: proposed,
-          containerWidth,
-          siblingDrawerWidth: canvasDrawerWidth,
-        });
-        setDrawerWidth(clamped);
+        const sanitized = Math.max(280, Math.min(containerWidth, proposed));
+        setDrawerWidth(sanitized);
       };
       const onMouseUp = () => {
         draggingRef.current = false;
@@ -66,7 +79,7 @@ export function BrowserDrawer({
       document.addEventListener("mousemove", onMouseMove);
       document.addEventListener("mouseup", onMouseUp);
     },
-    [canvasDrawerWidth, containerWidth, setDrawerWidth],
+    [containerWidth, setDrawerWidth],
   );
 
   return (
@@ -82,7 +95,7 @@ export function BrowserDrawer({
       <div
         className="flex flex-col flex-shrink-0 h-full bg-surface-light border-l border-surface-lighter overflow-hidden"
         style={{
-          width: drawerOpen ? `${drawerWidth}px` : 0,
+          width: drawerOpen ? `${browserEffectiveWidth}px` : 0,
           minWidth: drawerOpen ? 280 : 0,
         }}
       >
