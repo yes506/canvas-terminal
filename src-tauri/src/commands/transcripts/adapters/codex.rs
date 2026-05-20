@@ -166,71 +166,57 @@ impl TranscriptAdapter for CodexAdapter {
     /// Normalize one Codex turn.
     ///
     /// # Inputs Same shape as trait.
-    /// # Returns `Some(NormalizedTurn)` for `user_input` payloads
-    /// (role=User) and `response_item` payloads containing visible text
-    /// (role=Assistant). `None` for `session_meta`, `reasoning_text`,
-    /// `function_call`, `function_call_output`, `tool_call`, `tool_result`,
-    /// `system_message`.
+    /// # Returns `Some(NormalizedTurn)` for `event_msg` lines whose
+    /// `payload.type` is `user_message` (role=User) or `agent_message`
+    /// (role=Assistant). `None` for every other top-level type
+    /// (`response_item`, `session_meta`, `turn_context`) and every
+    /// other `event_msg.payload.type` (`task_started`, `token_count`,
+    /// `patch_apply_end`, etc.).
     /// # Errors Never panics. # Side effects None.
     /// # Invariants `source_tool == "codex"`; `ts_iso8601` is set from
     /// the line's top-level `timestamp` field when present (`ts_source =
-    /// Tool`), else CT-side fallback.
+    /// Tool`), else CT-side fallback. `event_msg` is the user-visible
+    /// "message bubble" surface; `response_item` events carry the
+    /// model's internal item stream (reasoning, function calls, paired
+    /// duplicates of agent_message) and are skipped to avoid
+    /// double-emission and tool-output leakage.
     /// # Concurrency Pure. # Lifecycle Per-turn.
-    /// # Test contract Turn with `payload.type == "reasoning_text"`
-    /// returns `None`. Turn with `payload.type == "user_input"` and
-    /// `payload.text == "hello"` returns `Some` with `text_visible ==
-    /// "hello"` and `role == User`.
+    /// # Test contract Turn with `top.type == "event_msg"` +
+    /// `payload.type == "user_message"` + `payload.message == "hello"`
+    /// returns `Some(role=User, text_visible="hello")`. Turn with
+    /// `top.type == "response_item"` returns `None`. Empty `message`
+    /// returns `None`.
     fn normalize(&self, raw: RawTurn, ctx: NormalizeContext<'_>) -> Option<NormalizedTurn> {
         let v = &raw.raw_payload;
 
-        // Codex rollout lines are `{ timestamp, type, payload }`. The inner
-        // `payload.type` discriminates which conversational role/content
-        // this turn carries. Anything not in the visible-text set returns
-        // None (filtered per the inclusion table's exclude list:
-        // session_meta, reasoning_text, function_call, function_call_output,
-        // tool_call, tool_result, system_message).
+        // Codex rollout lines are `{ timestamp, type, payload }`. The
+        // top-level `type` discriminates the event family. We accept
+        // only `event_msg` (the user-visible message stream) and skip
+        // every other top-level type:
+        //   - response_item: internal item stream (reasoning, function
+        //     calls, paired duplicates of agent_message). Skipping
+        //     avoids double-emission of assistant text.
+        //   - session_meta / turn_context: bookkeeping, no
+        //     user-visible content.
+        if v.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+            return None;
+        }
+
         let payload = v.get("payload")?;
         let payload_type = payload.get("type").and_then(|t| t.as_str())?;
 
         let (role, text_visible) = match payload_type {
-            "user_input" => {
-                // Per docstring test-contract: `payload.text == "hello"` →
-                // text_visible "hello", role User.
-                let text = payload.get("text").and_then(|x| x.as_str())?;
+            "user_message" => {
+                let text = payload.get("message").and_then(|x| x.as_str())?;
                 (TurnRole::User, text.to_string())
             }
-            "response_item" => {
-                // Assistant response. The visible text lives at
-                // `payload.message.content[*]` where each entry is a
-                // typed block (the include path "response_item.message.text"
-                // names this nested shape). Block types other than `text`
-                // are excluded.
-                let content = payload
-                    .get("message")
-                    .and_then(|m| m.get("content"))?;
-                let mut out = String::new();
-                if let Some(arr) = content.as_array() {
-                    for block in arr {
-                        let btype = match block.get("type").and_then(|t| t.as_str()) {
-                            Some(t) => t,
-                            None => continue,
-                        };
-                        if btype == "text" {
-                            if let Some(text) = block.get("text").and_then(|x| x.as_str()) {
-                                out.push_str(text);
-                            }
-                        }
-                    }
-                } else if let Some(s) = content.as_str() {
-                    // Some schema versions emit assistant text as a plain
-                    // string when the message contains only one text block.
-                    // Defensive (D2: best-effort field tolerance).
-                    out.push_str(s);
-                }
-                (TurnRole::Assistant, out)
+            "agent_message" => {
+                let text = payload.get("message").and_then(|x| x.as_str())?;
+                (TurnRole::Assistant, text.to_string())
             }
-            // session_meta, reasoning_text, function_call, function_call_output,
-            // tool_call, tool_result, system_message — all explicitly excluded.
+            // task_started, token_count, patch_apply_end, and every
+            // other event_msg subtype — internal/tool events, not
+            // user-visible message content. Excluded.
             _ => return None,
         };
 
@@ -260,6 +246,148 @@ impl TranscriptAdapter for CodexAdapter {
             // Chunk-relative per the trait's touch-up D contract.
             source_offset: raw.source_offset,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Fixture-based unit tests for the Codex adapter's `normalize` body.
+    //!
+    //! Line samples captured 2026-05-20 from a real rollout file at
+    //! `~/.codex/sessions/2026/05/19/rollout-2026-05-19T17-52-54-*.jsonl`.
+    //! Sanitized: agent handles / cwd paths trimmed; payload shapes kept
+    //! verbatim. If a future Codex version drifts the line shape, these
+    //! tests fail loudly — that's the intent.
+
+    use super::*;
+    use serde_json::json;
+
+    fn ctx() -> NormalizeContext<'static> {
+        NormalizeContext {
+            agent_handle: "codex1",
+            adapter_version: ADAPTER_VERSION,
+            turn_index: 0,
+        }
+    }
+
+    fn parse_line(line: serde_json::Value) -> RawTurn {
+        RawTurn {
+            raw_payload: line,
+            source_offset: 0,
+        }
+    }
+
+    #[test]
+    fn user_message_event_normalizes_to_user_role() {
+        let line = json!({
+            "timestamp": "2026-05-19T08:53:48.606Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "hello"
+            }
+        });
+        let out = CodexAdapter.normalize(parse_line(line), ctx()).expect("Some");
+        assert!(matches!(out.role, TurnRole::User));
+        assert_eq!(out.text_visible, "hello");
+        assert_eq!(out.source_tool, "codex");
+        assert_eq!(out.ts_iso8601, "2026-05-19T08:53:48.606Z");
+        assert!(matches!(out.ts_source, TsSource::Tool));
+    }
+
+    #[test]
+    fn agent_message_event_normalizes_to_assistant_role() {
+        let line = json!({
+            "timestamp": "2026-05-19T08:53:56.204Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "Hello from @codex1.",
+                "phase": "commentary",
+                "memory_citation": null
+            }
+        });
+        let out = CodexAdapter.normalize(parse_line(line), ctx()).expect("Some");
+        assert!(matches!(out.role, TurnRole::Assistant));
+        assert_eq!(out.text_visible, "Hello from @codex1.");
+    }
+
+    #[test]
+    fn session_meta_returns_none() {
+        let line = json!({
+            "timestamp": "2026-05-19T08:53:00.000Z",
+            "type": "session_meta",
+            "payload": { "cwd": "/Users/donghyeon" }
+        });
+        assert!(CodexAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn turn_context_returns_none() {
+        let line = json!({
+            "timestamp": "2026-05-19T08:53:01.000Z",
+            "type": "turn_context",
+            "payload": {}
+        });
+        assert!(CodexAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn response_item_returns_none() {
+        // response_item.message is the internal item stream; skipped
+        // to avoid double-emission with event_msg.agent_message.
+        let line = json!({
+            "timestamp": "2026-05-19T08:53:56.300Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "duplicate"}]
+                }
+            }
+        });
+        assert!(CodexAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn task_started_event_returns_none() {
+        let line = json!({
+            "timestamp": "2026-05-19T08:53:00.500Z",
+            "type": "event_msg",
+            "payload": { "type": "task_started" }
+        });
+        assert!(CodexAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn token_count_event_returns_none() {
+        let line = json!({
+            "timestamp": "2026-05-19T08:53:57.000Z",
+            "type": "event_msg",
+            "payload": { "type": "token_count", "input": 100, "output": 50 }
+        });
+        assert!(CodexAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn empty_user_message_returns_none() {
+        let line = json!({
+            "timestamp": "2026-05-19T08:53:48.000Z",
+            "type": "event_msg",
+            "payload": { "type": "user_message", "message": "" }
+        });
+        assert!(CodexAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn missing_timestamp_falls_back_to_ct_source() {
+        let line = json!({
+            "type": "event_msg",
+            "payload": { "type": "user_message", "message": "hi" }
+        });
+        let out = CodexAdapter.normalize(parse_line(line), ctx()).expect("Some");
+        assert!(matches!(out.ts_source, TsSource::Ct));
     }
 }
 

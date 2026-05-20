@@ -174,54 +174,62 @@ impl TranscriptAdapter for GeminiAdapter {
     /// Normalize one Gemini turn.
     ///
     /// # Inputs Same shape.
-    /// # Returns `Some(NormalizedTurn)` for user/model text. `None` for
-    /// `thoughts`, function-call/response, system blocks. `role` derived
-    /// from the turn's `role` field (`"user"` → User, `"model"` →
+    /// # Returns `Some(NormalizedTurn)` for user/gemini text. `None` for
+    /// session-header lines (no `type`), `$set` state-update lines
+    /// (also no `type`), or unknown role values. Role derived from the
+    /// turn's top-level `type` field (`"user"` → User, `"gemini"` →
     /// Assistant).
     /// # Errors Never panics.
     /// # Side effects None.
     /// # Invariants `source_tool == "gemini"`; `ts_iso8601` from the
-    /// turn's `startTime`/`timestamp` when present (`ts_source = Tool`),
-    /// else CT-side fallback.
+    /// turn's `timestamp`/`startTime` when present (`ts_source = Tool`),
+    /// else CT-side fallback. The `thoughts` array is Gemini's
+    /// reasoning-trace (analogue of Claude's `thinking`) and is
+    /// EXCLUDED per the inclusion-table contract.
     /// # Concurrency Pure. # Lifecycle Per-turn.
-    /// # Test contract First-line header turn returns `None`. Turn with
-    /// only `thoughts` parts returns `None`. Turn with mixed `thoughts` +
-    /// `text` returns `Some` with `text_visible` containing ONLY the
-    /// `text` parts (thoughts dropped).
+    /// # Test contract First-line session header returns `None` (no
+    /// `type` field). `$set` state-update returns `None`. User turn with
+    /// `content: [{text: "..."}]` returns `Some(role=User)` with the
+    /// joined text. Gemini turn with `content: "..."` (plain string)
+    /// returns `Some(role=Assistant)` with that string. Gemini turn
+    /// with empty `content` (only `thoughts`) returns `None`.
     fn normalize(&self, raw: RawTurn, ctx: NormalizeContext<'_>) -> Option<NormalizedTurn> {
         let v = &raw.raw_payload;
 
-        // First-line session header: `{ sessionId, projectHash, startTime,
-        // lastUpdated, kind }` — no `role`/`parts`. Per docstring test
-        // contract: first-line header turn returns None. The simplest
-        // discriminator is "missing `role` field" — header lines have none.
-        let role_str = v.get("role").and_then(|r| r.as_str())?;
-        let role = match role_str {
+        // Gemini per-turn lines carry `type: "user" | "gemini"`. The
+        // session header line (`{sessionId, projectHash, startTime,
+        // lastUpdated, kind}`) and `$set` state-update lines have no
+        // `type` field, so the early `?` returns None for both.
+        let type_str = v.get("type").and_then(|r| r.as_str())?;
+        let role = match type_str {
             "user" => TurnRole::User,
-            "model" => TurnRole::Assistant,
-            // Future Gemini versions may add new roles (e.g. "function" for
-            // tool invocations). Per D2 (best-effort field tolerance), unknown
-            // roles return None rather than panic — the watcher's
-            // turn_index still increments, so consumers detect gaps via
-            // non-contiguous indices.
+            "gemini" => TurnRole::Assistant,
+            // Future Gemini versions may add new types (e.g. "function"
+            // for tool invocations). Per D2 (best-effort field
+            // tolerance), unknown types return None rather than panic.
             _ => return None,
         };
 
-        // Per-turn shape: `parts: [{ text: "..." }, { thoughts: "..." }, ...]`.
-        // Each part has a single typed key. Filter to `text` only; drop
-        // `thoughts` (Gemini's reasoning-trace equivalent of Claude's
-        // `thinking`) and function_call / function_response / tool blocks.
-        let parts = v.get("parts").and_then(|p| p.as_array())?;
+        // Content shape is role-dependent:
+        //   - user turns:   `content: [{text: "..."}, ...]` (array of
+        //                   typed blocks; only `text` blocks emit).
+        //   - gemini turns: `content: "..."` (plain string, the assistant's
+        //                   user-visible response).
+        // The "thoughts" field (Gemini's reasoning-trace) lives at the
+        // top level alongside `content` and is EXCLUDED per the
+        // inclusion-table contract — we never read it.
         let mut text_visible = String::new();
-        for part in parts {
-            // A part with `.text` is the visible-text variant. Inspect for
-            // the key, ignore other variants per the inclusion table.
-            if let Some(text) = part.get("text").and_then(|x| x.as_str()) {
-                text_visible.push_str(text);
+        if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
+            for block in arr {
+                if let Some(text) = block.get("text").and_then(|x| x.as_str()) {
+                    text_visible.push_str(text);
+                }
+                // Other block shapes (functionCall, functionResponse,
+                // tool, ...) are silently skipped per D2's
+                // "schema-version drift: unknown fields dropped".
             }
-            // Future-tolerant: any other top-level key on a part (thought,
-            // functionCall, functionResponse, ...) is silently skipped per
-            // D2's "schema-version drift: unknown fields dropped".
+        } else if let Some(s) = v.get("content").and_then(|c| c.as_str()) {
+            text_visible.push_str(s);
         }
 
         if text_visible.is_empty() {
@@ -254,6 +262,144 @@ impl TranscriptAdapter for GeminiAdapter {
             // Chunk-relative per the trait's touch-up D contract.
             source_offset: raw.source_offset,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Fixture-based unit tests for the Gemini adapter's `normalize` body.
+    //!
+    //! Line samples captured 2026-05-20 from a real session file at
+    //! `~/.gemini/tmp/donghyeon/chats/session-2026-05-19T08-52-194738d9.jsonl`.
+    //! Sanitized: full identifiers / project paths trimmed; payload
+    //! shapes kept verbatim.
+
+    use super::*;
+    use serde_json::json;
+
+    fn ctx() -> NormalizeContext<'static> {
+        NormalizeContext {
+            agent_handle: "gemini1",
+            adapter_version: ADAPTER_VERSION,
+            turn_index: 0,
+        }
+    }
+
+    fn parse_line(line: serde_json::Value) -> RawTurn {
+        RawTurn {
+            raw_payload: line,
+            source_offset: 0,
+        }
+    }
+
+    #[test]
+    fn user_turn_with_content_array_normalizes_to_user_role() {
+        let line = json!({
+            "id": "d11f41d4-a1c7-4fb6-b212-88992b3a6b2f",
+            "timestamp": "2026-05-19T08:54:36.991Z",
+            "type": "user",
+            "content": [{"text": "hello"}],
+            "displayContent": "hello"
+        });
+        let out = GeminiAdapter.normalize(parse_line(line), ctx()).expect("Some");
+        assert!(matches!(out.role, TurnRole::User));
+        assert_eq!(out.text_visible, "hello");
+        assert_eq!(out.source_tool, "gemini");
+        assert_eq!(out.ts_iso8601, "2026-05-19T08:54:36.991Z");
+        assert!(matches!(out.ts_source, TsSource::Tool));
+    }
+
+    #[test]
+    fn user_turn_with_multi_block_content_joins_text_only() {
+        let line = json!({
+            "id": "x",
+            "timestamp": "2026-05-19T08:54:37.000Z",
+            "type": "user",
+            "content": [
+                {"text": "alpha"},
+                {"functionCall": {"name": "foo"}},  // should be skipped
+                {"text": "beta"}
+            ]
+        });
+        let out = GeminiAdapter.normalize(parse_line(line), ctx()).expect("Some");
+        assert_eq!(out.text_visible, "alphabeta");
+    }
+
+    #[test]
+    fn gemini_turn_with_content_string_normalizes_to_assistant_role() {
+        let line = json!({
+            "id": "f477d8b3-9440-4bad-ad6b-29ca177ab3aa",
+            "timestamp": "2026-05-19T08:54:41.863Z",
+            "type": "gemini",
+            "content": "Reviewing the agent tasks now.",
+            "thoughts": [{
+                "subject": "Reviewing Agent Tasks",
+                "description": "I'm currently reviewing.",
+                "timestamp": "2026-05-19T08:54:41.546Z"
+            }],
+            "tokens": {"input": 100, "output": 20, "total": 120}
+        });
+        let out = GeminiAdapter.normalize(parse_line(line), ctx()).expect("Some");
+        assert!(matches!(out.role, TurnRole::Assistant));
+        assert_eq!(out.text_visible, "Reviewing the agent tasks now.");
+    }
+
+    #[test]
+    fn gemini_turn_with_empty_content_returns_none() {
+        // Gemini emits `content: ""` when the assistant's full output is
+        // captured in `thoughts` (reasoning-only turn). Per inclusion
+        // table, thoughts are excluded — empty visible text is skipped.
+        let line = json!({
+            "id": "y",
+            "timestamp": "2026-05-19T08:54:42.000Z",
+            "type": "gemini",
+            "content": "",
+            "thoughts": [{"subject": "Thinking only", "description": "..."}]
+        });
+        assert!(GeminiAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn session_header_returns_none() {
+        // First line of every session file: no `type` field, so the
+        // early `?` returns None at v.get("type").
+        let line = json!({
+            "sessionId": "194738d9-...",
+            "projectHash": "donghyeon",
+            "startTime": "2026-05-19T08:52:00.000Z",
+            "lastUpdated": "2026-05-19T09:00:00.000Z",
+            "kind": "chat"
+        });
+        assert!(GeminiAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn set_state_update_returns_none() {
+        // `$set` lines mutate session-level state but carry no `type`
+        // field, so the early `?` returns None.
+        let line = json!({
+            "$set": {"lastUpdated": "2026-05-19T09:00:00.000Z"}
+        });
+        assert!(GeminiAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn unknown_type_returns_none() {
+        let line = json!({
+            "type": "function",
+            "content": "should not surface"
+        });
+        assert!(GeminiAdapter.normalize(parse_line(line), ctx()).is_none());
+    }
+
+    #[test]
+    fn missing_timestamp_falls_back_to_ct_source() {
+        let line = json!({
+            "type": "user",
+            "content": [{"text": "no timestamp here"}]
+        });
+        let out = GeminiAdapter.normalize(parse_line(line), ctx()).expect("Some");
+        assert!(matches!(out.ts_source, TsSource::Ct));
     }
 }
 
