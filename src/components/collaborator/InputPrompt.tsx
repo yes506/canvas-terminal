@@ -362,8 +362,37 @@ export function InputPrompt() {
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      // Never interfere with IME composition (Korean, Japanese, Chinese)
-      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+      // Never interfere with IME composition (Korean, Japanese, Chinese).
+      // macOS WKWebView + Hangul IME quirk: native ArrowLeft/ArrowRight
+      // inside the composing window commits an isolated Hangul Jamo
+      // (U+1100–U+11FF) instead of advancing the cursor. Those Jamo lack
+      // glyphs in the `font-mono` fallback chain and render as tofu (□).
+      // Move the cursor manually here so the IME never sees the arrow.
+      if (e.nativeEvent.isComposing || e.keyCode === 229) {
+        if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+          e.preventDefault();
+          const el = inputRef.current;
+          if (el) {
+            // Mirror native textarea: with a non-empty selection, an arrow
+            // collapses to the relevant end; with no selection, step by 1.
+            // Read `el.value.length` (DOM truth) rather than React `value.length`,
+            // since `onChange` typically does not fire mid-composition.
+            const start = el.selectionStart ?? 0;
+            const end = el.selectionEnd ?? start;
+            const hasSelection = start !== end;
+            const next =
+              e.key === "ArrowLeft"
+                ? hasSelection
+                  ? start
+                  : Math.max(0, start - 1)
+                : hasSelection
+                  ? end
+                  : Math.min(el.value.length, end + 1);
+            el.setSelectionRange(next, next);
+          }
+        }
+        return;
+      }
 
       // --- Target selector is visible ---
       if (showSelector) {
