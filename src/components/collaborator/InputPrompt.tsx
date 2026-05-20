@@ -373,11 +373,21 @@ export function InputPrompt() {
           e.preventDefault();
           const el = inputRef.current;
           if (el) {
-            const at = el.selectionStart ?? 0;
+            // Mirror native textarea: with a non-empty selection, an arrow
+            // collapses to the relevant end; with no selection, step by 1.
+            // Read `el.value.length` (DOM truth) rather than React `value.length`,
+            // since `onChange` typically does not fire mid-composition.
+            const start = el.selectionStart ?? 0;
+            const end = el.selectionEnd ?? start;
+            const hasSelection = start !== end;
             const next =
               e.key === "ArrowLeft"
-                ? Math.max(0, at - 1)
-                : Math.min(value.length, at + 1);
+                ? hasSelection
+                  ? start
+                  : Math.max(0, start - 1)
+                : hasSelection
+                  ? end
+                  : Math.min(el.value.length, end + 1);
             el.setSelectionRange(next, next);
           }
         }
