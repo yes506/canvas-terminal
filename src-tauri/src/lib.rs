@@ -181,6 +181,7 @@ pub fn run() {
             commands::browser::browser_tab_go_forward,
             commands::browser::browser_tab_reload,
             commands::browser::browser_tab_stop,
+            commands::browser::browser_tab_set_zoom,
             commands::browser::destroy_browser_tab,
             commands::browser::destroy_all_browser_tabs,
             commands::localfile::mint_localfile_token,

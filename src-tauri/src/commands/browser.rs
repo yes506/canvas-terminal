@@ -496,6 +496,44 @@ pub fn browser_tab_stop(
         .map_err(|e| format!("eval stop failed: {}", e))
 }
 
+const ZOOM_MIN: f64 = 0.25;
+const ZOOM_MAX: f64 = 5.0;
+
+/// Clamp a zoom request to the WKWebView-supported range. NaN collapses
+/// to 1.0 so a degenerate frontend value can't reach `setPageZoom:`.
+/// Defense-in-depth — the frontend ladder already produces in-range
+/// values; this catches future direct callers and test fixtures.
+fn clamp_zoom(zoom: f64) -> f64 {
+    if zoom.is_nan() {
+        return 1.0;
+    }
+    zoom.clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+/// Set the per-tab WKWebView zoom level via the native
+/// `Webview::set_zoom(scale_factor)` API (tauri 2.10 →
+/// wry `WKWebView.setPageZoom`). Requires macOS 11+ — enforced by
+/// `tauri.conf.json::minimumSystemVersion`.
+///
+/// Zoom is sticky per-webview across navigation and reload, so this
+/// is the only command needed for the per-tab zoom lifecycle. The
+/// localfile token registry is unaffected — `set_zoom` is not a
+/// navigation and does not touch `on_page_load` / `on_navigation`.
+#[tauri::command]
+pub fn browser_tab_set_zoom(
+    #[allow(non_snake_case)] tabId: TabId,
+    zoom: f64,
+    state: tauri::State<'_, BrowserTabsState<tauri::Wry>>,
+) -> Result<(), String> {
+    let clamped = clamp_zoom(zoom);
+    let webview = state
+        .clone_tab(&tabId)
+        .ok_or_else(|| format!("browser tab '{}' not created", tabId))?;
+    webview
+        .set_zoom(clamped)
+        .map_err(|e| format!("set_zoom failed: {}", e))
+}
+
 #[tauri::command]
 pub fn destroy_browser_tab(
     #[allow(non_snake_case)] tabId: TabId,
@@ -567,6 +605,21 @@ pub fn destroy_all_browser_tabs_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_zoom_bounds() {
+        assert_eq!(clamp_zoom(1.0), 1.0);
+        assert_eq!(clamp_zoom(0.25), 0.25);
+        assert_eq!(clamp_zoom(5.0), 5.0);
+        // Clamped from below.
+        assert_eq!(clamp_zoom(0.0), 0.25);
+        assert_eq!(clamp_zoom(-100.0), 0.25);
+        // Clamped from above.
+        assert_eq!(clamp_zoom(10.0), 5.0);
+        assert_eq!(clamp_zoom(f64::INFINITY), 5.0);
+        // NaN collapses to 1.0 so we never forward it to setPageZoom:.
+        assert_eq!(clamp_zoom(f64::NAN), 1.0);
+    }
 
     #[test]
     fn allow_http_https_about_blank() {

@@ -34,6 +34,8 @@ export interface Tab {
   title: string;
   isLoading: boolean;
   error: string | null;
+  /** WKWebView per-tab page zoom (1.0 = 100%). Native sticky across navigations. */
+  zoom: number;
 }
 
 /**

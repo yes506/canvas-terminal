@@ -1,162 +1,121 @@
-# Implementation report — drawer-resize-reclamp
+# Implementation report — browser-zoom
 
 (Prior `implementation-report.md` on `dev` documented
-`frame-collision-clip` and before that `capture-fix-injection`.
+`drawer-resize-reclamp` and before that several feature cycles.
 Overwritten with this local-lane report; historical content reachable
 via `git log -- implementation-report.md`.)
 
 ## Source
+- Planner marker: `local` (chat-only, same-session)
+- Planner artifact: `task-85-claude1-updated-plan-v4.md` (collab-memory session-2526)
+- Plan-confirm token: user typed `confirm plan` in chat after the v4 plan block
+- Scale: local
 
-- **Planner marker**: `scale: local` (chat-only per CLAUDE.md)
-- **Confirmation token**: `confirm plan` typed in this session after
-  the v5 marker emit
-- **Convergence**: 5 plan iterations (v1 → v5), 5 review rounds
-  (rounds 11–14). v5 ratified by 4/4 reviewers in round 14 with one
-  convergent guardrail folded in (browser drag sanitizer).
-- **Cross-reference**: task-59 investigation report (origin of the
-  resize-reclamp need); the round-11→14 plan iteration history is in
-  tasks 64, 69, 74, 79 (planner reflections).
-
-## Work-queue summary
-
-- Total items: **4**
-- Completed: **4**
-- Blocked: **0**
+## Work queue summary
+- Total items: 9
+- Completed: 9
+- Blocked: 0
 
 ## Files changed
 
-```
- src/App.tsx                                  | ~45 lines (state + helper call + render path)
- src/components/browser/BrowserDrawer.tsx     | ~30 lines (prop rename + sanitizer + drop local clamp)
- src/lib/drawerLayout.ts                      | +74 lines (new resolveDrawerWidths helper + doc comment)
- src/lib/drawerLayout.test.ts                 | +124 lines (7 new tests for the helper)
- 4 files changed, 274 insertions(+), 35 deletions(-)
-```
-
-(The 274/35 totals from `git diff --shortstat dev..HEAD` include the
-comment blocks accompanying each change; the load-bearing logic is
-~30-40 lines as predicted by v5.)
+| File | Change | Net lines |
+|---|---|---|
+| `src/types/browser.ts` | Add `zoom: number` field to `Tab` | +2 |
+| `src/stores/browserStore.ts` | `ZOOM_STEPS` ladder, `nextZoomStep`/`prevZoomStep`, `ZOOM_DEFAULT`, `setTabZoom` action, `selectActiveZoom`, `makeBlankTab` zoom default | +46 |
+| `src/stores/browserStore.test.ts` (NEW) | Vitest cases for step helpers | +78 |
+| `src/lib/browserIpc.ts` | `browserTabSetZoom` IPC wrapper | +9 |
+| `src-tauri/src/commands/browser.rs` | `clamp_zoom` helper + Rust unit test + `browser_tab_set_zoom` command | +52 |
+| `src-tauri/src/lib.rs` | Register `browser_tab_set_zoom` in `invoke_handler!` | +1 |
+| `src-tauri/tauri.conf.json` | Bump `minimumSystemVersion` `10.15` → `11.0` | ±1 |
+| `src/components/browser/ZoomControls.tsx` (NEW) | Three-button zoom group + IPC-first click handler | +109 |
+| `src/components/browser/BrowserDrawer.tsx` | Add `drawerRef` on outer `<div>`, render `<ZoomControls />` after `<AddressBar />`, drawer-scoped capture-phase keydown handler with focus-inside-drawer guard | +60 |
 
 ## Validation
-
-- **Baseline exit** (worktree HEAD = `dev` at `c6bc25e`):
-  `tsc --noEmit` = 0, `vitest run src/lib/drawerLayout.test.ts` =
-  8/8 passing
-- **Final validation command**: `cd <worktree> && npx tsc --noEmit && npx vitest run src/lib/drawerLayout.test.ts`
-- **Final exit**: 0
-- **Auto-fix attempts used**: **1 / 3** — one test assertion was
-  using `.toBe(490)` against `Math.max(280, 0.35 * 1400)` which
-  IEEE 754 produces as `489.99999999999994`. Fixed by switching to
-  `.toBeCloseTo(490, 5)`. **Pure test bug**; the helper math is
-  unchanged.
-- Final test run: 15/15 passing (8 existing `clampDrawerWidth` + 7
-  new `resolveDrawerWidths`).
+- Baseline exit (BASE_BRANCH HEAD `dev`): **0**
+- Final validation command: `npm run build && npm test -- --run && cargo check --manifest-path src-tauri/Cargo.toml`
+- Final exit: **0**
+- Auto-fix attempts used: **0/3**
+- Final test counts:
+  - Vitest: **234 passed** (was 223 → +11 from new step-helper cases)
+  - Cargo `--lib`: **38 passed** (was 37 → +1 `clamp_zoom_bounds`)
+  - `cargo check`: 9 warnings, all pre-existing dead-code lints (no new warnings introduced)
 
 ## Per-item outcomes
 
-| Item | Description | Status | File | Notes |
-|---|---|---|---|---|
-| 1 | Add `resolveDrawerWidths` helper | completed | `src/lib/drawerLayout.ts` | Pure function. Inputs: `canvasIntent`, `browserIntent`, `containerWidth`, `canvasOpen`, `browserOpen`, optional `canvasMin`/`browserMin`/`terminalMin`/`handleWidth`. Outputs: `{canvasEffective, browserEffective}`. Handle count computed internally from open flags × `handleWidth` (default 4). Sibling = OTHER drawer's INTENT (not effective) → order-independent. ~20 px asymmetric-allocation note in inline comment per @claude3 F1. |
-| 2 | Add 7 unit tests for helper | completed | `src/lib/drawerLayout.test.ts` | normal / squeeze@800 / expand-back / null-fallback materialized / single-drawer / no-drawer / handle-width override. All pass after the one auto-fix. |
-| 3 | App.tsx: state + helper call + render + drop DOM-write | completed | `src/App.tsx` | New `canvasIntent: number \| null` state. Drag handler updates intent (no DOM mutation). Resize handler measurement-only (just `setContainerWidth`). Materializes null → `Math.max(280, 0.35 * containerWidth)` inline before helper call. Canvas panel renders `"35%"` when `canvasIntent === null`, otherwise `canvasEffective`. Pass `browserEffectiveWidth` to BrowserDrawer (replaces `canvasDrawerWidth`). |
-| 4 | BrowserDrawer.tsx: new prop + sanitizer + drop local clamp | completed | `src/components/browser/BrowserDrawer.tsx` | New `browserEffectiveWidth: number` prop (replaces `canvasDrawerWidth`). Drag handler drops sibling-aware clamp; adds self-aware sanitizer `Math.max(280, Math.min(containerWidth, proposed))` so absurd raw deltas don't leak to settings via `useBrowserTabsSettings`'s debounced persist. Removed unused `drawerWidth` selector (read happens via the prop now). |
+| Item | Status | Files touched | Notes |
+|---|---|---|---|
+| q1 types-tab-zoom | completed | `src/types/browser.ts` | Mandatory field; forces every `Tab` literal to include it. |
+| q2 store-helpers | completed | `src/stores/browserStore.ts` | `ZOOM_STEPS`/`ZOOM_DEFAULT` exported; helpers snap to nearest-bracketing-step. |
+| q3 store-tests | completed | `src/stores/browserStore.test.ts` | Exact, floor, ceil, mid-step snap, absurd-input clamp. |
+| q4 browser-ipc-wrapper | completed | `src/lib/browserIpc.ts` | Maps 1:1 to `browser_tab_set_zoom` Rust command. |
+| q5 rust-zoom-cmd | completed | `src-tauri/src/commands/browser.rs` | Clamp `[0.25, 5.0]`; NaN collapses to 1.0; `webview.set_zoom(clamped)`. |
+| q6 rust-register | completed | `src-tauri/src/lib.rs` | Registered in `invoke_handler!`. |
+| q7 tauri-minver | completed | `src-tauri/tauri.conf.json` | macOS floor `11.0` (required for WKWebView `setPageZoom:`). |
+| q8 zoom-controls | completed | `src/components/browser/ZoomControls.tsx` | IPC-first; "not created" silent no-op; other err → `setTabError`. |
+| q9 browser-drawer-wiring | completed | `src/components/browser/BrowserDrawer.tsx` | `drawerRef` on outer `<div>`; `<ZoomControls />` after `<AddressBar />`; document-capture keydown handler with `stopPropagation` to preempt the existing window-bubble terminal-font handler at `useKeyboardShortcuts.ts:232-246` when focus is inside drawer chrome. |
+
+## Plan-AC coverage
+
+| AC | Status | Notes |
+|---|---|---|
+| 1 Zoom affects only page content; shell UI unchanged | covered | Rust `set_zoom` is per-tab WKWebView only; React DOM untouched. |
+| 2 `http(s)://` and `localfile://` zoom alike | covered | `set_zoom` operates on the webview regardless of URL scheme. |
+| 3 Per-tab isolation | covered | `Tab.zoom` is per-tab; each call carries a `tabId`. |
+| 4 Tab-switch percent display tracks active tab | covered | `selectActiveZoom` reads from `activeTabId`. |
+| 5 Reload + in-tab navigation preserve zoom | covered | Native sticky via wry `setPageZoom`. |
+| 6 New blank tab renders at 100% | covered | `makeBlankTab` returns `zoom: ZOOM_DEFAULT = 1.0`. |
+| 7 280px drawer remains usable | covered | Zoom buttons (~24px each) + `100%` label (~40px, tabular-nums) ≈ 88px after AddressBar; AddressBar (`flex:1; minWidth:0`) truncates rather than breaking. |
+| 8 Build / tests / cargo check all pass; helper tests cover floor/ceil/mid-step | covered | See validation block; new test file exercises `nextZoomStep`/`prevZoomStep`. |
+| 9 Shortcuts focus-scoped; terminal font preserved | covered | Capture-phase `document.addEventListener('keydown', ..., true)` + `drawerRef.contains(document.activeElement)` + `stopPropagation`. |
+| 10 Drawer close→reopen preserves zoom | covered | Child webviews persist (`useBrowserLifecycle.ts:74`); zoom is OS-level sticky. |
+| 11 Transient create-race no divergence | covered | IPC-first: `setTabZoom` only fires after `browserTabSetZoom` resolves OK. |
+| 12 IPC failures surface via `setTabError` | covered | Click handler + keydown handler share the same error path. |
+| 13 macOS <11 blocked at install | covered | `tauri.conf.json::minimumSystemVersion = "11.0"`. |
 
 ## Scope-discipline self-check
+- [x] No new interfaces / files outside hints (only `ZoomControls.tsx`, `browserStore.test.ts` — both listed in plan v4)
+- [x] No renames of committed public names
+- [x] No signature changes on planner-committed methods
+- [x] No edits to validation_command configuration
+- [x] No edits to files outside the work queue's hint set (`NavControls.tsx` deliberately NOT touched per v4 §"Files NOT touched"; `useBrowserLifecycle.ts` deliberately NOT touched per v4 §"Files NOT touched")
+- [x] No re-architecting or scale re-classification
 
-- [x] No new interfaces / files outside the plan's hint set — same 4 files predicted by v5
-- [x] No renames of committed public names — `clampDrawerWidth` and its signature are unchanged
-- [x] No signature changes on planner-committed methods — `clampDrawerWidth` is additive (new helper is a composition)
-- [x] No edits to `validation_command` configuration — `package.json`, `tsconfig.json` untouched
-- [x] No edits to files outside the work queue's hint set — diff is exactly the 4 named files
-- [x] BGRA → RGBA channel swap (capture.rs from prior runs) — untouched
-- [x] Native capture command — untouched
-- [x] Frame-collision `overflow-hidden` on terminal panel — untouched (still in place at App.tsx:158)
-- [x] `clampDrawerWidth`'s "give up at selfMin when upperBound < selfMin" degraded mode — preserved (it's what makes the squeeze graceful)
-- [x] No z-index changes
-- [x] No `tauri.conf.json` `minWidth` change
-- [x] No `package.json` / Cargo.toml / capability JSON changes
+## Reviewer "NOT adopted" items — confirmation kept
 
-## Notes for the manual acceptance pass
+Both rejected pinpoints from earlier reviewer rounds remain unadopted:
+- **Post-create apply hook** in `useBrowserLifecycle.ts` — IPC-first ordering eliminates the create-race divergence path; no behavioral need for the hook. Implementation matches v4.
+- **Rust IPC returning clamped value** — TS-side `ZOOM_STEPS` always feeds in-range values; the Rust clamp is defense-in-depth (verified by `clamp_zoom_bounds` covering 0.25/5.0/NaN/INF/negative). Implementation matches v4.
 
-`tsc --noEmit` + `vitest` validate types and helper math but **cannot exercise live layout** during window resize. The runtime AC is the only way to verify the user-visible UX change.
+## Notes for reviewers
+- Native zoom (`Webview::set_zoom`) is sticky per-webview across navigation and reload, so no `browser-tab-loaded` re-apply hook was added. Verified at `~/.cargo/registry/.../wry-0.54.4/src/wkwebview/mod.rs:933-941` (`setPageZoom:`).
+- Manual smoke (not run from this implementer, listed for the merge gate): `npm run tauri dev` → open browser drawer → navigate to a real page → `+` enlarges content, `−` shrinks, `100%` resets; reload preserves zoom; per-tab isolation by zooming on tab A and switching to tab B.
 
-1. **AC §1 — reproduce the user's snapshot scenario**: open at 1400×900, drag canvas to ~490 and browser to ~600. Shrink window to 800 px. **Expect**: terminal panel ≥ ~48 px (visible strip); both drawers auto-shrunk to 280 (degraded mode); terminal absorbs the rest (~232 px after handle budget). Pre-fix: terminal at 0.
-2. **AC §2 — no drag regression**: at 1400 px, drag each drawer in turn. **Expect**: drag stops at 280 px floor; no jitter; same feel as before this fix.
-3. **AC §3 — resize back up (free UX win from intent/effective separation)**: after AC §1's shrink, expand window back to 1400. **Expect**: drawers automatically restore toward their original intents (canvas back to 490, browser back to 600). **No re-drag needed.** This was explicitly out-of-scope in v1; v3+ design makes it free.
-4. **AC §4 — one drawer only**: open just the canvas drawer at 700 px. Shrink window past canvas+terminal threshold. **Expect**: canvas shrinks; terminal stays visible. Expand: canvas restores to 700.
-5. **AC §5 — no drawer open**: shrink aggressively. Terminal fills available space. No regressions.
-6. **AC §6 — rapid resize gesture**: drag window corner over 2-3 seconds. Drawer widths track smoothly without stutter or jump-oscillation. (Should pass for free under React batching.)
-7. **AC §7 — persistence**: after AC §1's shrink, wait > 800 ms (the `useBrowserTabsSettings` debounce). Verify the persisted browser `drawerWidth` in settings storage **still reflects the user's intent (600)**, not the shrunk effective (280). Confirms the intent/effective separation prevents lossy persistence.
-8. **AC §8 — toggle-during-resize**: close one drawer (e.g. canvas toggle off) → shrink window aggressively → re-open canvas. **Expect**: canvas drawer renders at its remembered intent value (or CSS `35%` if never dragged), not at a stale clamped value.
-9. **AC §9 — drag at narrow window**: at minWidth=800, with canvas intent=490, attempt to drag browser drawer wider. **Expect**: drag tracks cursor up to the helper's effective max; no visible snap-back; terminal stays at ≥ 48 px throughout. Confirms the (A) option works in practice (drop local drag clamp + render-time effective).
-10. **AC §10 — sanitizer (drag past window edge)**: at any window size, drag the browser handle past the left edge of the application window (so cursor goes "outside"). After releasing the drag, inspect the persisted `drawerWidth` in settings: it must be **≥ 280** (not 0 or negative). Confirms the `Math.max(280, ...)` sanitizer prevents nonsense persistence.
+## Round-4 peer-review fold (post-impl)
 
-## Post-implementation peer review (round 15)
+All four reviewers (@claude2 task-97, @claude3 task-92-impl, @codex2
+task-98, @codex3 task-99) ratified the code (13/13 ACs, plan-v4
+file-by-file fidelity, no code-level blockers). All four flagged the
+same merge-hygiene blocker:
 
-After commits `a7df95f` + `e3bb1a2`, four peers reviewed (task-80
-through task-83). Verdicts:
+**Dirty `package-lock.json`** in the worktree, version field synced
+from 0.3.8 → 0.5.0 by the baseline `npm install` (because the prior
+release cycle's `scripts/bump-version.sh` didn't re-sync the lockfile
+on `dev`). Not part of any feature commit; would leave `dev` with a
+stale lockfile post-merge and meant validation ran on a tree
+different from the merge tree.
 
-- **@claude2** — merge after manual AC. One stylistic suggestion
-  (canvas drag comment cross-reference). Non-blocking.
-- **@codex2** — ratify, no blockers. Two residual notes (restored
-  settings could normalize sub-280, "~20 px" comment imprecise).
-- **@claude3** — ratify with two observations. **H2 substantive**:
-  canvas drag-time `clampDrawerWidth` omitted the handle budget that
-  `resolveDrawerWidths` includes at render time → 4-8 px cursor↔handle
-  lag at max drag (both drawers open). One-line fix recommended in-PR.
-- **@codex3** — approve, no code blockers. `npm run build` clean.
+**Folded via commit `b845aa3`**: `chore(implementer): sync
+package-lock.json to package.json 0.5.0` — 2-line metadata-only
+diff, no behavioral impact. Worktree now clean. Re-validation against
+the committed tree: `npm run build` ✓, vitest 234/234 ✓,
+`cargo test --lib` 38/38 ✓.
 
-**Folds (commit `<post-review fix sha>`)** — three small reflections,
-all in-scope (body-generation only; no signature changes):
-
-1. **App.tsx canvas drag handler** — pass `terminalMinWidth: 48 +
-   handleBudget` where `handleBudget = 4 + (browserDrawerOpen ? 4 :
-   0)`, mirroring `resolveDrawerWidths`'s render-time handle budget.
-   Closes @claude3's H2. Comment expanded with the cursor↔handle-lag
-   rationale and the explicit contrast with BrowserDrawer's
-   self-aware sanitizer (also closes @claude2's stylistic
-   suggestion).
-2. **drawerLayout.ts asymmetric-slack comment** — softened the "≤ ~20
-   px" numeric bound (derived from a specific example) to the general
-   shape "at extreme asymmetric intents, proportionally some width
-   unallocated". Closes @codex2's residual note 2.
-3. **@codex2's residual note 1** (restored settings <280 normalization)
-   and **@claude3's H1** (sanitizer is intentional deviation from v4's
-   literal "no clamp") deliberately NOT folded — both are out of v4
-   scope. Note 1 belongs in `useBrowserTabsSettings` hardening (future
-   patch); H1 was an intentional deviation we already documented in
-   BrowserDrawer's drag-handler comment.
-
-Validation post-fold: `tsc --noEmit` = 0; `vitest` = 15/15 passing
-(no test changes required — the unit tests assert helper math, which
-was unaffected; H2 was an App-level drag-time/render-time alignment
-issue not visible in the helper's pure-numeric surface).
-
-**Pattern worth pinning**: single-reviewer behavioral findings with
-concrete reproduction + one-line fix should generally fold in-PR
-rather than be deferred to a follow-up. @claude3's H2 met both bars.
-
-## Process note — final iteration in the 14-round arc
-
-This commit closes the four-layer arc that started with the original
-`Capture Full Window` bug:
-
-1. **L1 architecture** (caught by planning rounds): html2canvas can't see Tauri webviews → `native-window-capture` (impl-local, `3da8c54`).
-2. **L2 IPC** (caught by Tauri-source reads): `WebviewWindow` arg-injector fails under multi-webview → `capture-fix-injection` (impl-micro, `2503e08`).
-3. **L3 live UI paint** (caught by user runtime AC): terminal panel missing panel-level clip → `frame-collision-clip` (impl-micro, `c6bc25e`).
-4. **L4 live UI layout reflow** (caught by user runtime AC): stale drag widths persist through resize → `drawer-resize-reclamp` (impl-local, this commit).
-
-Each layer had a distinct failure mode and surfaced from a distinct
-verification surface. The vault's `observation-20260502-v4-verification-pattern`
-maps cleanly: build-sanity gates catch architecture and types;
-manual AC catches IPC injection and layout behavior; runtime use
-catches each remaining layer.
-
-Also worth pinning: **convergent reviewer signal repeatedly simplified
-the design over rounds 11→14**. Drop C1 sub-floor (round 11). Adopt
-intent/effective separation (round 11). Extract pure helper (round 12).
-Drop local drag clamp (round 13). Add sanitizer (round 14). Each
-removal made the plan smaller and the invariant cleaner. **Pattern
-worth pinning for future planners**: when 3+ of 4 reviewers'
-concerns converge on the architecture's *shape* (not just edge
-cases), treat it as a redesign signal, not five orthogonal refinements.
+Two **non-blocking** observations from @claude2 (task-97) explicitly
+declined per CLAUDE.md "Don't add features, refactor, or introduce
+abstractions beyond what the task requires":
+1. Duplicated `applyZoom` logic across `ZoomControls` and
+   `BrowserDrawer` keydown — below the abstraction-payoff threshold;
+   two ~10-line copies are within tolerance.
+2. Autorepeat keydown doesn't deduplicate in-flight IPCs — functionally
+   idempotent (same value → same `set_zoom`); Chrome/Safari exhibit
+   the same one-press-one-step model. Not coding around in v1.
