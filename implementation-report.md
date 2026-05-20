@@ -1,89 +1,69 @@
-# Implementation report — inputprompt-c0-strip
+# Implementation report — collab-protocol-rule2
 
 (Prior `implementation-report.md` on `dev` documented
-`inputprompt-arrow-tofu`. Overwritten with this micro-lane report;
+`inputprompt-c0-strip`. Overwritten with this local-lane report;
 historical content reachable via `git log -- implementation-report.md`.)
 
 ## Source
-- Planner marker: micro (chat-gate, current session, planner round 2)
-- Marker text: `scale: micro   marker: (plan-micro, human-confirmed)`
-- Planner artifacts: none (chat-only per micro-lane contract)
-
-## Why a second round
-Round 1's `inputprompt-arrow-tofu` (merged at `5707b85`) added an IME
-composition guard on Arrow{Left,Right}, on the working theory that the
-tofu glyphs were Hangul Jamo committed by macOS Korean IME on arrow
-navigation. Empirical DevTools probe by the user after merge revealed
-two facts that falsified that hypothesis:
-
-1. The bug reproduces in **English mode too**, where the guard never
-   fires (`isComposing` is false and `keyCode !== 229`).
-2. The actual codepoints inserted are `U+001C` (File Separator) on
-   ArrowLeft and `U+001D` (Group Separator) on ArrowRight — ASCII C0
-   controls, **not** Hangul Jamo. These correspond to the legacy
-   "Information Separator" quartet (FS=Left, GS=Right, RS=Up, US=Down)
-   that macOS WKWebView surfaces as raw text-insert events instead of
-   routing to NSResponder cursor-navigation action methods.
-
-Round 1's guard remains in place — it's defensive against the original
-IME-Jamo edge case which is plausible in principle even if it wasn't
-the bug actually being reported. The real bug fix is this round.
+- Planner marker: local (chat-gate, current session)
+- Marker text: `scale: local   marker: (plan-local, human-confirmed)`
+- Planner artifacts: none (chat-only per local-lane contract)
 
 ## Work queue summary
-- Total items: 1
-- Completed: 1
+- Total items: 2
+- Completed: 2
 - Blocked: 0
 
 ## Files changed
-- `src/components/collaborator/InputPrompt.tsx` — +12 / −0
-  (new `onBeforeInput` handler; no other lines touched)
+- `docs/collaborator-agent-protocol.md` — **new**, +87 lines
+- `src/stores/collaboratorStore.ts` — +6 / −3 in the `TASK_PROTOCOL` template literal (lines 418-450)
 
 ## Validation
-- Baseline exit (BASE_BRANCH HEAD = `5707b85`): build 0, test 0 (216/216)
+- Baseline exit (BASE_BRANCH HEAD = `6912d5e`): build 0, test 0 (216/216)
 - Final validation command: `npm run build && npm run test`
 - Final exit: build 0, test 0 (216/216)
 - Auto-fix attempts used: 0/3
+- Tail:
 
 ```
  Test Files  12 passed (12)
       Tests  216 passed (216)
-   Start at  15:49:04
-   Duration  1.54s (transform 1.40s, setup 1.14s, import 2.78s, tests 530ms, environment 5.16s)
+   Start at  16:29:13
+   Duration  1.54s (transform 1.25s, setup 1.19s, import 2.73s, tests 520ms, environment 5.06s)
 ```
 
 ## Per-item outcomes
 
 | item_id | status | files_touched | notes |
 |---|---|---|---|
-| 1 | completed | src/components/collaborator/InputPrompt.tsx | Added `onBeforeInput` that rejects ASCII C0 controls (`[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]`). Tab/LF/CR intentionally kept. Implicitly covers paste-of-control-chars (beforeinput fires for paste). |
+| 1 | completed | docs/collaborator-agent-protocol.md | New tracked doc, 87 lines, mirrors the 6-rule protocol with contributor discipline notes. References the canonical source (`TASK_PROTOCOL` in collaboratorStore.ts) and related files (agentOutputCapture.ts regex, peer-context-mirror layout). |
+| 2 | completed | src/stores/collaboratorStore.ts | Inserted Rule 2 ("Discover peer context on demand") between current Rules 1 and 2. Renumbered Rules 2-5 → 3-6. Appended "Try Rule 2 first..." cross-ref to the renumbered Rule 5 (Signal blockers). |
 
 ## Scope-discipline self-check
 
-- [x] No new interfaces / files outside hints
+- [x] No new interfaces / files outside hints (the new docs file was hinted)
 - [x] No renames of committed public names
 - [x] No signature changes
 - [x] No edits to validation_command configuration
 - [x] No edits to files outside the work queue's hint set
-- [x] Round-1 IME guard preserved (no scope creep into "polish")
+- [x] Existing test assertions still pass without modification (predicted in plan, verified in validation)
 
-## Manual QA (to confirm after merge)
+## Risk audit
 
-Run `npm run tauri dev`, focus the Collaborator `>` prompt, then:
+- **Tests on protocol block**: 6 assertions in `collaboratorStore.test.ts` use `.toContain("Agent Task Protocol")` which matches the section header — unchanged by this round. Verified passing.
+- **`agentOutputCapture.ts:102` regex**: matches the protocol block by section delimiters (`## Agent Task Protocol` start, `## <next-header>` end), not by rule numbers or text. Unaffected.
+- **Local CLAUDE.md / AGENTS.md edits from earlier this turn**: kept per user choice. They mirror the tracked source. If they drift in the future, the tracked doc and the TS source remain authoritative.
 
-1. English IME (영) — hold ArrowRight a few seconds → cursor moves, no tofu inserted.
-2. English IME (영) — hold ArrowLeft a few seconds → same.
-3. Korean IME (한) — same checks.
-4. Cmd+Arrow / Shift+Arrow / Option+Arrow — modifier-arrow combos still
-   work natively (we only filter character-insert events, not key events).
-5. Tab key → still inserts a tab.
-6. Shift+Enter → still inserts a newline.
+## Manual QA (post-merge, optional)
 
-DevTools-verifiable: after step 1 or 2, in Console:
+After merge, spawn a fresh agent in the collaborator pane and verify
+the injected prompt contains:
 
-```js
-const ta = [...document.querySelectorAll('textarea')]
-  .find(t => /help|status|canvas-export|target/.test(t.placeholder || ''));
-[...(ta?.value ?? '')].map(c => 'U+' + c.codePointAt(0).toString(16).padStart(4,'0').toUpperCase())
-```
+- `2. **Discover peer context on demand**:` near the top of the Rules
+  list.
+- Renumbered Rules 3-6.
+- The "Try Rule 2 first" cross-ref appended to Rule 5.
 
-…should return `[]` (clean), not `["U+001C", "U+001C", ...]`.
+The PTY-captured output from any spawned agent should also have the
+protocol block stripped cleanly by `agentOutputCapture.ts` — verify
+peer-context entries don't echo back the rules.
