@@ -1,75 +1,53 @@
-# Implementation report — codex-gemini-schema-fix
+# Implementation report — notify-mutex-split
 
-(Prior `implementation-report.md` on `dev` documented `cli-id-aliases`.
-Overwritten with this local-lane report; historical content reachable
-via `git log -- implementation-report.md`.)
+(Prior `implementation-report.md` on `dev` documented
+`codex-gemini-schema-fix`. Overwritten with this local-lane report;
+historical content reachable via `git log -- implementation-report.md`.)
 
 ## Source
 
 - Planner marker: `local` (chat-only, this conversation) —
   `scale: local   marker: (plan-local, human-confirmed)`
 - Planner artifacts: none (local lane is chat-only per skill contract)
-- Investigation context: `task-9-claude2-adapter-schema-mismatch.md`
-  in shared collab-memory
+- Investigation context: `task-11-claude2-deadlock-found.md` +
+  `task-12-claude2-bug2-decoupled.md` in shared collab-memory
 
 ## Work queue summary
 
-- Total items: 2 (S1, S2)
-- Completed: 2
+- Total items: 6 (NM1 through NM6)
+- Completed: 6
 - Blocked: 0
 
 ## Files changed
 
 | File | Lines (Δ) |
 |---|---|
-| `src-tauri/src/commands/transcripts/adapters/codex.rs` | +179 / -51 |
-| `src-tauri/src/commands/transcripts/adapters/gemini.rs` | +180 / -34 |
-| **Total** | **+359 / -85** |
-
-Split per item:
-- codex.rs: `normalize` body rewrite (~40 lines) + `#[cfg(test)] mod tests` (~110 lines, 9 tests)
-- gemini.rs: `normalize` body rewrite (~35 lines) + `#[cfg(test)] mod tests` (~125 lines, 8 tests)
+| `src-tauri/src/commands/transcripts/mod.rs` | +197 / -95 |
+| `src-tauri/src/commands/transcripts/watcher.rs` | +94 / -29 |
+| **Total** | **+291 / -124** |
 
 ## Validation
 
-- Baseline exit (`dev@0fd3928`): 0 (cargo + tsc + vitest all green; 0 pre-existing adapter tests)
+- Baseline exit (`dev@945d167`): 0 (cargo + tsc + vitest all green;
+  17 adapter fixture tests pass)
 - Final validation command:
   `cd src-tauri && cargo test --lib commands::transcripts::adapters && cargo check && cd .. && npx tsc --noEmit && npm test`
 - Final exit: 0
 - Auto-fix attempts used: 0 / 3
 
-Tail of last `cargo test` run:
+Tail of last `cargo test`:
 
 ```
-running 17 tests
-test commands::transcripts::adapters::codex::tests::user_message_event_normalizes_to_user_role ... ok
-test commands::transcripts::adapters::codex::tests::agent_message_event_normalizes_to_assistant_role ... ok
-test commands::transcripts::adapters::codex::tests::session_meta_returns_none ... ok
-test commands::transcripts::adapters::codex::tests::turn_context_returns_none ... ok
-test commands::transcripts::adapters::codex::tests::response_item_returns_none ... ok
-test commands::transcripts::adapters::codex::tests::task_started_event_returns_none ... ok
-test commands::transcripts::adapters::codex::tests::token_count_event_returns_none ... ok
-test commands::transcripts::adapters::codex::tests::empty_user_message_returns_none ... ok
-test commands::transcripts::adapters::codex::tests::missing_timestamp_falls_back_to_ct_source ... ok
-test commands::transcripts::adapters::gemini::tests::user_turn_with_content_array_normalizes_to_user_role ... ok
-test commands::transcripts::adapters::gemini::tests::user_turn_with_multi_block_content_joins_text_only ... ok
-test commands::transcripts::adapters::gemini::tests::gemini_turn_with_content_string_normalizes_to_assistant_role ... ok
-test commands::transcripts::adapters::gemini::tests::gemini_turn_with_empty_content_returns_none ... ok
-test commands::transcripts::adapters::gemini::tests::session_header_returns_none ... ok
-test commands::transcripts::adapters::gemini::tests::set_state_update_returns_none ... ok
-test commands::transcripts::adapters::gemini::tests::unknown_type_returns_none ... ok
-test commands::transcripts::adapters::gemini::tests::missing_timestamp_falls_back_to_ct_source ... ok
-
 test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.00s
 ```
 
-Tail of last `vitest` run:
+Tail of last vitest:
 
 ```
  Test Files  12 passed (12)
       Tests  216 passed (216)
-   Start at  12:12:31
-   Duration  1.56s
+   Start at  13:51:51
+   Duration  1.42s
 ```
 
 Cargo: 9 warnings (baseline-equivalent).
@@ -78,70 +56,81 @@ Cargo: 9 warnings (baseline-equivalent).
 
 | Item | Status | Files touched | Notes |
 |---|---|---|---|
-| S1 | completed | `src-tauri/src/commands/transcripts/adapters/codex.rs` | Normalize body rewritten to accept `top.type=event_msg` with `payload.type=user_message|agent_message` and `payload.message` as plain string. Skips response_item (avoids double-emission), session_meta, turn_context, and all non-message event_msg subtypes. Docstring + inline comments updated with the real schema citations from task-9's investigation. 9 fixture tests added covering: user_message → User role, agent_message → Assistant role, all skip paths, empty message, missing timestamp fallback. |
-| S2 | completed | `src-tauri/src/commands/transcripts/adapters/gemini.rs` | Normalize body rewritten to accept `top.type=user|gemini` (was incorrectly `role` field with `user|model`) and read `content` as either array-of-blocks (user shape) or plain string (gemini shape). Skips `thoughts` (reasoning trace), session header (no `type`), `$set` state updates (no `type`). 8 fixture tests added covering: user with array content, multi-block joining (skip non-text blocks), gemini with string content, empty content → None, session header → None, $set → None, unknown type → None, missing timestamp fallback. |
+| NM1 | completed | `mod.rs` | Moved `notify::RecommendedWatcher` from `Inner.watcher` to a new `TranscriptWatcher.notify_watcher: Arc<Mutex<Option<RecommendedWatcher>>>` field. Updated `new()` to initialize both Inner and notify_watcher. Added lock-ordering invariant docstring on TranscriptWatcher (Inner first, then notify_watcher; FSEvents callback locks ONLY Inner). |
+| NM2 | completed | `mod.rs:start_if_needed` | Split the shutdown check (Inner mutex) from the already-installed check (notify_watcher mutex). Race-recheck on shutdown survives via Inner; race-recheck on already-installed survives via notify_watcher. New watcher is installed under the notify_watcher mutex; if shutdown raced between checks, the freshly-built watcher is dropped (Drop stops FSEvents thread). |
+| NM3 | completed | `watcher.rs:subscribe_fsevents` | Refactored to Phase A (Inner lock for next_id + parent_dir_refs pre-increment) → DROP → Phase B (notify_watcher lock for notify::Watcher::watch). On notify::watch failure, Phase C briefly re-acquires Inner to roll back the ref-count. Added `WATCHER_NOTIFY` static + `install_notify_watcher` helper paralleling the existing WATCHER_INNER pattern. |
+| NM4 | completed | `mod.rs:unwatch` (THE deadlock fix) | Refactored to capture `parent_to_unwatch: Option<PathBuf>` while holding Inner (for entries.remove + parent_dir_refs decrement + discovery_task.abort), DROP Inner, then call notify::Watcher::unwatch under the separate notify_watcher mutex. Abort of discovery_task stays inside Inner (no notify interaction). This is THE fix for the user-reported "infinite pending on close after contexts file created" deadlock. |
+| NM5 | completed | `mod.rs:populate_entry` rollback path | Same pattern as NM4 for the unwatch-race rollback branch. Decrement parent_dir_refs under Inner, capture `release_parent: Option<PathBuf>`, drop Inner, then notify::unwatch via `watcher::notify_watcher_handle()` helper (new accessor on watcher.rs that borrows the static OnceLock-installed Arc). Used a small local enum `PopulateOutcome` to thread the three states (Populated / RaceRollback / LockPoisoned) cleanly across the lock boundary. |
+| NM6 | completed | `mod.rs:shutdown` | Inner first: sets shutdown=true (any in-flight on_fs_event observes and bails), aborts discovery tasks, clears entries + parent_dir_refs. DROP Inner. Then notify_watcher mutex: set to None to drop the RecommendedWatcher (Drop signals FSEvents thread to stop). Order matters: shutdown=true is set BEFORE we drop the watcher so the FSEvents thread fires its last callback (if any) into a flagged Inner that bails. |
+
+Also touched (forced by NM1's struct change):
+- `watcher.rs:on_fs_event` — the `TranscriptWatcher` façade construction
+  now also clones the notify_watcher Arc (via WATCHER_NOTIFY.get())
+  so the struct literal type-checks. append_normalized_turn /
+  rotate_if_needed don't call into notify, so the field is unused by
+  the façade path, but the wiring is forward-compat.
 
 ## Scope-discipline self-check
 
-- [x] No new interfaces / files outside hints — only the two files in the plan
-- [x] No renames of committed public names — `normalize` / `TranscriptAdapter` trait / `NormalizedTurn` / etc. all unchanged
-- [x] No signature changes on planner-committed methods — `normalize(raw, ctx) -> Option<NormalizedTurn>` signature unchanged; only body rewritten
+- [x] No new interfaces / files outside hints — only the two files named in the plan
+- [x] No renames of committed public names — `TranscriptWatcher` / `Inner` / `subscribe_fsevents` / `on_fs_event` / `WatchToken` / `Entry` all unchanged externally
+- [x] No signature changes on planner-committed methods — `watch`, `unwatch`, `start_if_needed`, `shutdown`, `subscribe_fsevents`, `on_fs_event` all keep their existing signatures
 - [x] No edits to validation_command configuration
-- [x] No edits to files outside the work queue's hint set
+- [x] No edits to files outside the work queue's hint set (only mod.rs + watcher.rs)
 - [x] No `git push`, force-push, reset --hard, or other destructive ops
 - [x] No `--no-verify` or hook bypass
 
 ## Notes for reviewer
 
-1. **Disk schema unchanged**: `source_tool` in normalized output stays
-   `"codex"` / `"gemini"` (from `tool_id()`), matching cli-id-aliases'
-   contract. `fs_gate::ALLOWED_ROOTS` unchanged. `<handle>.jsonl`
-   format identical — only the rate of valid entries changes from
-   zero to "matches actual CLI output."
+1. **Lock-ordering invariant is the load-bearing contract**. The
+   `TranscriptWatcher` docstring documents it in detail; every call
+   site that needs both mutexes follows the pattern: lock Inner →
+   bookkeeping → DROP → lock notify_watcher → notify call. Future
+   contributors who add new code touching either mutex MUST honor this
+   ordering or the deadlock comes back.
 
-2. **Codex response_item dedup choice**: per user's plan-time
-   decision, the adapter processes ONLY `event_msg` events.
-   `response_item.message` carries paired duplicates of
-   `agent_message` content; skipping it prevents the same assistant
-   turn from being emitted twice. If a future Codex version emits
-   `response_item.message` WITHOUT a paired `event_msg.agent_message`
-   (e.g. internal-only message events), that content would be
-   silently dropped — explicit trade-off per task-9 + plan
-   conversation.
+2. **`populate_entry` enum was a deliberate choice**. The previous
+   inline `let populated = match ... { true / false }` couldn't carry
+   the rollback's `Option<PathBuf>` cleanly across the lock release.
+   A 3-variant enum (`Populated` / `RaceRollback(Option<PathBuf>)` /
+   `LockPoisoned`) makes the three states explicit and lets the
+   notify::unwatch fire OUTSIDE the lock without re-entering it.
 
-3. **Gemini content shape inversion**: user turns use
-   `content: [{text: ...}]` (array). Gemini turns use
-   `content: "..."` (plain string). The "if array else if string"
-   fallback handles both shapes independently — if a future variant
-   ever flips this, both paths remain functional.
+3. **Bug 2 (U+25AF rectangles) NOT addressed here**. Per task-12,
+   Bug 2 is confirmed pre-existing on main (independent of cycle F).
+   This fix only addresses Bug 1's deadlock. Bug 2 follows in its own
+   investigation cycle.
 
-4. **Fixture provenance**: both `#[cfg(test)] mod tests` blocks
-   document where the line samples came from ("captured 2026-05-20
-   from `~/.codex/sessions/2026/05/19/rollout-...jsonl`" /
-   "captured 2026-05-20 from `~/.gemini/tmp/donghyeon/chats/session-...jsonl`").
-   Future regressions where Codex / Gemini drift their schema
-   surface as fixture-test failures with the provenance line
-   pointing at when the assumption was last verified.
+4. **No new fixture tests**. The deadlock requires concurrent FSEvents
+   firings, which can't be reproduced in a unit test without a real
+   filesystem watcher running. The manual smoke test below is the
+   actual contract; documented as a follow-up consideration in task-11.
 
-5. **Manual smoke test (the actual contract)**:
-   - Stop the running `npm run tauri dev` (PID 93366)
-   - Restart: `npm run tauri dev`
-   - Spawn one agent each of Claude Code + Codex + Gemini
-   - Send "hello" to each
-   - Expected: all three
-     `~/.cache/canvas-terminal/collab-memory/session-<pid>/contexts/<handle>.jsonl`
-     appear within ~6s with valid normalized turns (`role`,
-     `text_visible`, `ts_iso8601`, etc.)
-   - The Eye icon should already be in the publishing state at spawn
-     (cycle F + cycle-f-hotfix contract)
-   - If any agent's contexts file is missing OR contains zero/wrong
-     content, that's a new bug — open as a follow-up.
+5. **Manual smoke test (THE actual contract for this fix)**:
+   - Stop the running `npm run tauri dev` (if any), restart
+   - Spawn one Claude Code agent
+   - Send `hello` and wait for the response — verify
+     `~/.cache/canvas-terminal/collab-memory/session-<pid>/contexts/claude1.jsonl`
+     materializes (proves FSEvents is firing for the source JSONL)
+   - Click X on the agent terminal
+   - **Expected**: terminal pane disappears within ~1s; the agent
+     record is removed from `useCollaboratorStore.getState().agents`
+   - **NOT expected**: infinite pending / terminal stays visible /
+     no DevTools logs
+   - Repeat for Codex + Gemini agents
+   - If Bug 1 is fixed, retest Bug 2 (right-arrow continuously in
+     each terminal). If U+25AF rectangles still appear, file a fresh
+     task — Bug 2 is decoupled from this fix per task-12.
 
-6. **Bug-count summary** (chain of follow-ups starting from cycle F merge):
-   - task-6: Eye disabled at spawn (cycle F planner gap) — fixed in cycle-f-hotfix
-   - task-7: tokio panic on Eye-toggle (cycle F impl bug; my error) — fixed in cycle-f-hotfix
-   - task-8: tool-id mismatch (pre-existing) — fixed in cli-id-aliases
-   - task-9: codex/gemini normalize schemas wrong (pre-existing, this fix) — **fixed here**
-   - This is the FOURTH and final bug in the chain. The new fixture
-     tests close the lesson-loop: the next adapter regression will
-     fail at `cargo test`, not at smoke-test time.
+## Bug-chain context (cycle F merge → today)
+
+| Commit | Marker | What it fixed |
+|---|---|---|
+| `b6921a9` | impl-feature cycle-f-always-on-rearm | Cycle F always-on watcher |
+| `dd3f817` | impl-local cycle-f-hotfix | Eye disabled + tokio runtime panic |
+| `0fd3928` | impl-micro cli-id-aliases | adapter_for accepting codex_cli/gemini_cli |
+| `945d167` | impl-local codex-gemini-schema-fix | normalize bodies + 17 fixture tests |
+| **this**  | **impl-local notify-mutex-split** | **task-11 deadlock fix — Bug 1** |
+
+Bug 2 stays as a documented follow-up. This commit is the **5th and
+hopefully final fix** in the post-cycle-F bug chain.
