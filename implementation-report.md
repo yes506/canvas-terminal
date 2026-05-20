@@ -89,3 +89,33 @@ Both rejected pinpoints from earlier reviewer rounds remain unadopted:
 ## Notes for reviewers
 - Native zoom (`Webview::set_zoom`) is sticky per-webview across navigation and reload, so no `browser-tab-loaded` re-apply hook was added. Verified at `~/.cargo/registry/.../wry-0.54.4/src/wkwebview/mod.rs:933-941` (`setPageZoom:`).
 - Manual smoke (not run from this implementer, listed for the merge gate): `npm run tauri dev` → open browser drawer → navigate to a real page → `+` enlarges content, `−` shrinks, `100%` resets; reload preserves zoom; per-tab isolation by zooming on tab A and switching to tab B.
+
+## Round-4 peer-review fold (post-impl)
+
+All four reviewers (@claude2 task-97, @claude3 task-92-impl, @codex2
+task-98, @codex3 task-99) ratified the code (13/13 ACs, plan-v4
+file-by-file fidelity, no code-level blockers). All four flagged the
+same merge-hygiene blocker:
+
+**Dirty `package-lock.json`** in the worktree, version field synced
+from 0.3.8 → 0.5.0 by the baseline `npm install` (because the prior
+release cycle's `scripts/bump-version.sh` didn't re-sync the lockfile
+on `dev`). Not part of any feature commit; would leave `dev` with a
+stale lockfile post-merge and meant validation ran on a tree
+different from the merge tree.
+
+**Folded via commit `b845aa3`**: `chore(implementer): sync
+package-lock.json to package.json 0.5.0` — 2-line metadata-only
+diff, no behavioral impact. Worktree now clean. Re-validation against
+the committed tree: `npm run build` ✓, vitest 234/234 ✓,
+`cargo test --lib` 38/38 ✓.
+
+Two **non-blocking** observations from @claude2 (task-97) explicitly
+declined per CLAUDE.md "Don't add features, refactor, or introduce
+abstractions beyond what the task requires":
+1. Duplicated `applyZoom` logic across `ZoomControls` and
+   `BrowserDrawer` keydown — below the abstraction-payoff threshold;
+   two ~10-line copies are within tolerance.
+2. Autorepeat keydown doesn't deduplicate in-flight IPCs — functionally
+   idempotent (same value → same `set_zoom`); Chrome/Safari exhibit
+   the same one-press-one-step model. Not coding around in v1.
