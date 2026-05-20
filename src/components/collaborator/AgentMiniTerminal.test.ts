@@ -7,8 +7,13 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockResolvedValue(null),
 }));
 
-// We import the helper, not the component — avoids xterm.js/PTY plumbing.
-import { handlePtyExit } from "./AgentMiniTerminal";
+// We import the helpers, not the component — avoids xterm.js/PTY plumbing.
+import {
+  handlePtyExit,
+  shouldFitMiniTerminal,
+  MIN_TERMINAL_COLS,
+  MIN_TERMINAL_ROWS,
+} from "./AgentMiniTerminal";
 import * as Store from "../../stores/collaboratorStore";
 import { useCollaboratorStore } from "../../stores/collaboratorStore";
 
@@ -289,5 +294,72 @@ describe("Phase 1.2 — handlePtyExit (task-31 implementation)", () => {
 
     expect(source).not.toContain("@xterm/addon-webgl");
     expect(source).not.toContain("WebglAddon");
+  });
+});
+
+describe("shouldFitMiniTerminal (column-floor guard)", () => {
+  it("exposes the documented floor constants", () => {
+    expect(MIN_TERMINAL_COLS).toBe(20);
+    expect(MIN_TERMINAL_ROWS).toBe(6);
+  });
+
+  it("rejects undefined (FitAddon returns undefined when its parent is missing)", () => {
+    expect(shouldFitMiniTerminal(undefined)).toBe(false);
+  });
+
+  it("rejects when cols is missing", () => {
+    expect(shouldFitMiniTerminal({ rows: 24 })).toBe(false);
+  });
+
+  it("rejects when rows is missing", () => {
+    expect(shouldFitMiniTerminal({ cols: 80 })).toBe(false);
+  });
+
+  it("rejects non-finite cols (NaN, Infinity)", () => {
+    expect(shouldFitMiniTerminal({ cols: NaN, rows: 24 })).toBe(false);
+    expect(shouldFitMiniTerminal({ cols: Infinity, rows: 24 })).toBe(false);
+  });
+
+  it("rejects zero or negative cols/rows", () => {
+    expect(shouldFitMiniTerminal({ cols: 0, rows: 24 })).toBe(false);
+    expect(shouldFitMiniTerminal({ cols: -1, rows: 24 })).toBe(false);
+    expect(shouldFitMiniTerminal({ cols: 80, rows: 0 })).toBe(false);
+    expect(shouldFitMiniTerminal({ cols: 80, rows: -1 })).toBe(false);
+  });
+
+  it("rejects degenerate FitAddon outputs (cols=1, the symptom of the reflow bug)", () => {
+    expect(shouldFitMiniTerminal({ cols: 1, rows: 24 })).toBe(false);
+    expect(shouldFitMiniTerminal({ cols: 2, rows: 24 })).toBe(false);
+  });
+
+  it("rejects just-below cols (boundary minus one)", () => {
+    expect(shouldFitMiniTerminal({ cols: 19, rows: 24 })).toBe(false);
+  });
+
+  it("rejects when rows fall below the floor even with healthy cols", () => {
+    expect(shouldFitMiniTerminal({ cols: 80, rows: 5 })).toBe(false);
+  });
+
+  it("accepts the exact boundary (cols=20, rows=6)", () => {
+    expect(shouldFitMiniTerminal({ cols: MIN_TERMINAL_COLS, rows: MIN_TERMINAL_ROWS })).toBe(true);
+  });
+
+  it("accepts comfortable defaults (cols=80, rows=24)", () => {
+    expect(shouldFitMiniTerminal({ cols: 80, rows: 24 })).toBe(true);
+  });
+
+  it("honors a caller-supplied floors override", () => {
+    expect(
+      shouldFitMiniTerminal(
+        { cols: 100, rows: 30 },
+        { minCols: 200, minRows: 30 },
+      ),
+    ).toBe(false);
+    expect(
+      shouldFitMiniTerminal(
+        { cols: 100, rows: 30 },
+        { minCols: 50, minRows: 10 },
+      ),
+    ).toBe(true);
   });
 });

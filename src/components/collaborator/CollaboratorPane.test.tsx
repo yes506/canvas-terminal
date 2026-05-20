@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, cleanup } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { invoke } from "@tauri-apps/api/core";
 
 // Mock Tauri invoke first — must be hoisted before any component imports.
@@ -256,5 +258,33 @@ describe("CollaboratorPane header — collab session id", () => {
     expect(getByText(PANE_SESSION)).toBeInTheDocument();
     // The title attribute carries the full id for tooltip on hover even when truncated.
     expect(getByTitle(PANE_SESSION)).toBeInTheDocument();
+  });
+});
+
+describe("CollaboratorPane grid — column floor regression guard", () => {
+  // Regression guard for the mini-terminal reflow bug. The CSS column
+  // floor in CollaboratorPane.tsx is the load-bearing fix; a future
+  // refactor that strips the `minmax(360px, 1fr)` will silently
+  // reopen the 1-char-wide hard-newline failure mode. Asserting on
+  // the rendered inline style at the source-text level is cheap and
+  // catches the regression without rendering the xterm-bearing
+  // AgentMiniTerminal children.
+  it("declares the 360px column floor in source so the load-bearing fix can't be silently stripped", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "src/components/collaborator/CollaboratorPane.tsx"),
+      "utf8",
+    );
+
+    // The named constant carries the explanatory comment, so its
+    // absence is a stronger regression signal than the literal "360".
+    expect(source).toContain("MIN_AGENT_TILE_WIDTH_PX = 360");
+    // Both grid branches (single-agent and multi-agent) must apply
+    // the floor — single-agent leaks otherwise (round-1 review C2).
+    expect(source).toMatch(
+      /minmax\(\$\{MIN_AGENT_TILE_WIDTH_PX\}px,\s*1fr\)/,
+    );
+    expect(source).toMatch(
+      /repeat\(2,\s*minmax\(\$\{MIN_AGENT_TILE_WIDTH_PX\}px,\s*1fr\)\)/,
+    );
   });
 });
