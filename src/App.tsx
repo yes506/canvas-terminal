@@ -148,8 +148,14 @@ export default function App() {
         />
       )}
 
-      {/* Terminal — always mounted, never re-created */}
-      <div className="flex-1 h-full min-w-0 bg-surface">
+      {/* Terminal — always mounted, never re-created.
+       *  overflow-hidden mirrors the canvas pane (above in this file)
+       *  and the browser drawer (BrowserDrawer.tsx) — keeps terminal-tab
+       *  content from painting into adjacent panel columns at width
+       *  limits, when clampDrawerWidth's degraded-mode collapses the
+       *  panel below the tab bar's intrinsic min-content size. Do not
+       *  remove. */}
+      <div className="flex-1 h-full min-w-0 bg-surface overflow-hidden">
         <TerminalTabs />
       </div>
 
