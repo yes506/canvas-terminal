@@ -48,9 +48,11 @@ Also folded @claude2 #4: stale comment on `addCapturedScreenshotToCanvas` still 
 ## Validation
 
 - **Baseline exit** (worktree HEAD = `dev`): `tsc --noEmit` = 0, `cargo check` = 0 (with 9 pre-existing warnings in `commands/transcripts/fs_gate.rs` — not in scope).
-- **Final validation command**: `cd <worktree> && npx tsc --noEmit && (cd src-tauri && cargo check)`
-- **Final exit**: `tsc --noEmit` = 0, `cargo check` = 0
-- **Auto-fix attempts used**: **0 / 3** (validation passed on first attempt)
+- **Final validation command**: `cd <worktree> && npx tsc --noEmit && (cd src-tauri && cargo check --locked)`
+- **Final exit (after `861976d`)**: `tsc --noEmit` = 0, `cargo check` = 0
+- **Re-validated after `8279c66`** (per @claude3 G1): `tsc --noEmit` = 0, `cargo check --locked` = 0 — unchanged 9-warning baseline, zero new
+- **External AC6 build-sanity** (independently run by 2/4 round-6 reviewers, @codex2 + @codex3): `npm run build` and `cd src-tauri && cargo build --release --locked` both **pass** with the existing warning set. The full-link release path is now empirically confirmed (the `cargo check`-only loop validator's known gap is closed).
+- **Auto-fix attempts used**: **0 / 3** (validation passed on first attempt; B1+B2 fixes also passed on first attempt)
 - Tail of last cargo run (all pre-existing warnings; zero new from this run):
 
 ```
