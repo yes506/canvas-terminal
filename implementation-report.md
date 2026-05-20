@@ -1,69 +1,103 @@
-# Implementation report — collab-protocol-rule2
+# Implementation report — native-window-capture
 
 (Prior `implementation-report.md` on `dev` documented
-`inputprompt-c0-strip`. Overwritten with this local-lane report;
-historical content reachable via `git log -- implementation-report.md`.)
+`collab-protocol-rule2` and before that `inputprompt-c0-strip`.
+Overwritten with this local-lane report; historical content
+reachable via `git log -- implementation-report.md`.)
 
 ## Source
-- Planner marker: local (chat-gate, current session)
-- Marker text: `scale: local   marker: (plan-local, human-confirmed)`
-- Planner artifacts: none (chat-only per local-lane contract)
 
-## Work queue summary
-- Total items: 2
-- Completed: 2
-- Blocked: 0
+- Planner marker: `scale: local` (chat-gate, current session)
+- Marker text: `scale: local   marker: (plan-local, human-confirmed)`
+- Planner artifacts (in collab-memory, not part of this repo):
+  - `task-6-claude1-bug-investigation.md` (root-cause)
+  - `task-11-claude1-updated-plan.md` (v2)
+  - `task-16-claude1-updated-plan-v3.md` (v3)
+  - `task-21-claude1-updated-plan-v4.md` (v4, ratified)
+- Confirmation token: `confirm plan` after the v4 marker emit
+- Convergence rounds: 4 (peer reviewers @claude2, @codex2, @claude3, @codex3 in each round)
+
+## Work-queue summary
+
+- Total items: **7**
+- Completed: **7**
+- Blocked: **0**
 
 ## Files changed
-- `docs/collaborator-agent-protocol.md` — **new**, +87 lines
-- `src/stores/collaboratorStore.ts` — +6 / −3 in the `TASK_PROTOCOL` template literal (lines 418-450)
-
-## Validation
-- Baseline exit (BASE_BRANCH HEAD = `6912d5e`): build 0, test 0 (216/216)
-- Final validation command: `npm run build && npm run test`
-- Final exit: build 0, test 0 (216/216)
-- Auto-fix attempts used: 0/3
-- Tail:
 
 ```
- Test Files  12 passed (12)
-      Tests  216 passed (216)
-   Start at  16:29:13
-   Duration  1.54s (transform 1.25s, setup 1.19s, import 2.73s, tests 520ms, environment 5.06s)
+ src-tauri/Cargo.toml                   |  12 ++
+ src-tauri/Info.plist                   |   8 ++  (new)
+ src-tauri/src/commands/capture.rs      | 206 ++  (new)
+ src-tauri/src/commands/mod.rs          |   1 +
+ src-tauri/src/lib.rs                   |   1 +
+ src/components/canvas/DrawingBoard.tsx | 118 +/- (mostly the swap)
+ src/lib/terminalManager.ts             |  18 ±
+ 7 files changed, 301 insertions(+), 63 deletions(-)
+```
+
+## Validation
+
+- **Baseline exit** (worktree HEAD = `dev`): `tsc --noEmit` = 0, `cargo check` = 0 (with 9 pre-existing warnings in `commands/transcripts/fs_gate.rs` — not in scope).
+- **Final validation command**: `cd <worktree> && npx tsc --noEmit && (cd src-tauri && cargo check)`
+- **Final exit**: `tsc --noEmit` = 0, `cargo check` = 0
+- **Auto-fix attempts used**: **0 / 3** (validation passed on first attempt)
+- Tail of last cargo run (all pre-existing warnings; zero new from this run):
+
+```
+warning: fields `adapter_id` and `candidate` are never read
+  --> src/commands/transcripts/fs_gate.rs:18:19
+...
+warning: `canvas-terminal` (lib) generated 9 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.40s
 ```
 
 ## Per-item outcomes
 
-| item_id | status | files_touched | notes |
-|---|---|---|---|
-| 1 | completed | docs/collaborator-agent-protocol.md | New tracked doc, 87 lines, mirrors the 6-rule protocol with contributor discipline notes. References the canonical source (`TASK_PROTOCOL` in collaboratorStore.ts) and related files (agentOutputCapture.ts regex, peer-context-mirror layout). |
-| 2 | completed | src/stores/collaboratorStore.ts | Inserted Rule 2 ("Discover peer context on demand") between current Rules 1 and 2. Renumbered Rules 2-5 → 3-6. Appended "Try Rule 2 first..." cross-ref to the renumbered Rule 5 (Signal blockers). |
+| Item | Description | Status | Files | Notes |
+|---|---|---|---|---|
+| 1 | `src-tauri/Info.plist` with `NSScreenCaptureUsageDescription` | completed | `src-tauri/Info.plist` | Tauri auto-discovers next to `tauri.conf.json` per schema; no `tauri.conf.json` change. Belt-and-suspenders — the in-app rationale toast carries the load-bearing UX (v3 D5). |
+| 2 | macOS-only Cargo deps | completed | `src-tauri/Cargo.toml` | `core-graphics 0.25`, `objc2 0.6`, `objc2-app-kit 0.3` (`NSWindow` feature), `image 0.25` (`default-features=false, features=["png"]`). Versions match the transitive copies already in `Cargo.lock`. |
+| 3 | `capture_main_window_png` Tauri command | completed | `src-tauri/src/commands/capture.rs` (new) | Sync `pub fn` (not async). `CGPreflightScreenCaptureAccess` + `CGRequestScreenCaptureAccess`. `NSWindow.windowNumber()` via `objc2-app-kit`. Safe `core_graphics::window::create_image` wrapper. `kCGWindowImageBoundsIgnoreFraming`. **BGRA→RGBA channel swap** before PNG encoding (v4 E2 — would silently produce blue/red-swapped PNGs otherwise). 50 MB cap matching `export_snapshot`. Non-macOS `#[cfg]` stub. |
+| 4 | `pub mod capture;` registration | completed | `src-tauri/src/commands/mod.rs` | Alphabetical position between `canvas` and `dashboard`. |
+| 5 | Add to `generate_handler!` | completed | `src-tauri/src/lib.rs` | Adjacent to `commands::canvas::export_snapshot` since the two share PNG/50 MB precedent. |
+| 6 | Swap `handleCaptureFullWindow` body | completed | `src/components/canvas/DrawingBoard.tsx` | Dropped `html2canvas` import (this file only — 4 other callers remain), `document.fonts.ready`, `onclone`, `dpr*2`. Destructures `{ pngBase64, sourceScale }`. One-time rationale toast with `RATIONALE_KEY` localStorage flag set only on success/non-`PERMISSION_DENIED` outcomes (v4 Δ3 — so first-attempt deny still re-shows the rationale on retry). |
+| 7 | `WebglAddon(true)` → `WebglAddon(false)` | completed | `src/lib/terminalManager.ts` | `preserveDrawingBuffer` was only needed for html2canvas drawImage. Inline comment names the future opt-back-in path for OCR / search-highlight pixel readback (v4 Δ12). |
 
 ## Scope-discipline self-check
 
-- [x] No new interfaces / files outside hints (the new docs file was hinted)
+- [x] No new interfaces / files outside the plan's hint set — only `Info.plist` + `capture.rs` are new, both explicit in v3/v4
 - [x] No renames of committed public names
-- [x] No signature changes
-- [x] No edits to validation_command configuration
+- [x] No signature changes on planner-committed methods — `addCapturedScreenshotToCanvas` signature unchanged; only the second arg's value source changes
+- [x] No edits to validation_command configuration — `package.json` build scripts unchanged; `Cargo.toml` only gains a new `[target.'cfg(...)'.dependencies]` table
 - [x] No edits to files outside the work queue's hint set
-- [x] Existing test assertions still pass without modification (predicted in plan, verified in validation)
+- [x] No `overflow-hidden` on `TerminalTabs.tsx` (4/4 reviewers' "things NOT to fix" list, all 4 rounds)
+- [x] No `BrowserDrawer` layout changes
+- [x] No removal of `html2canvas` from `package.json` (4 other runtime callers in `documentRenderer.ts` + `responseRenderer.ts` remain)
+- [x] No `src-tauri/capabilities/default.json` edit (v3 R8 / v4: Tauri 2 custom commands via `generate_handler!` need no capability entry)
 
-## Risk audit
+## Notes for the manual acceptance pass (planner AC6)
 
-- **Tests on protocol block**: 6 assertions in `collaboratorStore.test.ts` use `.toContain("Agent Task Protocol")` which matches the section header — unchanged by this round. Verified passing.
-- **`agentOutputCapture.ts:102` regex**: matches the protocol block by section delimiters (`## Agent Task Protocol` start, `## <next-header>` end), not by rule numbers or text. Unaffected.
-- **Local CLAUDE.md / AGENTS.md edits from earlier this turn**: kept per user choice. They mirror the tracked source. If they drift in the future, the tracked doc and the TS source remain authoritative.
+The implementer loop ran only `tsc --noEmit` + `cargo check`. Before merging, run the planner's AC6 build-sanity gate manually:
 
-## Manual QA (post-merge, optional)
+```bash
+cd <repo-root>
+npm run build           # tsc + vite for app and dashboard
+cd src-tauri && cargo build --release    # validates macOS deps + cfg gates
+```
 
-After merge, spawn a fresh agent in the collaborator pane and verify
-the injected prompt contains:
+Then exercise the runtime acceptance criteria:
 
-- `2. **Discover peer context on demand**:` near the top of the Rules
-  list.
-- Renumbered Rules 3-6.
-- The "Try Rule 2 first" cross-ref appended to Rule 5.
+1. Open browser drawer with Figma (or any non-trivial page) → click capture → resulting Fabric image **shows the live page content** (not a black rectangle).
+2. 3+ terminal tabs + 2+ browser tabs open → captured image has **no overlapping tab strips**.
+3. Retina display (DPR=2) → inserted image's CSS width is reasonable (≤900 px); optional: drag to a 1× display and capture again to exercise the `sourceScale` multi-display path.
+4. **4a** — Screen Recording **not** granted at boot → click capture → rationale toast appears ~3.5 s and auto-clears → macOS system prompt appears → if user denies, `PERMISSION_DENIED` toast appears; UI does not freeze; second click re-shows the rationale toast (per Δ3 localStorage gating).
+5. **4b** — Grant permission in System Settings → **Cmd+Q** Canvas Terminal → wait for dock icon to disappear → click app icon to relaunch → click capture → success on first try. (Window-close via the red "X" does NOT trigger TCC re-read on most macOS versions.)
+6. Build sanity: `npm run build` + `cd src-tauri && cargo build --release` both pass on macOS; `cargo build` passes on Linux/Windows CI via the `#[cfg]` stub.
 
-The PTY-captured output from any spawned agent should also have the
-protocol block stripped cleanly by `agentOutputCapture.ts` — verify
-peer-context entries don't echo back the rules.
+## Implementer-time spike points (v4 carry-forward)
+
+Not blockers — may surface during the AC pass:
+
+- **`kCGWindowImageBoundsIgnoreFraming` with `transparent: true`** (v3 R9 / v4 E8): may clip the titlebar in some macOS versions. If AC manual test shows clipping, swap to `kCGWindowImageDefault` — single-line change in `capture.rs`.
+- **Toast → invoke transition timing** (v4 E6): if the rationale toast clearing into the system prompt feels abrupt, add a ~500 ms grace inside `try { ... }`.
