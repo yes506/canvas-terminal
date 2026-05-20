@@ -449,18 +449,23 @@ pub(in crate::commands::transcripts) struct Entry {
 /// can hold their own clone via `OnceLock` (the notify callback runs on
 /// the notify thread, which doesn't have direct access to the Tauri
 /// `State<TranscriptWatcher>`).
+///
+/// NOTE: the `notify::RecommendedWatcher` is INTENTIONALLY held on
+/// `TranscriptWatcher::notify_watcher` rather than on this struct, to
+/// avoid a deadlock where `notify::Watcher::{watch,unwatch}` (called
+/// while holding this Inner mutex) waits for FSEvents callback thread
+/// synchronization, but the FSEvents thread is itself blocked acquiring
+/// this Inner mutex inside `on_fs_event`. See `TranscriptWatcher`
+/// docstring for the lock-ordering invariant.
 pub(in crate::commands::transcripts) struct Inner {
-    /// notify-crate watcher. `None` until `start_if_needed` promotes to
-    /// `Some`; cleared on `shutdown()` (drops the underlying FSEvents
-    /// thread).
-    pub(in crate::commands::transcripts) watcher: Option<notify::RecommendedWatcher>,
     /// `WatchToken.0` → Entry. Mutable per-token state lives here.
     pub(in crate::commands::transcripts) entries: HashMap<u64, Entry>,
     /// Parent-dir → subscription ref-count. FSEvents subscribes at the
     /// parent dir (NB2 — JSONL writes via atomic-rename change the
     /// watched inode), so multiple agents whose JSONLs share a parent
-    /// dir share one notify registration. Decrementing to zero
-    /// `notify::Watcher::unwatch`-es the path.
+    /// dir share one notify registration. Decrementing to zero triggers
+    /// a `notify::Watcher::unwatch` via the SEPARATE `notify_watcher`
+    /// mutex on `TranscriptWatcher`.
     pub(in crate::commands::transcripts) parent_dir_refs: HashMap<PathBuf, u32>,
     /// Monotonic counter for both `WatchToken` and `Subscription` ids.
     pub(in crate::commands::transcripts) next_id: u64,
@@ -483,8 +488,38 @@ pub(in crate::commands::transcripts) struct Inner {
 /// this indirection the notify closure would have no way back to the
 /// `TranscriptWatcher` (Tauri `State<>` is only available with an
 /// `AppHandle`, and the notify thread doesn't carry one).
+///
+/// # Lock-ordering invariant
+///
+/// `Inner` and `notify_watcher` are SEPARATE mutexes by deliberate
+/// design (task-11 deadlock fix). The FSEvents callback thread
+/// (`watcher::on_fs_event`) acquires ONLY `Inner` — never
+/// `notify_watcher`. User-side code that calls `notify::Watcher::watch`
+/// or `notify::Watcher::unwatch` MUST drop `Inner` first (capturing any
+/// state it needs in locals), then acquire `notify_watcher` for the
+/// notify-API call. Locking BOTH at once is forbidden because notify's
+/// FSEvents implementation synchronizes with the callback thread
+/// internally; if `Inner` is also held, `on_fs_event` can't acquire it
+/// and notify's API hangs waiting for the callback to ack → deadlock.
+///
+/// Quick reference:
+/// - `on_fs_event`: locks `Inner` only.
+/// - `subscribe_fsevents` / `TranscriptWatcher::unwatch` / `populate_entry`
+///   rollback: brief `Inner` lock for bookkeeping → DROP → then
+///   `notify_watcher` lock for the notify call.
+/// - `start_if_needed`: lazily installs the `RecommendedWatcher` via
+///   `notify_watcher`; consults `Inner.shutdown` separately.
+/// - `shutdown`: locks `Inner` first (sets shutdown=true, drains
+///   entries), DROPS, then locks `notify_watcher` to drop the
+///   `RecommendedWatcher` (stops FSEvents thread).
 pub struct TranscriptWatcher {
     pub(in crate::commands::transcripts) inner: Arc<Mutex<Inner>>,
+    /// notify-crate watcher held in its own mutex so notify-API calls
+    /// (which synchronize with the FSEvents callback thread) can never
+    /// contend with `on_fs_event`'s `Inner` locking. See the
+    /// lock-ordering invariant above.
+    pub(in crate::commands::transcripts) notify_watcher:
+        Arc<Mutex<Option<notify::RecommendedWatcher>>>,
 }
 
 impl TranscriptWatcher {
@@ -518,12 +553,12 @@ impl TranscriptWatcher {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
-                watcher: None,
                 entries: HashMap::new(),
                 parent_dir_refs: HashMap::new(),
                 next_id: 0,
                 shutdown: false,
             })),
+            notify_watcher: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -557,7 +592,9 @@ impl TranscriptWatcher {
     /// Two concurrent first-time calls result in exactly one FSEvents
     /// thread (test by inspecting thread-name count).
     pub fn start_if_needed(&self) -> Result<(), WatcherError> {
-        // Fast-path: already started or shut down.
+        // Fast-path: shutdown check (Inner) — already-installed check
+        // (notify_watcher). The two checks use different mutexes per the
+        // lock-ordering invariant.
         {
             let g = self
                 .inner
@@ -566,14 +603,23 @@ impl TranscriptWatcher {
             if g.shutdown {
                 return Err(WatcherError::NotStarted);
             }
-            if g.watcher.is_some() {
+        }
+        {
+            let nw = self
+                .notify_watcher
+                .lock()
+                .map_err(|_| WatcherError::NotStarted)?;
+            if nw.is_some() {
                 return Ok(());
             }
         }
 
-        // Install OnceLock so watcher.rs::subscribe_fsevents / on_fs_event
-        // can reach the Inner from the notify-thread closure context.
+        // Install OnceLocks so watcher.rs free functions can reach both
+        // mutexes from the notify-thread closure context. Inner powers
+        // on_fs_event; notify_watcher powers subscribe_fsevents'
+        // notify::Watcher::watch call without contending with Inner.
         watcher::install_inner(self.inner.clone());
+        watcher::install_notify_watcher(self.notify_watcher.clone());
 
         // notify's RecommendedWatcher invokes its callback on its own
         // background thread. We route each event path through on_fs_event,
@@ -598,17 +644,27 @@ impl TranscriptWatcher {
             ))
         })?;
 
-        let mut g = self
-            .inner
+        // Install under the notify_watcher mutex with a race recheck.
+        // Re-verify shutdown didn't race ahead via the Inner mutex too;
+        // if it did, drop the freshly-built RecommendedWatcher (its Drop
+        // halts its FSEvents thread).
+        {
+            let g = self
+                .inner
+                .lock()
+                .map_err(|_| WatcherError::NotStarted)?;
+            if g.shutdown {
+                return Err(WatcherError::NotStarted);
+            }
+        }
+        let mut nw = self
+            .notify_watcher
             .lock()
             .map_err(|_| WatcherError::NotStarted)?;
-        // Race recheck: between the fast-path lock and now another caller
-        // might have installed a watcher. Drop ours if so (the just-built
-        // RecommendedWatcher is dropped, halting its FSEvents thread).
-        if g.watcher.is_some() {
+        if nw.is_some() {
             return Ok(());
         }
-        g.watcher = Some(new_watcher);
+        *nw = Some(new_watcher);
         Ok(())
     }
 
@@ -893,33 +949,42 @@ impl TranscriptWatcher {
         let source_path_for_drain = handle.source_path.clone();
         let parent_for_rollback = handle.source_path.parent().map(|p| p.to_path_buf());
 
-        // Phase C: re-acquire lock + populate or roll back.
-        let populated = match inner.lock() {
+        // Phase C: re-acquire Inner lock + populate or schedule rollback.
+        // Lock-ordering invariant (task-11): no notify::Watcher::unwatch
+        // call inside this section. Capture rollback intent here; do the
+        // actual notify::unwatch outside the lock.
+        enum PopulateOutcome {
+            Populated,
+            RaceRollback(Option<PathBuf>), // Some(parent) = release notify too
+            LockPoisoned,
+        }
+        let outcome = match inner.lock() {
             Ok(mut g) => {
                 if let Some(entry) = g.entries.get_mut(&token_id) {
                     entry.handle = Some(handle);
                     entry.subscription_id = Some(subscription.0);
                     entry.tail_state = Some(tail_state);
                     entry.discovery_task = None;
-                    true
+                    PopulateOutcome::Populated
                 } else {
                     // Entry vanished between Phase A and Phase C —
                     // `unwatch` raced. Roll back the FSEvents
                     // subscription so parent_dir_refs doesn't leak.
+                    // Decrement under Inner; capture whether the ref-count
+                    // hit zero so the notify::unwatch call can fire
+                    // OUTSIDE this lock.
+                    let mut release_parent: Option<PathBuf> = None;
                     if let Some(parent) = &parent_for_rollback {
                         let cur = g.parent_dir_refs.get(parent).copied().unwrap_or(0);
                         let next = cur.saturating_sub(1);
                         if next == 0 {
                             g.parent_dir_refs.remove(parent);
-                            if let Some(w) = g.watcher.as_mut() {
-                                use notify::Watcher;
-                                let _ = w.unwatch(parent);
-                            }
+                            release_parent = Some(parent.clone());
                         } else {
                             g.parent_dir_refs.insert(parent.clone(), next);
                         }
                     }
-                    false
+                    PopulateOutcome::RaceRollback(release_parent)
                 }
             }
             Err(_) => {
@@ -927,11 +992,25 @@ impl TranscriptWatcher {
                 // until shutdown(); acceptable because lock-poison means
                 // we already panicked somewhere and are in a degraded
                 // process state.
-                false
+                PopulateOutcome::LockPoisoned
             }
-        };
+        };  // <-- Inner lock DROPPED here
 
-        if !populated {
+        // Phase D (no Inner held): if the unwatch race triggered a
+        // parent-dir release, perform the notify::unwatch outside the
+        // Inner lock per the lock-ordering invariant.
+        if let PopulateOutcome::RaceRollback(Some(parent)) = &outcome {
+            if let Some(notify_watcher) = watcher::notify_watcher_handle() {
+                if let Ok(mut nw) = notify_watcher.lock() {
+                    if let Some(w) = nw.as_mut() {
+                        use notify::Watcher;
+                        let _ = w.unwatch(parent);
+                    }
+                }
+            }
+        }
+
+        if !matches!(outcome, PopulateOutcome::Populated) {
             return;
         }
 
@@ -979,48 +1058,74 @@ impl TranscriptWatcher {
         // Idempotent: unknown / already-removed token is a silent no-op
         // per the trait docstring (Q6). Lock-poisoning is also silent —
         // we're in a teardown path that shouldn't panic.
-        let mut g = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let entry = match g.entries.remove(&token.0) {
-            Some(e) => e,
-            None => return,
-        };
+        //
+        // Lock-ordering invariant (task-11 deadlock fix): Inner lock is
+        // held BRIEFLY for entries+parent_dir_refs bookkeeping, then
+        // DROPPED before any notify::Watcher::unwatch call. Holding
+        // Inner across notify::unwatch causes deadlock when the
+        // FSEvents callback thread is mid-on_fs_event waiting on the
+        // same Inner mutex.
+        let parent_to_unwatch: Option<PathBuf> = {
+            let mut g = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let entry = match g.entries.remove(&token.0) {
+                Some(e) => e,
+                None => return,
+            };
 
-        // Cycle F (F7): abort the discovery task whether or not the entry
-        // ever populated. `AbortHandle::abort` is a no-op for tasks that
-        // have already completed, so this is safe regardless of state.
-        if let Some(task) = entry.discovery_task {
-            task.abort();
-        }
+            // Cycle F (F7): abort the discovery task whether or not the entry
+            // ever populated. `AbortHandle::abort` is a no-op for tasks that
+            // have already completed, so this is safe regardless of state.
+            // This does NOT call into notify, so it's safe under Inner.
+            if let Some(task) = entry.discovery_task {
+                task.abort();
+            }
 
-        // Decrement parent_dir_refs only for POPULATED entries. Pending
-        // entries (handle == None) never subscribed to FSEvents — there
-        // is no ref-count to decrement. The mirror file in
-        // `contexts/<agent>.jsonl` (if any) stays on disk; clean-up is
-        // the user's call, matching the session-lifetime retention
-        // default.
-        if let Some(handle) = entry.handle.as_ref() {
-            if let Some(parent) = handle.source_path.parent() {
-                let parent_path = parent.to_path_buf();
-                let prev = g
-                    .parent_dir_refs
-                    .get(&parent_path)
-                    .copied()
-                    .unwrap_or(0);
-                let next = prev.saturating_sub(1);
-                if next == 0 {
-                    g.parent_dir_refs.remove(&parent_path);
-                    if let Some(w) = g.watcher.as_mut() {
-                        use notify::Watcher;
-                        // Best-effort: errors are swallowed (the path may
-                        // already be unwatched if FSEvents detected the dir
-                        // disappear).
-                        let _ = w.unwatch(&parent_path);
+            // Decrement parent_dir_refs only for POPULATED entries. Pending
+            // entries (handle == None) never subscribed to FSEvents — there
+            // is no ref-count to decrement.
+            if let Some(handle) = entry.handle.as_ref() {
+                if let Some(parent) = handle.source_path.parent() {
+                    let parent_path = parent.to_path_buf();
+                    let prev = g
+                        .parent_dir_refs
+                        .get(&parent_path)
+                        .copied()
+                        .unwrap_or(0);
+                    let next = prev.saturating_sub(1);
+                    if next == 0 {
+                        g.parent_dir_refs.remove(&parent_path);
+                        // Capture parent path for the post-lock-release
+                        // notify::unwatch call. The mirror file in
+                        // `contexts/<agent>.jsonl` (if any) stays on disk;
+                        // clean-up is the user's call, matching the
+                        // session-lifetime retention default.
+                        Some(parent_path)
+                    } else {
+                        g.parent_dir_refs.insert(parent_path, next);
+                        None
                     }
                 } else {
-                    g.parent_dir_refs.insert(parent_path, next);
+                    None
+                }
+            } else {
+                None
+            }
+        };  // <-- Inner lock DROPPED here
+
+        // Phase B (notify_watcher lock, no Inner held): the actual
+        // notify::Watcher::unwatch call. Best-effort: errors are
+        // swallowed (the path may already be unwatched if FSEvents
+        // detected the dir disappear). Critically, this can no longer
+        // deadlock with on_fs_event because on_fs_event only locks
+        // Inner, never notify_watcher.
+        if let Some(parent) = parent_to_unwatch {
+            if let Ok(mut nw) = self.notify_watcher.lock() {
+                if let Some(w) = nw.as_mut() {
+                    use notify::Watcher;
+                    let _ = w.unwatch(&parent);
                 }
             }
         }
@@ -1323,30 +1428,41 @@ impl TranscriptWatcher {
         // Idempotent — multiple calls (RunEvent::Exit + WindowEvent::Destroyed
         // both fire on macOS in some configurations per claude2 r5 O1).
         // Lock-poisoning is silent: shutdown is best-effort.
-        let mut g = match self.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        g.shutdown = true;
-        // Cycle F (F6/F7): abort every pending discovery task before
-        // dropping the entries map. Dropping an AbortHandle without
-        // calling .abort() does NOT cancel the task — it would keep
-        // polling against the Inner Arc (which survives shutdown via the
-        // OnceLock) and would log retry errors forever.
-        for entry in g.entries.values_mut() {
-            if let Some(task) = entry.discovery_task.take() {
-                task.abort();
+        //
+        // Lock-ordering invariant (task-11): lock Inner FIRST (sets the
+        // shutdown flag so any in-flight on_fs_event observes it and
+        // bails), then DROP Inner, then lock notify_watcher to drop the
+        // RecommendedWatcher (whose Drop signals the FSEvents callback
+        // thread to stop). Locking both at once would re-introduce the
+        // notify-vs-on_fs_event deadlock.
+        {
+            let mut g = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            g.shutdown = true;
+            // Cycle F (F6/F7): abort every pending discovery task before
+            // dropping the entries map. Dropping an AbortHandle without
+            // calling .abort() does NOT cancel the task — it would keep
+            // polling against the Inner Arc (which survives shutdown via
+            // the OnceLock) and would log retry errors forever.
+            for entry in g.entries.values_mut() {
+                if let Some(task) = entry.discovery_task.take() {
+                    task.abort();
+                }
             }
-        }
-        g.entries.clear();
-        g.parent_dir_refs.clear();
+            g.entries.clear();
+            g.parent_dir_refs.clear();
+        }  // <-- Inner lock DROPPED here
+
         // Drop the notify::RecommendedWatcher — its Drop impl stops the
         // FSEvents thread. Per the docstring's invariant: no further
-        // callbacks fire after this returns. The OnceLock-installed
-        // Arc<Mutex<Inner>> remains live (its strong-count drops by 1
-        // here; the OnceLock holds the other), but with `shutdown=true`
-        // any in-flight on_fs_event observes the flag and bails.
-        g.watcher = None;
+        // callbacks fire after this returns. By this point any in-flight
+        // on_fs_event has either already returned, or it sees
+        // shutdown=true (set above) and bails fast.
+        if let Ok(mut nw) = self.notify_watcher.lock() {
+            *nw = None;
+        }
     }
 }
 
