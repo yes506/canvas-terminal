@@ -5,6 +5,47 @@ const DEFAULT_DRAWER_WIDTH = 500; // CSS px; clamped on first user drag
 const MAX_TABS = 10;
 const BLANK_URL = "about:blank";
 
+/**
+ * Chrome-style discrete zoom ladder. The OS-layer WKWebView is set
+ * via `Webview::set_zoom(scale_factor)` per the matching IPC; values
+ * outside this range are clamped server-side in Rust as
+ * defense-in-depth.
+ */
+export const ZOOM_STEPS: readonly number[] = [
+  0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0,
+  2.5, 3.0, 4.0, 5.0,
+] as const;
+
+export const ZOOM_DEFAULT = 1.0;
+const ZOOM_MIN = ZOOM_STEPS[0];
+const ZOOM_MAX = ZOOM_STEPS[ZOOM_STEPS.length - 1];
+
+/**
+ * Return the next step strictly greater than `current`. Non-exact
+ * inputs snap to the nearest-bracketing-higher step. At the ceiling
+ * the current value is returned unchanged.
+ */
+export function nextZoomStep(current: number): number {
+  const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, current));
+  for (const step of ZOOM_STEPS) {
+    if (step > clamped) return step;
+  }
+  return ZOOM_MAX;
+}
+
+/**
+ * Mirror of {@link nextZoomStep} in the opposite direction. Non-exact
+ * inputs snap to the nearest-bracketing-lower step. At the floor the
+ * current value is returned unchanged.
+ */
+export function prevZoomStep(current: number): number {
+  const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, current));
+  for (let i = ZOOM_STEPS.length - 1; i >= 0; i -= 1) {
+    if (ZOOM_STEPS[i] < clamped) return ZOOM_STEPS[i];
+  }
+  return ZOOM_MIN;
+}
+
 function makeBlankTab(): Tab {
   return {
     id: crypto.randomUUID(),
@@ -12,6 +53,7 @@ function makeBlankTab(): Tab {
     title: "",
     isLoading: false,
     error: null,
+    zoom: ZOOM_DEFAULT,
   };
 }
 
@@ -30,6 +72,7 @@ interface BrowserStoreActions {
   setTabTitle: (id: string, title: string) => void;
   setTabLoading: (id: string, isLoading: boolean) => void;
   setTabError: (id: string, err: string | null) => void;
+  setTabZoom: (id: string, zoom: number) => void;
 
   // Bulk seed (used by BrowserTabsSettings.seedFirstTabUrl on mount)
   seedInitialTab: (url: string) => void;
@@ -96,6 +139,10 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
     set((s) => ({
       tabs: s.tabs.map((t) => (t.id === id ? { ...t, error: err } : t)),
     })),
+  setTabZoom: (id, zoom) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => (t.id === id ? { ...t, zoom } : t)),
+    })),
 
   seedInitialTab: (url) =>
     set((s) => {
@@ -120,6 +167,9 @@ export function selectActiveLoading(s: BrowserState): boolean {
 }
 export function selectActiveError(s: BrowserState): string | null {
   return selectActiveTab(s)?.error ?? null;
+}
+export function selectActiveZoom(s: BrowserState): number {
+  return selectActiveTab(s)?.zoom ?? ZOOM_DEFAULT;
 }
 
 export { MAX_TABS };
