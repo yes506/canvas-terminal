@@ -13,6 +13,14 @@
 
 use serde::Serialize;
 
+// Local duplicate of `browser.rs::MAIN_WINDOW_LABEL` (which is module-private
+// at the time of writing). Promoting that constant to `pub(crate)` and
+// `use`-importing here would touch a file this fix doesn't otherwise need
+// to edit; we duplicate the one-line constant instead and leave the
+// centralization for a separate cleanup once a third caller appears (the
+// rule-of-three threshold).
+const MAIN_WINDOW_LABEL: &str = "main";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapturePayload {
@@ -30,15 +38,34 @@ pub struct CapturePayload {
 
 #[tauri::command]
 pub fn capture_main_window_png(
-    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
 ) -> Result<CapturePayload, String> {
+    // The previous signature took `tauri::WebviewWindow` directly. Tauri 2's
+    // command-argument injector populates `WebviewWindow` only when the
+    // caller's "current webview" satisfies `Window::is_webview_window()`,
+    // which is `webviews().iter().all(|w| w.label() == self.label())`. This
+    // app attaches browser-drawer child webviews (labels `browser-tab-<id>`)
+    // to the main window, so once any tab is open the predicate flips false
+    // and the injector errors with "current webview is not a WebviewWindow".
+    //
+    // The fix is to take `AppHandle` (always injectable) and resolve the
+    // main window by label. We deliberately use `get_window` rather than
+    // `get_webview_window` — the latter applies the same `is_webview_window`
+    // predicate internally and would return `None` under the same
+    // multi-webview condition that broke the original injector, just with a
+    // different error string. This mirrors the canonical pattern already in
+    // commands/browser.rs at the two `get_window(MAIN_WINDOW_LABEL)` sites.
     #[cfg(target_os = "macos")]
     {
+        use tauri::Manager;
+        let window = app
+            .get_window(MAIN_WINDOW_LABEL)
+            .ok_or_else(|| format!("main window not found (label '{}')", MAIN_WINDOW_LABEL))?;
         capture_macos(window)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = window;
+        let _ = app;
         Err("native window capture is only supported on macOS in v1".into())
     }
 }
@@ -52,8 +79,13 @@ const PERMISSION_DENIED_MSG: &str = "PERMISSION_DENIED: Screen Recording not gra
      Enable in System Settings → Privacy & Security → Screen Recording → Canvas Terminal, \
      then fully quit (Cmd+Q) and relaunch the app.";
 
+// Receives a `tauri::Window` (not `WebviewWindow`). Both expose the
+// `.ns_window()` and `.scale_factor()` macOS methods the body needs;
+// taking the broader type avoids the `is_webview_window` predicate that
+// gates `WebviewWindow` and which fails on this app's multi-webview
+// layout (see the explanation on `capture_main_window_png` above).
 #[cfg(target_os = "macos")]
-fn capture_macos(window: tauri::WebviewWindow) -> Result<CapturePayload, String> {
+fn capture_macos(window: tauri::Window) -> Result<CapturePayload, String> {
     use base64::Engine;
     use core_graphics::access::ScreenCaptureAccess;
     use core_graphics::display::CGRectNull;
