@@ -1,121 +1,94 @@
-# Implementation report — browser-zoom
-
-(Prior `implementation-report.md` on `dev` documented
-`drawer-resize-reclamp` and before that several feature cycles.
-Overwritten with this local-lane report; historical content reachable
-via `git log -- implementation-report.md`.)
+# Implementation report — mini-term-column-floor
 
 ## Source
-- Planner marker: `local` (chat-only, same-session)
-- Planner artifact: `task-85-claude1-updated-plan-v4.md` (collab-memory session-2526)
-- Plan-confirm token: user typed `confirm plan` in chat after the v4 plan block
-- Scale: local
+- Planner marker: `local` from chat-gate (same-session)
+  - Planner block emitted in this conversation with classification `scale: local` after Round-2 peer-review convergence.
+  - User typed `confirm plan` after the planner block, then the planner emitted `marker: (plan-local, human-confirmed)`.
+- Planner artifacts: none on disk (chat-only contract for the local lane).
+- Source hash: n/a (chat-only inputs).
+
+Note on inspector finding: the implementer inspector reported an unrelated past planner marker (`b035a9cb feat(planner): merge cycle-f-always-on-rearm`) under a different slug whose implementation is already merged. The chat-based local gate for THIS project slug (`mini-term-column-floor`) was honored independently.
 
 ## Work queue summary
-- Total items: 9
-- Completed: 9
+- Total items: 7
+- Completed: 7
 - Blocked: 0
 
-## Files changed
+| Item | Title | Status | Files touched |
+|---|---|---|---|
+| WQ-1 | MIN_AGENT_TILE_WIDTH_PX constant + load-bearing comment | completed | `src/components/collaborator/CollaboratorPane.tsx` |
+| WQ-2 | Column floor on both grid branches + data-testid | completed | `src/components/collaborator/CollaboratorPane.tsx` |
+| WQ-3 | MIN_TERMINAL_COLS=20 / MIN_TERMINAL_ROWS=6 exported | completed | `src/components/collaborator/AgentMiniTerminal.tsx` |
+| WQ-4 | Exported pure `shouldFitMiniTerminal` helper | completed | `src/components/collaborator/AgentMiniTerminal.tsx` |
+| WQ-5 | `safeFit()` wrapper at 4 fit sites + skip-no-scroll + L860 asymmetry comment | completed | `src/components/collaborator/AgentMiniTerminal.tsx` |
+| WQ-6 | 12 unit tests for `shouldFitMiniTerminal` | completed | `src/components/collaborator/AgentMiniTerminal.test.ts` |
+| WQ-7 | Source-level regression guard on `gridTemplateColumns` (both branches) | completed | `src/components/collaborator/CollaboratorPane.test.tsx` |
 
-| File | Change | Net lines |
-|---|---|---|
-| `src/types/browser.ts` | Add `zoom: number` field to `Tab` | +2 |
-| `src/stores/browserStore.ts` | `ZOOM_STEPS` ladder, `nextZoomStep`/`prevZoomStep`, `ZOOM_DEFAULT`, `setTabZoom` action, `selectActiveZoom`, `makeBlankTab` zoom default | +46 |
-| `src/stores/browserStore.test.ts` (NEW) | Vitest cases for step helpers | +78 |
-| `src/lib/browserIpc.ts` | `browserTabSetZoom` IPC wrapper | +9 |
-| `src-tauri/src/commands/browser.rs` | `clamp_zoom` helper + Rust unit test + `browser_tab_set_zoom` command | +52 |
-| `src-tauri/src/lib.rs` | Register `browser_tab_set_zoom` in `invoke_handler!` | +1 |
-| `src-tauri/tauri.conf.json` | Bump `minimumSystemVersion` `10.15` → `11.0` | ±1 |
-| `src/components/browser/ZoomControls.tsx` (NEW) | Three-button zoom group + IPC-first click handler | +109 |
-| `src/components/browser/BrowserDrawer.tsx` | Add `drawerRef` on outer `<div>`, render `<ZoomControls />` after `<AddressBar />`, drawer-scoped capture-phase keydown handler with focus-inside-drawer guard | +60 |
+## Files changed
+- `src/components/collaborator/CollaboratorPane.tsx` — constant + comment + grid template + data-testid
+- `src/components/collaborator/CollaboratorPane.test.tsx` — regression guard describe block
+- `src/components/collaborator/AgentMiniTerminal.tsx` — constants + helper + safeFit wrapper + 4 site updates + font-size asymmetry comment
+- `src/components/collaborator/AgentMiniTerminal.test.ts` — 12 unit tests + import line
+
+Total: **4 files, +222 / -18 lines.**
 
 ## Validation
-- Baseline exit (BASE_BRANCH HEAD `dev`): **0**
-- Final validation command: `npm run build && npm test -- --run && cargo check --manifest-path src-tauri/Cargo.toml`
+- Baseline exit (BASE_BRANCH HEAD, dev @ f209444): **0** (tsc 0 errors; vitest 234/234 pass)
+- Final validation command: `npx tsc --noEmit && npm run test`
 - Final exit: **0**
-- Auto-fix attempts used: **0/3**
-- Final test counts:
-  - Vitest: **234 passed** (was 223 → +11 from new step-helper cases)
-  - Cargo `--lib`: **38 passed** (was 37 → +1 `clamp_zoom_bounds`)
-  - `cargo check`: 9 warnings, all pre-existing dead-code lints (no new warnings introduced)
+- Auto-fix attempts used: 0/3
+- Tail of last run:
+
+```
+ Test Files  13 passed (13)
+      Tests  247 passed (247)
+   Start at  03:55:22
+   Duration  1.53s (transform 1.44s, setup 1.22s, import 2.98s, tests 526ms, environment 5.04s)
+```
+
+Delta: 234 → 247 passing (+13 = 12 `shouldFitMiniTerminal` cases + 1 column-floor regression guard).
 
 ## Per-item outcomes
 
-| Item | Status | Files touched | Notes |
+| item_id | status | files_touched | notes |
 |---|---|---|---|
-| q1 types-tab-zoom | completed | `src/types/browser.ts` | Mandatory field; forces every `Tab` literal to include it. |
-| q2 store-helpers | completed | `src/stores/browserStore.ts` | `ZOOM_STEPS`/`ZOOM_DEFAULT` exported; helpers snap to nearest-bracketing-step. |
-| q3 store-tests | completed | `src/stores/browserStore.test.ts` | Exact, floor, ceil, mid-step snap, absurd-input clamp. |
-| q4 browser-ipc-wrapper | completed | `src/lib/browserIpc.ts` | Maps 1:1 to `browser_tab_set_zoom` Rust command. |
-| q5 rust-zoom-cmd | completed | `src-tauri/src/commands/browser.rs` | Clamp `[0.25, 5.0]`; NaN collapses to 1.0; `webview.set_zoom(clamped)`. |
-| q6 rust-register | completed | `src-tauri/src/lib.rs` | Registered in `invoke_handler!`. |
-| q7 tauri-minver | completed | `src-tauri/tauri.conf.json` | macOS floor `11.0` (required for WKWebView `setPageZoom:`). |
-| q8 zoom-controls | completed | `src/components/browser/ZoomControls.tsx` | IPC-first; "not created" silent no-op; other err → `setTabError`. |
-| q9 browser-drawer-wiring | completed | `src/components/browser/BrowserDrawer.tsx` | `drawerRef` on outer `<div>`; `<ZoomControls />` after `<AddressBar />`; document-capture keydown handler with `stopPropagation` to preempt the existing window-bubble terminal-font handler at `useKeyboardShortcuts.ts:232-246` when focus is inside drawer chrome. |
-
-## Plan-AC coverage
-
-| AC | Status | Notes |
-|---|---|---|
-| 1 Zoom affects only page content; shell UI unchanged | covered | Rust `set_zoom` is per-tab WKWebView only; React DOM untouched. |
-| 2 `http(s)://` and `localfile://` zoom alike | covered | `set_zoom` operates on the webview regardless of URL scheme. |
-| 3 Per-tab isolation | covered | `Tab.zoom` is per-tab; each call carries a `tabId`. |
-| 4 Tab-switch percent display tracks active tab | covered | `selectActiveZoom` reads from `activeTabId`. |
-| 5 Reload + in-tab navigation preserve zoom | covered | Native sticky via wry `setPageZoom`. |
-| 6 New blank tab renders at 100% | covered | `makeBlankTab` returns `zoom: ZOOM_DEFAULT = 1.0`. |
-| 7 280px drawer remains usable | covered | Zoom buttons (~24px each) + `100%` label (~40px, tabular-nums) ≈ 88px after AddressBar; AddressBar (`flex:1; minWidth:0`) truncates rather than breaking. |
-| 8 Build / tests / cargo check all pass; helper tests cover floor/ceil/mid-step | covered | See validation block; new test file exercises `nextZoomStep`/`prevZoomStep`. |
-| 9 Shortcuts focus-scoped; terminal font preserved | covered | Capture-phase `document.addEventListener('keydown', ..., true)` + `drawerRef.contains(document.activeElement)` + `stopPropagation`. |
-| 10 Drawer close→reopen preserves zoom | covered | Child webviews persist (`useBrowserLifecycle.ts:74`); zoom is OS-level sticky. |
-| 11 Transient create-race no divergence | covered | IPC-first: `setTabZoom` only fires after `browserTabSetZoom` resolves OK. |
-| 12 IPC failures surface via `setTabError` | covered | Click handler + keydown handler share the same error path. |
-| 13 macOS <11 blocked at install | covered | `tauri.conf.json::minimumSystemVersion = "11.0"`. |
+| WQ-1 | completed | CollaboratorPane.tsx | Constant lives above the component; docstring covers cascade, b261437 mirror, 360px↔20cols cell-width relation, and the large-fontSize edge. |
+| WQ-2 | completed | CollaboratorPane.tsx | Both `spawns.length === 1` and multi-agent branches now apply `minmax(${MIN}px, 1fr)`; data-testid="agent-grid" added for future render tests. |
+| WQ-3 | completed | AgentMiniTerminal.tsx | Constants are `export const` at module scope so the test file can import them. |
+| WQ-4 | completed | AgentMiniTerminal.tsx | Helper rejects undefined / missing-field / non-number / NaN / Infinity / non-positive / below-floor. Takes optional `floors` override to keep callers' policies tunable without re-exporting constants. |
+| WQ-5 | completed | AgentMiniTerminal.tsx | Wrapper `safeFit()` lives inside `initTerminal` closure (binds to local `fitAddon`), used at initial, RAF, ResizeObserver. The font-size subscriber is outside that closure, so it calls the exported `shouldFitMiniTerminal` against `fitAddonRef.current?.proposeDimensions()` inline. Skip path no longer invokes `scrollToBottom`. Comment at the font-size site documents the intentional asymmetry per claude3's review N4. |
+| WQ-6 | completed | AgentMiniTerminal.test.ts | 12 cases covering all rejection branches plus the documented boundary `cols=20, rows=6`. |
+| WQ-7 | completed | CollaboratorPane.test.tsx | Source-level rather than DOM-render because the existing test file mocks `AgentToolbar` (which owns the spawn-trigger button), so rendering a populated grid in jsdom would require unwinding that mock. Source assertion mirrors the precedent at AgentMiniTerminal.test.ts (WebGL-renderer absence check). |
 
 ## Scope-discipline self-check
-- [x] No new interfaces / files outside hints (only `ZoomControls.tsx`, `browserStore.test.ts` — both listed in plan v4)
-- [x] No renames of committed public names
-- [x] No signature changes on planner-committed methods
-- [x] No edits to validation_command configuration
-- [x] No edits to files outside the work queue's hint set (`NavControls.tsx` deliberately NOT touched per v4 §"Files NOT touched"; `useBrowserLifecycle.ts` deliberately NOT touched per v4 §"Files NOT touched")
-- [x] No re-architecting or scale re-classification
+- [x] No new tracked files outside hints — exactly the 4 hinted files modified, plus this report. The worktree also carries an untracked `node_modules` symlink (`-> ../../node_modules`) created at Phase 2 to share the parent install for `tsc`/`vitest`. It is `.gitignore`-matched (the root `node_modules/` entry), not in the commit, and must be removed before `git worktree remove` per `git`'s safety check (see "Worktree cleanup" below).
+- [x] No renames of committed public names — only additions (`MIN_TERMINAL_COLS`, `MIN_TERMINAL_ROWS`, `shouldFitMiniTerminal`).
+- [x] No signature changes on planner-committed methods — `handlePtyExit`, `AgentMiniTerminal`, `CollaboratorPane` props all unchanged.
+- [x] No edits to `validation_command` configuration — `package.json`, `vitest.config.ts`, `tsconfig.json` untouched.
+- [x] No edits to files outside the work queue's hint set — Rust `pty.rs` left alone per plan (4/4 reviewer consensus to keep `resize_pty` unchanged).
+- [x] No `--no-verify`, no force ops — incremental commits on the implementer branch, no amend.
 
-## Reviewer "NOT adopted" items — confirmation kept
+## Worktree cleanup (merge gate)
+After `confirm merge`, the parent skill will offer to `git worktree remove .worktrees/implementer-mini-term-column-floor-03031-83265-22119`. Because git refuses to remove a worktree with untracked files, the `node_modules` symlink (created during Phase 2 for validation reuse) must be removed first:
 
-Both rejected pinpoints from earlier reviewer rounds remain unadopted:
-- **Post-create apply hook** in `useBrowserLifecycle.ts` — IPC-first ordering eliminates the create-race divergence path; no behavioral need for the hook. Implementation matches v4.
-- **Rust IPC returning clamped value** — TS-side `ZOOM_STEPS` always feeds in-range values; the Rust clamp is defense-in-depth (verified by `clamp_zoom_bounds` covering 0.25/5.0/NaN/INF/negative). Implementation matches v4.
+```bash
+rm /Users/donghyeon/Desktop/development/my-private-develoment/dev-utils/canvas-terminal/.worktrees/implementer-mini-term-column-floor-03031-83265-22119/node_modules
+```
 
-## Notes for reviewers
-- Native zoom (`Webview::set_zoom`) is sticky per-webview across navigation and reload, so no `browser-tab-loaded` re-apply hook was added. Verified at `~/.cargo/registry/.../wry-0.54.4/src/wkwebview/mod.rs:933-941` (`setPageZoom:`).
-- Manual smoke (not run from this implementer, listed for the merge gate): `npm run tauri dev` → open browser drawer → navigate to a real page → `+` enlarges content, `−` shrinks, `100%` resets; reload preserves zoom; per-tab isolation by zooming on tab A and switching to tab B.
+The symlink is the only untracked artifact in the worktree.
 
-## Round-4 peer-review fold (post-impl)
+## Known limitations (documented for the merge gate)
+- **Pre-existing narrow scrollback is not repaired.** The fix prevents future narrowing; lines emitted as hard newlines while the pane was narrow remain narrow in the buffer. User workaround: Ctrl-L (clear) after re-expanding. This was an explicit Round-2 review acknowledgment, not a regression.
+- **Large terminal fontSize (≥16px) edges close to the floor.** 360px maps to ~16-18 cols at 16-22px font cells. Above FitAddon's `MINIMUM_COLS=2` but cramped for Claude/Codex prompt frames. Constant is documented as tunable in the source.
 
-All four reviewers (@claude2 task-97, @claude3 task-92-impl, @codex2
-task-98, @codex3 task-99) ratified the code (13/13 ACs, plan-v4
-file-by-file fidelity, no code-level blockers). All four flagged the
-same merge-hygiene blocker:
+## Manual repro (post-merge user verification)
+1. Launch the app: `npm run tauri dev`.
+2. Spawn ≥2 agents in the collaborator pane.
+3. Drag the collaborator pane width below 360px → horizontal scroll bar should appear; columns must NOT shrink below 360px each.
+4. Spawn-then-close back to one agent → same 360px floor should hold (single-agent branch).
+5. Widen the pane again → press Ctrl-L in a mini terminal → type a prompt → new output should fill the now-wider width without 1-char-wide breaks.
+6. Bump terminal font size in settings → fit may be skipped that cycle; this is the intended asymmetry.
 
-**Dirty `package-lock.json`** in the worktree, version field synced
-from 0.3.8 → 0.5.0 by the baseline `npm install` (because the prior
-release cycle's `scripts/bump-version.sh` didn't re-sync the lockfile
-on `dev`). Not part of any feature commit; would leave `dev` with a
-stale lockfile post-merge and meant validation ran on a tree
-different from the merge tree.
+---
 
-**Folded via commit `b845aa3`**: `chore(implementer): sync
-package-lock.json to package.json 0.5.0` — 2-line metadata-only
-diff, no behavioral impact. Worktree now clean. Re-validation against
-the committed tree: `npm run build` ✓, vitest 234/234 ✓,
-`cargo test --lib` 38/38 ✓.
-
-Two **non-blocking** observations from @claude2 (task-97) explicitly
-declined per CLAUDE.md "Don't add features, refactor, or introduce
-abstractions beyond what the task requires":
-1. Duplicated `applyZoom` logic across `ZoomControls` and
-   `BrowserDrawer` keydown — below the abstraction-payoff threshold;
-   two ~10-line copies are within tolerance.
-2. Autorepeat keydown doesn't deduplicate in-flight IPCs — functionally
-   idempotent (same value → same `set_zoom`); Chrome/Safari exhibit
-   the same one-press-one-step model. Not coding around in v1.
+(Prior `implementation-report.md` content for `browser-zoom` is reachable via `git log -- implementation-report.md`.)

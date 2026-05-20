@@ -11,6 +11,29 @@ import { InputPrompt } from "./InputPrompt";
 import { Zap, Cpu, X, Monitor } from "lucide-react";
 import type { ToolConfig } from "../../types/collaborator";
 
+// Load-bearing fix for the collaborator mini-terminal reflow bug.
+// If a column shrinks below this width, FitAddon proposes tiny cols
+// (down to its internal floor of 2), `resize_pty` propagates them,
+// and the child CLI redraws with hard newlines that xterm cannot
+// reflow on re-expand — leaving 1-char-wide stranded lines behind.
+// This is the perpendicular-axis mirror of the 220px row floor added
+// in b261437 (`fix(collaborator): floor mini-terminal tile height at
+// 220px`), enforced through the same `gridAutoRows: minmax(...)`
+// pattern.
+//
+// Relation to the AgentMiniTerminal MIN_TERMINAL_COLS=20 JS guard:
+//   MIN_AGENT_TILE_WIDTH_PX ≈ MIN_TERMINAL_COLS × monospace-cell-width
+//   + container padding. At the default terminal fontSize=11 (mini
+//   uses fontSize-2 = 9), cell width is ~9px, so 360px ≈ ~38 cols
+//   of usable width — comfortably above the floor. The CSS floor is
+//   load-bearing; the JS guard is defense-in-depth for callers that
+//   render the terminal outside this grid (tests, future layouts).
+//
+// Edge: large terminal fontSize (≥16px) maps 360px to ~16-18 cols —
+// still above FitAddon.MINIMUM_COLS=2 but cramped for Claude/Codex
+// prompt frames. Re-tune the constant if that becomes a real pain.
+const MIN_AGENT_TILE_WIDTH_PX = 360;
+
 interface CollaboratorPaneProps {
   /** Session ID from the pane tree — used as the collab session identifier. */
   paneSessionId: string;
@@ -193,17 +216,24 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
             <div
               className="grid gap-2 h-full"
               style={{
-                // `minmax(0, 1fr)` columns prevent a child's intrinsic min-width
-                // from growing the column beyond the grid's bounds.
-                // `gridAutoRows: minmax(220px, 1fr)` enforces a usable floor for
-                // each tile so xterm's fitAddon can't size the PTY below the
-                // ~10–13 row threshold where Claude/Codex TUIs draw their
-                // header/transcript/prompt/footer regions on top of each other.
+                // `minmax(MIN_AGENT_TILE_WIDTH_PX, 1fr)` columns enforce a
+                // horizontal floor for each tile so xterm's fitAddon can't
+                // size the PTY below the cols threshold where Claude/Codex
+                // TUIs collapse into 1-char-wide hard-newline output that
+                // can never reflow on re-expand. See the constant's docstring
+                // for the cascade and the b261437 row-floor precedent.
+                // `gridAutoRows: minmax(220px, 1fr)` enforces the symmetric
+                // vertical floor (b261437): below ~10–13 rows Claude/Codex
+                // TUIs draw their header/transcript/prompt/footer regions on
+                // top of each other.
                 // The parent already has `overflow-auto`, so the pane scrolls
-                // when many agents push the grid past viewport height instead
-                // of squeezing tiles below the floor.
+                // when many agents push the grid past viewport (or when a
+                // narrow window can't fit two min-width columns) instead of
+                // squeezing tiles below the floor.
                 gridTemplateColumns:
-                  spawns.length === 1 ? "1fr" : "repeat(2, minmax(0, 1fr))",
+                  spawns.length === 1
+                    ? `minmax(${MIN_AGENT_TILE_WIDTH_PX}px, 1fr)`
+                    : `repeat(2, minmax(${MIN_AGENT_TILE_WIDTH_PX}px, 1fr))`,
                 gridAutoRows: "minmax(220px, 1fr)",
               }}
             >

@@ -28,6 +28,50 @@ import {
 } from "../../types/peerContext";
 import { Eye, EyeOff, X } from "lucide-react";
 
+// Defense-in-depth floor for FitAddon-driven PTY resizes. The
+// load-bearing fix is the CSS column floor in CollaboratorPane.tsx
+// (MIN_AGENT_TILE_WIDTH_PX), which guarantees fitAddon.proposeDimensions
+// never sees a degenerate container. These constants guard the
+// helper used at all four fit() sites below, so a caller that renders
+// the terminal outside the collaborator grid (tests, future layouts)
+// still can't drive cols≈2 redraws into the child CLI.
+export const MIN_TERMINAL_COLS = 20;
+export const MIN_TERMINAL_ROWS = 6;
+
+/**
+ * Pure decision: is it safe to call FitAddon.fit() given the
+ * dimensions FitAddon would propose? Returns false (= skip the fit)
+ * when:
+ *   - proposed is undefined (FitAddon returns undefined when its
+ *     parentElement is missing or has zero cell-width)
+ *   - cols/rows are missing, non-finite (NaN/Infinity), or non-positive
+ *   - cols or rows fall below the supplied floor
+ *
+ * The plain-object shape (rather than a FitAddon instance) keeps this
+ * helper trivially unit-testable without xterm/jsdom mocking.
+ */
+export function shouldFitMiniTerminal(
+  proposed: { cols?: number; rows?: number } | undefined,
+  floors: { minCols: number; minRows: number } = {
+    minCols: MIN_TERMINAL_COLS,
+    minRows: MIN_TERMINAL_ROWS,
+  },
+): boolean {
+  if (!proposed) return false;
+  const { cols, rows } = proposed;
+  if (
+    typeof cols !== "number" ||
+    !Number.isFinite(cols) ||
+    cols <= 0 ||
+    typeof rows !== "number" ||
+    !Number.isFinite(rows) ||
+    rows <= 0
+  ) {
+    return false;
+  }
+  return cols >= floors.minCols && rows >= floors.minRows;
+}
+
 interface AgentMiniTerminalProps {
   sessionId: string;
   tool: ToolConfig;
@@ -169,10 +213,23 @@ export function AgentMiniTerminal({
       // These panes are small and numerous, so avoiding WebGL prevents
       // idle GPU-context loss from leaving a black, stale viewport.
 
-      fitAddon.fit();
-      requestAnimationFrame(() => {
+      // Guarded fit: propose first, only call fit() when the proposed
+      // dimensions clear MIN_TERMINAL_COLS/ROWS. Skipping leaves
+      // xterm's default 80×24 in place, which spawn IPC (L329/L338)
+      // will carry to the PTY — safe even if the pane mounts at a
+      // pathologically narrow size during initial layout. Returns
+      // whether the fit actually ran so callers can gate follow-up
+      // side effects (e.g. scrollToBottom).
+      const safeFit = (): boolean => {
+        const proposed = fitAddon.proposeDimensions();
+        if (!shouldFitMiniTerminal(proposed)) return false;
         fitAddon.fit();
-        terminal.scrollToBottom();
+        return true;
+      };
+
+      safeFit();
+      requestAnimationFrame(() => {
+        if (safeFit()) terminal.scrollToBottom();
       });
 
       terminalRef.current = terminal;
@@ -210,8 +267,10 @@ export function AgentMiniTerminal({
         ) {
           const buf = terminal.buffer.active;
           const wasAtBottom = buf.viewportY >= buf.baseY;
-          fitAddon.fit();
-          if (wasAtBottom) terminal.scrollToBottom();
+          // Only auto-scroll if the fit actually ran — a skipped fit
+          // leaves the buffer untouched and forcing scrollToBottom
+          // would yank the user out of any manual scrollback.
+          if (safeFit() && wasAtBottom) terminal.scrollToBottom();
         }
       });
       if (termRef.current) observer.observe(termRef.current);
@@ -857,8 +916,20 @@ export function AgentMiniTerminal({
         }
         const buf = terminalRef.current.buffer.active;
         const wasAtBottom = buf.viewportY >= buf.baseY;
-        fitAddonRef.current?.fit();
-        if (wasAtBottom) terminalRef.current.scrollToBottom();
+        // Intentional asymmetry: when the font grows large enough
+        // that the available cols drop below MIN_TERMINAL_COLS, the
+        // fit is skipped this cycle and the last-good cols persist
+        // until the next layout widens the tile. Don't "fix" this by
+        // removing the guard — letting an unconstrained fit() through
+        // here is exactly what produces the 1-char-wide hard-newline
+        // damage on the PTY side.
+        const fitAddon = fitAddonRef.current;
+        let fitRan = false;
+        if (fitAddon && shouldFitMiniTerminal(fitAddon.proposeDimensions())) {
+          fitAddon.fit();
+          fitRan = true;
+        }
+        if (fitRan && wasAtBottom) terminalRef.current.scrollToBottom();
       }
     });
   }, []);
