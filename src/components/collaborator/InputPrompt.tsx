@@ -641,6 +641,18 @@ export function InputPrompt() {
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
+          onBeforeInput={(e) => {
+            // macOS WKWebView occasionally surfaces arrow-key navigation as
+            // raw ASCII Information-Separator codepoints (FS 0x1C for Left,
+            // GS 0x1D for Right, RS 0x1E for Up, US 0x1F for Down) instead
+            // of routing to NSResponder move actions. They render as tofu
+            // in `font-mono`. Reject any C0 control character — Tab (0x09),
+            // LF (0x0A), and CR (0x0D) are intentionally kept.
+            const data = (e as React.FormEvent<HTMLTextAreaElement> & { data?: string | null }).data;
+            if (data && /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(data)) {
+              e.preventDefault();
+            }
+          }}
           className="flex-1 bg-transparent text-text outline-none placeholder-text-dim resize-none leading-7"
           style={{ height: textareaHeight }}
           placeholder={
