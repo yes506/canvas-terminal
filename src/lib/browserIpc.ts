@@ -49,6 +49,15 @@ export function browserTabStop(tabId: string): Promise<void> {
   return invoke<void>("browser_tab_stop", { tabId });
 }
 
+/**
+ * Set the per-tab WKWebView zoom level. Rust clamps `zoom` to
+ * `[0.25, 5.0]` as defense-in-depth before forwarding to
+ * `Webview::set_zoom`. Native sticky across navigations on macOS 11+.
+ */
+export function browserTabSetZoom(tabId: string, zoom: number): Promise<void> {
+  return invoke<void>("browser_tab_set_zoom", { tabId, zoom });
+}
+
 export function destroyBrowserTab(tabId: string): Promise<void> {
   return invoke<void>("destroy_browser_tab", { tabId });
 }

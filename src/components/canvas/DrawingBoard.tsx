@@ -7,7 +7,6 @@ import {
   Download,
 } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
-import html2canvas from "html2canvas";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { exportCanvasToDataUrl } from "../../lib/canvasOps";
@@ -27,6 +26,13 @@ interface LayerContextMenu {
   y: number;
   target: fabric.FabricObject;
 }
+
+// localStorage flag so the "first capture will trigger a system prompt"
+// rationale toast fires exactly once per browser profile — but only after
+// a non-permission-denied outcome, so a first-attempt deny still gets the
+// gentler explanation on retry (handled inside handleCaptureFullWindow's
+// finally branch).
+const RATIONALE_KEY = "canvas-terminal:capture-permission-warned";
 
 export function DrawingBoard() {
   const { canvasRef, containerRef } = useCanvas();
@@ -174,12 +180,15 @@ export function DrawingBoard() {
   // render. Integer-snap left/top avoids a mild bilinear pass from sub-pixel
   // placement.
   //
-  // `sourceScale` is the device-pixels-per-CSS-pixel factor that produced the
-  // source bitmap — must match the `scale`/`multiplier` used at capture. Pass
-  // `dpr` for `exportCanvasToDataUrl` (multiplier=dpr) and `dpr*2` for the
-  // fullwindow `html2canvas(scale: dpr*2)` path. Without this, the helper
-  // would compute the source's CSS width incorrectly for higher-density
-  // captures and clamp/scale the displayed image to the wrong size.
+  // `sourceScale` is the device-pixels-per-CSS-pixel factor that produced
+  // the source bitmap — must match the scale at which the bitmap was
+  // captured. Pass `window.devicePixelRatio` for `exportCanvasToDataUrl`
+  // (canvas-only capture, multiplier=dpr) and the `sourceScale` returned
+  // by `capture_main_window_png` for the full-window path (Rust reads
+  // the actual device scale at capture time, which is robust against
+  // multi-display drag between click and capture). Without the right
+  // value, the helper computes CSS width incorrectly and the displayed
+  // image is mis-sized on high-DPI displays.
   const addCapturedScreenshotToCanvas = (dataUrl: string, sourceScale: number) => {
     if (!fabricCanvas) return;
     const imgEl = new Image();
@@ -221,73 +230,63 @@ export function DrawingBoard() {
     }
   };
 
+  // Replaces the prior html2canvas (DOM-clone) path. html2canvas could not
+  // see the native Tauri child webview that hosts the browser drawer — its
+  // pixels live in the OS compositor, not in the DOM — so captures showed a
+  // black rectangle where the browser was. The native capture below reads
+  // the compositor framebuffer via a Rust IPC (`capture_main_window_png`)
+  // and gets the webview content + correct occlusion in one shot.
+  //
+  // The Rust side returns { pngBase64, sourceScale } so the helper below
+  // can recover the source's CSS width correctly across multi-display
+  // moves where window.devicePixelRatio would otherwise drift from the
+  // actual capture scale.
   const handleCaptureFullWindow = async () => {
     if (isCapturing.current) return;
     isCapturing.current = true;
 
+    // One-time rationale shown BEFORE the first invocation. macOS will
+    // surface a Screen Recording prompt the first time the Rust side calls
+    // CGRequestScreenCaptureAccess(); the system prompt's wording is fixed
+    // by Apple (the NSScreenCaptureUsageDescription Info.plist key likely
+    // doesn't customize it for this specific category), so the in-app
+    // toast is the load-bearing rationale.
+    const showedRationale = localStorage.getItem(RATIONALE_KEY) === "1";
+    if (!showedRationale) {
+      setSnapshotToast(
+        "First capture: macOS will ask for Screen Recording permission. " +
+        "Grant it, then fully quit (Cmd+Q) and relaunch Canvas Terminal."
+      );
+      // Give the user time to read before the system prompt slams in.
+      await new Promise((r) => setTimeout(r, 3500));
+      setSnapshotToast(null);
+    }
+
+    let suppressRationaleNextTime = true;
     try {
-      const appRoot = document.querySelector<HTMLElement>("#root");
-      if (!appRoot) return;
-
-      // Wait for web fonts (e.g. JetBrainsMono Nerd Font Mono) so the cloned
-      // DOM html2canvas builds doesn't fall back to a system font with
-      // different metrics. xterm's DomRenderer measures `cellHeight` from
-      // the loaded font; a fallback in the clone breaks the row clip
-      // invariant and produces visually-collided rows in the screenshot.
-      if (document.fonts?.ready) {
-        try { await document.fonts.ready; } catch { /* fonts API absent */ }
-      }
-
-      // html2canvas natively clones canvas elements via drawImage().
-      // For WebGL canvases (xterm.js), this requires preserveDrawingBuffer=true
-      // on the WebGL addon — see useTerminal.ts where it's enabled.
-      //
-      // scale: dpr*2 — gives downstream Fabric resampling enough source
-      // pixels per text row that monospaced rows stay distinct after the
-      // export's bilinear pass.
-      //
-      // onclone — re-asserts row geometry that xterm.js v5 DomRenderer sets
-      // at runtime (overflow:hidden + per-row height + span inline-block).
-      // xterm appends those rules in a <style> under `_screenElement`
-      // (NOT <head>); html2canvas v1 commonly drops scoped stylesheets,
-      // which lets cloned glyphs overflow their row slot and visually
-      // collide with neighbours. We re-apply the invariants in <head> so
-      // the clip survives the clone.
-      const screenshot = await html2canvas(appRoot, {
-        backgroundColor: null,
-        scale: window.devicePixelRatio * 2,
-        useCORS: true,
-        onclone: (doc) => {
-          // `contain: layout paint` (NOT `contain: strict`): we intentionally
-          // omit the `size` containment aspect because that requires the
-          // element to declare an explicit size, otherwise it collapses to
-          // 0×0. xterm v5 does inline `height: <px>` on each row at runtime
-          // so `contain: strict` would work today, but a future xterm refactor
-          // (e.g. flexbox-based rows) could remove the inline height and
-          // produce blank captures. `layout paint` gets us the paint-bleed
-          // isolation we need without the size-collapse risk.
-          const styleEl = doc.createElement("style");
-          styleEl.textContent = `
-            .xterm-rows > div {
-              overflow: hidden !important;
-              contain: layout paint;
-            }
-            .xterm-rows span {
-              display: inline-block !important;
-              height: 100% !important;
-              vertical-align: top !important;
-            }
-          `;
-          doc.head.appendChild(styleEl);
-        },
-      });
-      const dataUrl = screenshot.toDataURL("image/png");
-      // Match the `scale: dpr*2` used by html2canvas above so the helper
-      // computes the source's CSS width correctly.
-      addCapturedScreenshotToCanvas(dataUrl, window.devicePixelRatio * 2);
+      const { pngBase64, sourceScale } = await invoke<{
+        pngBase64: string;
+        sourceScale: number;
+      }>("capture_main_window_png");
+      addCapturedScreenshotToCanvas(`data:image/png;base64,${pngBase64}`, sourceScale);
     } catch (err) {
-      console.error("Full window capture failed:", err);
+      const msg = String(err);
+      if (msg.startsWith("PERMISSION_DENIED:")) {
+        // Permission denied — keep the gentle rationale path available on
+        // retry. Without this guard, a first-attempt deny would mean the
+        // user never sees the rationale toast again.
+        suppressRationaleNextTime = false;
+        setSnapshotToast(msg.slice("PERMISSION_DENIED:".length).trim());
+        setTimeout(() => setSnapshotToast(null), 6000);
+      } else {
+        console.error("Full window capture failed:", err);
+        setSnapshotToast("Capture failed — see console for details");
+        setTimeout(() => setSnapshotToast(null), 6000);
+      }
     } finally {
+      if (suppressRationaleNextTime) {
+        localStorage.setItem(RATIONALE_KEY, "1");
+      }
       isCapturing.current = false;
     }
   };
@@ -305,7 +304,10 @@ export function DrawingBoard() {
     try {
       const savedPath = await invoke<string>("export_snapshot", { base64Data });
       await writeText(savedPath);
-      setSnapshotToast(savedPath);
+      // The toast text carries its own intended display string (no
+      // auto-prefix at the renderer) so capture/permission messages
+      // don't accidentally appear as "Copied to clipboard: ...".
+      setSnapshotToast(`Copied to clipboard: ${savedPath}`);
       setTimeout(() => setSnapshotToast(null), 3000);
     } catch (err) {
       console.error("Export for AI failed:", err);
@@ -392,7 +394,10 @@ export function DrawingBoard() {
       {/* Snapshot export toast */}
       {snapshotToast && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-surface-light/95 backdrop-blur border border-surface-lighter rounded-lg px-3 py-2 shadow z-10 text-xs text-text-muted max-w-[90%]">
-          <span className="text-green-400">{snapshotToast.startsWith("Saved:") ? "" : "Copied to clipboard: "}</span>
+          {/* The toast text is the full intended display string (set by
+              each caller). No auto-prefix here — that would mislabel
+              capture rationale / PERMISSION_DENIED / "Capture failed"
+              messages as clipboard operations. */}
           <code className="text-text">{snapshotToast}</code>
         </div>
       )}

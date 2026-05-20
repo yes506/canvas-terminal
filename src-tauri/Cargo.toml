@@ -39,6 +39,18 @@ hex = "0.4"
 # `RecommendedWatcher` is held by `commands::transcripts::TranscriptWatcher`.
 notify = "6"
 
+# macOS-only deps for the native window-capture command
+# (commands::capture). core-graphics gives us CGWindowListCreateImage +
+# ScreenCaptureAccess preflight/request; objc2-app-kit lets us go from
+# Tauri's NSWindow* to a CGWindowID via -[NSWindow windowNumber]; the
+# image crate handles RGBA → PNG encoding after the BGRA byte-swap that
+# CGWindowListCreateImage's pixel format demands.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` is the cleanest way to drive an axum Router
 # in unit tests without binding a real TCP port. Test-only — the production

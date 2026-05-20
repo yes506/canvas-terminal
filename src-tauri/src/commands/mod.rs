@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod canvas;
+pub mod capture;
 pub mod dashboard;
 pub mod fs_safety;
 pub mod localfile;
