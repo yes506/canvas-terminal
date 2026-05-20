@@ -362,8 +362,37 @@ export function InputPrompt() {
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      // Never interfere with IME composition (Korean, Japanese, Chinese)
-      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+      // Never interfere with IME composition (Korean, Japanese, Chinese).
+      // macOS WKWebView + Hangul IME quirk: native ArrowLeft/ArrowRight
+      // inside the composing window commits an isolated Hangul Jamo
+      // (U+1100–U+11FF) instead of advancing the cursor. Those Jamo lack
+      // glyphs in the `font-mono` fallback chain and render as tofu (□).
+      // Move the cursor manually here so the IME never sees the arrow.
+      if (e.nativeEvent.isComposing || e.keyCode === 229) {
+        if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+          e.preventDefault();
+          const el = inputRef.current;
+          if (el) {
+            // Mirror native textarea: with a non-empty selection, an arrow
+            // collapses to the relevant end; with no selection, step by 1.
+            // Read `el.value.length` (DOM truth) rather than React `value.length`,
+            // since `onChange` typically does not fire mid-composition.
+            const start = el.selectionStart ?? 0;
+            const end = el.selectionEnd ?? start;
+            const hasSelection = start !== end;
+            const next =
+              e.key === "ArrowLeft"
+                ? hasSelection
+                  ? start
+                  : Math.max(0, start - 1)
+                : hasSelection
+                  ? end
+                  : Math.min(el.value.length, end + 1);
+            el.setSelectionRange(next, next);
+          }
+        }
+        return;
+      }
 
       // --- Target selector is visible ---
       if (showSelector) {
@@ -612,6 +641,18 @@ export function InputPrompt() {
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
+          onBeforeInput={(e) => {
+            // macOS WKWebView occasionally surfaces arrow-key navigation as
+            // raw ASCII Information-Separator codepoints (FS 0x1C for Left,
+            // GS 0x1D for Right, RS 0x1E for Up, US 0x1F for Down) instead
+            // of routing to NSResponder move actions. They render as tofu
+            // in `font-mono`. Reject any C0 control character — Tab (0x09),
+            // LF (0x0A), and CR (0x0D) are intentionally kept.
+            const data = (e as React.FormEvent<HTMLTextAreaElement> & { data?: string | null }).data;
+            if (data && /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(data)) {
+              e.preventDefault();
+            }
+          }}
           className="flex-1 bg-transparent text-text outline-none placeholder-text-dim resize-none leading-7"
           style={{ height: textareaHeight }}
           placeholder={

@@ -34,6 +34,10 @@ rust-embed = { version = "8", features = ["debug-embed"] }
 futures = "0.3"
 rand = "0.8"
 hex = "0.4"
+# Filesystem watcher for the transcripts subsystem (peer-context-mirror).
+# Adds FSEvents on macOS, inotify on Linux. Cross-platform abstraction;
+# `RecommendedWatcher` is held by `commands::transcripts::TranscriptWatcher`.
+notify = "6"
 
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` is the cleanest way to drive an axum Router

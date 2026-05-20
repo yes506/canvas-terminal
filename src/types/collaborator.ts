@@ -21,6 +21,35 @@ export interface SpawnedAgentInit {
   status: "spawning" | "running" | "exited";
   /** Which collaborator pane owns this agent. */
   collabSessionId: string;
+  /**
+   * Pre-minted handle to bypass the store's `nextOrdinal` mint.
+   *
+   * Used by the peer-context-mirror reservation lifecycle:
+   * `reserveAgentHandle` (lib/peerContext.ts) mints the handle BEFORE
+   * the spawn IPC so it can be injected as `CT_AGENT_ID` via
+   * `extra_env`. The same handle must end up on the `SpawnedAgent`
+   * record so the env-derived identity matches the store's identity.
+   *
+   * When present, `addAgent` skips its own `nextOrdinal` call and
+   * derives `ordinal` from the trailing digits of this handle.
+   * When absent, the legacy mint-now path is taken — backward
+   * compatible for callers that don't use the reservation API
+   * (tests, future code).
+   */
+  handle?: string;
+  /**
+   * Cross-tool agent context surfacing opt-in (peer-context-mirror feature).
+   * Optional on init; `addAgent` defaults to `true` when omitted (cycle F
+   * always-on). The Eye toggle in `AgentMiniTerminal.tsx` remains as a
+   * per-agent opt-out via `setPublishOptedIn`. Backward-compatible for
+   * pre-peer-context-mirror callers (tests, future code) that haven't
+   * been migrated.
+   *
+   * The UI (cycle C) flips this via `setPublishOptedIn`; the watch
+   * lifecycle in `AgentMiniTerminal.tsx` gates `invoke('watch_transcript')`
+   * on `publishOptedIn === true && status === 'running'`.
+   */
+  publishOptedIn?: boolean;
 }
 
 /** One entry per name change. Append-only; index 0 is the system-set birth name. */
@@ -54,6 +83,18 @@ export interface SpawnedAgent extends SpawnedAgentInit {
   /** Append-only rename audit. `nameHistory[0]` is the birth name (`setBy: "system"`);
    *  the last entry is always the current nickname. */
   nameHistory: AgentNameRecord[];
+  /**
+   * Cross-tool agent context surfacing opt-in. `addAgent` defaults this
+   * to `true` (cycle F: peer-context-mirror is always-on; Eye toggle
+   * remains the per-agent opt-out) when omitted from `SpawnedAgentInit`.
+   * Optional on the materialized record too so pre-peer-context-mirror
+   * test fixtures (which construct `SpawnedAgent` literals directly,
+   * bypassing `addAgent`) continue to compile without `publishOptedIn`
+   * boilerplate. Readers MUST check `=== true` (not truthy or `!== false`)
+   * so `undefined` (only produced by direct-construction test fixtures)
+   * reads as "not publishing".
+   */
+  publishOptedIn?: boolean;
 }
 
 /** Result type returned by `renameAgent`. The store owns the human-readable message

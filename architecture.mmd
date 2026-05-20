@@ -1,4 +1,23 @@
 graph LR
-  LocalFileTokenStore["LocalFileTokenStore"]
-  commands__localfile["commands::localfile"]
-  commands__localfile --> LocalFileTokenStore
+  FsSafety["FsSafety"]
+  TranscriptFsGate["TranscriptFsGate"]
+  TranscriptAdapter["TranscriptAdapter"]
+  TranscriptWatcher["TranscriptWatcher"]
+  Tailer["Tailer"]
+  Watcher["Watcher"]
+  pty__extension_["pty (extension)"]
+  CollaboratorStore__extension_["CollaboratorStore (extension)"]
+  PeerContextPanel["PeerContextPanel"]
+  AgentMiniTerminal__extension_["AgentMiniTerminal (extension)"]
+  TranscriptFsGate --> FsSafety
+  TranscriptAdapter --> TranscriptFsGate
+  TranscriptWatcher --> Watcher
+  TranscriptWatcher --> TranscriptAdapter
+  TranscriptWatcher --> TranscriptFsGate
+  TranscriptWatcher --> Tailer
+  Tailer --> TranscriptAdapter
+  Tailer --> TranscriptWatcher
+  Watcher --> Tailer
+  PeerContextPanel --> CollaboratorStore__extension_
+  AgentMiniTerminal__extension_ --> TranscriptWatcher
+  AgentMiniTerminal__extension_ --> CollaboratorStore__extension_

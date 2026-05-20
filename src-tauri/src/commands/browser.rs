@@ -25,6 +25,14 @@ const MAIN_WINDOW_LABEL: &str = "main";
 /// state on tab switch (Chrome-like behaviour).
 const HIDDEN_TAB_Y: f64 = -99999.0;
 
+/// Refresh per Safari release; matches Atlassian's supported-Safari window.
+/// WKWebView's default UA omits the `Version/X Safari/Y` suffix and trips
+/// UA allowlists on Atlassian/Confluence and similar enterprise SaaS,
+/// rendering their "Browser not supported" interstitial. `AppleWebKit/605.1.15`
+/// is truthful for WKWebView; the `Intel Mac OS X 10_15_7` platform token
+/// mirrors Safari's own fingerprint-resistant freeze.
+const SAFARI_DESKTOP_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15";
+
 /// B1 fix — route `target="_blank"` / `window.open` / `form target="_blank"`
 /// requests to the SAME webview's navigation instead of letting WebKit
 /// emit a new-window request that no handler is subscribed to (silent
@@ -247,6 +255,10 @@ pub fn create_browser_tab(
 
     let builder: WebviewBuilder<tauri::Wry> =
         WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+            // Pass a Safari-on-macOS UA so UA-gating sites (Atlassian
+            // Confluence, etc.) accept the WKWebView child. See
+            // SAFARI_DESKTOP_UA for the format rationale.
+            .user_agent(SAFARI_DESKTOP_UA)
             // B1 fix — DOM-only new-window interceptor. Does NOT touch
             // `__TAURI__` / IPC, so the prior cycle's capability isolation
             // intent (no Tauri bridge in the browser child) holds. See

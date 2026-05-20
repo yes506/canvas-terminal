@@ -17,7 +17,16 @@ import { useCollabSessionId } from "./CollabSessionContext";
 import { createOutputCapture, stripAnsi, registerCapture, unregisterCapture } from "../../lib/agentOutputCapture";
 import { isEnvBootstrapped } from "../../lib/terminalManager";
 import type { ToolConfig } from "../../types/collaborator";
-import { X } from "lucide-react";
+import {
+  consumeReservation,
+  releaseReservation,
+  reserveAgentHandle,
+} from "../../lib/peerContext";
+import {
+  ENV_AGENT_ID,
+  ENV_COLLAB_SESSION_ID,
+} from "../../types/peerContext";
+import { Eye, EyeOff, X } from "lucide-react";
 
 interface AgentMiniTerminalProps {
   sessionId: string;
@@ -96,7 +105,21 @@ export function AgentMiniTerminal({
   const docInputRef = useRef<((e: Event) => void) | null>(null);
   const imeOverlayRef = useRef<HTMLSpanElement | null>(null);
   const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Holds the u64 token returned by `invoke('watch_transcript')` so the
+  // matching `invoke('unwatch_transcript')` can release it on unmount or
+  // when publishOptedIn flips false. null = no active watch.
+  const watchTokenRef = useRef<number | null>(null);
   const disposed = useRef(false);
+  // Monotonic per-effect-run counter. Each useEffect entry bumps this and
+  // captures the new value in a closure-local `runId`; async paths inside
+  // that effect verify `initRunRef.current === runId` (via `isCurrentRun()`)
+  // before touching shared state. Defeats the React.StrictMode double-mount
+  // race that, without this guard, lets Mount #1's stale async closures
+  // run their post-await side effects (notably `addAgent`) AFTER Mount #2
+  // has reset `disposed.current = false` for its own run — producing
+  // duplicate SpawnedAgent records under the same `sessionId`. Restores
+  // the pattern collaterally removed by 69ca18b ("Revert worktree feature").
+  const initRunRef = useRef(0);
   const [focused, setFocused] = useState(false);
   // Inline-rename state for the header label. `editing === false` shows the
   // <span>; `editing === true` shows an <input value={draft}>. The store action
@@ -107,7 +130,13 @@ export function AgentMiniTerminal({
   const renameInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
+    // Bump-and-capture the per-run id BEFORE resetting `disposed.current`.
+    // Order matters: if cleanup #1 fires before this effect run starts,
+    // Mount #1's closures (captured against the prior runId) see the bumped
+    // value and bail; the disposed-flag reset below only affects new closures.
+    const runId = ++initRunRef.current;
     disposed.current = false;
+    const isCurrentRun = () => !disposed.current && initRunRef.current === runId;
 
     const initTerminal = async () => {
       if (!termRef.current || terminalRef.current) return;
@@ -162,12 +191,12 @@ export function AgentMiniTerminal({
           buf.baseY - buf.viewportY <= 2 ||
           document.activeElement === terminal.textarea;
         terminal.write(payload, () => {
-          if (disposed.current) return;
+          if (!isCurrentRun()) return;
           if (shouldFollow) terminal.scrollToBottom();
         });
       };
 
-      if (disposed.current) {
+      if (!isCurrentRun()) {
         terminal.dispose();
         return;
       }
@@ -205,14 +234,14 @@ export function AgentMiniTerminal({
       unlistenDataRef.current = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
           }
         },
       );
 
-      if (disposed.current) {
+      if (!isCurrentRun()) {
         unlistenDataRef.current?.();
         observer.disconnect();
         terminal.dispose();
@@ -227,7 +256,9 @@ export function AgentMiniTerminal({
         `pty-exit-${sessionId}`,
         () => {
           void handlePtyExit({
-            disposed: disposed.current,
+            // Use !isCurrentRun() so Mount #1's stale pty-exit listener bails
+            // when it fires after Mount #2 has reset disposed.current = false.
+            disposed: !isCurrentRun(),
             capture: captureRef.current,
             writeProcessExitedLine: () =>
               writeWithFollowBottom("\r\n\x1b[33m[Process exited]\x1b[0m\r\n"),
@@ -237,7 +268,7 @@ export function AgentMiniTerminal({
         },
       );
 
-      if (disposed.current) {
+      if (!isCurrentRun()) {
         unlistenDataRef.current?.();
         unlistenExitRef.current?.();
         observer.disconnect();
@@ -245,16 +276,55 @@ export function AgentMiniTerminal({
         return;
       }
 
-      // Spawn the CLI tool — try direct process first, fall back to shell
+      // Spawn the CLI tool — try direct process first, fall back to shell.
+      //
+      // peer-context-mirror reservation lifecycle (L5+L6+L7+L8):
+      // 1. BEFORE the spawn IPC, reserveAgentHandle mints the bare CT
+      //    handle (e.g. "claude3") via collaboratorStore.nextOrdinal.
+      //    The same counter addAgent would use, so the post-spawn
+      //    record's ordinal/handle line up with the pre-spawn env.
+      // 2. The reserved handle is passed into the spawn IPC via
+      //    extra_env as CT_AGENT_ID + CT_COLLAB_SESSION_ID. Both
+      //    spawn_process and spawn_shell accept the parameter
+      //    (cycle A wired spawn_shell's body).
+      // 3. On spawn success: consumeReservation returns the reserved
+      //    data, and addAgent gets the pre-minted handle so it skips
+      //    its own nextOrdinal mint.
+      // 4. On spawn failure: releaseReservation rolls back the
+      //    registry entry so the slot can be reused.
       const [program, ...programArgs] = tool.command.split(/\s+/);
       let spawnedViaShell = false;
+
+      // L5: pre-spawn reservation. Synchronous — throws on unknown
+      // collabSessionId, which the outer initTerminal's React error
+      // boundary would catch; in practice collabSessionId always
+      // resolves from CollabSessionContext.
+      let reservation;
+      try {
+        reservation = reserveAgentHandle(collabSessionId, tool.id);
+      } catch (reserveErr) {
+        if (isCurrentRun()) {
+          writeWithFollowBottom(
+            `\r\n\x1b[31m[Failed to reserve handle: ${reserveErr}]\x1b[0m\r\n`,
+          );
+        }
+        return;
+      }
+
+      // L6: build extraEnv from the reservation. Using imported
+      // constants (not literal strings) so the keys stay aligned with
+      // the Rust adapter's expectations.
+      const extraEnv: Record<string, string> = {
+        [ENV_AGENT_ID]: reservation.handle,
+        [ENV_COLLAB_SESSION_ID]: collabSessionId,
+      };
 
       try {
         await invoke("spawn_process", {
           sessionId,
           program,
           args: programArgs.length > 0 ? programArgs : null,
-          extraEnv: null,
+          extraEnv,
           cwd: cwd ?? null,
           cols: terminal.cols,
           rows: terminal.rows,
@@ -269,9 +339,14 @@ export function AgentMiniTerminal({
             rows: terminal.rows,
             cwd: cwd ?? null,
             login: !isEnvBootstrapped(),
+            extraEnv,
           });
         } catch (shellErr) {
-          if (!disposed.current) {
+          // L8: release reservation on spawn failure so the ordinal
+          // slot can be reused. Idempotent; safe to fire on either
+          // catch path.
+          releaseReservation(reservation.reservationId);
+          if (isCurrentRun()) {
             writeWithFollowBottom(
               `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
             );
@@ -280,7 +355,13 @@ export function AgentMiniTerminal({
         }
       }
 
-      if (disposed.current) return;
+      if (!isCurrentRun()) {
+        // StrictMode dispose between spawn-success and post-spawn
+        // setup: release the reservation so the next mount's fresh
+        // reserveAgentHandle doesn't see a leaked slot.
+        releaseReservation(reservation.reservationId);
+        return;
+      }
 
       // Let app-level shortcuts bubble past xterm
       terminal.attachCustomKeyEventHandler((e) => {
@@ -560,7 +641,7 @@ export function AgentMiniTerminal({
 
       // Forward user keystrokes to PTY
       terminal.onData((data) => {
-        if (disposed.current) return;
+        if (!isCurrentRun()) return;
         invoke("write_to_pty", { sessionId, data }).catch(() => {});
         // S2 fix: user typing is explicit "I want to see the prompt" intent.
         // Always snap to bottom on input — prevents the case where the user
@@ -577,7 +658,7 @@ export function AgentMiniTerminal({
       terminal.textarea?.addEventListener("focus", () => {
         setFocused(true);
         requestAnimationFrame(() => {
-          if (!disposed.current && document.activeElement === terminal.textarea) {
+          if (isCurrentRun() && document.activeElement === terminal.textarea) {
             terminal.scrollToBottom();
           }
         });
@@ -599,11 +680,33 @@ export function AgentMiniTerminal({
       // Register in store as "spawning" — not ready for messages yet.
       // The readiness detector below will set status to "running" and flush
       // any queued messages once the CLI tool's prompt appears.
+      //
+      // CRITICAL guard: only the current effect-run may push the agent
+      // record. Without this check, Mount #1's stale async closure (still
+      // mid-await on its spawn IPC when StrictMode unmounts) reaches this
+      // line AFTER Mount #2 has reset disposed.current = false, and both
+      // mounts' addAgent calls land — producing two SpawnedAgent records
+      // with the same sessionId. The 69ca18b revert collaterally removed
+      // this guard; this is its restoration.
+      if (!isCurrentRun()) {
+        // Same StrictMode-dispose-mid-flight case as the spawn-success
+        // guard above: release the reservation so the next mount's
+        // fresh reserveAgentHandle doesn't see a leaked slot.
+        releaseReservation(reservation.reservationId);
+        return;
+      }
+      // L7: consume the reservation (returns reserved handle data) and
+      // pass the pre-minted handle into addAgent so the store record's
+      // handle matches the env-injected CT_AGENT_ID.
+      const claimed = consumeReservation(reservation.reservationId);
       useCollaboratorStore.getState().addAgent({
         sessionId,
         tool: tool.id,
         status: "spawning",
         collabSessionId,
+        handle: claimed.handle,
+        // publishOptedIn omitted — store defaults to `true` (cycle F
+        // always-on). Eye toggle remains the per-agent opt-out.
       });
 
       // ---- CLI readiness detection ----
@@ -621,7 +724,7 @@ export function AgentMiniTerminal({
       const READY_BUF_MAX = 200;
       // Also use a fallback timer in case prompt pattern isn't matched
       readyTimeoutRef.current = setTimeout(() => {
-        if (!readyDetected && !disposed.current) {
+        if (!readyDetected && isCurrentRun()) {
           readyDetected = true;
           const store = useCollaboratorStore.getState();
           store.setAgentStatus(sessionId, "running");
@@ -650,7 +753,7 @@ export function AgentMiniTerminal({
       unlistenDataRef.current = await listen<string>(
         `pty-data-${sessionId}`,
         (event) => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
             checkReady(event.payload);
@@ -663,10 +766,10 @@ export function AgentMiniTerminal({
       // Handle resize
       let resizeTimer: ReturnType<typeof setTimeout> | null = null;
       terminal.onResize(({ cols, rows }) => {
-        if (disposed.current) return;
+        if (!isCurrentRun()) return;
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          if (!disposed.current) {
+          if (isCurrentRun()) {
             invoke("resize_pty", { sessionId, cols, rows }).catch(() => {});
           }
         }, 80);
@@ -763,6 +866,68 @@ export function AgentMiniTerminal({
   const agent = useCollaboratorStore((s) =>
     s.agents.find((a) => a.sessionId === sessionId),
   );
+
+  // W9 + W10: peer-context-mirror watch lifecycle. Reactive on the
+  // (handle, publishOptedIn, status) triple. When status==='running' &&
+  // publishOptedIn===true, invoke('watch_transcript') and stash the
+  // returned u64 token in watchTokenRef. When the dependencies flip
+  // such that "should be watching" becomes false (publishOptedIn flipped
+  // off, status left 'running', or component unmounts), invoke
+  // ('unwatch_transcript') with the stashed token.
+  //
+  // The Rust side's TranscriptWatcher::unwatch is idempotent per its Q6
+  // contract — double-unwatching is safe; tokens that referred to a
+  // shutdown-cleared registry are silent no-ops. So we don't need to
+  // synchronize the catch handlers; .catch(() => {}) is sufficient.
+  //
+  // Why not gated by isCurrentRun(): this useEffect doesn't share a
+  // closure with the spawn useEffect's runId — it's a separate effect
+  // with its own per-mount lifecycle. React handles its own
+  // mount/unmount ordering; StrictMode's double-mount fires this
+  // effect's cleanup between renders, which calls unwatch before the
+  // next mount's watch fires. No race.
+  const agentHandle = agent?.handle;
+  const isRunning = agent?.status === "running";
+  const isPublishing = agent?.publishOptedIn === true;
+  const toolId = tool.id;
+  useEffect(() => {
+    if (!agentHandle || !isRunning || !isPublishing) {
+      return;
+    }
+    let unmounted = false;
+    invoke<number>("watch_transcript", {
+      sessionId,
+      agentHandle,
+      tool: toolId,
+      spawnedAtUnixMs: Date.now(),
+    })
+      .then((token) => {
+        if (unmounted) {
+          // Effect cleanup already ran — release the token immediately.
+          // Without this, a fast publish-toggle could leak a token whose
+          // cleanup ran before its watch_transcript Promise resolved.
+          invoke("unwatch_transcript", { token }).catch(() => {});
+          return;
+        }
+        watchTokenRef.current = token;
+      })
+      .catch(() => {
+        // watch_transcript failures (PTY died, fs_gate refused, etc.)
+        // are non-fatal — the watcher's idempotent contract means the
+        // next mount/toggle can retry cleanly. Don't surface a UI
+        // error; the agent's terminal pane already shows its own
+        // failure state.
+      });
+    return () => {
+      unmounted = true;
+      const token = watchTokenRef.current;
+      if (token !== null) {
+        watchTokenRef.current = null;
+        invoke("unwatch_transcript", { token }).catch(() => {});
+      }
+    };
+  }, [sessionId, agentHandle, isRunning, isPublishing, toolId]);
+
   const displayName = agent ? agentDisplayName(agent) : tool.label;
   const isExited = agent?.status === "exited";
   const isSpawning = agent?.status === "spawning";
@@ -888,6 +1053,31 @@ export function AgentMiniTerminal({
         >
           {indicator.label}
         </span>
+        {agent && (
+          <button
+            className="text-text-dim hover:text-cyan-400 transition-colors p-0.5 shrink-0"
+            onClick={() =>
+              useCollaboratorStore
+                .getState()
+                .setPublishOptedIn(
+                  sessionId,
+                  !(agent.publishOptedIn === true),
+                )
+            }
+            aria-pressed={agent.publishOptedIn === true}
+            title={
+              agent.publishOptedIn === true
+                ? "Publishing peer context (click to stop)"
+                : "Not publishing peer context (click to publish)"
+            }
+          >
+            {agent.publishOptedIn === true ? (
+              <Eye size={12} />
+            ) : (
+              <EyeOff size={12} />
+            )}
+          </button>
+        )}
         <button
           className="text-text-dim hover:text-red-400 transition-colors p-0.5 shrink-0"
           onClick={() => onClose(sessionId)}

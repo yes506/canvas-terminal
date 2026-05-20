@@ -95,6 +95,58 @@ const BASELINE_ENV_KEYS: &[&str] = &[
     "GIT_TERMINAL_PROMPT", "SSH_ASKPASS", "GIT_ASKPASS", "HOME",
 ];
 
+/// Apply caller-provided extra env vars AFTER the baseline.
+///
+/// Per K1 (cumulative reviewer fold): the prior shape `apply_baseline_env(cmd)`
+/// had no per-agent inputs; the peer-context-mirror feature needs
+/// `CT_AGENT_ID` + `CT_COLLAB_SESSION_ID` flowing in at spawn time. Rather
+/// than mutating the baseline function, the planner agreed to add this
+/// shared helper that both `spawn_process` and `spawn_shell` call AFTER
+/// `apply_baseline_env`. Caller-provided keys override baseline if they
+/// collide (per U4 DRY note — `spawn_process` should also migrate to call
+/// this helper instead of its inline merge loop during Phase 6).
+///
+/// # Inputs
+/// - `cmd`: builder to mutate.
+/// - `extra_env`: caller-provided merge set; `None` is a no-op.
+///
+/// # Returns
+/// Unit — mutation only.
+///
+/// # Errors
+/// Cannot fail.
+///
+/// # Side effects
+/// Sets each key on the builder. Empty map is a no-op.
+///
+/// # Invariants
+/// Caller-provided keys override baseline values when collisions occur
+/// (last-write wins; this helper runs AFTER apply_baseline_env per the
+/// call-site contract).
+///
+/// # Concurrency
+/// Mutates `cmd` only; thread-safe so long as `cmd` is not aliased.
+///
+/// # Lifecycle
+/// Called immediately after `apply_baseline_env` and before `apply_cwd`
+/// at each spawn site (`spawn_process`, `spawn_shell` — the latter after
+/// the Phase 6 signature change).
+///
+/// # Test contract
+/// Passing `Some({"FOO": "1"})` results in `cmd` having `FOO=1`. Passing
+/// `None` is observationally equivalent to not calling this function.
+/// Passing `Some({})` is a no-op.
+fn apply_extra_env(
+    cmd: &mut CommandBuilder,
+    extra_env: Option<&std::collections::HashMap<String, String>>,
+) {
+    if let Some(map) = extra_env {
+        for (key, val) in map {
+            cmd.env(key, val);
+        }
+    }
+}
+
 /// Apply CWD to a CommandBuilder if valid.
 fn apply_cwd(cmd: &mut CommandBuilder, cwd: &Option<String>) {
     if let Some(ref dir) = cwd {
@@ -283,6 +335,56 @@ pub fn spawn_process(
     Ok(())
 }
 
+/// Spawn an interactive shell PTY session.
+///
+/// Per the peer-context-mirror K1/C1 reviewer-folded contract, this command
+/// accepts a caller-provided `extra_env` map (matching `spawn_process`'s
+/// existing shape) so the shell-fallback launch path can propagate
+/// `CT_AGENT_ID` / `CT_COLLAB_SESSION_ID` at spawn time. The implementation
+/// wiring — calling `apply_extra_env(&mut cmd, extra_env.as_ref())` after
+/// `apply_baseline_env` — is deferred to the implementer cycle. This
+/// signature-only change unblocks the implementer's scope discipline (the
+/// implementer cannot add parameters to planner-committed functions).
+///
+/// # Inputs
+/// - `app` / `state`: standard Tauri injection.
+/// - `session_id`: caller-allocated session identifier; must be unique.
+/// - `cols` / `rows`: initial PTY size.
+/// - `cwd`: optional working directory; `None` inherits the host process.
+/// - `login`: when `Some(true)`, uses `-l` (sources the full login profile
+///   chain); when `None`/`Some(false)`, uses `-i` and injects the cached env.
+/// - `extra_env`: caller-provided env merged AFTER `apply_baseline_env`.
+///   `None` is observationally equivalent to omitting the argument; an
+///   empty map is also a no-op. Implementation wiring deferred per above.
+///
+/// # Returns
+/// `Ok(())` on successful spawn (session is registered in `state.sessions`).
+///
+/// # Errors
+/// Returns `Err(String)` on PTY open failure, lock poisoning, or
+/// `spawn_command` failure.
+///
+/// # Side effects
+/// Allocates a PTY pair, spawns a child process, starts a reader thread,
+/// inserts a `PtySession` into the shared session map.
+///
+/// # Invariants
+/// Each call inserts at most one session into `state.sessions`; on early
+/// error no session is inserted.
+///
+/// # Concurrency
+/// Internally serialized at the `state.sessions` mutex; safe to call from
+/// multiple Tauri IPC handlers concurrently.
+///
+/// # Lifecycle
+/// Called from the frontend `AgentMiniTerminal` / shell-fallback launch
+/// path; paired with `kill_pty(session_id)` for teardown.
+///
+/// # Test contract
+/// `extra_env = Some({"CT_AGENT_ID": "claude3"})` MUST result in the spawned
+/// child seeing `CT_AGENT_ID=claude3` in its environment (test deferred to
+/// the implementer cycle that wires `apply_extra_env`). `extra_env = None`
+/// MUST behave identically to the pre-touchup call shape.
 #[tauri::command]
 pub fn spawn_shell(
     app: AppHandle,
@@ -292,6 +394,7 @@ pub fn spawn_shell(
     rows: u16,
     cwd: Option<String>,
     login: Option<bool>,
+    extra_env: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
     let pty_system = native_pty_system();
 
@@ -320,6 +423,11 @@ pub fn spawn_shell(
 
     apply_cwd(&mut cmd, &cwd);
     apply_baseline_env(&mut cmd);
+    // Caller-provided env merged AFTER baseline so collision keys
+    // override baseline values (per apply_extra_env's docstring
+    // contract). Used by AgentMiniTerminal once Cluster H lands to
+    // pass CT_AGENT_ID / CT_COLLAB_SESSION_ID at PTY spawn-time.
+    apply_extra_env(&mut cmd, extra_env.as_ref());
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);

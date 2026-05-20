@@ -10,6 +10,7 @@ import type {
 } from "../types/collaborator";
 import { TOOL_CONFIGS } from "../types/collaborator";
 import { muteCapture } from "../lib/agentOutputCapture";
+import { hasContextsBreadcrumb } from "../lib/peerContext";
 import { useTerminalStore } from "./terminalStore";
 
 // ---------------------------------------------------------------------------
@@ -258,6 +259,25 @@ function nextOrdinal(collabSessionId: string, tool: ToolId): number {
   return next;
 }
 
+/**
+ * Public wrapper around `nextOrdinal` for `peerContext.ts::reserveAgentHandle`.
+ *
+ * Per K5/W2: `reserveAgentHandle` needs the SAME ordinal counter that
+ * `addAgent` uses so a reserved handle pre-spawn and an `addAgent` call
+ * post-spawn agree. Direct export of `nextOrdinal` would make a private
+ * helper public; this named wrapper keeps the call-site explicit.
+ *
+ * Test contract: identical to `nextOrdinal` — distinct calls for the
+ * same `(collabSessionId, tool)` pair return strictly increasing
+ * integers; first call returns 1.
+ */
+export function reserveOrdinalForPeerContext(
+  collabSessionId: string,
+  tool: ToolId,
+): number {
+  return nextOrdinal(collabSessionId, tool);
+}
+
 function resetOrdinalCounters(forSession: string): void {
   for (const key of toolOrdinalCounters.keys()) {
     if (key.startsWith(`${forSession}:`)) {
@@ -402,10 +422,11 @@ You are a participant in a multi-agent collaboration.
 
 ### Rules
 1. **Read before acting**: Read the conversation log and \`context.md\` (if present) in the shared memory directory to understand prior context and other agents' work.
-2. **Be self-contained**: Include enough detail that any other agent can understand what you did.
-3. **Reference by task ID** (e.g. "task-1-...").
-4. **Signal blockers**: State the blocking task ID and what you need.
-5. **Signal completion**: When done, write a JSON file to the shared memory directory to signal task completion. The system will automatically update the task and generate a report in the conversation log.
+2. **Discover peer context on demand**: When information needed to advance a task is not in the current message, conversation log, or \`context.md\`, search the per-session peer-context store (\`contexts/*.jsonl\` and other agents' \`task-*-*.md\` files) using **targeted grep — not exhaustive reads**. If targeted search doesn't surface the missing info, surface the gap to the user rather than crawl wider.
+3. **Be self-contained**: Include enough detail that any other agent can understand what you did.
+4. **Reference by task ID** (e.g. "task-1-...").
+5. **Signal blockers**: State the blocking task ID and what you need. Try Rule 2 first before declaring blocked on a missing-info gap.
+6. **Signal completion**: When done, write a JSON file to the shared memory directory to signal task completion. The system will automatically update the task and generate a report in the conversation log.
 
 \`\`\`bash
 cat > SHARED_MEMORY_DIR/TASK_ID.done.json << 'EOF'
@@ -801,6 +822,16 @@ interface CollaboratorState {
   // Agent lifecycle
   addAgent: (agent: SpawnedAgentInit) => void;
   /**
+   * Flip the cross-tool agent context surfacing opt-in for a given agent
+   * (peer-context-mirror feature). The watch lifecycle in
+   * `AgentMiniTerminal.tsx` reactively reads `publishOptedIn` + `status`
+   * and invokes `watch_transcript` / `unwatch_transcript` accordingly.
+   * Idempotent: setting the same value is a no-op (preserves zustand
+   * reference equality so React doesn't re-render on identical writes).
+   * Unknown sessionId is a silent no-op.
+   */
+  setPublishOptedIn: (sessionId: string, value: boolean) => void;
+  /**
    * Rename an agent's nickname. Returns `RenameResult`; the store owns the
    * human-readable failure messages so all rename surfaces (inline UI, /rename
    * slash command) share one wording. The handle is IMMUTABLE — only `nickname`,
@@ -1051,6 +1082,19 @@ async function prependContextHeader(
     // No context file
   }
 
+  // Peer-context-mirror breadcrumb (Q3-A wording): mirrors the
+  // context.md conditional above. Surfaces the contexts/ directory
+  // only when at least one peer agent is actively publishing — the
+  // agent can enumerate via list_memory_files. hasContextsBreadcrumb
+  // already silent-falses on IPC failure (see peerContext.ts).
+  try {
+    if (await hasContextsBreadcrumb()) {
+      parts.push(`[Peer contexts: ${dir}/contexts/]`);
+    }
+  } catch {
+    // No peer contexts available
+  }
+
   parts.push(
     "[To share notes with other agents, write files to the shared memory directory above.]",
   );
@@ -1250,19 +1294,83 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
   // -- Agent lifecycle ----------------------------------------------------
 
   addAgent: (raw) => {
-    const ordinal = nextOrdinal(raw.collabSessionId, raw.tool);
+    // Idempotent on sessionId. Defense in depth against any caller that
+    // double-fires `addAgent` for the same sessionId — most notably the
+    // React.StrictMode double-mount race in AgentMiniTerminal, which the
+    // component's runId guard now catches directly (see AgentMiniTerminal
+    // `isCurrentRun()`). This early-return is a belt-and-suspenders so a
+    // future re-entrant caller can't slip past the component-level guard
+    // and corrupt the store. sessionId is mint-once per spawn at the
+    // parent (CollaboratorPanel); legitimate re-adds don't occur in the
+    // current call graph. Skipping the duplicate also avoids burning an
+    // extra `nextOrdinal` slot, which would create a numbering gap.
+    if (get().agents.some((a) => a.sessionId === raw.sessionId)) {
+      return;
+    }
+    // Handle override path (peer-context-mirror reservation lifecycle):
+    // when `raw.handle` is present, it was pre-minted by
+    // `peerContext.reserveAgentHandle` via `reserveOrdinalForPeerContext`
+    // — the SAME `nextOrdinal` counter this branch uses, so the ordinal
+    // baked into the handle's trailing digits matches what `nextOrdinal`
+    // would have produced here. We extract the trailing-digit ordinal
+    // rather than re-minting so the env-injected `CT_AGENT_ID` (set at
+    // spawn time) lines up with the store's record.
+    //
+    // Legacy mint-now path: when `raw.handle` is absent, call
+    // `nextOrdinal` and derive the handle locally. Pre-peer-context-mirror
+    // callers (and tests) take this branch unchanged.
     const short = toolShortName(raw.tool);
+    let ordinal: number;
+    let handle: string;
+    if (raw.handle !== undefined) {
+      handle = raw.handle;
+      // Extract trailing digits — `claude3` → 3, `codex12` → 12. If the
+      // handle doesn't end in digits (defensive; reservation API mints
+      // `${short}${ordinal}` so this shouldn't happen), fall back to
+      // nextOrdinal so the record stays internally consistent.
+      const match = handle.match(/(\d+)$/);
+      ordinal = match
+        ? parseInt(match[1], 10)
+        : nextOrdinal(raw.collabSessionId, raw.tool);
+    } else {
+      ordinal = nextOrdinal(raw.collabSessionId, raw.tool);
+      handle = `${short}${ordinal}`;
+    }
     const initialNickname = `${toolLabel(raw.tool)} #${ordinal}`;
     const setAt = new Date().toISOString();
     const agent: SpawnedAgent = {
       ...raw,
       ordinal,
-      handle: `${short}${ordinal}`,
+      handle,
       nickname: initialNickname,
       nicknameSlug: slugify(initialNickname),
       nameHistory: [{ nickname: initialNickname, setAt, setBy: "system" }],
+      // Default publishOptedIn=true per cycle F: peer-context-mirror is
+      // always-on; the Eye toggle remains as a per-agent opt-out. The
+      // prior "Default visibility OFF on session start" criterion was
+      // dropped in favor of frictionless cross-agent context surfacing.
+      // `raw.publishOptedIn` takes precedence if the caller explicitly
+      // sets it (e.g. for tests verifying the watch-lifecycle's off-state).
+      publishOptedIn: raw.publishOptedIn ?? true,
     };
     set((s) => ({ agents: [...s.agents, agent] }));
+  },
+
+  setPublishOptedIn: (sessionId, value) => {
+    set((s) => {
+      // Reference-equality preserve: scan first, only emit a new array
+      // when a real value change happens. Avoids React rerenders on
+      // idempotent writes (UI toggle that fires the same value twice).
+      const target = s.agents.find((a) => a.sessionId === sessionId);
+      if (!target || target.publishOptedIn === value) {
+        return s;
+      }
+      return {
+        agents: s.agents.map((a) =>
+          a.sessionId === sessionId ? { ...a, publishOptedIn: value } : a,
+        ),
+      };
+    });
   },
 
   renameAgent: (sessionId, rawNickname) => {
