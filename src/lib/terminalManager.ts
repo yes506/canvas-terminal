@@ -230,9 +230,23 @@ export async function createSession(
 
   terminal.open(containerEl);
 
-  // WebGL addon for GPU-accelerated rendering
+  // WebGL addon for GPU-accelerated rendering.
+  //
+  // The constructor's boolean is `preserveDrawingBuffer`. It used to be `true`
+  // because the prior "Capture Full Window" implementation rasterized via
+  // html2canvas, which clones the DOM and copies canvases through
+  // drawImage() — that pixel-readback path needs the WebGL drawing buffer
+  // preserved between frames. Once the capture path moved to a native OS
+  // compositor read (commands::capture::capture_main_window_png), the
+  // readback requirement went away and we can keep the (small) browser
+  // optimization of letting the GL driver discard the buffer.
+  //
+  // Any future feature that wants to read xterm WebGL pixels back from JS
+  // (OCR, search highlight rasterization, etc.) must re-enable this flag
+  // — leave the buffer-discard default in place until that need actually
+  // shows up.
   try {
-    const webglAddon = new WebglAddon(true);
+    const webglAddon = new WebglAddon(false);
     webglAddon.onContextLoss(() => { try { webglAddon.dispose(); } catch { /* already disposed */ } });
     terminal.loadAddon(webglAddon);
   } catch {
