@@ -215,7 +215,6 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
           ) : (
             <div
               className="grid gap-2 h-full"
-              data-testid="agent-grid"
               style={{
                 // `minmax(MIN_AGENT_TILE_WIDTH_PX, 1fr)` columns enforce a
                 // horizontal floor for each tile so xterm's fitAddon can't

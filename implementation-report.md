@@ -61,12 +61,21 @@ Delta: 234 → 247 passing (+13 = 12 `shouldFitMiniTerminal` cases + 1 column-fl
 | WQ-7 | completed | CollaboratorPane.test.tsx | Source-level rather than DOM-render because the existing test file mocks `AgentToolbar` (which owns the spawn-trigger button), so rendering a populated grid in jsdom would require unwinding that mock. Source assertion mirrors the precedent at AgentMiniTerminal.test.ts (WebGL-renderer absence check). |
 
 ## Scope-discipline self-check
-- [x] No new interfaces / files outside hints — exactly the 4 hinted files modified, no file created (other than this report).
+- [x] No new tracked files outside hints — exactly the 4 hinted files modified, plus this report. The worktree also carries an untracked `node_modules` symlink (`-> ../../node_modules`) created at Phase 2 to share the parent install for `tsc`/`vitest`. It is `.gitignore`-matched (the root `node_modules/` entry), not in the commit, and must be removed before `git worktree remove` per `git`'s safety check (see "Worktree cleanup" below).
 - [x] No renames of committed public names — only additions (`MIN_TERMINAL_COLS`, `MIN_TERMINAL_ROWS`, `shouldFitMiniTerminal`).
 - [x] No signature changes on planner-committed methods — `handlePtyExit`, `AgentMiniTerminal`, `CollaboratorPane` props all unchanged.
 - [x] No edits to `validation_command` configuration — `package.json`, `vitest.config.ts`, `tsconfig.json` untouched.
 - [x] No edits to files outside the work queue's hint set — Rust `pty.rs` left alone per plan (4/4 reviewer consensus to keep `resize_pty` unchanged).
-- [x] No `--no-verify`, no amend, no force ops — single new commit on the implementer branch.
+- [x] No `--no-verify`, no force ops — incremental commits on the implementer branch, no amend.
+
+## Worktree cleanup (merge gate)
+After `confirm merge`, the parent skill will offer to `git worktree remove .worktrees/implementer-mini-term-column-floor-03031-83265-22119`. Because git refuses to remove a worktree with untracked files, the `node_modules` symlink (created during Phase 2 for validation reuse) must be removed first:
+
+```bash
+rm /Users/donghyeon/Desktop/development/my-private-develoment/dev-utils/canvas-terminal/.worktrees/implementer-mini-term-column-floor-03031-83265-22119/node_modules
+```
+
+The symlink is the only untracked artifact in the worktree.
 
 ## Known limitations (documented for the merge gate)
 - **Pre-existing narrow scrollback is not repaired.** The fix prevents future narrowing; lines emitted as hard newlines while the pane was narrow remain narrow in the buffer. User workaround: Ctrl-L (clear) after re-expanding. This was an explicit Round-2 review acknowledgment, not a regression.
