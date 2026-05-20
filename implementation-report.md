@@ -19,21 +19,30 @@ reachable via `git log -- implementation-report.md`.)
 
 ## Work-queue summary
 
-- Total items: **7**
+- Total items: **7** (plus 2 review-round fixes — B1, B2 — folded in after the round-5 peer review on `861976d`)
 - Completed: **7**
 - Blocked: **0**
+
+## Review-round fixes (commit `8279c66`)
+
+Two reviewers (@codex2 + @codex3) independently flagged the same two issues on the first implementation commit. Both fixed:
+
+- **B1 — `src-tauri/Cargo.lock` was dirty + uncommitted.** The first commit added direct macOS deps to `Cargo.toml` but did not include the matching lockfile update (version bump 0.4.0 → 0.5.0 + new direct/transitive packages). Releases and CI `--locked` builds would have been unreproducible. Lockfile now committed.
+- **B2 — Toast renderer mislabeled capture messages as "Copied to clipboard:".** The renderer auto-prefixed every non-`Saved:` message with `Copied to clipboard:`. After the swap, that meant rationale / `PERMISSION_DENIED` / "Capture failed" toasts rendered with the wrong prefix — directly undermining v3 D5's load-bearing permission UX. Refactored so each setter passes the full intended display string and the renderer is unconditional.
+
+Also folded @claude2 #4: stale comment on `addCapturedScreenshotToCanvas` still referenced "`dpr*2` for html2canvas" — updated to name the new Rust-returned `sourceScale` flow.
 
 ## Files changed
 
 ```
  src-tauri/Cargo.toml                   |  12 ++
+ src-tauri/Cargo.lock                   | 100+ ±  (added by 8279c66 — direct deps + transitive closure)
  src-tauri/Info.plist                   |   8 ++  (new)
  src-tauri/src/commands/capture.rs      | 206 ++  (new)
  src-tauri/src/commands/mod.rs          |   1 +
  src-tauri/src/lib.rs                   |   1 +
- src/components/canvas/DrawingBoard.tsx | 118 +/- (mostly the swap)
+ src/components/canvas/DrawingBoard.tsx | ~140 ±  (the swap + B2 toast refactor + #4 comment)
  src/lib/terminalManager.ts             |  18 ±
- 7 files changed, 301 insertions(+), 63 deletions(-)
 ```
 
 ## Validation
