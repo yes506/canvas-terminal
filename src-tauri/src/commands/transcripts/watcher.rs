@@ -18,12 +18,41 @@ use super::{Inner, NormalizeContext, TranscriptHandle, WatcherError};
 /// `Inner.shutdown=true` after `shutdown()` short-circuits everything).
 static WATCHER_INNER: OnceLock<Arc<Mutex<Inner>>> = OnceLock::new();
 
+/// Process-wide handle to the `TranscriptWatcher::notify_watcher` mutex.
+/// SEPARATE from `WATCHER_INNER` per task-11 deadlock fix: notify-API
+/// calls must NOT happen while holding the Inner mutex, since
+/// `notify::Watcher::{watch,unwatch}` synchronize internally with the
+/// FSEvents callback thread which itself locks Inner via `on_fs_event`.
+/// See `TranscriptWatcher` docstring for the lock-ordering invariant.
+static WATCHER_NOTIFY: OnceLock<Arc<Mutex<Option<notify::RecommendedWatcher>>>> =
+    OnceLock::new();
+
 /// Install the `Inner` handle. Called once from
 /// `TranscriptWatcher::start_if_needed`; subsequent calls are silent
 /// no-ops (`OnceLock::set` is idempotent). Visibility: `pub(super)`
 /// so the parent module (`transcripts`) can call it; not exported.
 pub(super) fn install_inner(inner: Arc<Mutex<Inner>>) {
     let _ = WATCHER_INNER.set(inner);
+}
+
+/// Install the `notify_watcher` handle. Paired with `install_inner` —
+/// both must be set before any `subscribe_fsevents` call so the free
+/// functions can reach the notify mutex without contending with Inner.
+pub(super) fn install_notify_watcher(
+    nw: Arc<Mutex<Option<notify::RecommendedWatcher>>>,
+) {
+    let _ = WATCHER_NOTIFY.set(nw);
+}
+
+/// Borrow the `notify_watcher` handle for code in sibling modules that
+/// needs to call `notify::Watcher::{watch,unwatch}` from outside an
+/// Inner-locked section (per the lock-ordering invariant). Returns
+/// `None` if `start_if_needed` hasn't run yet — caller should treat
+/// that as a no-op silently.
+pub(super) fn notify_watcher_handle()
+    -> Option<&'static Arc<Mutex<Option<notify::RecommendedWatcher>>>>
+{
+    WATCHER_NOTIFY.get()
 }
 
 // Debounce floor — coalesces FSEvents that fire within this window. macOS
@@ -72,6 +101,9 @@ pub fn subscribe_fsevents(handle: &TranscriptHandle) -> Result<Subscription, Wat
     let inner = WATCHER_INNER
         .get()
         .ok_or(WatcherError::NotStarted)?;
+    let notify_watcher = WATCHER_NOTIFY
+        .get()
+        .ok_or(WatcherError::NotStarted)?;
 
     // Watch the PARENT dir, not the file itself — per the docstring
     // invariant: JSONL writes via atomic-rename change the watched inode,
@@ -87,38 +119,48 @@ pub fn subscribe_fsevents(handle: &TranscriptHandle) -> Result<Subscription, Wat
         })?
         .to_path_buf();
 
-    let mut g = inner.lock().map_err(|_| WatcherError::NotStarted)?;
-    if g.shutdown {
-        return Err(WatcherError::NotStarted);
-    }
+    // Phase A (Inner lock): ref-count bookkeeping. Capture whether THIS
+    // call is the one that needs to invoke notify::Watcher::watch
+    // (the prev==0 case), then DROP Inner before the notify call to
+    // avoid the lock-while-calling-notify deadlock per task-11.
+    let (sub_id, must_register) = {
+        let mut g = inner.lock().map_err(|_| WatcherError::NotStarted)?;
+        if g.shutdown {
+            return Err(WatcherError::NotStarted);
+        }
+        g.next_id += 1;
+        let sub_id = g.next_id;
+        let prev = g.parent_dir_refs.get(&parent).copied().unwrap_or(0);
+        g.parent_dir_refs.insert(parent.clone(), prev + 1);
+        (sub_id, prev == 0)
+    };  // <-- Inner lock DROPPED here
 
-    g.next_id += 1;
-    let sub_id = g.next_id;
+    if must_register {
+        // Phase B (notify_watcher lock, no Inner held): the actual
+        // notify::Watcher::watch call. If this blocks waiting for the
+        // FSEvents callback thread, on_fs_event can still acquire Inner
+        // freely — no deadlock.
+        let watch_result = {
+            let mut nw = notify_watcher
+                .lock()
+                .map_err(|_| WatcherError::NotStarted)?;
+            let w = nw.as_mut().ok_or(WatcherError::NotStarted)?;
+            use notify::Watcher;
+            // NonRecursive — JSONL writes happen directly in the parent
+            // dir; recursive would inflate the event volume for adapter
+            // roots that contain nested project dirs (Codex's date
+            // hierarchy in particular).
+            w.watch(&parent, notify::RecursiveMode::NonRecursive)
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                })
+        };
 
-    // Ref-count: only the first subscription for a given parent dir
-    // actually invokes notify::Watcher::watch. Two adapters whose JSONLs
-    // share a parent dir (e.g. two Claude Code agents in the same
-    // project) share one notify registration but get distinct
-    // Subscription tokens (matching the docstring's test contract).
-    let prev = g.parent_dir_refs.get(&parent).copied().unwrap_or(0);
-    g.parent_dir_refs.insert(parent.clone(), prev + 1);
-
-    if prev == 0 {
-        let watcher = g
-            .watcher
-            .as_mut()
-            .ok_or(WatcherError::NotStarted)?;
-        use notify::Watcher;
-        // NonRecursive — JSONL writes happen directly in the parent dir;
-        // recursive would inflate the event volume for adapter roots that
-        // contain nested project dirs (Codex's date hierarchy in
-        // particular).
-        watcher
-            .watch(&parent, notify::RecursiveMode::NonRecursive)
-            .map_err(|e| {
-                // Roll back the ref-count on failure so a future
-                // subscribe_fsevents on the same parent doesn't think
-                // notify is already listening.
+        if let Err(e) = watch_result {
+            // Phase C (Inner lock again): roll back the ref-count we
+            // pre-incremented in Phase A. Brief Inner lock — no notify
+            // calls inside.
+            if let Ok(mut g) = inner.lock() {
                 let cur = g.parent_dir_refs.get(&parent).copied().unwrap_or(1);
                 let rolled = cur.saturating_sub(1);
                 if rolled == 0 {
@@ -126,11 +168,9 @@ pub fn subscribe_fsevents(handle: &TranscriptHandle) -> Result<Subscription, Wat
                 } else {
                     g.parent_dir_refs.insert(parent.clone(), rolled);
                 }
-                WatcherError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            }
+            return Err(WatcherError::Io(e));
+        }
     }
 
     Ok(Subscription(sub_id))
@@ -290,9 +330,20 @@ pub fn on_fs_event(subscription: &Subscription, event_path: &PathBuf) {
     // can't reach the Tauri State<> from this thread, but we own an
     // Arc clone of the same Inner that powers the live watcher — so
     // a temporary TranscriptWatcher pointing at the same Arc behaves
-    // identically. (The Drop on this temporary doesn't touch Inner.)
+    // identically. The façade also shares the notify_watcher mutex
+    // (cloned from the OnceLock-installed handle) so that any code
+    // path on it which needs notify::Watcher won't NPE — though
+    // append_normalized_turn / rotate_if_needed today don't call into
+    // notify, so an empty placeholder would also work. Sharing the
+    // real handle is forward-compat for any future façade caller.
+    // (The Drop on this temporary doesn't touch Inner or notify.)
+    let notify_facade = WATCHER_NOTIFY
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
     let façade = super::TranscriptWatcher {
         inner: inner.clone(),
+        notify_watcher: notify_facade,
     };
     let token = super::WatchToken(token_id);
 
