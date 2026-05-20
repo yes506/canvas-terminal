@@ -180,12 +180,15 @@ export function DrawingBoard() {
   // render. Integer-snap left/top avoids a mild bilinear pass from sub-pixel
   // placement.
   //
-  // `sourceScale` is the device-pixels-per-CSS-pixel factor that produced the
-  // source bitmap — must match the `scale`/`multiplier` used at capture. Pass
-  // `dpr` for `exportCanvasToDataUrl` (multiplier=dpr) and `dpr*2` for the
-  // fullwindow `html2canvas(scale: dpr*2)` path. Without this, the helper
-  // would compute the source's CSS width incorrectly for higher-density
-  // captures and clamp/scale the displayed image to the wrong size.
+  // `sourceScale` is the device-pixels-per-CSS-pixel factor that produced
+  // the source bitmap — must match the scale at which the bitmap was
+  // captured. Pass `window.devicePixelRatio` for `exportCanvasToDataUrl`
+  // (canvas-only capture, multiplier=dpr) and the `sourceScale` returned
+  // by `capture_main_window_png` for the full-window path (Rust reads
+  // the actual device scale at capture time, which is robust against
+  // multi-display drag between click and capture). Without the right
+  // value, the helper computes CSS width incorrectly and the displayed
+  // image is mis-sized on high-DPI displays.
   const addCapturedScreenshotToCanvas = (dataUrl: string, sourceScale: number) => {
     if (!fabricCanvas) return;
     const imgEl = new Image();
@@ -301,7 +304,10 @@ export function DrawingBoard() {
     try {
       const savedPath = await invoke<string>("export_snapshot", { base64Data });
       await writeText(savedPath);
-      setSnapshotToast(savedPath);
+      // The toast text carries its own intended display string (no
+      // auto-prefix at the renderer) so capture/permission messages
+      // don't accidentally appear as "Copied to clipboard: ...".
+      setSnapshotToast(`Copied to clipboard: ${savedPath}`);
       setTimeout(() => setSnapshotToast(null), 3000);
     } catch (err) {
       console.error("Export for AI failed:", err);
@@ -388,7 +394,10 @@ export function DrawingBoard() {
       {/* Snapshot export toast */}
       {snapshotToast && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-surface-light/95 backdrop-blur border border-surface-lighter rounded-lg px-3 py-2 shadow z-10 text-xs text-text-muted max-w-[90%]">
-          <span className="text-green-400">{snapshotToast.startsWith("Saved:") ? "" : "Copied to clipboard: "}</span>
+          {/* The toast text is the full intended display string (set by
+              each caller). No auto-prefix here — that would mislabel
+              capture rationale / PERMISSION_DENIED / "Capture failed"
+              messages as clipboard operations. */}
           <code className="text-text">{snapshotToast}</code>
         </div>
       )}
