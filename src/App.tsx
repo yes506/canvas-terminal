@@ -85,17 +85,24 @@ export default function App() {
       if (!dragging.current || !containerRef.current) return;
       const cw = containerRef.current.getBoundingClientRect().width;
       const browserW = browserDrawerOpen ? browserDrawerWidth : 0;
-      // Drag-time clamp: same single-drawer primitive as before (drag stops
-      // at selfMin=280, doesn't push terminal below 48 px). The drag handler
-      // updates INTENT (React state) instead of mutating the DOM directly;
-      // the render path computes effective width via resolveDrawerWidths.
-      // Sibling-aware clamping at render time handles the cross-drawer
-      // budget; this drag-time clamp keeps the drag-feel snappy without
-      // adding sibling-effective dependencies.
+      // Drag-time clamp mirrors resolveDrawerWidths's render-time handle
+      // budget: 4 px for canvas's own handle (always present while dragging)
+      // plus 4 px for the browser handle when that drawer is open. Without
+      // this the drag would stop 8 px past where the panel actually renders,
+      // leaving an 8 px cursor↔handle lag at max drag (caught by @claude3
+      // H2 in peer review). Drag handler updates INTENT (React state); the
+      // render path runs the same intent through resolveDrawerWidths.
+      // Contrast with BrowserDrawer's drag handler, which uses a self-aware
+      // sanitizer [280, containerWidth] because browser intent is persisted
+      // by useBrowserTabsSettings's debounced settings writer — canvas
+      // intent lives only in React state, so it doesn't need the same
+      // persistence guard.
+      const handleBudget = 4 + (browserDrawerOpen ? 4 : 0);
       const newWidth = clampDrawerWidth({
         proposedWidth: ev.clientX,
         containerWidth: cw,
         siblingDrawerWidth: browserW,
+        terminalMinWidth: 48 + handleBudget,
       });
       setCanvasIntent(newWidth);
     };

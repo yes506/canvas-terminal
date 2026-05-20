@@ -44,11 +44,12 @@ export function clampDrawerWidth(input: ClampInput): number {
  *
  * Order-independence: each drawer's effective is computed against the
  * OTHER drawer's INTENT (not effective), so the result does not depend on
- * which side is evaluated first. Known small trade-off — in extreme
- * asymmetric squeezes (e.g. canvas_intent=700, browser_intent=300,
- * container=1000) the intent-sibling formulation can leave ≤ ~20 px
- * unused; acceptable for v1, a future fixed-point iteration could close
- * the gap if product cares.
+ * which side is evaluated first. Trade-off — at extreme asymmetric
+ * intents (one drawer's intent far exceeds available budget, the other's
+ * fits), the intent-sibling formulation can leave proportionally some
+ * width unallocated to the terminal that a sibling-effective formulation
+ * would recover. Acceptable for v1; a future fixed-point iteration could
+ * close the gap if product cares.
  *
  * Handle budgeting: each open drawer contributes one drag handle of
  * `handleWidth` px (default 4 — Tailwind `w-1` = 0.25rem). The total is

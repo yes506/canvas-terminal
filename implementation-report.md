@@ -91,6 +91,51 @@ comment blocks accompanying each change; the load-bearing logic is
 9. **AC §9 — drag at narrow window**: at minWidth=800, with canvas intent=490, attempt to drag browser drawer wider. **Expect**: drag tracks cursor up to the helper's effective max; no visible snap-back; terminal stays at ≥ 48 px throughout. Confirms the (A) option works in practice (drop local drag clamp + render-time effective).
 10. **AC §10 — sanitizer (drag past window edge)**: at any window size, drag the browser handle past the left edge of the application window (so cursor goes "outside"). After releasing the drag, inspect the persisted `drawerWidth` in settings: it must be **≥ 280** (not 0 or negative). Confirms the `Math.max(280, ...)` sanitizer prevents nonsense persistence.
 
+## Post-implementation peer review (round 15)
+
+After commits `a7df95f` + `e3bb1a2`, four peers reviewed (task-80
+through task-83). Verdicts:
+
+- **@claude2** — merge after manual AC. One stylistic suggestion
+  (canvas drag comment cross-reference). Non-blocking.
+- **@codex2** — ratify, no blockers. Two residual notes (restored
+  settings could normalize sub-280, "~20 px" comment imprecise).
+- **@claude3** — ratify with two observations. **H2 substantive**:
+  canvas drag-time `clampDrawerWidth` omitted the handle budget that
+  `resolveDrawerWidths` includes at render time → 4-8 px cursor↔handle
+  lag at max drag (both drawers open). One-line fix recommended in-PR.
+- **@codex3** — approve, no code blockers. `npm run build` clean.
+
+**Folds (commit `<post-review fix sha>`)** — three small reflections,
+all in-scope (body-generation only; no signature changes):
+
+1. **App.tsx canvas drag handler** — pass `terminalMinWidth: 48 +
+   handleBudget` where `handleBudget = 4 + (browserDrawerOpen ? 4 :
+   0)`, mirroring `resolveDrawerWidths`'s render-time handle budget.
+   Closes @claude3's H2. Comment expanded with the cursor↔handle-lag
+   rationale and the explicit contrast with BrowserDrawer's
+   self-aware sanitizer (also closes @claude2's stylistic
+   suggestion).
+2. **drawerLayout.ts asymmetric-slack comment** — softened the "≤ ~20
+   px" numeric bound (derived from a specific example) to the general
+   shape "at extreme asymmetric intents, proportionally some width
+   unallocated". Closes @codex2's residual note 2.
+3. **@codex2's residual note 1** (restored settings <280 normalization)
+   and **@claude3's H1** (sanitizer is intentional deviation from v4's
+   literal "no clamp") deliberately NOT folded — both are out of v4
+   scope. Note 1 belongs in `useBrowserTabsSettings` hardening (future
+   patch); H1 was an intentional deviation we already documented in
+   BrowserDrawer's drag-handler comment.
+
+Validation post-fold: `tsc --noEmit` = 0; `vitest` = 15/15 passing
+(no test changes required — the unit tests assert helper math, which
+was unaffected; H2 was an App-level drag-time/render-time alignment
+issue not visible in the helper's pure-numeric surface).
+
+**Pattern worth pinning**: single-reviewer behavioral findings with
+concrete reproduction + one-line fix should generally fold in-PR
+rather than be deferred to a follow-up. @claude3's H2 met both bars.
+
 ## Process note — final iteration in the 14-round arc
 
 This commit closes the four-layer arc that started with the original
