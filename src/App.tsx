@@ -8,7 +8,7 @@ import { useCanvasIntegration } from "./components/canvas/CanvasIntegration";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useCanvasStore } from "./stores/canvasStore";
 import { useBrowserStore } from "./stores/browserStore";
-import { clampDrawerWidth } from "./lib/drawerLayout";
+import { clampDrawerWidth, resolveDrawerWidths } from "./lib/drawerLayout";
 import { checkForUpdates } from "./lib/updater";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -23,7 +23,16 @@ export default function App() {
   useKeyboardShortcuts();
 
   const [containerWidth, setContainerWidth] = useState(0);
-  const [canvasWidth, setCanvasWidth] = useState(0);
+  // `canvasIntent` is the user's last-dragged canvas width in pixels, or
+  // `null` if the user hasn't dragged the canvas drawer yet. Under the
+  // null sentinel the canvas pane renders at CSS `width: 35%` (responsive
+  // to the container before any drag); after first drag the intent is a
+  // px value and the render path runs it through `resolveDrawerWidths`.
+  // This separation keeps the user's intent stable across window resize:
+  // shrinking the window narrows the rendered (effective) width via the
+  // helper, but doesn't overwrite intent — expanding the window restores
+  // the drawer toward the user's original drag value automatically.
+  const [canvasIntent, setCanvasIntent] = useState<number | null>(null);
 
   useEffect(() => {
     getVersion().then((version) => {
@@ -73,18 +82,22 @@ export default function App() {
     dragging.current = true;
 
     const onMouseMove = (ev: MouseEvent) => {
-      if (!dragging.current || !containerRef.current || !canvasPanelRef.current) return;
+      if (!dragging.current || !containerRef.current) return;
       const cw = containerRef.current.getBoundingClientRect().width;
       const browserW = browserDrawerOpen ? browserDrawerWidth : 0;
-      // Shared two-drawer clamp (Phase-1 in-scope #10): reserve space for
-      // the right-side browser drawer + 48px terminal minimum.
+      // Drag-time clamp: same single-drawer primitive as before (drag stops
+      // at selfMin=280, doesn't push terminal below 48 px). The drag handler
+      // updates INTENT (React state) instead of mutating the DOM directly;
+      // the render path computes effective width via resolveDrawerWidths.
+      // Sibling-aware clamping at render time handles the cross-drawer
+      // budget; this drag-time clamp keeps the drag-feel snappy without
+      // adding sibling-effective dependencies.
       const newWidth = clampDrawerWidth({
         proposedWidth: ev.clientX,
         containerWidth: cw,
         siblingDrawerWidth: browserW,
       });
-      canvasPanelRef.current.style.width = `${newWidth}px`;
-      setCanvasWidth(newWidth);
+      setCanvasIntent(newWidth);
     };
 
     const onMouseUp = () => {
@@ -97,35 +110,61 @@ export default function App() {
     document.addEventListener("mouseup", onMouseUp);
   }, [browserDrawerOpen, browserDrawerWidth]);
 
-  // Track container width + canvas panel width so the browser drawer's
-  // clamp math has accurate sibling-width info.
+  // Track container width so `resolveDrawerWidths` recomputes both
+  // effective drawer widths at render time as the window resizes. The
+  // handler is measurement-only — it does NOT write back to any drawer
+  // intent. That's the load-bearing property: intent stays stable across
+  // resize (no lossy persistence, no drag-vs-resize race), and the
+  // render path produces the right effective widths from current
+  // container + stored intents.
   useEffect(() => {
     const updateMeasurements = () => {
       if (containerRef.current) {
         setContainerWidth(containerRef.current.getBoundingClientRect().width);
       }
-      if (canvasPanelRef.current && drawerOpen) {
-        setCanvasWidth(canvasPanelRef.current.getBoundingClientRect().width);
-      } else if (!drawerOpen) {
-        setCanvasWidth(0);
-      }
     };
     updateMeasurements();
     window.addEventListener("resize", updateMeasurements);
     return () => window.removeEventListener("resize", updateMeasurements);
-  }, [drawerOpen]);
+  }, []);
+
+  // Materialize the canvas null sentinel into a concrete pixel value for
+  // the helper. Pre-first-drag, intent is null; we substitute a sensible
+  // default (max of selfMin and ~35% of container) so the helper has a
+  // numeric sibling value when clamping the browser drawer. The CANVAS
+  // RENDER below still uses CSS "35%" until first drag — the materialized
+  // value only feeds the helper math.
+  const materializedCanvasIntent =
+    canvasIntent ?? Math.max(280, containerWidth * 0.35);
+  const { canvasEffective, browserEffective } = resolveDrawerWidths({
+    canvasIntent: materializedCanvasIntent,
+    browserIntent: browserDrawerWidth,
+    containerWidth,
+    canvasOpen: drawerOpen,
+    browserOpen: browserDrawerOpen,
+  });
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden" style={{ background: "transparent" }}>
       <UpdateBanner />
       <div ref={containerRef} className="flex flex-1 min-h-0 overflow-hidden" style={{ background: "transparent" }}>
-      {/* Canvas panel — always mounted, width controlled by CSS */}
+      {/* Canvas panel — always mounted, width controlled by React state.
+       *  Pre-first-drag: intent is null → render at CSS "35%" so the
+       *  panel scales responsively with the window. After first drag:
+       *  intent is a px value → render at canvasEffective from
+       *  resolveDrawerWidths, which re-clamps against the current
+       *  container + browser intent on every render (auto-restores
+       *  toward intent when the window grows back). */}
       <div
         ref={canvasPanelRef}
         className="flex flex-shrink-0 h-full overflow-hidden"
         style={{
           background: "transparent",
-          width: drawerOpen ? "35%" : 0,
+          width: !drawerOpen
+            ? 0
+            : canvasIntent === null
+              ? "35%"
+              : `${canvasEffective}px`,
           minWidth: drawerOpen ? 280 : 0,
         }}
       >
@@ -161,7 +200,7 @@ export default function App() {
 
       {/* Right-side browser drawer + its drag handle */}
       <BrowserDrawer
-        canvasDrawerWidth={drawerOpen ? canvasWidth : 0}
+        browserEffectiveWidth={browserEffective}
         containerWidth={containerWidth}
       />
       </div>
