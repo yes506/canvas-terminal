@@ -1,130 +1,117 @@
-# Implementation report — frame-collision-clip
+# Implementation report — drawer-resize-reclamp
 
 (Prior `implementation-report.md` on `dev` documented
-`capture-fix-injection` and before that `native-window-capture`.
-Overwritten with this micro-lane report; historical content reachable
+`frame-collision-clip` and before that `capture-fix-injection`.
+Overwritten with this local-lane report; historical content reachable
 via `git log -- implementation-report.md`.)
 
 ## Source
 
-- **Planner marker**: `scale: micro` (chat-only per CLAUDE.md; no
-  commit-based marker for micro lane)
+- **Planner marker**: `scale: local` (chat-only per CLAUDE.md)
 - **Confirmation token**: `confirm plan` typed in this session after
-  the v2 marker emit
-- **Convergence**: 1 planning round + 1 review round; v2 plan ratified
-  by 4/4 reviewers in round 9
-- **Cross-reference**: task-48 investigation report names this as the
-  long-deferred live-UI cousin of @claude2's round-1 Concern #1 on
-  `native-window-capture` (the capture-side artifact landed at
-  `3da8c54`; this is the matching real-UI fix)
+  the v5 marker emit
+- **Convergence**: 5 plan iterations (v1 → v5), 5 review rounds
+  (rounds 11–14). v5 ratified by 4/4 reviewers in round 14 with one
+  convergent guardrail folded in (browser drag sanitizer).
+- **Cross-reference**: task-59 investigation report (origin of the
+  resize-reclamp need); the round-11→14 plan iteration history is in
+  tasks 64, 69, 74, 79 (planner reflections).
 
 ## Work-queue summary
 
-- Total items: **1**
-- Completed: **1**
+- Total items: **4**
+- Completed: **4**
 - Blocked: **0**
 
 ## Files changed
 
 ```
- src/App.tsx | 9 ++++++++-
- 1 file changed, 7 insertions(+), 2 deletions(-)
+ src/App.tsx                                  | ~45 lines (state + helper call + render path)
+ src/components/browser/BrowserDrawer.tsx     | ~30 lines (prop rename + sanitizer + drop local clamp)
+ src/lib/drawerLayout.ts                      | +74 lines (new resolveDrawerWidths helper + doc comment)
+ src/lib/drawerLayout.test.ts                 | +124 lines (7 new tests for the helper)
+ 4 files changed, 274 insertions(+), 35 deletions(-)
 ```
 
-Single file, 7-line insertion (1 Tailwind class + 5-line preserve-
-comment + closing-bracket newline), 2-line deletion (the prior
-single-line comment + the prior className line).
+(The 274/35 totals from `git diff --shortstat dev..HEAD` include the
+comment blocks accompanying each change; the load-bearing logic is
+~30-40 lines as predicted by v5.)
 
 ## Validation
 
-- **Baseline exit** (worktree HEAD = `dev` at `2503e08`):
-  `npx tsc --noEmit` = 0
-- **Final validation command**: `cd <worktree> && npx tsc --noEmit`
+- **Baseline exit** (worktree HEAD = `dev` at `c6bc25e`):
+  `tsc --noEmit` = 0, `vitest run src/lib/drawerLayout.test.ts` =
+  8/8 passing
+- **Final validation command**: `cd <worktree> && npx tsc --noEmit && npx vitest run src/lib/drawerLayout.test.ts`
 - **Final exit**: 0
-- **Auto-fix attempts used**: **0 / 3** (validation passed on first
-  attempt; no type-surface change)
-- Tail of final tsc run: no output (clean compile)
-
-The `cargo check` Rust validation is **not relevant** for this lane —
-the change is TypeScript only, the `Cargo.toml` build manifest lives
-under `src-tauri/` (a subdirectory, not a root build file), and the
-project's primary root build manifest is `tsconfig.json`.
+- **Auto-fix attempts used**: **1 / 3** — one test assertion was
+  using `.toBe(490)` against `Math.max(280, 0.35 * 1400)` which
+  IEEE 754 produces as `489.99999999999994`. Fixed by switching to
+  `.toBeCloseTo(490, 5)`. **Pure test bug**; the helper math is
+  unchanged.
+- Final test run: 15/15 passing (8 existing `clampDrawerWidth` + 7
+  new `resolveDrawerWidths`).
 
 ## Per-item outcomes
 
 | Item | Description | Status | File | Notes |
 |---|---|---|---|---|
-| 1 | Add `overflow-hidden` to terminal panel container's className + insert 5-line preserve-comment | completed | `src/App.tsx` | Tailwind class lands inline at L158 (was L152 pre-change); preserve-comment names the canvas/browser-drawer parallel + the `clampDrawerWidth` degraded-mode condition that triggers the collision. Future contributors should not strip the class as "surplus". |
+| 1 | Add `resolveDrawerWidths` helper | completed | `src/lib/drawerLayout.ts` | Pure function. Inputs: `canvasIntent`, `browserIntent`, `containerWidth`, `canvasOpen`, `browserOpen`, optional `canvasMin`/`browserMin`/`terminalMin`/`handleWidth`. Outputs: `{canvasEffective, browserEffective}`. Handle count computed internally from open flags × `handleWidth` (default 4). Sibling = OTHER drawer's INTENT (not effective) → order-independent. ~20 px asymmetric-allocation note in inline comment per @claude3 F1. |
+| 2 | Add 7 unit tests for helper | completed | `src/lib/drawerLayout.test.ts` | normal / squeeze@800 / expand-back / null-fallback materialized / single-drawer / no-drawer / handle-width override. All pass after the one auto-fix. |
+| 3 | App.tsx: state + helper call + render + drop DOM-write | completed | `src/App.tsx` | New `canvasIntent: number \| null` state. Drag handler updates intent (no DOM mutation). Resize handler measurement-only (just `setContainerWidth`). Materializes null → `Math.max(280, 0.35 * containerWidth)` inline before helper call. Canvas panel renders `"35%"` when `canvasIntent === null`, otherwise `canvasEffective`. Pass `browserEffectiveWidth` to BrowserDrawer (replaces `canvasDrawerWidth`). |
+| 4 | BrowserDrawer.tsx: new prop + sanitizer + drop local clamp | completed | `src/components/browser/BrowserDrawer.tsx` | New `browserEffectiveWidth: number` prop (replaces `canvasDrawerWidth`). Drag handler drops sibling-aware clamp; adds self-aware sanitizer `Math.max(280, Math.min(containerWidth, proposed))` so absurd raw deltas don't leak to settings via `useBrowserTabsSettings`'s debounced persist. Removed unused `drawerWidth` selector (read happens via the prop now). |
 
 ## Scope-discipline self-check
 
-- [x] No new interfaces / files outside the plan's hint set — only `src/App.tsx` touched
-- [x] No renames of committed public names — only one Tailwind class added to existing JSX
-- [x] No signature changes on planner-committed methods — no methods involved (CSS-class change only)
-- [x] No edits to `validation_command` configuration — `package.json`, `tsconfig.json`, build scripts all untouched
-- [x] No edits to files outside the work queue's hint set — exactly one file
-- [x] BGRA → RGBA channel swap (capture.rs from prior `impl-local`) — untouched
-- [x] Native capture permission flow — untouched
-- [x] `WebglAddon(false)` in terminalManager.ts — untouched
-- [x] `clampDrawerWidth` math — untouched (intentional degraded mode per task-48 §"Why the clamp math is not in scope")
-- [x] `TerminalTabs.tsx` — untouched (Option B explicitly deferred; tab-bar `overflow-hidden` would clip the drag preview which is `position: absolute` inside the bar)
-- [x] No z-index changes — z-stack is correct; the bug was about clipping, not stacking
-- [x] No `BrowserDrawer.tsx` changes — already clips at its panel box
-- [x] No `package.json` / `tauri.conf.json` / capability JSON changes
+- [x] No new interfaces / files outside the plan's hint set — same 4 files predicted by v5
+- [x] No renames of committed public names — `clampDrawerWidth` and its signature are unchanged
+- [x] No signature changes on planner-committed methods — `clampDrawerWidth` is additive (new helper is a composition)
+- [x] No edits to `validation_command` configuration — `package.json`, `tsconfig.json` untouched
+- [x] No edits to files outside the work queue's hint set — diff is exactly the 4 named files
+- [x] BGRA → RGBA channel swap (capture.rs from prior runs) — untouched
+- [x] Native capture command — untouched
+- [x] Frame-collision `overflow-hidden` on terminal panel — untouched (still in place at App.tsx:158)
+- [x] `clampDrawerWidth`'s "give up at selfMin when upperBound < selfMin" degraded mode — preserved (it's what makes the squeeze graceful)
+- [x] No z-index changes
+- [x] No `tauri.conf.json` `minWidth` change
+- [x] No `package.json` / Cargo.toml / capability JSON changes
 
 ## Notes for the manual acceptance pass
 
-`tsc --noEmit` validates types but cannot exercise layout behavior.
-Required runtime checks (full text in the v2 plan + task-48 report):
+`tsc --noEmit` + `vitest` validate types and helper math but **cannot exercise live layout** during window resize. The runtime AC is the only way to verify the user-visible UX change.
 
-1. **AC §1**: Shrink window to ~580 px with both drawers open at
-   min-widths. Terminal panel collapses; **no terminal tabs render
-   visibly inside the browser-drawer column**.
-2. **AC §2**: Open 3+ terminal tabs and repeat AC §1. Tabs visible
-   only within the terminal panel.
-3. **AC §3 — drag affordances (three sub-conditions)**:
-   - (i) Insertion indicators at tab boundaries (lines 252/291)
-     render as full 1-px accent lines, not bisected.
-   - (ii) Floating drag preview (line 316+) follows the cursor
-     **without clipping** while the cursor is inside the terminal
-     panel.
-   - (iii) When the cursor crosses into the browser-drawer column,
-     the preview is **expected to clip** at the panel edge. This is
-     Option A intended behavior — verify the drag still **completes
-     correctly** (releases at the cursor position; tab reorders). If
-     product finds the clip intrusive, the follow-up is a **React
-     portal to `document.body`** for the preview, NOT removing the
-     panel-level `overflow-hidden`.
-4. **AC §4 — regression check (not the primary capture fix; that
-   landed at `3da8c54`)**: Re-test Capture Full Window. The native
-   capture sees what the user sees, so the live-UI fix reflects in
-   screenshots automatically.
-5. **AC §5 — recovery from squeeze**: Shrink window to ~580 px, then
-   **expand back to 1200 px**. Terminal panel recovers to full width
-   with no stuck-clipping artifact. Confirms `overflow-hidden` ×
-   `flex-shrink-0` siblings interact cleanly.
+1. **AC §1 — reproduce the user's snapshot scenario**: open at 1400×900, drag canvas to ~490 and browser to ~600. Shrink window to 800 px. **Expect**: terminal panel ≥ ~48 px (visible strip); both drawers auto-shrunk to 280 (degraded mode); terminal absorbs the rest (~232 px after handle budget). Pre-fix: terminal at 0.
+2. **AC §2 — no drag regression**: at 1400 px, drag each drawer in turn. **Expect**: drag stops at 280 px floor; no jitter; same feel as before this fix.
+3. **AC §3 — resize back up (free UX win from intent/effective separation)**: after AC §1's shrink, expand window back to 1400. **Expect**: drawers automatically restore toward their original intents (canvas back to 490, browser back to 600). **No re-drag needed.** This was explicitly out-of-scope in v1; v3+ design makes it free.
+4. **AC §4 — one drawer only**: open just the canvas drawer at 700 px. Shrink window past canvas+terminal threshold. **Expect**: canvas shrinks; terminal stays visible. Expand: canvas restores to 700.
+5. **AC §5 — no drawer open**: shrink aggressively. Terminal fills available space. No regressions.
+6. **AC §6 — rapid resize gesture**: drag window corner over 2-3 seconds. Drawer widths track smoothly without stutter or jump-oscillation. (Should pass for free under React batching.)
+7. **AC §7 — persistence**: after AC §1's shrink, wait > 800 ms (the `useBrowserTabsSettings` debounce). Verify the persisted browser `drawerWidth` in settings storage **still reflects the user's intent (600)**, not the shrunk effective (280). Confirms the intent/effective separation prevents lossy persistence.
+8. **AC §8 — toggle-during-resize**: close one drawer (e.g. canvas toggle off) → shrink window aggressively → re-open canvas. **Expect**: canvas drawer renders at its remembered intent value (or CSS `35%` if never dragged), not at a stale clamped value.
+9. **AC §9 — drag at narrow window**: at minWidth=800, with canvas intent=490, attempt to drag browser drawer wider. **Expect**: drag tracks cursor up to the helper's effective max; no visible snap-back; terminal stays at ≥ 48 px throughout. Confirms the (A) option works in practice (drop local drag clamp + render-time effective).
+10. **AC §10 — sanitizer (drag past window edge)**: at any window size, drag the browser handle past the left edge of the application window (so cursor goes "outside"). After releasing the drag, inspect the persisted `drawerWidth` in settings: it must be **≥ 280** (not 0 or negative). Confirms the `Math.max(280, ...)` sanitizer prevents nonsense persistence.
 
-## Residual-risk note (per @codex2; out of scope)
+## Process note — final iteration in the 14-round arc
 
-If a user reports terminal tabs overlapping with **in-bar controls**
-(`CollaboratorButton` / `BrowserToggleButton` at the right of the tab
-bar), the App-level clip alone won't catch that — those buttons live
-inside the tab bar, so overflow within the bar would still paint over
-them. That would require Option B (clipping the tab bar) PLUS a portal
-for the drag preview — a separate `local` ticket if the AC reveals it.
+This commit closes the four-layer arc that started with the original
+`Capture Full Window` bug:
 
-## Process note
+1. **L1 architecture** (caught by planning rounds): html2canvas can't see Tauri webviews → `native-window-capture` (impl-local, `3da8c54`).
+2. **L2 IPC** (caught by Tauri-source reads): `WebviewWindow` arg-injector fails under multi-webview → `capture-fix-injection` (impl-micro, `2503e08`).
+3. **L3 live UI paint** (caught by user runtime AC): terminal panel missing panel-level clip → `frame-collision-clip` (impl-micro, `c6bc25e`).
+4. **L4 live UI layout reflow** (caught by user runtime AC): stale drag widths persist through resize → `drawer-resize-reclamp` (impl-local, this commit).
 
-This is the third micro/local fix in the chain
-(native-window-capture → capture-fix-injection → frame-collision-clip).
-Each surfaced a different failure mode in the same `Capture Full
-Window` / panel-layout area:
-- `native-window-capture`: html2canvas can't see Tauri webviews.
-- `capture-fix-injection`: Tauri `WebviewWindow` arg-injector fails
-  under multi-webview layout.
-- `frame-collision-clip`: terminal panel lacks panel-level clip.
+Each layer had a distinct failure mode and surfaced from a distinct
+verification surface. The vault's `observation-20260502-v4-verification-pattern`
+maps cleanly: build-sanity gates catch architecture and types;
+manual AC catches IPC injection and layout behavior; runtime use
+catches each remaining layer.
 
-The first two were caught by code review + Tauri-source reads; this
-one needed user runtime AC. Each verification layer has a distinct
-failure mode — this pattern is the vault's
-`observation-20260502-v4-verification-pattern` working as designed.
+Also worth pinning: **convergent reviewer signal repeatedly simplified
+the design over rounds 11→14**. Drop C1 sub-floor (round 11). Adopt
+intent/effective separation (round 11). Extract pure helper (round 12).
+Drop local drag clamp (round 13). Add sanitizer (round 14). Each
+removal made the plan smaller and the invariant cleaner. **Pattern
+worth pinning for future planners**: when 3+ of 4 reviewers'
+concerns converge on the architecture's *shape* (not just edge
+cases), treat it as a redesign signal, not five orthogonal refinements.
