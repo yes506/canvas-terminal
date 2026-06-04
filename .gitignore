@@ -43,3 +43,4 @@ npm-debug.log*
 .planner-state.json
 .implementer-state.json
 .intent-state.json
+.plan-state.json
