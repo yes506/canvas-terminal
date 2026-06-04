@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>플랜 — korean-ime-dup-render · v1</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --fg:          #1a1a1a;
+      --fg-muted:    #5a5a5a;
+      --fg-soft:     #888;
+      --bg:          #f7f7f5;
+      --bg-card:     #fff;
+      --accent:      #2b5fb5;
+      --accent-soft: #e8f0fb;
+      --good:        #2f7c4f;
+      --good-soft:   #e6f4ec;
+      --good-line:   #b6dcc4;
+      --bad:         #b53737;
+      --bad-soft:    #fbeaea;
+      --bad-line:    #e6b8b8;
+      --warn:        #b87900;
+      --warn-soft:   #fff4d6;
+      --warn-line:   #e8c870;
+      --info:        #5a4ec0;
+      --info-soft:   #ede9fa;
+      --info-line:   #c8c0ea;
+      --border:      #e0e0dc;
+      --shadow:      0 1px 2px rgba(0,0,0,0.04);
+      --code-bg:     #f0f0ec;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
+            "Noto Sans KR", "Malgun Gothic", Roboto, "Helvetica Neue", Arial, sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+    }
+    .page { max-width: 920px; margin: 0 auto; padding: 36px 32px 60px; }
+
+    /* ── HEADER ──────────────────────────────────────────────── */
+    header.doc-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
+      margin-bottom: 24px;
+    }
+    header.doc-head h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    header.doc-head h1 .slug { color: var(--accent); }
+    .pill {
+      display: inline-block;
+      padding: 3px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      margin-left: 8px;
+    }
+    .pill.version { background: var(--info-soft); color: var(--info); }
+
+    /* ── PIPELINE BREADCRUMB (chain ubiquitous vocabulary) ───── */
+    .pipeline-wrap { margin: 0 0 18px; }
+    .pipeline-svg {
+      width: 100%; height: auto; max-height: 76px; display: block;
+    }
+
+    /* ── STAT TAPE (at-a-glance counts) ──────────────────────── */
+    .stat-tape-wrap {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 6px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .stat-tape {
+      width: 100%; height: auto; max-height: 64px; display: block;
+    }
+
+    /* ── LANE LADDER SVG (replaces text lane pill) ───────────── */
+    .lane-ladder-wrap {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 16px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .lane-ladder {
+      width: 100%; height: auto; max-width: 360px; display: block;
+    }
+
+    /* ── HERO ────────────────────────────────────────────────── */
+    .hero {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 22px 26px;
+      margin-bottom: 28px;
+      box-shadow: var(--shadow);
+    }
+    .hero .label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+      margin-bottom: 8px;
+    }
+    .hero .goal {
+      font-size: 19px;
+      font-weight: 500;
+      line-height: 1.45;
+      color: var(--fg);
+      margin: 0;
+    }
+
+    /* ── SCOPE GRID ──────────────────────────────────────────── */
+    .scope-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+    .scope-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+    }
+    .scope-col.in  { border-top: 3px solid var(--good); }
+    .scope-col.out { border-top: 3px solid var(--bad); }
+    .scope-col h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .scope-col.in  h2 { color: var(--good); }
+    .scope-col.out h2 { color: var(--bad); }
+    .scope-col ul { list-style: none; padding: 0; margin: 0; }
+    .scope-col li {
+      position: relative;
+      padding: 6px 0 6px 22px;
+      font-size: 14px;
+      line-height: 1.5;
+      border-bottom: 1px dashed var(--border);
+    }
+    .scope-col li:last-child { border-bottom: none; }
+    .scope-col.in  li::before {
+      content: "✓"; position: absolute; left: 0; top: 6px;
+      color: var(--good); font-weight: 700;
+    }
+    .scope-col.out li::before {
+      content: "✗"; position: absolute; left: 0; top: 6px;
+      color: var(--bad); font-weight: 700;
+    }
+
+    /* ── PANEL (generic) ─────────────────────────────────────── */
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .panel > h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+    }
+
+    /* ── SUCCESS CHECKLIST ───────────────────────────────────── */
+    .checklist { list-style: none; padding: 0; margin: 0; }
+    .checklist li {
+      position: relative;
+      padding: 8px 0 8px 28px;
+      font-size: 14.5px;
+      border-bottom: 1px dashed var(--border);
+    }
+    .checklist li:last-child { border-bottom: none; }
+    .checklist li::before {
+      content: ""; position: absolute; left: 0; top: 11px;
+      width: 14px; height: 14px;
+      border: 1.5px solid var(--accent);
+      border-radius: 3px;
+      background: var(--bg-card);
+    }
+
+    /* ── CONSTRAINTS ─────────────────────────────────────────── */
+    .constraint-list { list-style: none; padding: 0; margin: 0; }
+    .constraint-list li {
+      position: relative;
+      padding: 5px 0 5px 18px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .constraint-list li::before {
+      content: "▸"; position: absolute; left: 0; top: 5px;
+      color: var(--accent);
+    }
+
+    /* ── LANE REASONING CALLOUT ──────────────────────────────── */
+    .lane-callout {
+      background: var(--info-soft);
+      border: 1px solid var(--info-line);
+      border-left: 5px solid var(--info);
+      border-radius: 8px;
+      padding: 16px 22px;
+      margin-bottom: 22px;
+    }
+    .lane-callout h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--info);
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .lane-callout p {
+      margin: 0;
+      font-size: 14.5px;
+      line-height: 1.6;
+      color: var(--fg);
+    }
+
+    /* ── EVIDENCE INVENTORY TABLE ────────────────────────────── */
+    .evidence-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13.5px;
+    }
+    .evidence-table th, .evidence-table td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .evidence-table th {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+      background: var(--bg);
+    }
+    .evidence-table td.field {
+      font-weight: 600;
+      color: var(--fg);
+      white-space: nowrap;
+      width: 32%;
+    }
+    .evidence-table td.seeds .seed-row {
+      padding: 2px 0;
+      line-height: 1.5;
+    }
+    .evidence-table td.seeds .seed-row + .seed-row {
+      border-top: 1px dashed var(--border);
+      margin-top: 2px;
+      padding-top: 4px;
+    }
+    .evidence-table td.seeds code {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.92em;
+      background: var(--code-bg);
+      padding: 1px 5px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+    .evidence-table td.seeds .relevance {
+      color: var(--fg-muted);
+      font-size: 0.95em;
+    }
+    .evidence-table td.seeds .relevance.placeholder {
+      font-style: italic;
+      color: var(--fg-soft);
+    }
+    .evidence-table td.intent-only {
+      color: var(--fg-soft);
+      font-style: italic;
+    }
+    .evidence-empty {
+      padding: 16px;
+      text-align: center;
+      color: var(--fg-soft);
+      font-style: italic;
+      font-size: 13.5px;
+    }
+
+    /* ── RESOLVED AMBIGUITIES ────────────────────────────────── */
+    .resolved-list { list-style: none; padding: 0; margin: 0; }
+    .resolved-list li {
+      padding: 8px 0;
+      font-size: 14px;
+      line-height: 1.55;
+      border-bottom: 1px dashed var(--border);
+    }
+    .resolved-list li:last-child { border-bottom: none; }
+    .resolved-list .finding {
+      color: var(--fg-muted);
+    }
+    .resolved-list .resolution {
+      color: var(--fg);
+      font-weight: 500;
+    }
+    .resolved-list .resolution::before {
+      content: " → ";
+      color: var(--good);
+      font-weight: 700;
+    }
+    .resolved-list li.auto::before {
+      content: "(auto) ";
+      color: var(--fg-soft);
+      font-style: italic;
+      font-size: 12px;
+    }
+
+    /* ── OPEN QUESTIONS (loud) ───────────────────────────────── */
+    .open-questions {
+      background: var(--warn-soft);
+      border: 1px solid var(--warn-line);
+      border-left: 5px solid var(--warn);
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 28px;
+    }
+    .open-questions > h2 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--warn);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .open-questions > h2::before { content: "⚠"; font-size: 18px; }
+    .open-questions ul { list-style: none; padding: 0; margin: 0; }
+    .open-questions li {
+      padding: 6px 0;
+      font-size: 14.5px;
+      line-height: 1.5;
+      border-bottom: 1px dashed var(--warn-line);
+    }
+    .open-questions li:last-child { border-bottom: none; }
+
+    /* ── PROVENANCE FOOTER ───────────────────────────────────── */
+    footer.doc-foot {
+      margin-top: 32px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--fg-soft);
+    }
+    footer.doc-foot dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 4px 16px;
+    }
+    footer.doc-foot dt {
+      font-weight: 600;
+      color: var(--fg-muted);
+    }
+    footer.doc-foot dd {
+      margin: 0;
+      color: var(--fg);
+    }
+    footer.doc-foot code {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--code-bg);
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+
+    /* ── PLACEHOLDERS ────────────────────────────────────────── */
+    .placeholder {
+      color: var(--fg-soft);
+      font-style: italic;
+      font-size: 13.5px;
+    }
+
+    /* ── PRINT ───────────────────────────────────────────────── */
+    @media print {
+      body { background: #fff; }
+      .page { padding: 0; max-width: none; }
+      .hero, .panel, .scope-col, .lane-callout, .open-questions {
+        box-shadow: none;
+        page-break-inside: avoid;
+      }
+    }
+    /* ── NARROW ──────────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      .scope-grid { grid-template-columns: 1fr; }
+      footer.doc-foot dl { grid-template-columns: 1fr; gap: 8px; }
+      footer.doc-foot dt { margin-top: 4px; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+<div class="pipeline-wrap"><svg class="pipeline-svg" viewBox="0 0 880 76" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Pipeline position: plan"><line x1="88" y1="32" x2="792" y2="32" stroke="#d4d4cf" stroke-width="2" stroke-dasharray="4 3"/><polygon points="88,18 102,32 88,46 74,32" fill="#fff" stroke="#2b5fb5" stroke-width="1.5"/><text x="88" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">의도</text><circle cx="264" cy="32" r="14" fill="#fff" stroke="#2f7c4f" stroke-width="1.5"/><text x="264" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">씨앗</text><polygon points="440,18 454,44 426,44" fill="#7a3fb5" stroke="#7a3fb5" stroke-width="2"/><text x="440" y="62" text-anchor="middle" font-size="12" font-weight="600" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">계획</text><rect x="602" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#b87900" stroke-width="1.5"/><line x1="606" y1="29" x2="626" y2="29" stroke="#b87900" stroke-width="1.4"/><line x1="606" y1="35" x2="626" y2="35" stroke="#b87900" stroke-width="1.4"/><text x="616" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">문서 골격</text><rect x="778" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#0f7a83" stroke-width="1.5"/><line x1="792" y1="21" x2="792" y2="43" stroke="#0f7a83" stroke-width="1.4"/><text x="792" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">인터페이스</text></svg></div>
+
+<header class="doc-head">
+  <h1>
+    플랜 — <span class="slug">korean-ime-dup-render</span>
+    <span class="pill version">v1</span>
+  </h1>
+</header>
+
+<div class="stat-tape-wrap"><svg class="stat-tape" viewBox="0 0 880 64" preserveAspectRatio="xMidYMid meet" role="img" aria-label="At a glance"><text x="62" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2f7c4f" font-family="-apple-system, system-ui, sans-serif">3</text><text x="62" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">범위 안</text><line x1="125" y1="12" x2="125" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="187" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b53737" font-family="-apple-system, system-ui, sans-serif">2</text><text x="187" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">범위 밖</text><line x1="250" y1="12" x2="250" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="312" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">5</text><text x="312" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">성공 기준</text><line x1="375" y1="12" x2="375" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="437" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">5</text><text x="437" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">제약</text><line x1="500" y1="12" x2="500" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="562" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#bbb" font-family="-apple-system, system-ui, sans-serif">0</text><text x="562" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#999" font-family="-apple-system, system-ui, sans-serif">기여 시드</text><line x1="625" y1="12" x2="625" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="687" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#bbb" font-family="-apple-system, system-ui, sans-serif">0</text><text x="687" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#999" font-family="-apple-system, system-ui, sans-serif">해결됨</text><line x1="750" y1="12" x2="750" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="812" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b87900" font-family="-apple-system, system-ui, sans-serif">1</text><text x="812" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">미해결</text></svg></div>
+<div class="lane-ladder-wrap"><svg class="lane-ladder" viewBox="0 0 360 64" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Scale lane: system"><rect x="4" y="30" width="76" height="16" rx="3" fill="#fff" stroke="#0f7a83" stroke-width="1.4"/><text x="42" y="58" text-anchor="middle" font-size="11" font-weight="500" fill="#888" letter-spacing="0.04em" font-family="-apple-system, system-ui, sans-serif">마이크로</text><rect x="88" y="22" width="76" height="24" rx="3" fill="#fff" stroke="#2b5fb5" stroke-width="1.4"/><text x="126" y="58" text-anchor="middle" font-size="11" font-weight="500" fill="#888" letter-spacing="0.04em" font-family="-apple-system, system-ui, sans-serif">로컬</text><rect x="172" y="14" width="76" height="32" rx="3" fill="#fff" stroke="#7a3fb5" stroke-width="1.4"/><text x="210" y="58" text-anchor="middle" font-size="11" font-weight="500" fill="#888" letter-spacing="0.04em" font-family="-apple-system, system-ui, sans-serif">피처</text><rect x="256" y="6" width="76" height="40" rx="3" fill="#b53737" stroke="#b53737" stroke-width="2"/><text x="294" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="#b53737" letter-spacing="0.04em" font-family="-apple-system, system-ui, sans-serif">시스템</text></svg></div>
+
+<section class="hero"><div class="label">목표</div><p class="goal">For Canvas Terminal users typing Korean (Hangul) IME input, typed characters render in place without visual duplication or required arrow-key cleanup, in both the PTY terminal pane and the AI agent&#x27;s built-in terminal.</p></section>
+<section class="scope-grid"><div class="scope-col in"><h2>범위 안</h2><ul><li>Diagnose and fix the IME composition + buffer rendering interaction in the xterm.js + PTY pipeline used by Canvas Terminal, including the existing custom IME handling layer present in both terminal surfaces</li><li>Cover both terminal surfaces (PTY pane + collaborator-pane built-in terminals); the planner must determine whether the fix lands as parallel changes on both surfaces or via a refactor to a shared helper, given that both surfaces already implement near-identical custom IME workaround code</li><li>Ship the fix in a v0.5.x patch release (patch-release compatibility — version bump and release flow are separate work)</li></ul></div><div class="scope-col out"><h2>범위 밖</h2><ul><li>Japanese / Chinese IME functional support (user only uses Korean+English; explicitly deferred to a future intent — non-regression of these IMEs is covered separately as a constraint and success criterion)</li><li>Non-macOS platforms (Linux / Windows untested; outside user&#x27;s environment)</li></ul></div></section>
+<section class="panel"><h2>제약 사항</h2><ul class="constraint-list"><li>Must ship as a v0.5.x patch — no breaking API changes, bounded scope</li><li>No regression in non-IME typing latency or correctness</li><li>Per current repro the buffer appears correct (arrow-key redraw resolves cleanly), but this is the user&#x27;s inference, not a captured PTY/buffer transcript; the planner must empirically verify whether the bug surface is render-only (DOM/renderer reconciliation) or includes write-path duplication (e.g., compositionend → PTY → echo, or the deferred triggerDataEvent fragment) before committing to a fix strategy</li><li>Avoid xterm.js major version bump or broad architectural refactor of the IME/keystroke handling layer. Patch-release compatibility (no breaking API changes) is the hard envelope, which by SemVer convention effectively rules out a major xterm.js bump in this patch. If empirical investigation shows the only viable fix requires breaking that envelope, escalate by re-opening this intent rather than silently bumping under the guise of refactor</li><li>The fix must cover both terminal surfaces — the PTY terminal pane and the collaborator-pane built-in terminal. Landing changes on only one surface leaves half the bug present, because both surfaces currently carry parallel custom IME handling code</li></ul></section>
+<section class="panel"><h2>성공의 기준</h2><ul class="checklist"><li>While typing &quot;안녕하세요&quot; character-by-character in the PTY terminal pane, each intermediate composition/commit state renders the current Korean text (committed + in-progress composing) exactly once with no duplicated prefix anywhere in the buffer; after the final syllable the visible line reads exactly 안녕하세요 without any arrow-key cleanup</li><li>Same behavior in the AI agent&#x27;s built-in terminal (collaborator pane) — each intermediate state renders the current Korean text exactly once, and the final commit reads exactly 안녕하세요 without arrow-key cleanup</li><li>A longer phrase (e.g., &quot;한국어 입력 테스트&quot;) composes to the final string exactly once, with no accumulating duplicate prefixes at any intermediate step, on both surfaces</li><li>No regression in ASCII typing, paste, arrow keys, Ctrl+C / Ctrl+R, Tab completion, or shell history (↑/↓) on either surface</li><li>Japanese / Chinese IME rendering not visibly worsened relative to the current pre-fix baseline — verification depth is a lightweight smoke check on code paths exercised by the Korean IME fix, not full functional parity testing with Korean</li></ul></section>
+<section class="lane-callout"><h2>이 스케일 레인을 선택한 이유</h2><p>이 의도는 두 터미널 surface (`src/components/terminal/`의 PTY 패널, `src/components/collaborator/`의 AI 에이전트 패널)에 걸친 cross-module 수정으로, &quot;lockstep parallel&quot; vs &quot;shared-helper refactor&quot; 사이의 아키텍처 선택이 명시적으로 planner로 위임된 deferred design open question을 포함합니다. plan-establisher 휴리스틱 상 &quot;deferred design open question 보유&quot;는 `system` 레인 분류 신호에 직접 해당합니다. 추가 ambiguity 신호로 (i) 근본 원인이 render-only인지 buffer/write-path 중복인지 경험적 검증 필요, (ii) 통제된 keystroke-indexed trace 확보 필요, (iii) macOS Tahoe 26.5.1 회귀 가설 falsification, (iv) JP/ZH IME baseline smoke check, (v) 두 surface가 서로 다른 xterm.js 렌더러(WebGL addon 사용 여부 차이)를 사용해 렌더러별 fix variant 가능성 존재 — 총 6개의 carry-through 공개 질문이 plan의 Remaining open questions에 verbatim으로 보존됩니다. 범위는 patch-release 봉투 (v0.5.x, non-breaking API)와 IME 레이어에 한정되지만, planner의 recon 결과에 따라 touch surface가 단일 surface에 머문다면 `feature`로 downshift할 여지가 있습니다. 모호성이 높을 때는 over-budget이 안전하므로 `system`을 제안합니다.</p></section>
+<section class="panel"><h2>근거 인벤토리</h2><div class="evidence-empty">(의도-단독 플랜 — 어떤 시드도 루브릭 필드에 기여하지 않음)</div></section>
+
+<section class="open-questions"><h2>남은 미해결 질문</h2><ul><li>intent.korean-ime-dup-render.md declares 6 Open questions intended as planner carry-through (empirical investigation / deferred design items). plan.md schema does not auto-promote intent.open_questions to Remaining open questions, and downstream contract states the planner treats plan.md as the only active input. Decision needed: carry verbatim to Remaining open questions or resolve inline.</li></ul></section>
+
+<footer class="doc-foot">
+  <dl>
+    <dt>의도 슬러그:</dt>     <dd><code>korean-ime-dup-render</code></dd>
+    <dt>플랜 버전:</dt>    <dd><code>v1</code></dd>
+    <dt>플랜 런 ID:</dt>     <dd><code>59637-195-16359</code></dd>
+    <dt>확정 시각:</dt>  <dd><code>2026-06-04T16:54:46+09:00</code></dd>
+    <dt>포맷 버전:</dt>     <dd><code>1.0</code></dd>
+  </dl>
+</footer>
+
+</div>
+</body>
+</html>
