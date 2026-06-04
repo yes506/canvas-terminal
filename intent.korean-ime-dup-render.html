@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Intent — korean-ime-dup-render</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --fg:          #1a1a1a;
+      --fg-muted:    #5a5a5a;
+      --fg-soft:     #888;
+      --bg:          #f7f7f5;
+      --bg-card:     #fff;
+      --accent:      #2b5fb5;
+      --accent-soft: #e8f0fb;
+      --good:        #2f7c4f;
+      --good-soft:   #e6f4ec;
+      --good-line:   #b6dcc4;
+      --bad:         #b53737;
+      --bad-soft:    #fbeaea;
+      --bad-line:    #e6b8b8;
+      --warn:        #b87900;
+      --warn-soft:   #fff4d6;
+      --warn-line:   #e8c870;
+      --border:      #e0e0dc;
+      --shadow:      0 1px 2px rgba(0,0,0,0.04);
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
+            "Noto Sans KR", "Malgun Gothic", Roboto, "Helvetica Neue", Arial, sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+    }
+    .page {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 36px 32px 60px;
+    }
+    /* ── HEADER ─────────────────────────────────────────────── */
+    header.doc-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
+      margin-bottom: 24px;
+    }
+    header.doc-head h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    header.doc-head h1 .slug {
+      color: var(--accent);
+    }
+    /* ── PIPELINE BREADCRUMB (chain ubiquitous vocabulary) ──── */
+    .pipeline-wrap {
+      margin: 0 0 18px;
+    }
+    .pipeline-svg {
+      width: 100%;
+      height: auto;
+      max-height: 76px;
+      display: block;
+    }
+    /* ── MODE BADGE (replaces text pill) ────────────────────── */
+    .mode-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      padding: 6px 12px 6px 10px;
+      border: 1px solid;
+      border-radius: 8px;
+      background: var(--accent-soft);
+      font-size: 12px;
+    }
+    .mode-badge svg { flex: 0 0 20px; }
+    .mode-badge .mode-text {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.15;
+    }
+    .mode-badge .mode-text strong {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .mode-badge .mode-tagline {
+      font-size: 11px;
+      opacity: 0.78;
+      font-weight: 500;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    /* ── STAT TAPE (at-a-glance counts) ─────────────────────── */
+    .stat-tape-wrap {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 6px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .stat-tape {
+      width: 100%;
+      height: auto;
+      max-height: 64px;
+      display: block;
+    }
+    /* ── FISHBONE ───────────────────────────────────────────── */
+    .fishbone-svg {
+      width: 100%;
+      height: auto;
+      max-height: 230px;
+      display: block;
+    }
+    /* ── HERO BLOCK ─────────────────────────────────────────── */
+    .hero {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 22px 26px;
+      margin-bottom: 28px;
+      box-shadow: var(--shadow);
+    }
+    .hero .label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+      margin-bottom: 8px;
+    }
+    .hero .goal {
+      font-size: 19px;
+      font-weight: 500;
+      line-height: 1.45;
+      color: var(--fg);
+      margin: 0 0 14px;
+    }
+    .hero .persona {
+      font-size: 14px;
+      color: var(--fg-muted);
+      margin: 0;
+    }
+    .hero .persona strong {
+      color: var(--fg);
+      font-weight: 600;
+    }
+    /* ── SCOPE GRID (✓ in / ✗ out) ──────────────────────────── */
+    .scope-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+    .scope-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+    }
+    .scope-col.in  { border-top: 3px solid var(--good); }
+    .scope-col.out { border-top: 3px solid var(--bad); }
+    .scope-col h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .scope-col.in  h2 { color: var(--good); }
+    .scope-col.out h2 { color: var(--bad); }
+    .scope-col ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .scope-col li {
+      position: relative;
+      padding: 6px 0 6px 22px;
+      font-size: 14px;
+      line-height: 1.5;
+      border-bottom: 1px dashed var(--border);
+    }
+    .scope-col li:last-child { border-bottom: none; }
+    .scope-col.in  li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      top: 6px;
+      color: var(--good);
+      font-weight: 700;
+    }
+    .scope-col.out li::before {
+      content: "✗";
+      position: absolute;
+      left: 0;
+      top: 6px;
+      color: var(--bad);
+      font-weight: 700;
+    }
+    /* ── PANEL (generic card) ───────────────────────────────── */
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .panel > h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+    }
+    /* ── SUCCESS CRITERIA AS CHECKLIST ──────────────────────── */
+    .checklist {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .checklist li {
+      position: relative;
+      padding: 8px 0 8px 28px;
+      font-size: 14.5px;
+      border-bottom: 1px dashed var(--border);
+    }
+    .checklist li:last-child { border-bottom: none; }
+    .checklist li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 11px;
+      width: 14px;
+      height: 14px;
+      border: 1.5px solid var(--accent);
+      border-radius: 3px;
+      background: var(--bg-card);
+    }
+    /* ── CONSTRAINTS AS BARE LIST ───────────────────────────── */
+    .constraint-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .constraint-list li {
+      position: relative;
+      padding: 5px 0 5px 18px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .constraint-list li::before {
+      content: "▸";
+      position: absolute;
+      left: 0;
+      top: 5px;
+      color: var(--accent);
+    }
+    /* ── EXAMPLES (paired ✓ / ✗) ────────────────────────────── */
+    .ex-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .ex-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+    }
+    .ex-col h2 {
+      margin: 0 0 10px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .ex-col.good h2 { color: var(--good); }
+    .ex-col.bad  h2 { color: var(--bad);  }
+    .ex-item {
+      padding: 10px 12px;
+      border-radius: 5px;
+      margin-bottom: 8px;
+      font-size: 13.5px;
+      line-height: 1.5;
+    }
+    .ex-item:last-child { margin-bottom: 0; }
+    .ex-col.good .ex-item { background: var(--good-soft); border-left: 3px solid var(--good); }
+    .ex-col.bad  .ex-item { background: var(--bad-soft);  border-left: 3px solid var(--bad);  }
+    /* ── OPEN QUESTIONS (loud call-to-action) ───────────────── */
+    .open-questions {
+      background: var(--warn-soft);
+      border: 1px solid var(--warn-line);
+      border-left: 5px solid var(--warn);
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 28px;
+    }
+    .open-questions > h2 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--warn);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .open-questions > h2::before {
+      content: "⚠";
+      font-size: 18px;
+    }
+    .open-questions ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .open-questions li {
+      padding: 6px 0;
+      font-size: 14.5px;
+      line-height: 1.5;
+      border-bottom: 1px dashed var(--warn-line);
+    }
+    .open-questions li:last-child { border-bottom: none; }
+    /* ── PLACEHOLDERS (when state is sparse) ────────────────── */
+    .placeholder {
+      color: var(--fg-soft);
+      font-style: italic;
+      font-size: 13.5px;
+    }
+    /* ── FOOTER ─────────────────────────────────────────────── */
+    footer.doc-foot {
+      margin-top: 32px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--fg-soft);
+      text-align: center;
+    }
+    /* ── PRINT ──────────────────────────────────────────────── */
+    @media print {
+      body { background: #fff; }
+      .page { padding: 0; max-width: none; }
+      .hero, .panel, .scope-col, .ex-col, .open-questions {
+        box-shadow: none;
+        page-break-inside: avoid;
+      }
+    }
+    /* ── NARROW ─────────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      .scope-grid, .ex-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+<div class="pipeline-wrap"><svg class="pipeline-svg" viewBox="0 0 880 76" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Pipeline position: intent"><line x1="88" y1="32" x2="792" y2="32" stroke="#d4d4cf" stroke-width="2" stroke-dasharray="4 3"/><polygon points="88,18 102,32 88,46 74,32" fill="#2b5fb5" stroke="#2b5fb5" stroke-width="2"/><text x="88" y="62" text-anchor="middle" font-size="12" font-weight="600" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">Intent</text><circle cx="264" cy="32" r="14" fill="#fff" stroke="#2f7c4f" stroke-width="1.5"/><text x="264" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">Seed</text><polygon points="440,18 454,44 426,44" fill="#fff" stroke="#7a3fb5" stroke-width="1.5"/><text x="440" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">Plan</text><rect x="602" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#b87900" stroke-width="1.5"/><line x1="606" y1="29" x2="626" y2="29" stroke="#b87900" stroke-width="1.4"/><line x1="606" y1="35" x2="626" y2="35" stroke="#b87900" stroke-width="1.4"/><text x="616" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">Doc Stub</text><rect x="778" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#0f7a83" stroke-width="1.5"/><line x1="792" y1="21" x2="792" y2="43" stroke="#0f7a83" stroke-width="1.4"/><text x="792" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">Interface</text></svg></div>
+
+<header class="doc-head">
+  <h1>Intent — <span class="slug">korean-ime-dup-render</span></h1>
+  <span class="mode-badge" style="background:#fbeaea;border-color:#b53737;color:#b53737"><svg viewBox="0 0 28 28" width="20" height="20" aria-hidden="true"><polygon points="14,4 26,24 2,24" fill="none" stroke="#b53737" stroke-width="2.2" stroke-linejoin="round"/><line x1="14" y1="11" x2="14" y2="18" stroke="#b53737" stroke-width="2.2" stroke-linecap="round"/><circle cx="14" cy="21.5" r="1.2" fill="#b53737"/></svg><span class="mode-text"><strong>Problem</strong><span class="mode-tagline">Root-cause analysis</span></span></span>
+</header>
+
+<div class="stat-tape-wrap"><svg class="stat-tape" viewBox="0 0 880 64" preserveAspectRatio="xMidYMid meet" role="img" aria-label="At a glance"><text x="88" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2f7c4f" font-family="-apple-system, system-ui, sans-serif">3</text><text x="88" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">IN SCOPE</text><line x1="176" y1="12" x2="176" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="264" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b53737" font-family="-apple-system, system-ui, sans-serif">2</text><text x="264" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">OUT OF SCOPE</text><line x1="352" y1="12" x2="352" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="440" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">5</text><text x="440" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">SUCCESS</text><line x1="528" y1="12" x2="528" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="616" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">5</text><text x="616" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">CONSTRAINTS</text><line x1="704" y1="12" x2="704" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="792" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b87900" font-family="-apple-system, system-ui, sans-serif">6</text><text x="792" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">OPEN Q</text></svg></div>
+
+<section class="hero"><div class="label">What we agreed to build</div><p class="goal">For Canvas Terminal users typing Korean (Hangul) IME input, typed characters render in place without visual duplication or required arrow-key cleanup, in both the PTY terminal pane and the AI agent&#x27;s built-in terminal.</p><p class="persona"><strong>For:</strong> Canvas Terminal users on macOS who type Korean (Hangul) IME input in either the PTY terminal pane or the AI agent&#x27;s built-in terminal in the collaborator pane; primary witness is the project maintainer, who hits this on every Korean word.</p></section>
+<section class="scope-grid"><div class="scope-col in"><h2>In scope</h2><ul><li>Diagnose and fix the IME composition + buffer rendering interaction in the xterm.js + PTY pipeline used by Canvas Terminal, including the existing custom IME handling layer present in both terminal surfaces</li><li>Cover both terminal surfaces (PTY pane + collaborator-pane built-in terminals); the planner must determine whether the fix lands as parallel changes on both surfaces or via a refactor to a shared helper, given that both surfaces already implement near-identical custom IME workaround code</li><li>Ship the fix in a v0.5.x patch release (patch-release compatibility — version bump and release flow are separate work)</li></ul></div><div class="scope-col out"><h2>Not in scope</h2><ul><li>Japanese / Chinese IME functional support (user only uses Korean+English; explicitly deferred to a future intent — non-regression of these IMEs is covered separately as a constraint and success criterion)</li><li>Non-macOS platforms (Linux / Windows untested; outside user&#x27;s environment)</li></ul></div></section>
+<section class="panel"><h2>How we&#x27;ll know it works</h2><ul class="checklist"><li>While typing &quot;안녕하세요&quot; character-by-character in the PTY terminal pane, each intermediate composition/commit state renders the current Korean text (committed + in-progress composing) exactly once with no duplicated prefix anywhere in the buffer; after the final syllable the visible line reads exactly 안녕하세요 without any arrow-key cleanup</li><li>Same behavior in the AI agent&#x27;s built-in terminal (collaborator pane) — each intermediate state renders the current Korean text exactly once, and the final commit reads exactly 안녕하세요 without arrow-key cleanup</li><li>A longer phrase (e.g., &quot;한국어 입력 테스트&quot;) composes to the final string exactly once, with no accumulating duplicate prefixes at any intermediate step, on both surfaces</li><li>No regression in ASCII typing, paste, arrow keys, Ctrl+C / Ctrl+R, Tab completion, or shell history (↑/↓) on either surface</li><li>Japanese / Chinese IME rendering not visibly worsened relative to the current pre-fix baseline — verification depth is a lightweight smoke check on code paths exercised by the Korean IME fix, not full functional parity testing with Korean</li></ul></section>
+<section class="panel"><h2>Constraints</h2><ul class="constraint-list"><li>Must ship as a v0.5.x patch — no breaking API changes, bounded scope</li><li>No regression in non-IME typing latency or correctness</li><li>Per current repro the buffer appears correct (arrow-key redraw resolves cleanly), but this is the user&#x27;s inference, not a captured PTY/buffer transcript; the planner must empirically verify whether the bug surface is render-only (DOM/renderer reconciliation) or includes write-path duplication (e.g., compositionend → PTY → echo, or the deferred triggerDataEvent fragment) before committing to a fix strategy</li><li>Avoid xterm.js major version bump or broad architectural refactor of the IME/keystroke handling layer. Patch-release compatibility (no breaking API changes) is the hard envelope, which by SemVer convention effectively rules out a major xterm.js bump in this patch. If empirical investigation shows the only viable fix requires breaking that envelope, escalate by re-opening this intent rather than silently bumping under the guise of refactor</li><li>The fix must cover both terminal surfaces — the PTY terminal pane and the collaborator-pane built-in terminal. Landing changes on only one surface leaves half the bug present, because both surfaces currently carry parallel custom IME handling code</li></ul></section>
+<section class="panel"><h2>Why this is happening</h2><svg class="fishbone-svg" viewBox="0 0 880 230" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Root cause chain"><line x1="20" y1="130" x2="860" y2="130" stroke="#888" stroke-width="2.5"/><polygon points="860,130 850,124 850,136" fill="#888"/><circle cx="20" cy="130" r="6" fill="#b53737" stroke="#fff" stroke-width="2"/><line x1="20" y1="130" x2="50" y2="80" stroke="#b53737" stroke-width="2" stroke-dasharray="3 3"/><rect x="50" y="58" width="220" height="56" rx="5" fill="#fff" stroke="#b53737" stroke-width="1.5"/><text x="58" y="74" font-size="10" font-weight="700" fill="#b53737" letter-spacing="0.06em" font-family="-apple-system, system-ui, sans-serif">SYMPTOM</text><text x="58" y="94" font-size="12" fill="#1a1a1a" font-family="-apple-system, system-ui, sans-serif">Symptom: each composed Korean syllable visually echoes th…</text><circle cx="860" cy="130" r="6" fill="#2f7c4f" stroke="#fff" stroke-width="2"/><line x1="860" y1="130" x2="656" y2="180" stroke="#2f7c4f" stroke-width="2" stroke-dasharray="3 3"/><rect x="656" y="178" width="220" height="56" rx="5" fill="#fff" stroke="#2f7c4f" stroke-width="1.5"/><text x="664" y="194" font-size="10" font-weight="700" fill="#2f7c4f" letter-spacing="0.06em" font-family="-apple-system, system-ui, sans-serif">ROOT CAUSE</text><text x="664" y="214" font-size="12" fill="#1a1a1a" font-family="-apple-system, system-ui, sans-serif">Why 1: unknown — the user hypothesizes (with stated uncer…</text></svg></section>
+<section class="ex-grid"><div class="ex-col good"><h2>Recent incidents (the pain we&#x27;re solving)</h2><div class="ex-item">PTY terminal pane: typing the syllables of &quot;안녕하세요&quot; one keystroke at a time produces this visible sequence: ㅇ → 아 → 안 → 안ㄴ → 안 안녀 → 안 안녕 → 안녕 안녕하 하. Each commit step echoes the prior committed text at the start of the line while new composition continues, accumulating duplicate prefixes. Pressing → (arrow right) once collapses cleanly to &quot;안녕하세요&quot;. Reproducible 100% of the time; happens on every Korean word.</div><div class="ex-item">⚠ Note on the trace above: it is the user&#x27;s verbal-recall fingerprint of the bug shape elicited mid-conversation, not a literal frame-by-frame fixture. Notable known imprecisions: the transition 안 → 안ㄴ skips the duplicate prefix that appears one step later as 안 안녀, and the trailing fragment ends at 안녕 안녕하 하 rather than continuing through 세 and 요. The planner must obtain a controlled keystroke-indexed trace covering the full string 안녕하세요 from first keystroke through final compositionend (per the controlled-repro open question) before using this fingerprint as an acceptance oracle.</div><div class="ex-item">Same symptom in the AI agent&#x27;s built-in terminal (collaborator pane) — same repro, same resolution via arrow-key redraw.</div></div><div class="ex-col bad"><h2>Adjacent areas that must not break</h2><div class="ex-item">ASCII / English typing regresses in latency or correctness — much larger blast radius than the IME bug; would affect every user on every keystroke</div><div class="ex-item">Arrow keys, Ctrl+C, Ctrl+R, Tab completion, or shell history (↑/↓) stop working — core terminal UX; users would abandon the app</div><div class="ex-item">Paste of Korean text from clipboard breaks — currently the only alternative input method; removing it leaves no path for Korean input</div><div class="ex-item">Japanese / Chinese IME rendering made visibly worse than their own current pre-fix baseline (not measured against Korean&#x27;s broken state) — expanding blast radius to other IMEs while &quot;fixing&quot; Korean is a net regression</div><div class="ex-item">PTY stream / agent-visible buffer corrupted — agents reading PTY output rely on it being uncorrupted; verifying this requires capturing the actual PTY transcript mid-composition (the user&#x27;s current claim of buffer correctness is an inference from arrow-key redraw behavior)</div></div></section>
+<section class="open-questions"><h2>Still unresolved</h2><ul><li>Did the bug truly start with macOS Tahoe 26.5.1? Possible falsification approaches (diagnostic avenues, not mandatory preconditions before fixing): (a) git-bisect Canvas Terminal across release tags (v0.4.x → v0.5.2) to localize the regression to a code change vs. an environment change; (b) load a minimal xterm.js demo in Safari (and, if feasible, in a minimal Tauri/WKWebView harness) to separate generic WebKit/xterm/macOS behavior from Canvas Terminal&#x27;s custom IME path — Safari alone isolates upstream xterm/WebKit/macOS but is not equivalent to Tauri&#x27;s WKWebView host environment, so a positive WKWebView-only signal still requires the Tauri harness; (c) if a non-Tahoe macOS host is reachable, repro there as a tiebreaker.</li><li>Which root-cause hypothesis is correct: (a) xterm.js native IME composition overlay colliding with PTY echo of committed bytes, (b) missing row invalidation on `compositionupdate`, (c) a Canvas Terminal-specific duplicate write path in the keystroke handler (e.g., the existing custom IME shim), or (d) something else (e.g., a macOS Tahoe Cocoa input-handling change). Planner to verify empirically.</li><li>Is the underlying PTY/terminal buffer actually correct (render-only bug), or does the duplicate also exist in the buffer/write path (and only happens to be visually overwritten by shell-side reprint on arrow-key redraw)? This must be empirically verified — e.g., by dumping terminal.buffer.active mid-composition or capturing the PTY transcript — before committing to a render-only vs. write-path fix.</li><li>Japanese / Chinese IME current baseline rendering on macOS is untested. The planner must establish a lightweight baseline (smoke-only) sufficient to verify that the Korean fix does not visibly worsen these IMEs. Bounds: code-path inspection (confirming no JP/ZH-specific branch was touched by the Korean fix) is the floor; one manual smoke pass with a JP IME installed is the ceiling — the actual install/test scope is decided at plan time. Full functional support remains explicitly out of scope.</li><li>The two affected terminal surfaces currently implement parallel custom IME handling. Should the fix be applied in lockstep to both, or refactored into a shared helper as part of this patch? The two surfaces also use different xterm.js renderers (one with the WebGL addon, the other intentionally without), which may force renderer-specific fix variants.</li><li>The user-supplied repro trace (ㅇ → 아 → 안 → 안ㄴ → 안 안녀 → 안 안녕 → 안녕 안녕하 하) is a verbal recall, not a literal frame-by-frame capture. The planner should obtain a controlled, keystroke-indexed step-by-step trace covering the full string 안녕하세요 from first keystroke through final compositionend — a keystroke-numbered table with the exact visible buffer at each step, including any cursor/column hint — before committing to a specific render-vs-write-path fix hypothesis. Notable known imprecisions in the verbal trace (transition 안 → 안ㄴ lacks the duplicated prefix that appears one step later as 안 안녀; the trailing fragment ends mid-word at 안녕 안녕하 하) should be specifically clarified by the controlled trace.</li></ul></section>
+
+<footer class="doc-foot">
+  Verified by user at <code>2026-06-04T15:44:34+09:00</code>
+</footer>
+
+</div>
+</body>
+</html>
