@@ -5,7 +5,7 @@
 - Planner marker: **feature** from commit `daf9e89` (`feat(planner): merge korean-ime-dup-period-arrow (plan-feature, human-confirmed)`)
 - Planner artifacts: `plan.md` (44 401 bytes), `plan.mmd` (1 934 bytes)
 - Source hash (sha256, 16 hex): `8e4b9fc836cb9436`
-- Implementation commits: `c833c8d` (round-0 body) + `3dcbc2a` (round-1 peer-review fold)
+- Implementation commits: `c833c8d` (round-0 body) + `3dcbc2a` (round-1 peer-review fold) + `42b1642` (round-2 peer-review fold)
 - Base branch: `dev`
 - Implementer branch: `implementer/korean-ime-dup-period-arrow-46880-19563-17468`
 
@@ -24,16 +24,17 @@
 
 ## Files changed
 
-- `src/lib/xtermImeShim.ts` — +71 / −2 lines:
+- `src/lib/xtermImeShim.ts` — +97 / −12 lines:
   - declare `lastCompositionCommit:{text,gen}|null`;
   - record post-`imeFlushGen++` in `onCompositionEnd` + `onTextareaBlur`;
   - **round-1 fold**: schedule 40 ms time-bound clear after each commit (token-identity guard);
   - suppress matching deferred Korean re-emit in the `triggerDataEvent` wrapper;
-  - **round-1 fold**: consume the token (`lastCompositionCommit = null`) on suppression.
-- `src/lib/xtermImeShim.test.ts` — +373 / −1 line:
+  - **round-2 fold**: claim the token atomically at trigger schedule time (capture into defer closure + nullify live token). The suppression decision uses the captured `claim`, race-free against the 40 ms safety clear. Atomic null doubles as consume-on-suppress — subsequent triggers see live token === null at schedule time and pass through.
+- `src/lib/xtermImeShim.test.ts` — +425 / −1 line:
   - extend `fireKeydown` for `shift/ctrl/alt/metaKey`;
   - add T1 (compose → period), T2 (compose → arrow), T3 (compose → period → arrow, **case d full repro**), T4-shift, T4-meta;
-  - **round-1 fold**: add T5 (time-bound: 60 ms past commit → later trigger passes through) + T6 (consume-on-suppress: after one match, next trigger passes through).
+  - **round-1 fold**: add T5 (time-bound: 60 ms past commit → later trigger passes through) + T6 (consume: after one match, next trigger passes through);
+  - **round-2 fold**: add T7 (delayed-duplicate: xterm re-emit at t=25 ms inside the 40 ms safety window must still be suppressed — race-free via claim-at-schedule).
 
 ## Validation
 
@@ -43,6 +44,7 @@
 - Auto-fix attempts used: **0 / 3**
 - Test totals post-fix (round-0): **14 files, 275 passed (270 baseline + 5 new T1–T4)**, ≈ 5 s wall
 - Test totals post-round-1 fold: **14 files, 277 passed (270 baseline + 7 new T1–T6)**, ≈ 5 s wall
+- Test totals post-round-2 fold: **14 files, 278 passed (270 baseline + 8 new T1–T7)**, ≈ 5 s wall
 
 Tail of the final vitest run (truncated):
 
@@ -83,6 +85,7 @@ AssertionError: expected [ '요' ] to deeply equal []
 | WQ-3 | completed | `src/lib/xtermImeShim.ts` | Shape B4 applied. `lastCompositionCommit:{text,gen}\|null` declared in shim closure; written AFTER `imeFlushGen++` in `onCompositionEnd` (only when `written !== null`) and `onTextareaBlur` (defensive consistency). Wrapper's 20 ms-defer fire path checks `lastCompositionCommit` and suppresses `origTrigger` when `data === text && imeFlushGen === gen`. No signature changes; no new modules; PTY payload bit-identical to today. |
 | WQ-4 | completed | `src/lib/xtermImeShim.test.ts` | T1 (compose → period, case b positive control), T2 (compose → arrow with synthetic CSI passthrough, case b positive control), T4-shift, T4-meta (both confirming `isModifier` check uses `e.key === "ArrowRight"` → modifier flag does NOT bypass node 7). Triple-channel assertions: `ptyWrites()`, `origTriggerCalls`, `onComposedFlush`. T4 as two `it()` blocks per round-2 fold (claude4 G4). |
 | ROUND-1-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 4/5 convergent peer-review finding (codex2/codex3/codex4/claude4): `lastCompositionCommit` had no consume/expiry. Added consume-on-suppress in the wrapper timer callback + 40 ms time-bound clear in `onCompositionEnd`/`onTextareaBlur` (token-identity guarded). Added T5 (time-bound) + T6 (consume-on-suppress) regression tests. Full suite 277/277. Commit `3dcbc2a`. |
+| ROUND-2-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 3/5 convergent peer-review finding (codex2/codex3/codex4): round-1's 40 ms safety clear races the wrapper's 20 ms defer for delayed xterm re-emits arriving between t=20 ms and t=40 ms. Replaced suppression-check-at-fire-time with **claim-at-schedule**: atomic capture `claim = lastCompositionCommit` into the defer closure + nullify live token. Defer's match check uses captured `claim`, race-free against safety clear. Atomic null doubles as consume-on-suppress. Added T7 (delayed-duplicate regression). Full suite 278/278. Commit `42b1642`. |
 
 ## Variant selection rationale (Phase 0 Step 3)
 
@@ -218,6 +221,85 @@ sub-variant of Shape B family), OUT-OF-SCOPE boundary (terminator union
 frozen, consumers untouched), PTY payload bit-identity, scope discipline
 (single-file body changes only) — all unchanged from round-0. The round-1
 fold is purely a token-lifetime tightening within B4.
+
+## Round-2 implementer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+
+5/5 reviewers verified the round-1 fold; 3/5 surfaced the same convergent
+finding around a stacked-timer race between the round-1 safety clear and
+the wrapper's 20 ms defer. Folded.
+
+### Reviewer verdicts (round-1 fold = c833c8d + 3dcbc2a + d5e9823)
+
+| Reviewer | Verdict | Severity assigned |
+|---|---|---|
+| @codex4 (task-26) | HOLD before merge | HIGH |
+| @codex2 (task-22) | HOLD pending one fix | MEDIUM |
+| @claude3 (task-23) | APPROVE | LOW (40 ms tight under load) |
+| @codex3 (task-24) | HOLD before merge | HIGH |
+| @claude4 (task-25) | APPROVE | NIT only (timer leak, identity guard untested) |
+
+### Convergent (3/5 reviewers) — F1'' 40 ms safety clear races the 20 ms wrapper defer
+
+- **codex4 task-26 HIGH** — 40 ms expiry starts at commit time; for a duplicate arriving at t=25 ms, its 20 ms defer fires at t=45 ms — AFTER the safety clear at t=40 ms. Token is nullified before suppression can fire, duplicate escapes.
+- **codex3 task-24 HIGH** — same trace; recommended **captured-token approach** (capture matching commit at trigger schedule time, use captured value in delayed callback).
+- **codex2 task-22 MEDIUM** — same trace; offered "preserve and consume a matched token through the deferred check rather than clearing solely from commit time".
+
+Independently traced against the round-1 wrapper at `xtermImeShim.ts:603-616`:
+the inner check evaluated `lastCompositionCommit` at timer-fire time, so any
+delayed duplicate whose own 20 ms defer outlasted the 40 ms safety clear
+lost the suppression race.
+
+**Folded** in commit `42b1642` with the **claim-at-schedule** approach
+(all three convergent reviewers' preferred fix):
+
+- The wrapper atomically captures `claim = lastCompositionCommit` into the
+  defer closure AND nullifies the live token at trigger-schedule time.
+- The defer's inner check uses the captured `claim`, race-free against
+  the safety clear's later mutation of `lastCompositionCommit`.
+- The atomic null doubles as **consume-on-suppress**: subsequent triggers
+  see live token === null at schedule time → don't capture → pass through.
+  This closes the same window that the explicit "consume on suppress"
+  code from round-1 covered (the explicit code became redundant and was
+  removed in this fold).
+
+### Regression test added in the fold
+
+- **T7 (delayed-duplicate)** — commit `요` at t=0 → advance 25 ms →
+  `cs.triggerDataEvent("요", true)` (simulating xterm's delayed re-emit
+  inside the 40 ms window) → advance 25 ms past both the safety timer
+  (t=40 ms) and the defer (t=45 ms) → expect `origTriggerCalls === []`
+  (suppressed) and `ptyWrites === ["요"]` (one direct compositionend
+  invoke).
+
+Empirically verified: pre-round-2 T7 fails with `origTriggerCalls=["요"]`
+(round-1's race-prone code escapes the duplicate); post-round-2 T7 passes.
+
+### LOW / NIT (not folded)
+
+- **claude3 task-23 F1 (LOW — 40 ms tight under load)** — auto-resolved
+  by claim-at-schedule. The safety clear is no longer load-bearing for
+  case-(d) suppression; it now exists only to bound the long-tail when
+  no trigger ever arrives. CPU-load timing skew on the safety timer
+  cannot recreate the race because the suppression decision is made at
+  trigger arrival, not at safety-clear time. Documented here for the
+  audit trail; no code change needed.
+- **claude4 task-25 F1 (NIT — pending 40 ms timers not cancelled on
+  dispose)** — same pattern as the existing 20 ms wrapper defer
+  (pre-existing). `!disposed` guard in the safety callback keeps
+  post-dispose fires inert. Bounded leak (≤ 40 ms per pending commit),
+  no functional impact. Single-reviewer NIT.
+- **claude4 task-25 F2 (NIT — token-identity guard not exercised by a
+  test)** — guard is correct by code reading; failure-mode is exotic
+  (rapid two-syllable composition within 40 ms with case-(d) re-emit
+  landing on the wrong syllable). Single-reviewer NIT.
+
+### Architectural axis unchanged across rounds
+
+Bug-site identification (node 9 / case d), variant choice (B4 — single
+sub-variant of Shape B family), OUT-OF-SCOPE boundary (terminator union
+frozen, consumers untouched), PTY payload bit-identity, scope discipline
+(single-file body changes only) — all unchanged from rounds 0 / 1.
+Round-2 fold is purely a timing-correctness tightening within B4.
 
 ## Blast-radius note (per round-3 fold F5')
 
