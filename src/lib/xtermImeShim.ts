@@ -609,41 +609,42 @@ export function attachKoreanImeShim(
       // FIXME: 20ms empirically tuned for WKWebView on macOS; revalidate on major macOS bumps
       if (data.length === 1 && KOREAN_CODEPOINT_RE.test(data)) {
         const gen = imeFlushGen;
-        // Round-2 implementer-review fold (3/5 convergent: @codex2 MED,
-        // @codex3 HIGH, @codex4 HIGH): atomically claim the dedup token
-        // at schedule time. Without this capture, a delayed xterm
-        // CompositionHelper re-emit arriving between the 40 ms safety
-        // clear and its own 20 ms defer would lose the race — the
-        // safety nullifies lastCompositionCommit at t=40 ms while the
-        // duplicate's suppression check fires at t=arrival+20 ms (e.g.,
-        // t=45 ms for arrival at t=25 ms), and sees no token → duplicate
-        // escapes. By capturing `claim` into the defer closure at
-        // arrival time, the suppression decision is race-free against
-        // the safety clear. Atomic null of live also doubles as consume-
-        // on-suppress: subsequent triggers see live === null at schedule
-        // time so they don't claim and pass through (closes the "second
-        // legitimate same-syllable trigger in same gen" case from
-        // round-1 fold).
-        const claim = lastCompositionCommit;
-        lastCompositionCommit = null;
+        // B4 (korean-ime-dup-period-arrow): xterm's CompositionHelper
+        // batches the IME commit and re-emits it via triggerDataEvent
+        // AFTER onCompositionEnd already wrote via invoke (case d
+        // defer fire-after-compositionend race). If we recognize the
+        // arriving payload as the live commit's matching duplicate
+        // candidate (text + gen both equal), we capture the token
+        // into the defer closure AND null the live token atomically —
+        // the captured `claim` then drives the suppression decision
+        // inside the deferred callback, race-free against the 40 ms
+        // safety clear (round-2 fold).
+        //
+        // Round-3 implementer-review fold (3/5 convergent: @codex2 MED,
+        // @codex3 MED, @codex4 LOW): only claim when the data + gen
+        // actually match. The unconditional capture from round-2 let a
+        // non-matching single-Hangul event arriving before the actual
+        // duplicate consume the token (e.g. paste of "한" between
+        // compositionend("요") and xterm's case-d re-emit of "요"). A
+        // non-matching event now leaves the live token intact and
+        // passes through after the normal 20 ms defer; the matching
+        // duplicate later captures and suppresses.
+        //
+        // Inverse-race coverage: when there's no prior commit (live
+        // null) OR the prior commit is for a different syllable / gen,
+        // isCandidate is false → claim stays null → defer falls through
+        // to origTrigger. Existing §"Korean triggerDataEvent defer"
+        // tests remain green.
+        const live = lastCompositionCommit;
+        const isCandidate =
+          live !== null && data === live.text && gen === live.gen;
+        const claim = isCandidate ? live : null;
+        if (isCandidate) {
+          lastCompositionCommit = null;
+        }
         setTimeout(() => {
           if (!disposed && !isComposing && gen === imeFlushGen) {
-            // B4 (korean-ime-dup-period-arrow): xterm's CompositionHelper
-            // batches the IME commit and re-emits it via triggerDataEvent
-            // AFTER onCompositionEnd already wrote via invoke (case d
-            // defer fire-after-compositionend race). If the captured
-            // claim matches the deferred payload (same text + same
-            // post-increment gen, meaning no new composition has bumped
-            // gen since), suppress origTrigger to prevent the duplicate.
-            // Inverse race (defer captured pre-compositionend, before
-            // any commit) — claim is null at schedule time → no match →
-            // pass-through, preserving the §"Korean triggerDataEvent
-            // defer" inverse-race semantics.
-            if (
-              claim !== null &&
-              data === claim.text &&
-              imeFlushGen === claim.gen
-            ) {
+            if (claim !== null) {
               return;
             }
             origTrigger(data, wasUserInput);

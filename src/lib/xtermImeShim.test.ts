@@ -1009,6 +1009,71 @@ describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => 
     vi.useRealTimers();
   });
 
+  it("T8 (non-matching Hangul preserves token): a non-matching single-Hangul triggerDataEvent does NOT consume the dedup token meant for the matching duplicate", () => {
+    // Round-3 implementer-review fold (3/5 convergent: @codex2 MED,
+    // @codex3 MED, @codex4 LOW). Round-2's claim-at-schedule
+    // captured AND nullified the live token unconditionally for any
+    // single-Hangul triggerDataEvent. A non-matching event ("한")
+    // arriving between compositionend("요") and xterm's case-(d)
+    // re-emit of "요" would consume the "요" token, leaving the
+    // actual duplicate uncovered → it would escape via origTrigger.
+    // Round-3 fix: claim only when data + gen match the live commit.
+    // Non-matching events pass through normally without touching the
+    // live token; the matching duplicate later captures and suppresses.
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    // 1. Commit "요" at t=0. Live token = {text:"요", gen:1}.
+    textarea.value = "요";
+    fireInput(textarea, "insertText", "요");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "요");
+
+    // 2. Non-matching single-Hangul event "한" arrives at t=10 ms
+    //    (e.g., paste of a different syllable while "요" commit is
+    //    still pending its case-(d) re-emit window). Round-3 fix:
+    //    isCandidate is false ("한" !== "요"), so the live token
+    //    is NOT nullified; "한" gets a normal 20 ms defer with
+    //    claim=null and will pass through.
+    vi.advanceTimersByTime(10);
+    cs.triggerDataEvent("한", true);
+
+    // 3. The actual delayed xterm CompositionHelper duplicate of "요"
+    //    arrives at t=25 ms. isCandidate is true (live still set,
+    //    data + gen match), so we capture+null. Defer scheduled at
+    //    t=45 ms → suppress.
+    vi.advanceTimersByTime(15);
+    cs.triggerDataEvent("요", true);
+
+    // 4. Advance past both 20 ms defers AND the 40 ms safety clear.
+    vi.advanceTimersByTime(30);
+
+    // POST-FOLD: "한" passes through (non-matching); "요" duplicate
+    // suppressed.
+    // PRE-FOLD (round-2): claim=X consumed at t=10 by "한"; "요" at
+    //   t=25 captures claim=null; "한" defer falls through (mismatch);
+    //   "요" defer falls through (claim=null) → BOTH "한" AND "요"
+    //   land in origTriggerCalls → duplicate escapes.
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["한"]);
+    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
+    expect(onComposedFlush).toHaveBeenCalledTimes(1);
+    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
+
+    vi.useRealTimers();
+  });
+
   it("T7 (delayed duplicate inside 40ms window): a delayed xterm CompositionHelper re-emit at t=25ms is suppressed via claim-at-schedule (race-free against safety clear)", () => {
     // Round-2 implementer-review fold (3/5 convergent: @codex2 MEDIUM,
     // @codex3 HIGH, @codex4 HIGH). Pre-fold (round-1) failed this case:
