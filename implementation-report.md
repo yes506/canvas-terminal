@@ -5,7 +5,7 @@
 - Planner marker: **feature** from commit `daf9e89` (`feat(planner): merge korean-ime-dup-period-arrow (plan-feature, human-confirmed)`)
 - Planner artifacts: `plan.md` (44 401 bytes), `plan.mmd` (1 934 bytes)
 - Source hash (sha256, 16 hex): `8e4b9fc836cb9436`
-- Implementation commit: `c833c8d`
+- Implementation commits: `c833c8d` (round-0 body) + `3dcbc2a` (round-1 peer-review fold)
 - Base branch: `dev`
 - Implementer branch: `implementer/korean-ime-dup-period-arrow-46880-19563-17468`
 
@@ -24,8 +24,16 @@
 
 ## Files changed
 
-- `src/lib/xtermImeShim.ts` — +37 / −2 lines: declare `lastCompositionCommit:{text,gen}|null`; record post-`imeFlushGen++` in `onCompositionEnd` + `onTextareaBlur`; suppress matching deferred Korean re-emit in the `triggerDataEvent` wrapper.
-- `src/lib/xtermImeShim.test.ts` — +267 / −1 line: extend `fireKeydown` for `shift/ctrl/alt/metaKey`; add T1 (compose → period), T2 (compose → arrow), T3 (compose → period → arrow, **case d full repro**), T4-shift, T4-meta.
+- `src/lib/xtermImeShim.ts` — +71 / −2 lines:
+  - declare `lastCompositionCommit:{text,gen}|null`;
+  - record post-`imeFlushGen++` in `onCompositionEnd` + `onTextareaBlur`;
+  - **round-1 fold**: schedule 40 ms time-bound clear after each commit (token-identity guard);
+  - suppress matching deferred Korean re-emit in the `triggerDataEvent` wrapper;
+  - **round-1 fold**: consume the token (`lastCompositionCommit = null`) on suppression.
+- `src/lib/xtermImeShim.test.ts` — +373 / −1 line:
+  - extend `fireKeydown` for `shift/ctrl/alt/metaKey`;
+  - add T1 (compose → period), T2 (compose → arrow), T3 (compose → period → arrow, **case d full repro**), T4-shift, T4-meta;
+  - **round-1 fold**: add T5 (time-bound: 60 ms past commit → later trigger passes through) + T6 (consume-on-suppress: after one match, next trigger passes through).
 
 ## Validation
 
@@ -33,7 +41,8 @@
 - Final validation command: `npx tsc --noEmit && npm test`
 - Final exit: **0**
 - Auto-fix attempts used: **0 / 3**
-- Test totals post-fix: **14 files, 275 passed (270 baseline + 5 new)**, ≈ 5 s wall
+- Test totals post-fix (round-0): **14 files, 275 passed (270 baseline + 5 new T1–T4)**, ≈ 5 s wall
+- Test totals post-round-1 fold: **14 files, 277 passed (270 baseline + 7 new T1–T6)**, ≈ 5 s wall
 
 Tail of the final vitest run (truncated):
 
@@ -73,6 +82,7 @@ AssertionError: expected [ '요' ] to deeply equal []
 | WQ-2 | completed | `src/lib/xtermImeShim.test.ts` | T3 written with `cs.triggerDataEvent("요", true)` after `fireCompositionEnd` (Phase 0 Step 5.3 candidate path 2; the JSDOM-viable case d reproduction per round-3 fold F3'). Period+arrow keystrokes included as user-flow noise. Negative-baseline run produced `origTriggerCalls=["요"]` against unmodified HEAD → case (d) locked + case-label header comment inserted. |
 | WQ-3 | completed | `src/lib/xtermImeShim.ts` | Shape B4 applied. `lastCompositionCommit:{text,gen}\|null` declared in shim closure; written AFTER `imeFlushGen++` in `onCompositionEnd` (only when `written !== null`) and `onTextareaBlur` (defensive consistency). Wrapper's 20 ms-defer fire path checks `lastCompositionCommit` and suppresses `origTrigger` when `data === text && imeFlushGen === gen`. No signature changes; no new modules; PTY payload bit-identical to today. |
 | WQ-4 | completed | `src/lib/xtermImeShim.test.ts` | T1 (compose → period, case b positive control), T2 (compose → arrow with synthetic CSI passthrough, case b positive control), T4-shift, T4-meta (both confirming `isModifier` check uses `e.key === "ArrowRight"` → modifier flag does NOT bypass node 7). Triple-channel assertions: `ptyWrites()`, `origTriggerCalls`, `onComposedFlush`. T4 as two `it()` blocks per round-2 fold (claude4 G4). |
+| ROUND-1-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 4/5 convergent peer-review finding (codex2/codex3/codex4/claude4): `lastCompositionCommit` had no consume/expiry. Added consume-on-suppress in the wrapper timer callback + 40 ms time-bound clear in `onCompositionEnd`/`onTextareaBlur` (token-identity guarded). Added T5 (time-bound) + T6 (consume-on-suppress) regression tests. Full suite 277/277. Commit `3dcbc2a`. |
 
 ## Variant selection rationale (Phase 0 Step 3)
 
@@ -126,6 +136,88 @@ the implementer branch and refuse merge if any duplicate `요` appears:
 - **1a** `compose 안녕하세요 → .` → screen `안녕하세요.` (no trailing `요`).
 - **1b** `compose 안녕하세요 → arrow` → screen `안녕하세요` with cursor moved.
 - **1c** `compose 안녕하세요 → . → arrow` → screen `안녕하세요.` with cursor moved, no `요`.
+
+## Round-1 implementer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+
+5/5 reviewers verified the round-0 implementation; 4/5 surfaced the same
+convergent finding around B4 dedup token lifetime. Folded.
+
+### Reviewer verdicts (round-0 = c833c8d + 1f8aa48)
+
+| Reviewer | Verdict | Severity assigned |
+|---|---|---|
+| @codex4 (task-16) | HOLD before merge | HIGH |
+| @codex2 (task-17) | HOLD pending one fix | HIGH |
+| @claude3 (task-18) | APPROVE with one MEDIUM advisory (case-b coverage) | MEDIUM advisory non-blocking |
+| @codex3 (task-19) | REVISE before merge | MEDIUM |
+| @claude4 (task-20) | APPROVE with one LOW non-blocking observation | LOW |
+
+### Convergent (4/5 reviewers) — F1' B4 dedup token had no consume / expiry
+
+- **codex4 task-16 HIGH** — token suppresses later legitimate same-syllable input until next `imeFlushGen` bump; recommended one-shot + time-bound + regression test
+- **codex2 task-17 HIGH** — same trace, including paste / non-IME single-Hangul scenarios; recommended consume on suppress
+- **codex3 task-19 MEDIUM** — same finding, recommended one-shot and/or time-bound
+- **claude4 task-20 LOW (F1)** — same long-tail trace; recommended one-shot clear inside the timer callback; deferred as follow-up but noted as a real edge case
+
+Independently traced against `src/lib/xtermImeShim.ts:487/505/603-608`
+(round-0 line numbers): `lastCompositionCommit` was set on every commit and
+never cleared until the next IME action incremented `imeFlushGen`. Any
+legitimate same-syllable `triggerDataEvent("요")` in the window between
+the commit and the next IME activity was silently dropped — affecting
+single-Hangul paste, programmatic terminal input, plugin emission, and
+existing harness's `cs.triggerDataEvent("한")` style code paths.
+
+**Folded** with two complementary safeguards in commit `3dcbc2a`:
+
+1. **Consume on suppress** — wrapper timer callback (after the B4 inner
+   check matches) sets `lastCompositionCommit = null` before `return`.
+   Closes the "second `triggerDataEvent` in same generation" window:
+   the first xterm CompositionHelper post-commit re-emit is suppressed;
+   any subsequent same-syllable trigger passes through.
+2. **Time-bound 40 ms** — `onCompositionEnd` / `onTextareaBlur` schedule
+   a `setTimeout(40)` that nulls `lastCompositionCommit` if it still
+   references the same commit (token-identity check keeps a newer commit
+   safe from a stale clear). Closes the "no `triggerDataEvent` ever
+   arrives" long-tail: the dedup window is bounded to 40 ms (2× the
+   defer wait) regardless of subsequent IME activity.
+
+### Regression tests added in the fold
+
+- **T5 (time-bound)** — commit → advance 60 ms → `cs.triggerDataEvent("요", true)` → advance 25 ms → expect `origTriggerCalls === ["요"]` (pass-through after the 40 ms safety window).
+- **T6 (consume-on-suppress)** — commit → immediate `cs.triggerDataEvent("요", true)` + 25 ms (suppressed by B4) → second `cs.triggerDataEvent("요", true)` + 25 ms → expect the second event passes through.
+
+### MEDIUM advisory (1 reviewer) — F2' case-(b) untested in JSDOM (@claude3 task-18)
+
+@claude3 raised MEDIUM advisory non-blocking: B4 fixes case (d) only; if
+the live macOS WKWebView mechanism is case (b) rather than case (d),
+node 7's `invoke` write path fires without consulting
+`lastCompositionCommit`, so a case-(b) duplicate would survive the fix.
+
+**Not folded** — this is by design. `plan.md` explicitly delegates the
+case-(b)-vs-case-(d) distinction to the Phase 6 manual repro per
+Constraint #6. Applying B1+B4 prophylactically without a JSDOM-failing
+baseline for case (b) would violate `plan.md` §133/§491 ("Do NOT apply
+a fix against a non-reproducing test"). The Phase 6 user-acceptance gate
+(sequences 1a/1b/1c) is the falsification gate; if 1a or 1b reproduces
+the duplicate, a follow-up round adding B1 (node-7 no-write) is needed.
+
+### Single-reviewer LOW / NIT (not folded)
+
+- @claude3 task-18 F2 (LOW) — T4-meta/shift CSI assertions are tautological synthetic-CSI pass-through; documentation nuance only.
+- @claude3 task-18 F3 (LOW) — `onTextareaBlur` B4 store is forward-defensive with no direct test; harmless documentation nuance.
+- @claude4 task-20 F2 (NIT) — TSDoc on the wrapper doesn't mention B4 dedup; inline trace already covers it.
+
+These are non-blocking observations from single reviewers; no convergence
+across the panel. Documenting here in the implementation report for the
+audit trail rather than touching code.
+
+### Architectural axis unchanged
+
+Bug-site identification (node 9 / case d), variant choice (B4 — single
+sub-variant of Shape B family), OUT-OF-SCOPE boundary (terminator union
+frozen, consumers untouched), PTY payload bit-identity, scope discipline
+(single-file body changes only) — all unchanged from round-0. The round-1
+fold is purely a token-lifetime tightening within B4.
 
 ## Blast-radius note (per round-3 fold F5')
 
