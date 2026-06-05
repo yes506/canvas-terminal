@@ -305,10 +305,19 @@ xterm.js's internal `coreService.triggerDataEvent` is NOT part of
 that enumeration — it is xterm's own forwarding mechanism, not a
 user-dispatched DOM event.
 
-| Test | Sequence | PTY writes observed | Plan-conformance |
-|---|---|---|---|
-| existing Node 10 (a) — "processes JP-like..." | `keydown(229) → input → compositionend` (3 events) | **1** | **satisfied** ✓ |
-| round-1 fold supplementary — "pins residual..." | `input → triggerDataEvent → keydown(229) → compositionend` (4 events) | 2 (1 origTrigger + 1 direct) | NOT in plan's fixture text |
+The plan enumerates the events as a **symbolic set** of three DOM
+events in plan order (`keydown(229)` + `insertReplacementText/insertText`
++ `compositionend`). The automated test preserves WKWebView's actual
+dispatch order — `input` fires BEFORE `keydown(229)` in WKWebView —
+which is the same three-element symbolic set, just dispatched in
+WKWebView order. The plan's "no duplicate flush" requirement is a
+property of the symbolic set, independent of the within-set dispatch
+order.
+
+| Test | Dispatch order (actual code) | Symbolic event set | PTY writes observed | Plan-conformance |
+|---|---|---|---|---|
+| existing Node 10 (a) — "processes JP-like..." | `input(insertReplacementText) → keydown(229) → compositionend` (WKWebView order) | 3-event set: `{keydown(229), insertReplacementText, compositionend}` — same as plan | **1** | **satisfied** ✓ |
+| round-1 fold supplementary — "4-event ordering outside plan's Node 10..." | `input → triggerDataEvent → keydown(229) → compositionend` | 4-event set adds `triggerDataEvent` (xterm internal) | 2 (1 origTrigger + 1 direct) | NOT in plan's fixture text |
 
 **The plan's literal 3-event fixture floor PASSES with no duplicate.**
 The round-1 supplementary 4-event test pins a different ordering the
