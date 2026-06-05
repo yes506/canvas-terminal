@@ -58,6 +58,15 @@ export interface AttachKoreanImeShimOptions {
    *     scroll at AgentMiniTerminal.tsx:709 provides for ASCII
    *     typing (which bypasses the helper).
    *
+   * **Synchronous-only contract**: the shim invokes the callback
+   * synchronously inside its IME handlers and catches synchronous
+   * throws. The return type is `void`, not `Promise<void>` — if a
+   * subscriber needs to do async work, it MUST schedule it via its
+   * own `void Promise.resolve().then(...)` / `queueMicrotask(...)`
+   * wrapper. An unhandled rejection from an async callback would
+   * escape the shim's sync `try/catch` (and the documented exception
+   * swallow contract) on its way to the global handler.
+   *
    * @param committedText The fragment that was just sent to the PTY,
    *   EXCLUDING any terminator. Never contains `\r`, `\x1b`, or `\t` —
    *   those go in the `terminator` argument.
@@ -104,10 +113,16 @@ export interface KoreanImeShimHandle {
 
   /**
    * Re-binds the focus / preventScroll patch to the current
-   * `.xterm-helper-textarea`. Idempotent when called repeatedly with
-   * the same underlying element. Call this after a terminal layout
-   * change (e.g. reattachment to a new container) that may have
-   * replaced the textarea node.
+   * `.xterm-helper-textarea` AND retries the overlay attach if the
+   * shim is in degraded-overlay mode (the `.xterm-screen` element was
+   * not yet in the DOM tree at attach time — see Failure-modes).
+   *
+   * Idempotent on the helper textarea (no-op when called repeatedly
+   * with the same underlying element) and on the overlay attach
+   * (no-op once overlay is attached). Call this after a terminal
+   * layout change (e.g. reattachment to a new container) that may
+   * have replaced the textarea node or made the screen element
+   * newly reachable.
    */
   rebind(): void;
 
@@ -257,13 +272,16 @@ function isFullWidth(ch: string): boolean {
  *     should treat this as a hard upgrade-required signal; the shim
  *     refuses to attach silently because a partial attach would leave
  *     the visual bug present without any indication of why.
- *   - Returns gracefully (no-op shim with valid handle) if
+ *   - Degraded-overlay mode (NOT a true no-op) if
  *     `container.querySelector(".xterm-screen")` returns null AND
- *     `container` itself is not in the DOM tree; the overlay simply
- *     never paints. Caller's typing path continues to work via the
- *     unwrapped `triggerDataEvent` fall-through. This is the
- *     non-attached-yet case; `handle.rebind()` may rescue it once the
- *     element is in the tree.
+ *     `container` itself is not in the DOM tree: the overlay is not
+ *     painted, but the `triggerDataEvent` patch, `isCursorHidden`
+ *     descriptor swap, document-level capture listeners, and helper
+ *     textarea bindings are STILL installed. `handle.rebind()` will
+ *     retry the overlay attach once the screen/container becomes
+ *     reachable, in addition to re-binding the helper textarea —
+ *     callers can use this to recover overlay rendering after a
+ *     deferred `terminal.open(...)` or layout change.
  *   - The `write_to_pty` invocation is fire-and-forget; rejected
  *     promises are swallowed (matching existing call sites). The shim
  *     does NOT surface PTY write failures because there is no useful
@@ -328,16 +346,22 @@ export function attachKoreanImeShim(
   }
 
   let overlayAttached = false;
-  const screenEl = container.querySelector(".xterm-screen") as HTMLElement | null;
-  if (screenEl) {
-    screenEl.style.position = "relative";
-    screenEl.appendChild(overlayEl);
-    overlayAttached = true;
-  } else if (container.isConnected) {
-    container.style.position = "relative";
-    container.appendChild(overlayEl);
-    overlayAttached = true;
-  }
+  const tryAttachOverlay = () => {
+    if (overlayAttached || disposed) return;
+    const screenElNow = container.querySelector(
+      ".xterm-screen",
+    ) as HTMLElement | null;
+    if (screenElNow) {
+      screenElNow.style.position = "relative";
+      screenElNow.appendChild(overlayEl);
+      overlayAttached = true;
+    } else if (container.isConnected) {
+      container.style.position = "relative";
+      container.appendChild(overlayEl);
+      overlayAttached = true;
+    }
+  };
+  tryAttachOverlay();
 
   const origIsCursorHiddenDesc = Object.getOwnPropertyDescriptor(
     coreService,
@@ -602,6 +626,10 @@ export function attachKoreanImeShim(
       return disposed || !overlayAttached ? null : overlayEl;
     },
     rebind() {
+      // Retry overlay attach in case `.xterm-screen` was not yet in the
+      // DOM tree at attach time (degraded-overlay mode — see Failure-modes).
+      // Idempotent: tryAttachOverlay short-circuits if already attached.
+      tryAttachOverlay();
       bindHelperTextarea();
     },
     dispose() {

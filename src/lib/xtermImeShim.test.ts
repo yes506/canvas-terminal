@@ -216,8 +216,40 @@ describe("attachKoreanImeShim — attach", () => {
     expect(handle.overlayEl?.parentElement).toBe(container);
   });
 
-  it("returns no-op handle (overlayEl=null) when container is detached and has no .xterm-screen", () => {
+  it("enters degraded-overlay mode (overlayEl=null, other patches still installed) when container is detached and has no .xterm-screen", () => {
     const container = document.createElement("div"); // intentionally NOT appended to body
+    const textarea = document.createElement("textarea");
+    textarea.className = "xterm-helper-textarea";
+    container.appendChild(textarea);
+    const origTriggerCalls: Array<{ data: string }> = [];
+    const terminal = {
+      options: { fontSize: 12, cursorBlink: true },
+      textarea,
+      buffer: { active: { cursorX: 0, cursorY: 0 } },
+      _core: {
+        coreService: {
+          isCursorHidden: false,
+          triggerDataEvent: (data: string) => origTriggerCalls.push({ data }),
+        },
+        _renderService: { dimensions: { css: { cell: { width: 8, height: 16 } } } },
+      },
+    } as unknown as Terminal;
+    const handle = attach(terminal, container);
+    expect(handle.overlayEl).toBeNull();
+    // Per the Failure-modes doc: degraded-overlay mode still patches
+    // triggerDataEvent (wrapper installed → captured by ASCII path test).
+    const cs = (
+      terminal as unknown as {
+        _core: { coreService: { triggerDataEvent: (d: string) => void } };
+      }
+    )._core.coreService;
+    cs.triggerDataEvent("a");
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["a"]);
+  });
+
+  it("rebind() retries overlay attach after the container becomes reachable (F2 — round-2 fold)", () => {
+    // Start with a detached container — overlay attach fails initially.
+    const container = document.createElement("div");
     const textarea = document.createElement("textarea");
     textarea.className = "xterm-helper-textarea";
     container.appendChild(textarea);
@@ -232,6 +264,22 @@ describe("attachKoreanImeShim — attach", () => {
     } as unknown as Terminal;
     const handle = attach(terminal, container);
     expect(handle.overlayEl).toBeNull();
+
+    // Caller mounts the container + adds an .xterm-screen (the production
+    // case where terminal.open(...) ran AFTER attachKoreanImeShim was
+    // called, or where layout deferred screen rendering).
+    document.body.appendChild(container);
+    const screenEl = document.createElement("div");
+    screenEl.className = "xterm-screen";
+    container.appendChild(screenEl);
+
+    handle.rebind();
+
+    // Overlay is now attached under .xterm-screen.
+    expect(handle.overlayEl).not.toBeNull();
+    expect(
+      handle.overlayEl?.parentElement?.classList.contains("xterm-screen"),
+    ).toBe(true);
   });
 });
 
@@ -383,7 +431,7 @@ describe("attachKoreanImeShim — onComposedFlush emission", () => {
 //
 // Verifies the helper's state machine doesn't special-case Hangul in its
 // docKeyDown/docInput/compositionend wiring — only the triggerDataEvent
-// 20ms-defer path is Korean-specific (reKorean). JP/ZH compositions ride
+// 20ms-defer path is Korean-specific (KOREAN_CODEPOINT_RE). JP/ZH compositions ride
 // the same generic pipeline.
 // ===========================================================================
 
@@ -431,6 +479,68 @@ describe("attachKoreanImeShim — JP/ZH non-regression fixture floor (Node 10)",
     expect(origTriggerCalls.map((c) => c.data)).toEqual(["こ", "a"]);
 
     vi.useRealTimers();
+  });
+
+  // Round-2 fold (codex1/claude3 F1): document the production-adjacent
+  // duplicate-write path that the JP/ZH fixture floor above does NOT
+  // exercise. The shared IME state machine has no Korean-only branch in
+  // docInput/docKeyDown/compositionend, but the `triggerDataEvent`
+  // wrapper IS Korean-only (20ms defer only for KOREAN_CODEPOINT_RE).
+  // In production, xterm.js's CompositionHelper can call
+  // `coreService.triggerDataEvent(data)` synchronously during the
+  // `input` event (or via setTimeout(0) from compositionend) for any
+  // committed text. For Korean the wrapper holds the bytes back for
+  // 20ms and discards them if a new composition starts. For non-Korean
+  // (JP/ZH/etc), the wrapper falls through immediately.
+  //
+  // If xterm fires triggerDataEvent("こ") AND the shim's compositionend
+  // handler also direct-writes "こ" via `invoke("write_to_pty")`, the
+  // PTY receives the bytes twice. This is a PRE-EXISTING residual from
+  // the original inline shims (reKorean-only check is identical), not
+  // a regression introduced by the helper extraction. The test below
+  // PINS this behavior so a future wrapper refactor doesn't silently
+  // change it. JP/ZH live acceptance (plan node 10 manual ceiling)
+  // remains the authoritative check; fixing the residual is out of
+  // scope for korean-ime-dup-render and would require widening the
+  // 20ms-defer to all single-codepoint CJK ranges.
+  it("pins residual duplicate-write behavior for JP/ZH when xterm fires triggerDataEvent between input and compositionend (out-of-scope residual; documents current behavior)", () => {
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    attach(terminal, container);
+
+    const cs = (
+      terminal as unknown as {
+        _core: { coreService: { triggerDataEvent: (d: string) => void } };
+      }
+    )._core.coreService;
+
+    // Simulated production order for a JP IME composing-then-committing
+    // a single hiragana "こ":
+    //   1. WKWebView fires `input` (insertReplacementText, data="こ")
+    //   2. xterm's input handler calls coreService.triggerDataEvent("こ")
+    //      synchronously — isComposing is still false because keydown(229)
+    //      hasn't fired yet AND the Korean defer doesn't apply (non-Korean
+    //      codepoint), so origTrigger fires immediately
+    //   3. WKWebView fires `keydown(229)` → shim sets isComposing=true,
+    //      paints overlay
+    //   4. WKWebView fires `compositionend(data="こ")` → shim direct-writes
+    //      "こ" to PTY via invoke
+    //
+    // Result: PTY receives 2x "こ" — one via origTrigger fall-through
+    // (terminal.onData → PTY), one via direct invoke from compositionend.
+    textarea.value = "こ";
+    fireInput(textarea, "insertReplacementText", "こ");
+    cs.triggerDataEvent("こ");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "こ");
+
+    // Pinned residual: 1 origTrigger call (the non-Korean fall-through)
+    // AND 1 direct PTY write (the compositionend direct-write).
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["こ"]);
+    expect(ptyWrites().map((c) => c.data)).toEqual(["こ"]);
+    // Combined: PTY sees the byte twice (1 + 1). This is the residual
+    // duplicate the test name calls out — accepted as out-of-scope for
+    // korean-ime-dup-render; tracked by the JP IME live acceptance gate.
   });
 });
 

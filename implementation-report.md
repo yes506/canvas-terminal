@@ -1,5 +1,45 @@
 # Implementation report — korean-ime-dup-render
 
+> **Round-1 peer-review fold (2026-06-05)**: 5 cold reviewers (claude2,
+> claude3, codex1, codex2, codex3) produced 3 verdicts of APPROVE
+> (claude2 with non-blocking note; claude3 with one narrow revision;
+> codex3 with acceptance caveats) and 2 of REVISE (codex1 Major on F1;
+> codex2 High on live WKWebView gate + Medium on F2). After empirical
+> verification (each finding reproduced against the code at HEAD
+> `81ea147`), 4 unique findings were folded:
+>
+> - **F1** (codex1 Major, claude3 Medium, claude2 non-blocker): the
+>   Node 10 JP/ZH fixture floor did not exercise the
+>   `input → triggerDataEvent → keydown(229) → compositionend`
+>   ordering. Added a test that pins the **pre-existing residual
+>   duplicate-write** for JP/ZH (xterm's non-Korean
+>   `triggerDataEvent` falls through immediately while
+>   `compositionend` also direct-writes). Out-of-scope for
+>   korean-ime-dup-render; fix would require widening the 20ms-defer
+>   to all single-codepoint CJK ranges.
+> - **F2** (claude3 Low, codex2 Medium): the Failure-modes TSDoc
+>   claimed "no-op shim" but the impl only skipped overlay attach
+>   (`triggerDataEvent`/`isCursorHidden`/listeners still patched).
+>   Refactored overlay attach into a `tryAttachOverlay()` function
+>   that `rebind()` also retries — degraded-overlay mode now
+>   genuinely recoverable. Docstring tightened to match. Added test.
+> - **F3** (claude3 Low, hardening): `onComposedFlush` callback is
+>   synchronous-only — async subscribers must wrap their own
+>   `try/catch`. Documented in TSDoc.
+> - **Cosmetic** (claude2 Low): test comment said `reKorean`; the
+>   helper uses `KOREAN_CODEPOINT_RE`. Aligned.
+>
+> Live WKWebView gate (codex2 High, codex3 Caveat 1, claude2/claude3
+> concurring framing): preserved as Phase 6 acceptance — the
+> autonomous loop has no Korean IME / WKWebView access. The fold did
+> NOT change the variant-(b) default; trace falsification at Phase 6
+> still escalates back to planner per plan Constraint #3.
+>
+> Test diff after fold: 268 → **270** tests (+1 JP/ZH residual pin,
+> +1 rebind() overlay retry). `tsc --noEmit` and full vitest both
+> exit 0.
+
+
 ## Source
 
 - Planner marker: `(plan-feature, human-confirmed)` from commit `0523fa8a` on `dev`
@@ -202,12 +242,20 @@ acceptance gates the user runs at Phase 6 before `confirm merge`:
   The `dispose()` restoration items (5/5) are unit-tested in WQ-2
   (`describe("dispose restoration")`); the integration-level
   StrictMode remount path is acceptance-only.
-- **N10 manual JP IME ceiling**: install JP IME and type a JP
-  syllable on both surfaces; verify no duplicate render, no drop.
-  **If JP IME is not installed at acceptance time**, leave a note:
-  `JP/ZH manual smoke: skipped — JP IME not installed`. The Node 10
+- **N10 manual JP IME ceiling**: **`JP/ZH manual smoke: skipped — JP
+  IME not installed in implementer environment` (the autonomous loop
+  has no live WKWebView / IME access for any language).** User Phase
+  6 acceptance: install JP IME and type a JP syllable on both
+  surfaces; verify no duplicate render, no drop. The Node 10
   **fixture floor** (jsdom `keydown(229) + insertReplacementText +
-  compositionend` sequence) IS automated in WQ-2 and passing.
+  compositionend` sequence) IS automated in WQ-2 and passing. The
+  Round-1 fold also added an explicit **residual-pin test** for the
+  `input → triggerDataEvent → keydown(229) → compositionend`
+  ordering — see `xtermImeShim.test.ts` for the test name "pins
+  residual duplicate-write behavior for JP/ZH..." — documenting that
+  JP/ZH currently has a 2x PTY-write residual via the xterm
+  `triggerDataEvent` fall-through path. Same as the pre-refactor
+  inline shims; out-of-scope for korean-ime-dup-render.
 
 ## Notes for reviewers
 
