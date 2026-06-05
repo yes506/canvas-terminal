@@ -484,7 +484,21 @@ export function attachKoreanImeShim(
       // B4: record AFTER imeFlushGen++ so the stored gen matches the value
       // captured by the deferred triggerDataEvent path (which also reads
       // imeFlushGen at defer-schedule time — post-increment under case d).
-      lastCompositionCommit = { text: written, gen: imeFlushGen };
+      const commit = { text: written, gen: imeFlushGen };
+      lastCompositionCommit = commit;
+      // Round-1 implementer-review fold (4/5 convergent: codex2, codex3,
+      // codex4, claude4): time-bound the dedup window so the token cannot
+      // suppress a later legitimate same-syllable triggerDataEvent in the
+      // same generation. xterm's CompositionHelper post-commit re-emit
+      // arrives within ~1 frame (≪ 20 ms defer + a small margin); 40 ms is
+      // 2× the defer window — comfortable for the case-(d) race while
+      // tightly bounding false-suppression long-tail. The token-identity
+      // check prevents a stale 40 ms timer from clobbering a newer commit.
+      setTimeout(() => {
+        if (!disposed && lastCompositionCommit === commit) {
+          lastCompositionCommit = null;
+        }
+      }, 40);
       emitFlush(written, null);
     }
   };
@@ -502,7 +516,15 @@ export function attachKoreanImeShim(
         // B4: blur-commit is a valid IME commit path; record so xterm's
         // CompositionHelper post-commit triggerDataEvent (if any) is
         // deduped consistently with onCompositionEnd.
-        lastCompositionCommit = { text: composed, gen: imeFlushGen };
+        const commit = { text: composed, gen: imeFlushGen };
+        lastCompositionCommit = commit;
+        // Round-1 implementer-review fold: same time-bound clear as
+        // onCompositionEnd — keeps the dedup window tight.
+        setTimeout(() => {
+          if (!disposed && lastCompositionCommit === commit) {
+            lastCompositionCommit = null;
+          }
+        }, 40);
         emitFlush(composed, null);
       }
     }
@@ -605,6 +627,14 @@ export function attachKoreanImeShim(
               data === lastCompositionCommit.text &&
               imeFlushGen === lastCompositionCommit.gen
             ) {
+              // Round-1 implementer-review fold (4/5 convergent): consume
+              // the dedup token after one suppression so subsequent
+              // legitimate same-syllable triggerDataEvent calls in the
+              // same generation pass through. Combined with the 40 ms
+              // safety clear in onCompositionEnd / onTextareaBlur, this
+              // closes both the "second triggerDataEvent in same gen" and
+              // "no triggerDataEvent ever arrives" long-tail windows.
+              lastCompositionCommit = null;
               return;
             }
             origTrigger(data, wasUserInput);

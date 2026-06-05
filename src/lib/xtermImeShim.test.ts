@@ -943,3 +943,109 @@ describe("attachKoreanImeShim — T4: modifier-augmented arrow (no duplicate)", 
     expect(onComposedFlush).toHaveBeenCalledWith("요", null);
   });
 });
+
+// ===========================================================================
+// Round-1 implementer-review fold (4/5 convergent: @codex2 HIGH, @codex3 MED,
+// @codex4 HIGH, @claude4 LOW) — B4 dedup token must not be open-ended.
+//
+// The initial B4 implementation set `lastCompositionCommit` on every
+// commit and only cleared it on the next `imeFlushGen`-bumping IME action
+// (compositionend / blur / node-7 stale-state). Inside that window any
+// legitimate same-syllable `triggerDataEvent("요")` (single-Hangul paste,
+// programmatic terminal input, plugin emission, etc.) was silently dropped.
+//
+// Fold: two complementary safeguards
+//   1. **Consume on suppress** — when the wrapper's 20 ms defer fires and
+//      the B4 inner check matches, clear `lastCompositionCommit` before
+//      `return`. The first xterm CompositionHelper post-commit re-emit
+//      is suppressed; any subsequent same-syllable trigger passes through.
+//   2. **Time-bound (40 ms)** — `onCompositionEnd` / `onTextareaBlur`
+//      schedule a `setTimeout(40)` that nulls `lastCompositionCommit` if
+//      it still references the same commit (token-identity check keeps
+//      a newer commit safe from a stale clear).
+// Combined, both close the "second trigger in same gen" and "no trigger
+// ever arrives" long-tail windows.
+// ===========================================================================
+
+describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => {
+  it("T5 (time-bound): a later legitimate triggerDataEvent('요') passes through after the 40ms post-commit dedup window expires", () => {
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    // 1. Commit "요" via compositionend. Sets lastCompositionCommit and
+    //    schedules the 40 ms safety clear.
+    textarea.value = "요";
+    fireInput(textarea, "insertText", "요");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "요");
+
+    // 2. Drive past the 40 ms safety window. No xterm CompositionHelper
+    //    re-emit arrives (the case-(d) window passed unused). The safety
+    //    timer fires → lastCompositionCommit cleared.
+    vi.advanceTimersByTime(60);
+
+    // 3. Later legitimate triggerDataEvent("요") (e.g., single-Hangul
+    //    paste, plugin emission, or programmatic terminal input). With
+    //    the token cleared, this schedules a normal 20 ms defer.
+    cs.triggerDataEvent("요", true);
+    vi.advanceTimersByTime(25);
+
+    // Pass-through: dedup did not fire (token was already null).
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["요"]);
+    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
+
+    vi.useRealTimers();
+  });
+
+  it("T6 (consume-on-suppress): after the first case-(d) suppression, a later legitimate triggerDataEvent('요') in the same generation passes through", () => {
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    // 1. Commit "요" via compositionend.
+    textarea.value = "요";
+    fireInput(textarea, "insertText", "요");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "요");
+
+    // 2. Case-(d) xterm CompositionHelper re-emit. Wrapper defers; timer
+    //    fires within the window → dedup suppress + consume.
+    cs.triggerDataEvent("요", true);
+    vi.advanceTimersByTime(25);
+    expect(origTriggerCalls.map((c) => c.data)).toEqual([]);
+
+    // 3. Later legitimate same-syllable triggerDataEvent in the same
+    //    imeFlushGen generation (no intervening IME activity). With the
+    //    token consumed by step 2's suppression, this passes through.
+    cs.triggerDataEvent("요", true);
+    vi.advanceTimersByTime(25);
+
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["요"]);
+    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
+
+    vi.useRealTimers();
+  });
+});
