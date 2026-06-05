@@ -392,6 +392,60 @@ frozen, consumers untouched), PTY payload bit-identity, scope discipline
 Round-3 fold is purely a precision tightening on the claim condition
 within B4.
 
+## Round-4 implementer-review convergence (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+
+**5/5 reviewers APPROVE for merge. Zero new blocking findings. No code
+change.**
+
+### Reviewer verdicts (round-3 fold = c833c8d + 3dcbc2a + d5e9823 + 42b1642 + 6513ff0 + 97cd808 + 6d85a73)
+
+| Reviewer | Verdict | New findings |
+|---|---|---|
+| @codex2 (task-34) | APPROVE | None |
+| @claude3 (task-35) | APPROVE | None (self-reflection on missed round-3 trace) |
+| @codex3 (task-36) | APPROVE | None |
+| @claude4 (task-37) | APPROVE | None (re-confirmed prior LOW/NIT non-fold reasoning) |
+| @codex4 (task-38) | APPROVE | None |
+
+### Independent verification (per reviewer)
+
+- **@codex2 (task-34)**: confirmed conditional claim at `xtermImeShim.ts:638-644` implements `isCandidate`; verified T8 covers prior task-28 finding; 32 file-local + 279 full-suite tests pass.
+- **@claude3 (task-35)**: self-reflected on missing the round-3 finding in their round-3 review ("audit must enumerate every channel that can present matching shape, not just the intended source"); empirically reproduced T8 failure on round-2 wrapper and pass on round-3; 4/4 prior regression tests (T3/T5/T6/T7) still green.
+- **@codex3 (task-36)**: confirmed `isCandidate` correctly implemented; T8 covers exact task-30 failure mode; T5/T6/T7 still cover their respective scenarios.
+- **@claude4 (task-37)**: round-2 wrapper restored, ran `vitest -t "T8"` → FAIL with `["한","요"]`; round-3 restored → PASS. Confirmed round-3 design is "strictly cleaner than round-2" (centralized match-check logic). Re-confirmed F1 (microtask-batched) and F2 (comment NIT) non-fold reasoning.
+- **@codex4 (task-38)**: confirmed conditional claim closes task-32 residual advisory; T7 still covers delayed-duplicate; T5/T6 still cover expiry/consume; no exported signatures or PTY payload changes.
+
+### Cumulative four-round convergence
+
+Each round's regression test reproduces the failure on the prior wrapper
+and passes on the new — the cycle is healthy. Cumulative coverage:
+
+| Round | Convergent finding | Fix | Regression test |
+|---|---|---|---|
+| 0 | (initial — case d via plan handoff) | Shape B4 at node 9 | T3 |
+| 1 | 4/5 — B4 token had no consume/expiry | consume + 40 ms time-bound | T5 + T6 |
+| 2 | 3/5 — 40 ms safety races 20 ms defer | claim-at-schedule | T7 |
+| 3 | 3/5 — unconditional claim consumed token for non-matching events | conditional claim (`isCandidate`) | T8 |
+| 4 | **none — 5/5 APPROVE** | (no fold) | — |
+
+### Phase 6 gate status
+
+The implementation is ready for the human `confirm merge` gate. Phase 6
+manual macOS WKWebView repro (plan Success Criterion #1a/1b/1c) remains
+the live falsification gate per Constraint #6.
+
+If 1a (`compose 안녕하세요 → .`) or 1b (`compose 안녕하세요 → arrow`)
+alone reproduces the duplicate on the real app, that would be evidence
+of a case-(b) production mechanism that B4 alone does not cover; a
+follow-up round adding B1 (node-7 no-write) would be needed.
+
+If only 1c (`compose 안녕하세요 → . → arrow`) reproduces, case (d) is
+validated as the production cause and the round-3-folded B4 is sufficient.
+
+If none of 1a/1b/1c reproduce, the four-round B4 fold has closed the bug
+in production — the unit-test surface (279/279 with T1–T8 inclusive of
+T4-shift/T4-meta) matches WKWebView behavior.
+
 ## Blast-radius note (per round-3 fold F5')
 
 Per `plan.md` case (d) "Blast-radius note": B4 may also close out other
