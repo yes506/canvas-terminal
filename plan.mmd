@@ -1,2 +1,31 @@
-graph LR
-  attachKoreanImeShim["attachKoreanImeShim"]
+flowchart TD
+    A["user keystroke at helper textarea"] --> B{"keydown type?"}
+
+    B -- "229 (IME jamo)" --> C["docKeyDown<br/>keyCode==229 branch — node 3"]
+    C --> C1["isComposing := true<br/>showOverlay(textarea.value.substring(imeStartPos))"]
+
+    B -- "non-229" --> D["docKeyDown else-branch"]
+    D --> D1{"!e.isComposing<br/>OR isTerminating?"}
+    D1 -- "no (browser still composing)" --> Dskip["skip — composition continues"]
+    D1 -- "yes" --> E{"isComposing(shim)<br/>AND !isModifier?"}
+    E -- "no" --> Eskip["skip — already in clean state"]
+    E -- "yes (stale-state catch-up)" --> F{"isTerminating?"}
+    F -- "yes (Enter/Esc/Tab)" --> Fwrite["write composed+suffix to PTY<br/>preventDefault, emitFlush — node 6"]
+    F -- "no (period/arrow/etc.)" --> Bug["BUG SITE — writes composed + empty suffix<br/>(effectively composed alone) — node 7 duplicate-write site"]
+
+    G["browser fires compositionend"] --> H["onCompositionEnd — node 5"]
+    H --> H1["if e.data AND shim still composing:<br/>invoke write_to_pty(committed)"]
+    H1 --> H2["clearOverlay → imeFragment := empty<br/>isComposing := false<br/>imeFlushGen++"]
+
+    I["xterm._handleKey<br/>(via attachCustomKeyEventHandler return true)"] --> J["triggerDataEvent wrapper — node 9"]
+    J --> J1{"isComposing(shim)?"}
+    J1 -- "yes" --> Jsup["suppress"]
+    J1 -- "no" --> J2{"single Korean codepoint?"}
+    J2 -- "yes" --> Jdef["defer 20ms<br/>check isComposing AND imeFlushGen at fire"]
+    J2 -- "no" --> Jpass["origTrigger -> terminal.onData -> PTY"]
+    Jdef --> Bug2["CANDIDATE BUG SITE (case d) — defer fires AFTER<br/>compositionend already wrote 요 via invoke;<br/>gen captured post-increment, so check passes;<br/>origTrigger writes 요 a second time via onData -> PTY"]
+
+    style Bug fill:#f99,stroke:#900,stroke-width:2px
+    style Bug2 fill:#f99,stroke:#900,stroke-width:2px
+    style F fill:#fcc
+    style H1 fill:#cfc
