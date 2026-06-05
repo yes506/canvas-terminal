@@ -23,8 +23,9 @@ flowchart TD
     J1 -- "no" --> J2{"single Korean codepoint?"}
     J2 -- "yes" --> Jdef["defer 20ms<br/>check isComposing AND imeFlushGen at fire"]
     J2 -- "no" --> Jpass["origTrigger -> terminal.onData -> PTY"]
+    Jdef --> Bug2["CANDIDATE BUG SITE (case d) — defer fires AFTER<br/>compositionend already wrote 요 via invoke;<br/>gen captured post-increment, so check passes;<br/>origTrigger writes 요 a second time via onData -> PTY"]
 
     style Bug fill:#f99,stroke:#900,stroke-width:2px
+    style Bug2 fill:#f99,stroke:#900,stroke-width:2px
     style F fill:#fcc
     style H1 fill:#cfc
-    style Jdef fill:#cfc
