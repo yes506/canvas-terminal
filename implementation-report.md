@@ -5,7 +5,7 @@
 - Planner marker: **feature** from commit `daf9e89` (`feat(planner): merge korean-ime-dup-period-arrow (plan-feature, human-confirmed)`)
 - Planner artifacts: `plan.md` (44 401 bytes), `plan.mmd` (1 934 bytes)
 - Source hash (sha256, 16 hex): `8e4b9fc836cb9436`
-- Implementation commits: `c833c8d` (round-0 body) + `3dcbc2a` (round-1 peer-review fold) + `42b1642` (round-2 peer-review fold)
+- Implementation commits: `c833c8d` (round-0 body) + `3dcbc2a` (round-1 peer-review fold) + `42b1642` (round-2 peer-review fold) + `97cd808` (round-3 peer-review fold)
 - Base branch: `dev`
 - Implementer branch: `implementer/korean-ime-dup-period-arrow-46880-19563-17468`
 
@@ -45,6 +45,7 @@
 - Test totals post-fix (round-0): **14 files, 275 passed (270 baseline + 5 new T1–T4)**, ≈ 5 s wall
 - Test totals post-round-1 fold: **14 files, 277 passed (270 baseline + 7 new T1–T6)**, ≈ 5 s wall
 - Test totals post-round-2 fold: **14 files, 278 passed (270 baseline + 8 new T1–T7)**, ≈ 5 s wall
+- Test totals post-round-3 fold: **14 files, 279 passed (270 baseline + 9 new T1–T8)**, ≈ 5 s wall
 
 Tail of the final vitest run (truncated):
 
@@ -86,6 +87,7 @@ AssertionError: expected [ '요' ] to deeply equal []
 | WQ-4 | completed | `src/lib/xtermImeShim.test.ts` | T1 (compose → period, case b positive control), T2 (compose → arrow with synthetic CSI passthrough, case b positive control), T4-shift, T4-meta (both confirming `isModifier` check uses `e.key === "ArrowRight"` → modifier flag does NOT bypass node 7). Triple-channel assertions: `ptyWrites()`, `origTriggerCalls`, `onComposedFlush`. T4 as two `it()` blocks per round-2 fold (claude4 G4). |
 | ROUND-1-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 4/5 convergent peer-review finding (codex2/codex3/codex4/claude4): `lastCompositionCommit` had no consume/expiry. Added consume-on-suppress in the wrapper timer callback + 40 ms time-bound clear in `onCompositionEnd`/`onTextareaBlur` (token-identity guarded). Added T5 (time-bound) + T6 (consume-on-suppress) regression tests. Full suite 277/277. Commit `3dcbc2a`. |
 | ROUND-2-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 3/5 convergent peer-review finding (codex2/codex3/codex4): round-1's 40 ms safety clear races the wrapper's 20 ms defer for delayed xterm re-emits arriving between t=20 ms and t=40 ms. Replaced suppression-check-at-fire-time with **claim-at-schedule**: atomic capture `claim = lastCompositionCommit` into the defer closure + nullify live token. Defer's match check uses captured `claim`, race-free against safety clear. Atomic null doubles as consume-on-suppress. Added T7 (delayed-duplicate regression). Full suite 278/278. Commit `42b1642`. |
+| ROUND-3-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 3/5 convergent peer-review finding (codex2/codex3/codex4): round-2's claim-at-schedule consumed the live token UNCONDITIONALLY for any single-Hangul triggerDataEvent. A non-matching event ("한") could steal the token meant for the matching duplicate ("요"), letting the real duplicate escape. Fix: gate capture+null on `isCandidate = live !== null && data === live.text && gen === live.gen` at schedule time. Non-matching events leave the live token intact and pass through normally. Added T8 (non-matching preservation regression). Full suite 279/279. Commit `97cd808`. |
 
 ## Variant selection rationale (Phase 0 Step 3)
 
@@ -300,6 +302,95 @@ sub-variant of Shape B family), OUT-OF-SCOPE boundary (terminator union
 frozen, consumers untouched), PTY payload bit-identity, scope discipline
 (single-file body changes only) — all unchanged from rounds 0 / 1.
 Round-2 fold is purely a timing-correctness tightening within B4.
+
+## Round-3 implementer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+
+5/5 reviewers verified the round-2 fold; 3/5 surfaced the same convergent
+finding around unconditional token capture. Folded.
+
+### Reviewer verdicts (round-2 fold = c833c8d + 3dcbc2a + d5e9823 + 42b1642 + 6513ff0)
+
+| Reviewer | Verdict | Severity assigned |
+|---|---|---|
+| @codex4 (task-32) | APPROVE (LOW residual advisory, non-blocking) | LOW |
+| @codex2 (task-28) | HOLD pending one fix | MEDIUM |
+| @claude3 (task-29) | APPROVE (no new findings) | None |
+| @codex3 (task-30) | REVISE before merge | MEDIUM |
+| @claude4 (task-31) | APPROVE (microtask-batched JSDOM-only LOW + NIT) | LOW non-blocking |
+
+### Convergent (3/5 reviewers) — F1''' unconditional claim consumes token before match-check
+
+- **codex4 task-32 LOW residual** — non-matching Korean event inside the 40 ms window can consume the token and allow a later same-syllable duplicate to pass through (assessed non-blocking but identified the trace).
+- **codex2 task-28 MEDIUM** — same trace, HOLD pending fix; offered the data+gen match check at schedule time.
+- **codex3 task-30 MEDIUM** — same trace; recommended "only claim/clear when `data === lastCompositionCommit.text && imeFlushGen === lastCompositionCommit.gen` at schedule time."
+
+Independently traced against the round-2 wrapper:
+
+```
+t=0:  compositionend("요") → live={text:"요", gen:N}
+t=10: cs.triggerDataEvent("한") → claim=X (live), live=null. defer1 scheduled.
+t=25: cs.triggerDataEvent("요") (actual case-d duplicate) → claim=null. defer2 scheduled.
+t=30: defer1 fires → claim.text="요" ≠ "한" → mismatch → origTrigger("한")  ✓
+t=45: defer2 fires → claim=null → origTrigger("요") → DUPLICATE LEAKS ✗
+```
+
+**Folded** in commit `97cd808` with the **conditional claim** (consensus
+fix from all 3 convergent reviewers):
+
+```ts
+const live = lastCompositionCommit;
+const isCandidate =
+  live !== null && data === live.text && gen === live.gen;
+const claim = isCandidate ? live : null;
+if (isCandidate) {
+  lastCompositionCommit = null;
+}
+setTimeout(() => {
+  if (!disposed && !isComposing && gen === imeFlushGen) {
+    if (claim !== null) return; // suppress (already verified at schedule)
+    origTrigger(data, wasUserInput);
+  }
+}, 20);
+```
+
+Match check moved from timer-fire time to schedule time. Non-matching
+single-Hangul events leave the live token intact; only the actual
+matching candidate captures and clears.
+
+### Regression test added in the fold
+
+- **T8 (non-matching preservation)** — commit `요` → `cs.triggerDataEvent("한")` at t=10 ms → `cs.triggerDataEvent("요")` at t=25 ms → advance 30 ms past both 20 ms defers AND the 40 ms safety → expect `origTriggerCalls === ["한"]` (non-matching pass-through) and `ptyWrites === ["요"]` (matching duplicate suppressed).
+
+Empirically verified: pre-round-3 T8 fails with `origTriggerCalls = ["한", "요"]` (matching duplicate escapes the round-2 unconditional-claim consumption); post-round-3 T8 passes.
+
+### LOW / NIT (not folded)
+
+- **claude4 task-31 F1 (LOW — microtask-batched ordering)** — JSDOM-only
+  edge case where two compositionends fire synchronously before either
+  case-(d) re-emit lands; the first re-emit captures the LIVE token
+  (which is commit2's) and the second escapes. **Per WHATWG**, microtasks
+  run after each task; in real WKWebView, two consecutive compositionends
+  are separate macrotasks (separate keystrokes), so the re-emit for
+  commit1 fires (via the microtask queue) BEFORE compositionend2's task
+  starts. Not a production failure mode. Single-reviewer LOW; not folded.
+- **claude4 task-31 F2 (NIT — comment clarity on 40 ms safety subsumption)** —
+  noted that the 40 ms safety timer's in-code comment doesn't make it
+  explicit that post-round-2 it's only a tail-clean (not load-bearing
+  for case-(d) suppression). Single-reviewer NIT; the round-2 + round-3
+  fold commit messages and this report cover the subsumption explicitly.
+- **claude3 round-2 LOW (40 ms tight under load)** — already auto-resolved
+  by round-2 fold; explicitly confirmed by claude3 task-29 round-3 review.
+- **Pre-existing single-reviewer items (claude3 F2/F3, claude4 F2 from
+  earlier rounds)** — unchanged. Acceptable.
+
+### Architectural axis unchanged across all rounds
+
+Bug-site identification (node 9 / case d), variant choice (B4 — single
+sub-variant of Shape B family), OUT-OF-SCOPE boundary (terminator union
+frozen, consumers untouched), PTY payload bit-identity, scope discipline
+(single-file body changes only) — all unchanged from rounds 0 / 1 / 2.
+Round-3 fold is purely a precision tightening on the claim condition
+within B4.
 
 ## Blast-radius note (per round-3 fold F5')
 
