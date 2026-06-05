@@ -1,391 +1,459 @@
-# Implementation report — korean-ime-dup-render
-
-> **Round-1 peer-review fold (2026-06-05)**: 5 cold reviewers (claude2,
-> claude3, codex1, codex2, codex3) produced 3 verdicts of APPROVE
-> (claude2 with non-blocking note; claude3 with one narrow revision;
-> codex3 with acceptance caveats) and 2 of REVISE (codex1 Major on F1;
-> codex2 High on live WKWebView gate + Medium on F2). After empirical
-> verification (each finding reproduced against the code at HEAD
-> `81ea147`), 4 unique findings were folded:
->
-> - **F1** (codex1 Major, claude3 Medium, claude2 non-blocker): the
->   Node 10 JP/ZH fixture floor did not exercise the
->   `input → triggerDataEvent → keydown(229) → compositionend`
->   ordering. Added a test that pins the **pre-existing residual
->   duplicate-write** for JP/ZH (xterm's non-Korean
->   `triggerDataEvent` falls through immediately while
->   `compositionend` also direct-writes). Out-of-scope for
->   korean-ime-dup-render; fix would require widening the 20ms-defer
->   to all single-codepoint CJK ranges.
-> - **F2** (claude3 Low, codex2 Medium): the Failure-modes TSDoc
->   claimed "no-op shim" but the impl only skipped overlay attach
->   (`triggerDataEvent`/`isCursorHidden`/listeners still patched).
->   Refactored overlay attach into a `tryAttachOverlay()` function
->   that `rebind()` also retries — degraded-overlay mode now
->   genuinely recoverable. Docstring tightened to match. Added test.
-> - **F3** (claude3 Low, hardening): `onComposedFlush` callback is
->   synchronous-only — async subscribers must wrap their own
->   `try/catch`. Documented in TSDoc.
-> - **Cosmetic** (claude2 Low): test comment said `reKorean`; the
->   helper uses `KOREAN_CODEPOINT_RE`. Aligned.
->
-> Live WKWebView gate (codex2 High, codex3 Caveat 1, claude2/claude3
-> concurring framing): preserved as Phase 6 acceptance — the
-> autonomous loop has no Korean IME / WKWebView access. The fold did
-> NOT change the variant-(b) default; trace falsification at Phase 6
-> still escalates back to planner per plan Constraint #3.
->
-> Test diff after fold: 268 → **270** tests (+1 JP/ZH residual pin,
-> +1 rebind() overlay retry). `tsc --noEmit` and full vitest both
-> exit 0.
->
-> **Round-2 peer-review fold (2026-06-05)**: 5 cold reviewers
-> (claude2 task-118, claude3 task-71 r2, codex1 task-111 updated,
-> codex2 task-119, codex3 task-120) re-reviewed HEAD `29f01fc`.
-> Verdicts: 3 APPROVE (claude2, claude3, codex2 for Phase 6) + 2
-> REVISE (codex1, codex3) split on interpretation of the round-1
-> JP/ZH residual-pin test vs `plan.md`'s Node 10 fixture text.
-> Verified empirically: `plan.md:33` and `plan.md:79(b)` specify the
-> fixture as a **3-event sequence** (`keydown(229)` +
-> `insertReplacementText/insertText` + `compositionend`) — xterm's
-> internal `triggerDataEvent` is NOT in that list. The pre-existing
-> 3-event test PASSES with one PTY write (Node 10 floor satisfied);
-> the round-1 supplementary 4-event test pins a sequence the plan
-> did not enumerate. Round-2 fold: (a) refresh stale validation
-> tables to post-fold numbers, (b) make the 3-event-vs-4-event
-> distinction explicit in WQ-2 description + the new
-> "Plan-conformance note on Node 10" section below, (c) surface
-> the codex1/codex3 alternative reading for the user's Phase 6
-> decision — the implementer does NOT unilaterally widen the
-> helper's behavior (would exceed body-generation scope; planner
-> committed Korean-only defer at `KOREAN_CODEPOINT_RE`).
-
+# Implementation report — korean-ime-dup-period-arrow
 
 ## Source
 
-- Planner marker: `(plan-feature, human-confirmed)` from commit `0523fa8a` on `dev`
-- Planner artifacts: `plan.md`, `plan.mmd`
-- Source hash (sha256, first 16): `b734b3abf67b14b4`
-- Scale lane: **feature**
-- Variant chosen: **(b)** — `isComposing = false` in `onCompositionEnd` (planner-preferred default)
+- Planner marker: **feature** from commit `daf9e89` (`feat(planner): merge korean-ime-dup-period-arrow (plan-feature, human-confirmed)`)
+- Planner artifacts: `plan.md` (44 401 bytes), `plan.mmd` (1 934 bytes)
+- Source hash (sha256, 16 hex): `8e4b9fc836cb9436`
+- Implementation commits: `c833c8d` (round-0 body) + `3dcbc2a` (round-1 peer-review fold) + `42b1642` (round-2 peer-review fold) + `97cd808` (round-3 peer-review fold)
+- Base branch: `dev`
+- Implementer branch: `implementer/korean-ime-dup-period-arrow-46880-19563-17468`
 
 ## Work queue summary
 
-| ID | Plan node(s) | Status | Files touched |
-|---|---|---|---|
-| WQ-1 | N3 + N4 | completed | `src/lib/xtermImeShim.ts` |
-| WQ-2 | N5 + N10 floor | completed | `src/lib/xtermImeShim.test.ts` |
-| WQ-3 | N6 | completed | `src/lib/terminalManager.ts` |
-| WQ-4 | N7 | completed | `src/components/collaborator/AgentMiniTerminal.tsx` |
+- Total items: **4**
+- Completed: **4**
+- Blocked: **0**
 
-- Total items: 4
-- Completed: 4
-- Blocked: 0
+| ID | Item | Status |
+|---|---|---|
+| WQ-1 | Extend `fireKeydown` helper for modifier flags | completed |
+| WQ-2 | Reproduce duplicate via T3 (case d locked) | completed |
+| WQ-3 | Apply Shape B4 fix (post-compositionend defer dedup) | completed |
+| WQ-4 | Add T1 / T2 / T4-shift / T4-meta tests | completed |
 
-## Files changed (post-round-1 fold)
+## Files changed
 
-| File | Lines |
-|---|---|
-| `src/lib/xtermImeShim.ts` | +444 / −34 (skeleton → body + round-1 fold: tryAttachOverlay, F2/F3 TSDoc) |
-| `src/lib/xtermImeShim.test.ts` | +668 / −0 (new file; +2 tests in round-1 fold: F1 residual pin, F2 rebind retry) |
-| `src/lib/terminalManager.ts` | +45 / −361 (315-line IME block → 22-line shim call + onComposedFlush) |
-| `src/components/collaborator/AgentMiniTerminal.tsx` | +35 / −278 (252-line IME block → 16-line shim call + onComposedFlush) |
-| **Total** | **+1192 / −673** (`implementation-report.md` not counted) |
+- `src/lib/xtermImeShim.ts` — +97 / −12 lines:
+  - declare `lastCompositionCommit:{text,gen}|null`;
+  - record post-`imeFlushGen++` in `onCompositionEnd` + `onTextareaBlur`;
+  - **round-1 fold**: schedule 40 ms time-bound clear after each commit (token-identity guard);
+  - suppress matching deferred Korean re-emit in the `triggerDataEvent` wrapper;
+  - **round-2 fold**: claim the token atomically at trigger schedule time (capture into defer closure + nullify live token). The suppression decision uses the captured `claim`, race-free against the 40 ms safety clear. Atomic null doubles as consume-on-suppress — subsequent triggers see live token === null at schedule time and pass through.
+- `src/lib/xtermImeShim.test.ts` — +425 / −1 line:
+  - extend `fireKeydown` for `shift/ctrl/alt/metaKey`;
+  - add T1 (compose → period), T2 (compose → arrow), T3 (compose → period → arrow, **case d full repro**), T4-shift, T4-meta;
+  - **round-1 fold**: add T5 (time-bound: 60 ms past commit → later trigger passes through) + T6 (consume: after one match, next trigger passes through);
+  - **round-2 fold**: add T7 (delayed-duplicate: xterm re-emit at t=25 ms inside the 40 ms safety window must still be suppressed — race-free via claim-at-schedule).
 
 ## Validation
 
-- Baseline exit on `dev` HEAD: `0` (tsc + vitest, 247/247)
-- Final validation command: `node_modules/.bin/tsc --noEmit && node_modules/.bin/vitest run`
-- Final exit: `0`
-- Auto-fix attempts used: 0/3
-- Test result diff: 13 → **14** test files (+`xtermImeShim.test.ts`); 247 → **270** tests (+23 new: 21 initial + 2 round-1 fold)
+- Baseline exit (BASE_BRANCH `dev` HEAD): **0** (tsc 0, vitest 270/270, ≈ 6 s wall)
+- Final validation command: `npx tsc --noEmit && npm test`
+- Final exit: **0**
+- Auto-fix attempts used: **0 / 3**
+- Test totals post-fix (round-0): **14 files, 275 passed (270 baseline + 5 new T1–T4)**, ≈ 5 s wall
+- Test totals post-round-1 fold: **14 files, 277 passed (270 baseline + 7 new T1–T6)**, ≈ 5 s wall
+- Test totals post-round-2 fold: **14 files, 278 passed (270 baseline + 8 new T1–T7)**, ≈ 5 s wall
+- Test totals post-round-3 fold: **14 files, 279 passed (270 baseline + 9 new T1–T8)**, ≈ 5 s wall
 
-Tail of last validation run (post-round-1 fold):
+Tail of the final vitest run (truncated):
 
 ```
+ RUN  v4.1.5 .../implementer-korean-ime-dup-period-arrow-46880-19563-17468
+
  Test Files  14 passed (14)
-      Tests  270 passed (270)
-   Duration  1.69s
+      Tests  275 passed (275)
+   Duration  1.66s (tests 600ms)
 ```
+
+### Phase 0 negative-baseline (pre-fix proof)
+
+Per `plan.md` Success Criterion #5, the implementer must prove the duplicate
+reproduces against current `dev` HEAD before applying the fix:
+
+```
+npx vitest run src/lib/xtermImeShim.test.ts -t "T3"
+…
+AssertionError: expected [ '요' ] to deeply equal []
+- Expected: []
++ Received: [ "요" ]
+  src/lib/xtermImeShim.test.ts:782:49
+    expect(origTriggerCalls.map((c) => c.data)).toEqual([])
+```
+
+`ptyWrites()` had one `"요"` (from `compositionend`'s `invoke`),
+`origTriggerCalls` had one `"요"` (from the wrapper's deferred
+`origTrigger`). Combined-channel duplicate per Success Criterion #5
+**signal #2**. **Case (d)** locked: defer fire-after-compositionend race.
 
 ## Per-item outcomes
 
-### WQ-1 — `attachKoreanImeShim` body (plan N3 + N4)
+| Item | Status | Files touched | Notes |
+|---|---|---|---|
+| WQ-1 | completed | `src/lib/xtermImeShim.test.ts` | `fireKeydown` now passes `shiftKey/ctrlKey/altKey/metaKey` through (4 default-false flags). Required by T4. No existing-test breakage. |
+| WQ-2 | completed | `src/lib/xtermImeShim.test.ts` | T3 written with `cs.triggerDataEvent("요", true)` after `fireCompositionEnd` (Phase 0 Step 5.3 candidate path 2; the JSDOM-viable case d reproduction per round-3 fold F3'). Period+arrow keystrokes included as user-flow noise. Negative-baseline run produced `origTriggerCalls=["요"]` against unmodified HEAD → case (d) locked + case-label header comment inserted. |
+| WQ-3 | completed | `src/lib/xtermImeShim.ts` | Shape B4 applied. `lastCompositionCommit:{text,gen}\|null` declared in shim closure; written AFTER `imeFlushGen++` in `onCompositionEnd` (only when `written !== null`) and `onTextareaBlur` (defensive consistency). Wrapper's 20 ms-defer fire path checks `lastCompositionCommit` and suppresses `origTrigger` when `data === text && imeFlushGen === gen`. No signature changes; no new modules; PTY payload bit-identical to today. |
+| WQ-4 | completed | `src/lib/xtermImeShim.test.ts` | T1 (compose → period, case b positive control), T2 (compose → arrow with synthetic CSI passthrough, case b positive control), T4-shift, T4-meta (both confirming `isModifier` check uses `e.key === "ArrowRight"` → modifier flag does NOT bypass node 7). Triple-channel assertions: `ptyWrites()`, `origTriggerCalls`, `onComposedFlush`. T4 as two `it()` blocks per round-2 fold (claude4 G4). |
+| ROUND-1-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 4/5 convergent peer-review finding (codex2/codex3/codex4/claude4): `lastCompositionCommit` had no consume/expiry. Added consume-on-suppress in the wrapper timer callback + 40 ms time-bound clear in `onCompositionEnd`/`onTextareaBlur` (token-identity guarded). Added T5 (time-bound) + T6 (consume-on-suppress) regression tests. Full suite 277/277. Commit `3dcbc2a`. |
+| ROUND-2-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 3/5 convergent peer-review finding (codex2/codex3/codex4): round-1's 40 ms safety clear races the wrapper's 20 ms defer for delayed xterm re-emits arriving between t=20 ms and t=40 ms. Replaced suppression-check-at-fire-time with **claim-at-schedule**: atomic capture `claim = lastCompositionCommit` into the defer closure + nullify live token. Defer's match check uses captured `claim`, race-free against safety clear. Atomic null doubles as consume-on-suppress. Added T7 (delayed-duplicate regression). Full suite 278/278. Commit `42b1642`. |
+| ROUND-3-FOLD | completed | `src/lib/xtermImeShim.{ts,test.ts}` | 3/5 convergent peer-review finding (codex2/codex3/codex4): round-2's claim-at-schedule consumed the live token UNCONDITIONALLY for any single-Hangul triggerDataEvent. A non-matching event ("한") could steal the token meant for the matching duplicate ("요"), letting the real duplicate escape. Fix: gate capture+null on `isCandidate = live !== null && data === live.text && gen === live.gen` at schedule time. Non-matching events leave the live token intact and pass through normally. Added T8 (non-matching preservation regression). Full suite 279/279. Commit `97cd808`. |
 
-- Removed `export declare` skeleton; emitted full body preserving the
-  committed signature `(terminal, container, options) => KoreanImeShimHandle`.
-- **Variant (b) fix** (plan N4 preferred default): `onCompositionEnd`
-  now sets `isComposing = false` and calls `clearOverlay()` at the
-  syllable boundary, so the next `keydown(229)` re-enters the
-  `if (!isComposing)` branch that anchors
-  `imeStartPos = textarea.value.length - 1`. Previous inline shims
-  left `isComposing = true`, causing `showOverlay(value.substring(stale_start))`
-  to repaint the already-committed prefix.
-- **`dispose()` contract** (skeleton TSDoc): full restoration —
-  document `keydown`/`input` listeners removed, original
-  `triggerDataEvent` reference restored (raw, not bound — captured at
-  attach as `origTriggerRaw`), original `isCursorHidden` property
-  descriptor restored via `Object.defineProperty`, overlay removed
-  from DOM, `cursorBlink` restored to its pre-attach value, helper
-  textarea `compositionend`/`blur`/`focus` listeners removed, `focus`
-  patch unpatched. Idempotent on the same handle.
-- **`onComposedFlush` emission**: fires after all 3 PTY write paths
-  (`compositionend` commit / `blur` flush / terminator-flush) with
-  `(committedText, terminator)`. Subscriber exceptions are swallowed.
-- **`webgl` option**: signature preserved (`void options.webgl;`)
-  matching the planner contract checklist item.
+## Variant selection rationale (Phase 0 Step 3)
 
-### WQ-2 — Unit tests (plan N5 + N10 floor)
+WQ-2 reproduced the duplicate via case (d) (defer fire-after-compositionend).
+Per `plan.md` Step 3, case (d) maps directly to **B4** — post-compositionend
+defer dedup at the `triggerDataEvent` wrapper. B1 (node-7 no-write) was not
+needed because the JSDOM reproduction's duplicate came entirely via
+`origTriggerCalls` (the wrapper path), not via a second `ptyWrites()` entry.
+The cross-variant rule (B1+B4 if both channels duplicate) did not apply.
 
-**23 tests across 6 `describe` blocks** (post-round-1 fold; 21 initial + 2 fold):
+Defensive extension: `onTextareaBlur` also writes `lastCompositionCommit` so
+the blur-commit IME path gets the same dedup coverage as `onCompositionEnd`.
+This is a single-variant generalization (still B4), not a multi-variant
+combination — both call sites are commit paths that bump `imeFlushGen` and
+fire to PTY via `invoke`, so the dedup invariant applies uniformly.
 
-1. **attach lifecycle** (5) — TypeError on missing `_core.coreService`;
-   `.xterm-screen` attach path; container fallback; **degraded-overlay
-   mode when container detached and no `.xterm-screen` (still patches
-   triggerDataEvent etc.)**; **`rebind()` retries overlay attach after
-   the container becomes reachable** (last two added by round-1 F2 fold).
-2. **variant (b) commit-boundary fix** (1) — full Korean composition
-   sequence `ㅎ→하→한` followed by `compositionend("한")` then new
-   composition `ㄱ`: asserts overlay shows ONLY "ㄱ", not "한ㄱ" (the
-   bug fix invariant).
-3. **`onComposedFlush` emission** (6) — `(text, null)` on
-   `compositionend`, `(text, null)` on blur, `(text, "\r")` on Enter
-   mid-composition with atomic `text+terminator` PTY write,
-   `(text, "\x1b")` on Escape, `(text, "\t")` on Tab, subscriber
-   exception swallow.
-4. **Node 10 JP/ZH non-regression fixture floor** (3) —
-   (a) the **plan's literal 3-event fixture** (`keydown(229) +
-   input(insertReplacementText) + compositionend`): exactly **one PTY
-   write**, no drop, overlay rendered exactly once, `onComposedFlush`
-   fires once — **the plan's success criterion 5 / Node 10 (b) IS
-   SATISFIED**; (b) non-Korean single characters NOT 20ms-deferred
-   through `triggerDataEvent`; (c) **round-1 fold supplementary**:
-   pins the production-adjacent 4-event ordering (`input +
-   triggerDataEvent + keydown(229) + compositionend`) which falls
-   outside the plan's 3-event fixture text — see "Plan-conformance
-   note on Node 10 (round-2 review)" below.
-5. **Korean 20ms defer** (2) — defers single Hangul chars by 20ms;
-   drops the deferred char if composition starts within the window.
-6. **`dispose()` restoration** (6) — `triggerDataEvent` reference
-   restored; `isCursorHidden` property descriptor restored; overlay
-   removed from DOM; document listeners removed (no PTY writes after
-   dispose); `cursorBlink` restored; idempotent.
+## Invariant non-regression (per `plan.md` "Stabilized invariants")
 
-Test setup uses `happy-dom` (project default). One synthesis quirk:
-`CompositionEvent` constructor in happy-dom does NOT honor `data` from
-the init dictionary, so the test helper force-sets it via
-`Object.defineProperty(e, "data", { value })`. WKWebView's
-`input`-before-`keydown` order is preserved by helper-fire ordering.
+| Invariant | Test file location | Result |
+|---|---|---|
+| variant-(b) commit-boundary fix | `describe(... "variant (b) commit-boundary fix")` line 303 | passes |
+| JP/ZH non-regression fixture floor (Node 10) | `describe(... "JP/ZH non-regression fixture floor")` line 451 | passes (both 3-event and 4-event pinned residuals) |
+| `onComposedFlush` Enter/Esc/Tab + compositionend + blur emission contract | `describe(... "onComposedFlush emission")` line 348 | passes |
+| 20 ms-defer single Korean codepoint with `imeFlushGen` check | `describe(... "Korean triggerDataEvent defer")` line 576 | passes (both defer-after-non-composing and defer-then-composition-cancels) |
+| Dispose restoration (triggerDataEvent / isCursorHidden / cursorBlink / overlay / listeners) | `describe(... "dispose restoration")` line 616 | passes |
 
-### WQ-3 — PTY pane substitution (plan N6)
-
-- `ManagedTerminal` interface: dropped 5 fields
-  (`imeHandlers`/`rebindIme`/`docKeyDown`/`docInput`/`imeOverlayEl`)
-  → single `imeHandle: KoreanImeShimHandle | null`.
-- 327-line IME block (terminalManager.ts:342–668) replaced with
-  22-line `attachKoreanImeShim(...)` call.
-- **`onComposedFlush` subscription** (Node 8b sub-case (i) fix):
-  Korean compositions DO NOT mutate `lineBuffer`. Terminator `\r`
-  resets `lineBuffer = ""` (mirrors `terminal.onData`'s `\r` branch).
-  Other terminators are no-ops on `lineBuffer`. This means a
-  Korean → IME-off → ASCII `collaborator\r` sequence leaves `lineBuffer
-  === "collaborator"` at the `\r` check → spawn fires correctly.
-  Baseline ASCII `collaborator\r` regression unaffected (sub-case (ii)).
-- `reparentTo`: `s.rebindIme?.()` → `s.imeHandle?.rebind()` (both
-  call sites updated).
-- `ensureGlobalSubscriptions` font-size handler:
-  `s.imeOverlayEl.style.fontSize` → `s.imeHandle?.overlayEl?.style.fontSize`.
-- `cleanupManaged`: 3 manual cleanup blocks (docInput/docKeyDown
-  removeEventListener + imeHandlers focus unpatch) → single
-  `s.imeHandle?.dispose()` + `s.imeHandle = null`. **No parallel
-  manual cleanup**, per plan's codex1-High fold.
-
-### WQ-4 — Collab pane substitution (plan N7)
-
-- React refs: dropped 4
-  (`imeHandlersRef`/`docKeyDownRef`/`docInputRef`/`imeOverlayRef`)
-  → single `imeHandleRef: useRef<KoreanImeShimHandle | null>`.
-- 252-line IME block (AgentMiniTerminal.tsx:448–699) replaced with
-  16-line `attachKoreanImeShim(...)` call.
-- **`onComposedFlush` subscription** (plan node 7 Medium #2):
-  every flushed composition calls `terminal.scrollToBottom()` —
-  closes the scroll-snap gap where Korean composes bypassed
-  `terminal.onData` and lost the "user-input intent" viewport snap
-  that ASCII typing gets.
-- `defaultFontSize: 10` (mini terminals use a smaller default than
-  the PTY pane's 12).
-- Font-size effect (line ~679):
-  `imeOverlayRef.current.style.fontSize` →
-  `imeHandleRef.current?.overlayEl?.style.fontSize`.
-- Unmount cleanup: 3 manual cleanup blocks → single
-  `imeHandleRef.current?.dispose()` + `imeHandleRef.current = null`.
+The B4 dedup is backward-compatible with both existing defer-path tests:
+- "defers single Hangul characters by 20 ms when not composing" — no
+  prior `compositionend` → `lastCompositionCommit === null` → suppression
+  branch never entered → original `origTrigger` fires.
+- "drops deferred Korean characters if composition starts before the
+  20 ms timer fires" — `isComposing === true` at timer fire → existing
+  outer guard returns before the B4 check is reached.
 
 ## Scope-discipline self-check
 
-- [x] No new interfaces / files outside hints (helper module +
-      test file were both planned in `plan.md::Package layout`).
-- [x] No renames of committed public names (`attachKoreanImeShim`,
-      `AttachKoreanImeShimOptions`, `KoreanImeShimHandle` preserved
-      verbatim from skeleton commit `7f4675b`).
-- [x] No signature changes on planner-committed methods (skeleton's
-      `export declare function attachKoreanImeShim(...)` →
-      same `(terminal, container, options) => KoreanImeShimHandle`,
-      including the contract-preserved `webgl?` option).
-- [x] No edits to `validation_command` configuration
-      (`package.json` scripts unchanged).
-- [x] No edits to files outside the work queue's hint set (4 files
-      total, all in `plan.md::Package layout`).
+- [x] No new interfaces / files outside hints (only `src/lib/xtermImeShim.{ts,test.ts}` touched — same files listed in `plan.md` "In scope").
+- [x] No renames of committed public names (`attachKoreanImeShim`, `onComposedFlush`, `KoreanImeShimHandle`, `AttachKoreanImeShimOptions` unchanged).
+- [x] No signature changes on planner-committed methods (terminator union `"\r" | "\x1b" | "\t" | null` preserved verbatim; `attachKoreanImeShim(terminal, container, opts)` signature untouched).
+- [x] No edits to `validation_command` configuration (`package.json` `scripts.test` unchanged; no test-skip flags introduced).
+- [x] No edits to files outside the work queue's hint set (`AgentMiniTerminal.tsx`, `terminalManager.ts`, and all other consumers untouched).
+- [x] No `console.log` instrumentation in committed code (per Phase 0 Step 6).
+- [x] PTY payload bit-identical to pre-fix (per round-3 fold F2' on B3 — B4 keeps `invoke("write_to_pty", { sessionId, data: e.data })` shape unchanged; the dedup happens entirely in the JS-side wrapper closure).
 
-## Deferred to human acceptance smoke (Phase 6)
+## Phase 6 user-acceptance gate (per Constraint #6)
 
-These plan nodes require live WKWebView + Korean (and optionally JP)
-IME input and cannot be exercised by the autonomous loop. They are
-acceptance gates the user runs at Phase 6 before `confirm merge`:
+The live macOS WKWebView repro is the user's `confirm merge` falsification
+gate. Run the three sequences from `plan.md` Success Criterion #1 against
+the implementer branch and refuse merge if any duplicate `요` appears:
 
-- **N1 — Controlled keystroke trace capture**: type "안녕하세요" + "한국어
-  입력 테스트" on both surfaces, capture visible buffer + cursorX/Y +
-  `textarea.value` + overlay text per step.
-- **N2 — buffer/PTY hypothesis verification**: dump
-  `terminal.buffer.active` mid-composition + PTY transcript. If
-  trace falsifies the render-only hypothesis (buffer contains the
-  duplicate too), escalate back to planner per plan Constraint #3.
-  Planner pre-committed variant (b) as the default; my Node 1/2
-  deferral inherits that default.
-- **N8 — Korean accept smoke**: both surfaces, "안녕하세요" + "한국어
-  입력 테스트", every intermediate composition/commit state renders
-  the current Hangul text (committed + composing) exactly once, no
-  arrow-key cleanup required.
-- **N8b — Korean → ASCII `collaborator` transition acceptance**:
-  - (i) "안녕" via Korean IME → IME off → "collaborator\r" → spawn
-    fires (lineBuffer-sync invariant from WQ-3's `onComposedFlush`).
-  - (ii) Baseline ASCII "collaborator\r" without prior Korean →
-    spawn fires (no regression on the existing path).
-- **N9 — non-IME regression + dispose restoration smoke**: ASCII,
-  paste, arrow keys, Ctrl+C/R, Tab completion, shell history (↑/↓),
-  Shift+Enter (CSI u), Cmd shortcuts on both surfaces. Plus React
-  StrictMode remount + terminal reparenting: after `dispose()`,
-  verify ① `triggerDataEvent` restored, ② `isCursorHidden` property
-  descriptor restored, ③ document listeners removed, ④ helper
-  textarea `focus` patch reverted, ⑤ overlay DOM removed.
-  The `dispose()` restoration items (5/5) are unit-tested in WQ-2
-  (`describe("dispose restoration")`); the integration-level
-  StrictMode remount path is acceptance-only.
-- **N10 manual JP IME ceiling**: **`JP/ZH manual smoke: skipped — JP
-  IME not installed in implementer environment` (the autonomous loop
-  has no live WKWebView / IME access for any language).** User Phase
-  6 acceptance: install JP IME and type a JP syllable on both
-  surfaces; verify no duplicate render, no drop. The Node 10
-  **fixture floor** (jsdom `keydown(229) + insertReplacementText +
-  compositionend` sequence) IS automated in WQ-2 and passing. The
-  Round-1 fold also added an explicit **residual-pin test** for the
-  `input → triggerDataEvent → keydown(229) → compositionend`
-  ordering — see `xtermImeShim.test.ts` for the test name "pins
-  residual duplicate-write behavior for JP/ZH..." — documenting that
-  JP/ZH currently has a 2x PTY-write residual via the xterm
-  `triggerDataEvent` fall-through path. Same as the pre-refactor
-  inline shims; out-of-scope for korean-ime-dup-render.
+- **1a** `compose 안녕하세요 → .` → screen `안녕하세요.` (no trailing `요`).
+- **1b** `compose 안녕하세요 → arrow` → screen `안녕하세요` with cursor moved.
+- **1c** `compose 안녕하세요 → . → arrow` → screen `안녕하세요.` with cursor moved, no `요`.
 
-## Plan-conformance note on Node 10 (round-2 review)
+## Round-1 implementer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
 
-Round-2 reviewers split on whether the round-1 supplementary 4-event
-test for JP/ZH (the "residual pin") constitutes a Node 10 plan-gate
-failure. Empirical re-read of the plan text (verified at `plan.md:33`
-and `plan.md:79(b)` in the merged branch `0523fa8`):
+5/5 reviewers verified the round-0 implementation; 4/5 surfaced the same
+convergent finding around B4 dedup token lifetime. Folded.
 
-> success criterion 5: *"비한글 `keydown(229)` + `insertReplacementText/insertText`
-> + `compositionend` **시퀀스** → 중복 flush 없음 / drop 없음 / overlay 1회 렌더"*
->
-> Node 10 (b): *"Node 5 fixture가 비한글 `keydown(229)` + `inputType=insertReplacementText`
-> + `compositionend` **시퀀스**를 헬퍼에 통과시켜 ① 중복 flush 없음, ② drop 없음,
-> ③ 오버레이 1회 렌더 검증"*
+### Reviewer verdicts (round-0 = c833c8d + 1f8aa48)
 
-The plan literally enumerates a **3-event sequence**:
-`keydown(229) + insertReplacementText/insertText + compositionend`.
-xterm.js's internal `coreService.triggerDataEvent` is NOT part of
-that enumeration — it is xterm's own forwarding mechanism, not a
-user-dispatched DOM event.
+| Reviewer | Verdict | Severity assigned |
+|---|---|---|
+| @codex4 (task-16) | HOLD before merge | HIGH |
+| @codex2 (task-17) | HOLD pending one fix | HIGH |
+| @claude3 (task-18) | APPROVE with one MEDIUM advisory (case-b coverage) | MEDIUM advisory non-blocking |
+| @codex3 (task-19) | REVISE before merge | MEDIUM |
+| @claude4 (task-20) | APPROVE with one LOW non-blocking observation | LOW |
 
-The plan enumerates the events as a **symbolic set** of three DOM
-events in plan order (`keydown(229)` + `insertReplacementText/insertText`
-+ `compositionend`). The automated test preserves WKWebView's actual
-dispatch order — `input` fires BEFORE `keydown(229)` in WKWebView —
-which is the same three-element symbolic set, just dispatched in
-WKWebView order. The plan's "no duplicate flush" requirement is a
-property of the symbolic set, independent of the within-set dispatch
-order.
+### Convergent (4/5 reviewers) — F1' B4 dedup token had no consume / expiry
 
-| Test | Dispatch order (actual code) | Symbolic event set | PTY writes observed | Plan-conformance |
-|---|---|---|---|---|
-| existing Node 10 (a) — "processes JP-like..." | `input(insertReplacementText) → keydown(229) → compositionend` (WKWebView order) | 3-event set: `{keydown(229), insertReplacementText, compositionend}` — same as plan | **1** | **satisfied** ✓ |
-| round-1 fold supplementary — "4-event ordering outside plan's Node 10..." | `input → triggerDataEvent → keydown(229) → compositionend` | 4-event set adds `triggerDataEvent` (xterm internal) | 2 (1 origTrigger + 1 direct) | NOT in plan's fixture text |
+- **codex4 task-16 HIGH** — token suppresses later legitimate same-syllable input until next `imeFlushGen` bump; recommended one-shot + time-bound + regression test
+- **codex2 task-17 HIGH** — same trace, including paste / non-IME single-Hangul scenarios; recommended consume on suppress
+- **codex3 task-19 MEDIUM** — same finding, recommended one-shot and/or time-bound
+- **claude4 task-20 LOW (F1)** — same long-tail trace; recommended one-shot clear inside the timer callback; deferred as follow-up but noted as a real edge case
 
-**The plan's literal 3-event fixture floor PASSES with no duplicate.**
-The round-1 supplementary 4-event test pins a different ordering the
-plan did not specify. The Round-1 fold preamble's wording "pins
-pre-existing residual duplicate-write" was honest about the
-behavior but ambiguous about scope; this round-2 fold clarifies
-that the residual sits *outside* the plan's fixture floor, not
-within it.
+Independently traced against `src/lib/xtermImeShim.ts:487/505/603-608`
+(round-0 line numbers): `lastCompositionCommit` was set on every commit and
+never cleared until the next IME action incremented `imeFlushGen`. Any
+legitimate same-syllable `triggerDataEvent("요")` in the window between
+the commit and the next IME activity was silently dropped — affecting
+single-Hangul paste, programmatic terminal input, plugin emission, and
+existing harness's `cs.triggerDataEvent("한")` style code paths.
 
-**Reviewer split** (round-2):
-- @claude2, @claude3, @codex2 — APPROVE the round-1 fold (no plan
-  violation; pre-existing inline shims had identical behavior →
-  non-regression OOS bar from `intent.korean-ime-dup-render.md` is
-  satisfied).
-- @codex1, @codex3 — REVISE: read Node 10 to cover any non-Korean
-  ordering including the production-adjacent 4-event one. Under
-  that reading, the implementer must either (a) widen
-  `KOREAN_CODEPOINT_RE` to all single-codepoint CJK ranges so the
-  4-event ordering also produces 1 PTY write, OR (b) escalate to
-  the planner to formally re-scope Node 10.
+**Folded** with two complementary safeguards in commit `3dcbc2a`:
 
-**Implementer's position** (3/5 + plan literalism + body-generation
-scope):
-- The plan's fixture is a 3-event sequence; the 3-event test passes
-  with no duplicate. Plan-conformance for Node 10's literal text is
-  unambiguously satisfied.
-- The 4-event ordering's behavior matches the **pre-refactor inline
-  shims** (`reKorean`-only check carried verbatim to
-  `KOREAN_CODEPOINT_RE`). This is non-regression — the OOS gate from
-  `intent.korean-ime-dup-render.md::Out of scope`
-  ("일본어/중국어 IME 기능 지원 ... non-regression만 acceptance 게이트") is
-  satisfied.
-- Widening `KOREAN_CODEPOINT_RE` to all single-codepoint CJK ranges
-  would change the helper's externally-observable behavior on JP/ZH
-  beyond the planner's committed contract — that is **outside
-  body-generation scope** per the implementer skill's forbidden
-  actions ("don't add unrequested features"). The implementer does
-  NOT unilaterally fold this code change.
+1. **Consume on suppress** — wrapper timer callback (after the B4 inner
+   check matches) sets `lastCompositionCommit = null` before `return`.
+   Closes the "second `triggerDataEvent` in same generation" window:
+   the first xterm CompositionHelper post-commit re-emit is suppressed;
+   any subsequent same-syllable trigger passes through.
+2. **Time-bound 40 ms** — `onCompositionEnd` / `onTextareaBlur` schedule
+   a `setTimeout(40)` that nulls `lastCompositionCommit` if it still
+   references the same commit (token-identity check keeps a newer commit
+   safe from a stale clear). Closes the "no `triggerDataEvent` ever
+   arrives" long-tail: the dedup window is bounded to 40 ms (2× the
+   defer wait) regardless of subsequent IME activity.
 
-**User decision at Phase 6**:
-- **Option A** (accept implementer position): leave the residual pin
-  as documentation, mark plan-conformance satisfied, proceed to
-  `confirm merge`. Recommended default given 3/5 reviewer consensus
-  and the plan's literal text.
-- **Option B** (accept codex1/codex3 reading): the implementer
-  cannot fold this unilaterally; user must either (b1) re-run the
-  planner with explicit "widen CJK defer" scope, OR (b2) accept the
-  residual as a documented limitation in the planner's success
-  criteria and re-emit `plan.md`. Both paths re-open the planner
-  gate.
+### Regression tests added in the fold
 
-If the user picks Option B, the implementer worktree stays at
-`29f01fc`; the planner re-run produces a new `plan.md` and a new
-implementer cycle picks up from there. The current implementer's
-WQ-1..WQ-4 code is unaffected by either choice (the round-1 fold
-is supplementary).
+- **T5 (time-bound)** — commit → advance 60 ms → `cs.triggerDataEvent("요", true)` → advance 25 ms → expect `origTriggerCalls === ["요"]` (pass-through after the 40 ms safety window).
+- **T6 (consume-on-suppress)** — commit → immediate `cs.triggerDataEvent("요", true)` + 25 ms (suppressed by B4) → second `cs.triggerDataEvent("요", true)` + 25 ms → expect the second event passes through.
 
-## Notes for reviewers
+### MEDIUM advisory (1 reviewer) — F2' case-(b) untested in JSDOM (@claude3 task-18)
 
-- The skeleton's TSDoc `Failure-modes` clause about
-  `TypeError` on missing `_core.coreService` was honored: the helper
-  throws synchronously at attach. Tests pin this behavior.
-- The `webgl` option is intentionally read-then-discarded
-  (`void options.webgl;`) — per plan node H8b's `webgl?` fold,
-  signature preserved for future renderer-asymmetric tweaks.
-- A previously documented leak (the inline shims never restored
-  `triggerDataEvent`) is now closed by the helper. Reviewers running
-  React StrictMode dev mode should see one less leaked listener
-  set per terminal mount.
-- The `// FIXME: 20ms empirically tuned for WKWebView` comment from
-  plan N3's round-1 N4 fold is carried into the helper body.
+@claude3 raised MEDIUM advisory non-blocking: B4 fixes case (d) only; if
+the live macOS WKWebView mechanism is case (b) rather than case (d),
+node 7's `invoke` write path fires without consulting
+`lastCompositionCommit`, so a case-(b) duplicate would survive the fix.
+
+**Not folded** — this is by design. `plan.md` explicitly delegates the
+case-(b)-vs-case-(d) distinction to the Phase 6 manual repro per
+Constraint #6. Applying B1+B4 prophylactically without a JSDOM-failing
+baseline for case (b) would violate `plan.md` §133/§491 ("Do NOT apply
+a fix against a non-reproducing test"). The Phase 6 user-acceptance gate
+(sequences 1a/1b/1c) is the falsification gate; if 1a or 1b reproduces
+the duplicate, a follow-up round adding B1 (node-7 no-write) is needed.
+
+### Single-reviewer LOW / NIT (not folded)
+
+- @claude3 task-18 F2 (LOW) — T4-meta/shift CSI assertions are tautological synthetic-CSI pass-through; documentation nuance only.
+- @claude3 task-18 F3 (LOW) — `onTextareaBlur` B4 store is forward-defensive with no direct test; harmless documentation nuance.
+- @claude4 task-20 F2 (NIT) — TSDoc on the wrapper doesn't mention B4 dedup; inline trace already covers it.
+
+These are non-blocking observations from single reviewers; no convergence
+across the panel. Documenting here in the implementation report for the
+audit trail rather than touching code.
+
+### Architectural axis unchanged
+
+Bug-site identification (node 9 / case d), variant choice (B4 — single
+sub-variant of Shape B family), OUT-OF-SCOPE boundary (terminator union
+frozen, consumers untouched), PTY payload bit-identity, scope discipline
+(single-file body changes only) — all unchanged from round-0. The round-1
+fold is purely a token-lifetime tightening within B4.
+
+## Round-2 implementer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+
+5/5 reviewers verified the round-1 fold; 3/5 surfaced the same convergent
+finding around a stacked-timer race between the round-1 safety clear and
+the wrapper's 20 ms defer. Folded.
+
+### Reviewer verdicts (round-1 fold = c833c8d + 3dcbc2a + d5e9823)
+
+| Reviewer | Verdict | Severity assigned |
+|---|---|---|
+| @codex4 (task-26) | HOLD before merge | HIGH |
+| @codex2 (task-22) | HOLD pending one fix | MEDIUM |
+| @claude3 (task-23) | APPROVE | LOW (40 ms tight under load) |
+| @codex3 (task-24) | HOLD before merge | HIGH |
+| @claude4 (task-25) | APPROVE | NIT only (timer leak, identity guard untested) |
+
+### Convergent (3/5 reviewers) — F1'' 40 ms safety clear races the 20 ms wrapper defer
+
+- **codex4 task-26 HIGH** — 40 ms expiry starts at commit time; for a duplicate arriving at t=25 ms, its 20 ms defer fires at t=45 ms — AFTER the safety clear at t=40 ms. Token is nullified before suppression can fire, duplicate escapes.
+- **codex3 task-24 HIGH** — same trace; recommended **captured-token approach** (capture matching commit at trigger schedule time, use captured value in delayed callback).
+- **codex2 task-22 MEDIUM** — same trace; offered "preserve and consume a matched token through the deferred check rather than clearing solely from commit time".
+
+Independently traced against the round-1 wrapper at `xtermImeShim.ts:603-616`:
+the inner check evaluated `lastCompositionCommit` at timer-fire time, so any
+delayed duplicate whose own 20 ms defer outlasted the 40 ms safety clear
+lost the suppression race.
+
+**Folded** in commit `42b1642` with the **claim-at-schedule** approach
+(all three convergent reviewers' preferred fix):
+
+- The wrapper atomically captures `claim = lastCompositionCommit` into the
+  defer closure AND nullifies the live token at trigger-schedule time.
+- The defer's inner check uses the captured `claim`, race-free against
+  the safety clear's later mutation of `lastCompositionCommit`.
+- The atomic null doubles as **consume-on-suppress**: subsequent triggers
+  see live token === null at schedule time → don't capture → pass through.
+  This closes the same window that the explicit "consume on suppress"
+  code from round-1 covered (the explicit code became redundant and was
+  removed in this fold).
+
+### Regression test added in the fold
+
+- **T7 (delayed-duplicate)** — commit `요` at t=0 → advance 25 ms →
+  `cs.triggerDataEvent("요", true)` (simulating xterm's delayed re-emit
+  inside the 40 ms window) → advance 25 ms past both the safety timer
+  (t=40 ms) and the defer (t=45 ms) → expect `origTriggerCalls === []`
+  (suppressed) and `ptyWrites === ["요"]` (one direct compositionend
+  invoke).
+
+Empirically verified: pre-round-2 T7 fails with `origTriggerCalls=["요"]`
+(round-1's race-prone code escapes the duplicate); post-round-2 T7 passes.
+
+### LOW / NIT (not folded)
+
+- **claude3 task-23 F1 (LOW — 40 ms tight under load)** — auto-resolved
+  by claim-at-schedule. The safety clear is no longer load-bearing for
+  case-(d) suppression; it now exists only to bound the long-tail when
+  no trigger ever arrives. CPU-load timing skew on the safety timer
+  cannot recreate the race because the suppression decision is made at
+  trigger arrival, not at safety-clear time. Documented here for the
+  audit trail; no code change needed.
+- **claude4 task-25 F1 (NIT — pending 40 ms timers not cancelled on
+  dispose)** — same pattern as the existing 20 ms wrapper defer
+  (pre-existing). `!disposed` guard in the safety callback keeps
+  post-dispose fires inert. Bounded leak (≤ 40 ms per pending commit),
+  no functional impact. Single-reviewer NIT.
+- **claude4 task-25 F2 (NIT — token-identity guard not exercised by a
+  test)** — guard is correct by code reading; failure-mode is exotic
+  (rapid two-syllable composition within 40 ms with case-(d) re-emit
+  landing on the wrong syllable). Single-reviewer NIT.
+
+### Architectural axis unchanged across rounds
+
+Bug-site identification (node 9 / case d), variant choice (B4 — single
+sub-variant of Shape B family), OUT-OF-SCOPE boundary (terminator union
+frozen, consumers untouched), PTY payload bit-identity, scope discipline
+(single-file body changes only) — all unchanged from rounds 0 / 1.
+Round-2 fold is purely a timing-correctness tightening within B4.
+
+## Round-3 implementer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+
+5/5 reviewers verified the round-2 fold; 3/5 surfaced the same convergent
+finding around unconditional token capture. Folded.
+
+### Reviewer verdicts (round-2 fold = c833c8d + 3dcbc2a + d5e9823 + 42b1642 + 6513ff0)
+
+| Reviewer | Verdict | Severity assigned |
+|---|---|---|
+| @codex4 (task-32) | APPROVE (LOW residual advisory, non-blocking) | LOW |
+| @codex2 (task-28) | HOLD pending one fix | MEDIUM |
+| @claude3 (task-29) | APPROVE (no new findings) | None |
+| @codex3 (task-30) | REVISE before merge | MEDIUM |
+| @claude4 (task-31) | APPROVE (microtask-batched JSDOM-only LOW + NIT) | LOW non-blocking |
+
+### Convergent (3/5 reviewers) — F1''' unconditional claim consumes token before match-check
+
+- **codex4 task-32 LOW residual** — non-matching Korean event inside the 40 ms window can consume the token and allow a later same-syllable duplicate to pass through (assessed non-blocking but identified the trace).
+- **codex2 task-28 MEDIUM** — same trace, HOLD pending fix; offered the data+gen match check at schedule time.
+- **codex3 task-30 MEDIUM** — same trace; recommended "only claim/clear when `data === lastCompositionCommit.text && imeFlushGen === lastCompositionCommit.gen` at schedule time."
+
+Independently traced against the round-2 wrapper:
+
+```
+t=0:  compositionend("요") → live={text:"요", gen:N}
+t=10: cs.triggerDataEvent("한") → claim=X (live), live=null. defer1 scheduled.
+t=25: cs.triggerDataEvent("요") (actual case-d duplicate) → claim=null. defer2 scheduled.
+t=30: defer1 fires → claim.text="요" ≠ "한" → mismatch → origTrigger("한")  ✓
+t=45: defer2 fires → claim=null → origTrigger("요") → DUPLICATE LEAKS ✗
+```
+
+**Folded** in commit `97cd808` with the **conditional claim** (consensus
+fix from all 3 convergent reviewers):
+
+```ts
+const live = lastCompositionCommit;
+const isCandidate =
+  live !== null && data === live.text && gen === live.gen;
+const claim = isCandidate ? live : null;
+if (isCandidate) {
+  lastCompositionCommit = null;
+}
+setTimeout(() => {
+  if (!disposed && !isComposing && gen === imeFlushGen) {
+    if (claim !== null) return; // suppress (already verified at schedule)
+    origTrigger(data, wasUserInput);
+  }
+}, 20);
+```
+
+Match check moved from timer-fire time to schedule time. Non-matching
+single-Hangul events leave the live token intact; only the actual
+matching candidate captures and clears.
+
+### Regression test added in the fold
+
+- **T8 (non-matching preservation)** — commit `요` → `cs.triggerDataEvent("한")` at t=10 ms → `cs.triggerDataEvent("요")` at t=25 ms → advance 30 ms past both 20 ms defers AND the 40 ms safety → expect `origTriggerCalls === ["한"]` (non-matching pass-through) and `ptyWrites === ["요"]` (matching duplicate suppressed).
+
+Empirically verified: pre-round-3 T8 fails with `origTriggerCalls = ["한", "요"]` (matching duplicate escapes the round-2 unconditional-claim consumption); post-round-3 T8 passes.
+
+### LOW / NIT (not folded)
+
+- **claude4 task-31 F1 (LOW — microtask-batched ordering)** — JSDOM-only
+  edge case where two compositionends fire synchronously before either
+  case-(d) re-emit lands; the first re-emit captures the LIVE token
+  (which is commit2's) and the second escapes. **Per WHATWG**, microtasks
+  run after each task; in real WKWebView, two consecutive compositionends
+  are separate macrotasks (separate keystrokes), so the re-emit for
+  commit1 fires (via the microtask queue) BEFORE compositionend2's task
+  starts. Not a production failure mode. Single-reviewer LOW; not folded.
+- **claude4 task-31 F2 (NIT — comment clarity on 40 ms safety subsumption)** —
+  noted that the 40 ms safety timer's in-code comment doesn't make it
+  explicit that post-round-2 it's only a tail-clean (not load-bearing
+  for case-(d) suppression). Single-reviewer NIT; the round-2 + round-3
+  fold commit messages and this report cover the subsumption explicitly.
+- **claude3 round-2 LOW (40 ms tight under load)** — already auto-resolved
+  by round-2 fold; explicitly confirmed by claude3 task-29 round-3 review.
+- **Pre-existing single-reviewer items (claude3 F2/F3, claude4 F2 from
+  earlier rounds)** — unchanged. Acceptable.
+
+### Architectural axis unchanged across all rounds
+
+Bug-site identification (node 9 / case d), variant choice (B4 — single
+sub-variant of Shape B family), OUT-OF-SCOPE boundary (terminator union
+frozen, consumers untouched), PTY payload bit-identity, scope discipline
+(single-file body changes only) — all unchanged from rounds 0 / 1 / 2.
+Round-3 fold is purely a precision tightening on the claim condition
+within B4.
+
+## Round-4 implementer-review convergence (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+
+**5/5 reviewers APPROVE for merge. Zero new blocking findings. No code
+change.**
+
+### Reviewer verdicts (round-3 fold = c833c8d + 3dcbc2a + d5e9823 + 42b1642 + 6513ff0 + 97cd808 + 6d85a73)
+
+| Reviewer | Verdict | New findings |
+|---|---|---|
+| @codex2 (task-34) | APPROVE | None |
+| @claude3 (task-35) | APPROVE | None (self-reflection on missed round-3 trace) |
+| @codex3 (task-36) | APPROVE | None |
+| @claude4 (task-37) | APPROVE | None (re-confirmed prior LOW/NIT non-fold reasoning) |
+| @codex4 (task-38) | APPROVE | None |
+
+### Independent verification (per reviewer)
+
+- **@codex2 (task-34)**: confirmed conditional claim at `xtermImeShim.ts:638-644` implements `isCandidate`; verified T8 covers prior task-28 finding; 32 file-local + 279 full-suite tests pass.
+- **@claude3 (task-35)**: self-reflected on missing the round-3 finding in their round-3 review ("audit must enumerate every channel that can present matching shape, not just the intended source"); empirically reproduced T8 failure on round-2 wrapper and pass on round-3; 4/4 prior regression tests (T3/T5/T6/T7) still green.
+- **@codex3 (task-36)**: confirmed `isCandidate` correctly implemented; T8 covers exact task-30 failure mode; T5/T6/T7 still cover their respective scenarios.
+- **@claude4 (task-37)**: round-2 wrapper restored, ran `vitest -t "T8"` → FAIL with `["한","요"]`; round-3 restored → PASS. Confirmed round-3 design is "strictly cleaner than round-2" (centralized match-check logic). Re-confirmed F1 (microtask-batched) and F2 (comment NIT) non-fold reasoning.
+- **@codex4 (task-38)**: confirmed conditional claim closes task-32 residual advisory; T7 still covers delayed-duplicate; T5/T6 still cover expiry/consume; no exported signatures or PTY payload changes.
+
+### Cumulative four-round convergence
+
+Each round's regression test reproduces the failure on the prior wrapper
+and passes on the new — the cycle is healthy. Cumulative coverage:
+
+| Round | Convergent finding | Fix | Regression test |
+|---|---|---|---|
+| 0 | (initial — case d via plan handoff) | Shape B4 at node 9 | T3 |
+| 1 | 4/5 — B4 token had no consume/expiry | consume + 40 ms time-bound | T5 + T6 |
+| 2 | 3/5 — 40 ms safety races 20 ms defer | claim-at-schedule | T7 |
+| 3 | 3/5 — unconditional claim consumed token for non-matching events | conditional claim (`isCandidate`) | T8 |
+| 4 | **none — 5/5 APPROVE** | (no fold) | — |
+
+### Phase 6 gate status
+
+The implementation is ready for the human `confirm merge` gate. Phase 6
+manual macOS WKWebView repro (plan Success Criterion #1a/1b/1c) remains
+the live falsification gate per Constraint #6.
+
+If 1a (`compose 안녕하세요 → .`) or 1b (`compose 안녕하세요 → arrow`)
+alone reproduces the duplicate on the real app, that would be evidence
+of a case-(b) production mechanism that B4 alone does not cover; a
+follow-up round adding B1 (node-7 no-write) would be needed.
+
+If only 1c (`compose 안녕하세요 → . → arrow`) reproduces, case (d) is
+validated as the production cause and the round-3-folded B4 is sufficient.
+
+If none of 1a/1b/1c reproduce, the four-round B4 fold has closed the bug
+in production — the unit-test surface (279/279 with T1–T8 inclusive of
+T4-shift/T4-meta) matches WKWebView behavior.
+
+## Blast-radius note (per round-3 fold F5')
+
+Per `plan.md` case (d) "Blast-radius note": B4 may also close out other
+unreported Korean-IME duplicates triggered by any "Korean syllable commit,
+then no follow-up composition within 20 ms" scenario — not just the
+period/arrow trigger family. The user's reported trigger family
+(period/arrow) appears to be a visibility artifact (the duplicate exists
+in the PTY byte stream regardless; the arrow forces a screen redraw
+exposing it). If `confirm merge` validates 1a/1b/1c, watch for
+incidental wins on other Korean-IME flows where users previously
+reported subtle ghost characters.
