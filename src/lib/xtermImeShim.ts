@@ -322,6 +322,11 @@ export function attachKoreanImeShim(
   let imeStartPos = 0;
   let imeFlushGen = 0;
   let imeFragment = "";
+  // B4 (korean-ime-dup-period-arrow): tracks the most recent committed IME
+  // text + post-increment imeFlushGen so the triggerDataEvent wrapper's
+  // 20ms defer can suppress xterm's CompositionHelper post-commit re-emit
+  // (case d defer fire-after-compositionend race).
+  let lastCompositionCommit: { text: string; gen: number } | null = null;
 
   const overlayEl = document.createElement("span");
   overlayEl.style.cssText =
@@ -475,7 +480,13 @@ export function attachKoreanImeShim(
     clearOverlay();
     isComposing = false;
     imeFlushGen++;
-    if (written !== null) emitFlush(written, null);
+    if (written !== null) {
+      // B4: record AFTER imeFlushGen++ so the stored gen matches the value
+      // captured by the deferred triggerDataEvent path (which also reads
+      // imeFlushGen at defer-schedule time — post-increment under case d).
+      lastCompositionCommit = { text: written, gen: imeFlushGen };
+      emitFlush(written, null);
+    }
   };
 
   const onTextareaBlur = () => {
@@ -487,7 +498,13 @@ export function attachKoreanImeShim(
       }
       isComposing = false;
       imeFlushGen++;
-      if (composed) emitFlush(composed, null);
+      if (composed) {
+        // B4: blur-commit is a valid IME commit path; record so xterm's
+        // CompositionHelper post-commit triggerDataEvent (if any) is
+        // deduped consistently with onCompositionEnd.
+        lastCompositionCommit = { text: composed, gen: imeFlushGen };
+        emitFlush(composed, null);
+      }
     }
   };
 
@@ -572,6 +589,24 @@ export function attachKoreanImeShim(
         const gen = imeFlushGen;
         setTimeout(() => {
           if (!disposed && !isComposing && gen === imeFlushGen) {
+            // B4 (korean-ime-dup-period-arrow): xterm's CompositionHelper
+            // batches the IME commit and re-emits it via triggerDataEvent
+            // AFTER onCompositionEnd already wrote via invoke (case d
+            // defer fire-after-compositionend race). If the deferred
+            // payload matches the most-recent commit (same text + same
+            // post-increment gen, meaning no new composition has bumped
+            // gen since), suppress origTrigger to prevent the duplicate.
+            // Inverse race (defer captured pre-compositionend) is
+            // preserved: a subsequent compositionend bumps imeFlushGen
+            // past the captured gen, so the outer gen===imeFlushGen
+            // check fails and this branch is never reached.
+            if (
+              lastCompositionCommit !== null &&
+              data === lastCompositionCommit.text &&
+              imeFlushGen === lastCompositionCommit.gen
+            ) {
+              return;
+            }
             origTrigger(data, wasUserInput);
           }
         }, 20);
