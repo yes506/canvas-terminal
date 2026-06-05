@@ -322,6 +322,11 @@ export function attachKoreanImeShim(
   let imeStartPos = 0;
   let imeFlushGen = 0;
   let imeFragment = "";
+  // B4 (korean-ime-dup-period-arrow): tracks the most recent committed IME
+  // text + post-increment imeFlushGen so the triggerDataEvent wrapper's
+  // 20ms defer can suppress xterm's CompositionHelper post-commit re-emit
+  // (case d defer fire-after-compositionend race).
+  let lastCompositionCommit: { text: string; gen: number } | null = null;
 
   const overlayEl = document.createElement("span");
   overlayEl.style.cssText =
@@ -475,7 +480,27 @@ export function attachKoreanImeShim(
     clearOverlay();
     isComposing = false;
     imeFlushGen++;
-    if (written !== null) emitFlush(written, null);
+    if (written !== null) {
+      // B4: record AFTER imeFlushGen++ so the stored gen matches the value
+      // captured by the deferred triggerDataEvent path (which also reads
+      // imeFlushGen at defer-schedule time — post-increment under case d).
+      const commit = { text: written, gen: imeFlushGen };
+      lastCompositionCommit = commit;
+      // Round-1 implementer-review fold (4/5 convergent: codex2, codex3,
+      // codex4, claude4): time-bound the dedup window so the token cannot
+      // suppress a later legitimate same-syllable triggerDataEvent in the
+      // same generation. xterm's CompositionHelper post-commit re-emit
+      // arrives within ~1 frame (≪ 20 ms defer + a small margin); 40 ms is
+      // 2× the defer window — comfortable for the case-(d) race while
+      // tightly bounding false-suppression long-tail. The token-identity
+      // check prevents a stale 40 ms timer from clobbering a newer commit.
+      setTimeout(() => {
+        if (!disposed && lastCompositionCommit === commit) {
+          lastCompositionCommit = null;
+        }
+      }, 40);
+      emitFlush(written, null);
+    }
   };
 
   const onTextareaBlur = () => {
@@ -487,7 +512,21 @@ export function attachKoreanImeShim(
       }
       isComposing = false;
       imeFlushGen++;
-      if (composed) emitFlush(composed, null);
+      if (composed) {
+        // B4: blur-commit is a valid IME commit path; record so xterm's
+        // CompositionHelper post-commit triggerDataEvent (if any) is
+        // deduped consistently with onCompositionEnd.
+        const commit = { text: composed, gen: imeFlushGen };
+        lastCompositionCommit = commit;
+        // Round-1 implementer-review fold: same time-bound clear as
+        // onCompositionEnd — keeps the dedup window tight.
+        setTimeout(() => {
+          if (!disposed && lastCompositionCommit === commit) {
+            lastCompositionCommit = null;
+          }
+        }, 40);
+        emitFlush(composed, null);
+      }
     }
   };
 
@@ -570,8 +609,44 @@ export function attachKoreanImeShim(
       // FIXME: 20ms empirically tuned for WKWebView on macOS; revalidate on major macOS bumps
       if (data.length === 1 && KOREAN_CODEPOINT_RE.test(data)) {
         const gen = imeFlushGen;
+        // B4 (korean-ime-dup-period-arrow): xterm's CompositionHelper
+        // batches the IME commit and re-emits it via triggerDataEvent
+        // AFTER onCompositionEnd already wrote via invoke (case d
+        // defer fire-after-compositionend race). If we recognize the
+        // arriving payload as the live commit's matching duplicate
+        // candidate (text + gen both equal), we capture the token
+        // into the defer closure AND null the live token atomically —
+        // the captured `claim` then drives the suppression decision
+        // inside the deferred callback, race-free against the 40 ms
+        // safety clear (round-2 fold).
+        //
+        // Round-3 implementer-review fold (3/5 convergent: @codex2 MED,
+        // @codex3 MED, @codex4 LOW): only claim when the data + gen
+        // actually match. The unconditional capture from round-2 let a
+        // non-matching single-Hangul event arriving before the actual
+        // duplicate consume the token (e.g. paste of "한" between
+        // compositionend("요") and xterm's case-d re-emit of "요"). A
+        // non-matching event now leaves the live token intact and
+        // passes through after the normal 20 ms defer; the matching
+        // duplicate later captures and suppresses.
+        //
+        // Inverse-race coverage: when there's no prior commit (live
+        // null) OR the prior commit is for a different syllable / gen,
+        // isCandidate is false → claim stays null → defer falls through
+        // to origTrigger. Existing §"Korean triggerDataEvent defer"
+        // tests remain green.
+        const live = lastCompositionCommit;
+        const isCandidate =
+          live !== null && data === live.text && gen === live.gen;
+        const claim = isCandidate ? live : null;
+        if (isCandidate) {
+          lastCompositionCommit = null;
+        }
         setTimeout(() => {
           if (!disposed && !isComposing && gen === imeFlushGen) {
+            if (claim !== null) {
+              return;
+            }
             origTrigger(data, wasUserInput);
           }
         }, 20);
