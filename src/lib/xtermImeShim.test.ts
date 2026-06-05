@@ -1009,6 +1009,58 @@ describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => 
     vi.useRealTimers();
   });
 
+  it("T7 (delayed duplicate inside 40ms window): a delayed xterm CompositionHelper re-emit at t=25ms is suppressed via claim-at-schedule (race-free against safety clear)", () => {
+    // Round-2 implementer-review fold (3/5 convergent: @codex2 MEDIUM,
+    // @codex3 HIGH, @codex4 HIGH). Pre-fold (round-1) failed this case:
+    // the 40 ms safety clear runs at t=40 ms (15 ms BEFORE the duplicate's
+    // 20 ms defer callback at t=45 ms), nulling lastCompositionCommit
+    // before suppression can fire → duplicate escapes via origTrigger.
+    // Round-2 fix: claim-at-schedule binds the live token into the defer
+    // closure at trigger-arrival time, so the suppression decision is
+    // race-free against the safety clear.
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    // 1. Commit "요" at t=0. Sets lastCompositionCommit; schedules 40 ms
+    //    safety clear for t=40.
+    textarea.value = "요";
+    fireInput(textarea, "insertText", "요");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "요");
+
+    // 2. Simulate xterm's CompositionHelper post-commit latency — the
+    //    duplicate re-emit arrives at t=25 ms, well inside the documented
+    //    40 ms dedup window. Its own 20 ms defer schedules for t=45 ms.
+    vi.advanceTimersByTime(25);
+    cs.triggerDataEvent("요", true);
+
+    // 3. Advance past both the safety timer (fires at t=40) AND the
+    //    defer (fires at t=45). Pre-fold: safety fires first, nullifies
+    //    token, defer sees null → origTrigger("요"). Post-fold: claim
+    //    was captured at t=25 (in-closure), so defer at t=45 still
+    //    matches → suppress.
+    vi.advanceTimersByTime(25);
+
+    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
+    expect(origTriggerCalls.map((c) => c.data)).toEqual([]);
+    expect(onComposedFlush).toHaveBeenCalledTimes(1);
+    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
+
+    vi.useRealTimers();
+  });
+
   it("T6 (consume-on-suppress): after the first case-(d) suppression, a later legitimate triggerDataEvent('요') in the same generation passes through", () => {
     const { terminal, container, textarea, origTriggerCalls } =
       makeMockTerminal();

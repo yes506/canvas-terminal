@@ -609,32 +609,41 @@ export function attachKoreanImeShim(
       // FIXME: 20ms empirically tuned for WKWebView on macOS; revalidate on major macOS bumps
       if (data.length === 1 && KOREAN_CODEPOINT_RE.test(data)) {
         const gen = imeFlushGen;
+        // Round-2 implementer-review fold (3/5 convergent: @codex2 MED,
+        // @codex3 HIGH, @codex4 HIGH): atomically claim the dedup token
+        // at schedule time. Without this capture, a delayed xterm
+        // CompositionHelper re-emit arriving between the 40 ms safety
+        // clear and its own 20 ms defer would lose the race — the
+        // safety nullifies lastCompositionCommit at t=40 ms while the
+        // duplicate's suppression check fires at t=arrival+20 ms (e.g.,
+        // t=45 ms for arrival at t=25 ms), and sees no token → duplicate
+        // escapes. By capturing `claim` into the defer closure at
+        // arrival time, the suppression decision is race-free against
+        // the safety clear. Atomic null of live also doubles as consume-
+        // on-suppress: subsequent triggers see live === null at schedule
+        // time so they don't claim and pass through (closes the "second
+        // legitimate same-syllable trigger in same gen" case from
+        // round-1 fold).
+        const claim = lastCompositionCommit;
+        lastCompositionCommit = null;
         setTimeout(() => {
           if (!disposed && !isComposing && gen === imeFlushGen) {
             // B4 (korean-ime-dup-period-arrow): xterm's CompositionHelper
             // batches the IME commit and re-emits it via triggerDataEvent
             // AFTER onCompositionEnd already wrote via invoke (case d
-            // defer fire-after-compositionend race). If the deferred
-            // payload matches the most-recent commit (same text + same
+            // defer fire-after-compositionend race). If the captured
+            // claim matches the deferred payload (same text + same
             // post-increment gen, meaning no new composition has bumped
             // gen since), suppress origTrigger to prevent the duplicate.
-            // Inverse race (defer captured pre-compositionend) is
-            // preserved: a subsequent compositionend bumps imeFlushGen
-            // past the captured gen, so the outer gen===imeFlushGen
-            // check fails and this branch is never reached.
+            // Inverse race (defer captured pre-compositionend, before
+            // any commit) — claim is null at schedule time → no match →
+            // pass-through, preserving the §"Korean triggerDataEvent
+            // defer" inverse-race semantics.
             if (
-              lastCompositionCommit !== null &&
-              data === lastCompositionCommit.text &&
-              imeFlushGen === lastCompositionCommit.gen
+              claim !== null &&
+              data === claim.text &&
+              imeFlushGen === claim.gen
             ) {
-              // Round-1 implementer-review fold (4/5 convergent): consume
-              // the dedup token after one suppression so subsequent
-              // legitimate same-syllable triggerDataEvent calls in the
-              // same generation pass through. Combined with the 40 ms
-              // safety clear in onCompositionEnd / onTextareaBlur, this
-              // closes both the "second triggerDataEvent in same gen" and
-              // "no triggerDataEvent ever arrives" long-tail windows.
-              lastCompositionCommit = null;
               return;
             }
             origTrigger(data, wasUserInput);
