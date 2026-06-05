@@ -481,29 +481,40 @@ describe("attachKoreanImeShim — JP/ZH non-regression fixture floor (Node 10)",
     vi.useRealTimers();
   });
 
-  // Round-2 fold (codex1/claude3 F1): document the production-adjacent
-  // duplicate-write path that the JP/ZH fixture floor above does NOT
-  // exercise. The shared IME state machine has no Korean-only branch in
-  // docInput/docKeyDown/compositionend, but the `triggerDataEvent`
-  // wrapper IS Korean-only (20ms defer only for KOREAN_CODEPOINT_RE).
-  // In production, xterm.js's CompositionHelper can call
-  // `coreService.triggerDataEvent(data)` synchronously during the
-  // `input` event (or via setTimeout(0) from compositionend) for any
-  // committed text. For Korean the wrapper holds the bytes back for
-  // 20ms and discards them if a new composition starts. For non-Korean
-  // (JP/ZH/etc), the wrapper falls through immediately.
+  // Round-1 fold supplementary (codex1/claude3 F1 + round-2
+  // clarification): the plan.md Node 10 fixture floor at success
+  // criterion 5 / Node 10 (b) literally enumerates a THREE-event
+  // sequence: `keydown(229) + insertReplacementText + compositionend`.
+  // The test in the previous `it(...)` block above ("processes JP-like
+  // keydown(229) + insertReplacementText + compositionend with exactly
+  // one PTY write") covers that 3-event sequence and PASSES with one
+  // PTY write — Node 10's literal text is satisfied.
   //
-  // If xterm fires triggerDataEvent("こ") AND the shim's compositionend
-  // handler also direct-writes "こ" via `invoke("write_to_pty")`, the
-  // PTY receives the bytes twice. This is a PRE-EXISTING residual from
-  // the original inline shims (reKorean-only check is identical), not
-  // a regression introduced by the helper extraction. The test below
-  // PINS this behavior so a future wrapper refactor doesn't silently
-  // change it. JP/ZH live acceptance (plan node 10 manual ceiling)
-  // remains the authoritative check; fixing the residual is out of
-  // scope for korean-ime-dup-render and would require widening the
-  // 20ms-defer to all single-codepoint CJK ranges.
-  it("pins residual duplicate-write behavior for JP/ZH when xterm fires triggerDataEvent between input and compositionend (out-of-scope residual; documents current behavior)", () => {
+  // The 4-event test below is OUTSIDE the plan's enumerated fixture: it
+  // inserts xterm.js's internal `coreService.triggerDataEvent(...)`
+  // between `input` and `keydown(229)`. xterm's CompositionHelper can
+  // call triggerDataEvent synchronously during the `input` event for
+  // committed text. For Korean the wrapper holds bytes back for 20ms
+  // and discards them if a new composition starts. For non-Korean
+  // (JP/ZH/etc), the wrapper at xtermImeShim.ts:570-580 falls through
+  // immediately to origTrigger because KOREAN_CODEPOINT_RE.test(data)
+  // is false. Then the shim's compositionend handler ALSO direct-writes
+  // "こ" via invoke("write_to_pty") → PTY receives bytes twice.
+  //
+  // This is PRE-EXISTING behavior carried from the inline shims
+  // (reKorean-only check is identical — same code, same residual). The
+  // intent.korean-ime-dup-render.md::Out of scope clause covers JP/ZH
+  // feature support with non-regression as the only acceptance gate;
+  // identical-to-pre-refactor = no regression. Fixing the residual
+  // would require widening KOREAN_CODEPOINT_RE to all single-codepoint
+  // CJK ranges — that is OUTSIDE this planner's committed scope and
+  // requires a separate intent / planner re-open.
+  //
+  // The test below PINS the current 4-event behavior so future
+  // refactors of the wrapper don't silently change it. Live JP IME
+  // acceptance smoke (plan node 10 ceiling) remains the authoritative
+  // check for JP rendering.
+  it("4-event ordering outside plan's Node 10 3-event fixture: input → triggerDataEvent → keydown(229) → compositionend pins pre-existing JP/ZH non-Korean fall-through (non-regression vs inline shims; plan widening would need planner re-open)", () => {
     const { terminal, container, textarea, origTriggerCalls } =
       makeMockTerminal();
     attach(terminal, container);
