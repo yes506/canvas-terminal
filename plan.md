@@ -175,9 +175,9 @@ is one handler function or sub-branch. The same nodes appear in
 | 4 | overlay paint on input | `src/lib/` | none | `docInput` (lines 496–506) |
 | 5 | composition commit | `src/lib/` | maybe | `onCompositionEnd` (lines 463–479) — may need guard for late commits |
 | 6 | terminator flush (Enter/Esc/Tab) | `src/lib/` | none | `docKeyDown` else-branch with `isTerminating==true` |
-| **7** | **stale-state catch-up (period/arrow)** | `src/lib/` | **PRIMARY** | `docKeyDown` else-branch with `isTerminating==false` (lines 528–558) — the duplicate-write site |
+| **7** | **stale-state catch-up (period/arrow)** | `src/lib/` | **CANDIDATE — case (b)** | `docKeyDown` else-branch with `isTerminating==false` (lines 528–558) — duplicate-write site under case (b). Co-equal with node 9 per round-2 case (d) hypothesis; not "primary" |
 | 8 | blur flush | `src/lib/` | none | `onTextareaBlur` (lines 481–492) |
-| 9 | xterm data-event suppress/defer | `src/lib/` | maybe | `triggerDataEvent` wrapper (lines 567–582) |
+| **9** | **xterm data-event suppress/defer** | `src/lib/` | **CANDIDATE — case (d)** | `triggerDataEvent` wrapper (lines 567–582) — duplicate-write site under case (d) defer-fire race. Co-equal with node 7 per round-2 fold |
 | 10 | overlay paint / clear | `src/lib/` | none | `showOverlay` / `clearOverlay` |
 | 11 | subscriber dispatch | `src/lib/` | none | `emitFlush` |
 | T1 | regression: compose → period (no arrow) | `src/lib/` | NEW | Triple-channel assertion: `ptyWrites()` contains exactly one entry for the committed last syllable (the `invoke("write_to_pty")` direct path); `.` flows through xterm and is captured in `origTriggerCalls` (NOT in `ptyWrites()` — different observable channel per test lines 41–46 / 127–137); `onComposedFlush` fires once with `(text, null)`. Dispatch sequence per Phase 0 handoff. |
@@ -249,6 +249,16 @@ falsification gate.
      not node 7** — node 7's stale-state inner check fails because
      compositionend already cleared `isComposing`. Affects new
      sub-variant B4.
+     **Blast-radius note**: case (d) would in principle fire on
+     ANY "Korean syllable commit, then no follow-up composition
+     within 20 ms" scenario, not just the period/arrow trigger
+     specifically. If (d) is the validated mechanism, the user's
+     reported trigger family (period/arrow) may be a visibility
+     artifact (the duplicate exists but only becomes visible after
+     the arrow forces a screen redraw), not the cause. B4 may
+     therefore close out other unreported Korean-IME duplicates as
+     a side effect — a positive outcome but worth documenting in
+     the implementation report.
 
    The Phase 0 deliverable is to identify which case (a/b/c/d) the
    T1/T2/T3/T4 dispatch sequences actually reproduce against current
@@ -367,27 +377,63 @@ falsification gate.
      Pick this if cases (a) and (b) are mixed, OR if you want defense
      in depth against case (a). Recommended default when uncertain
      between case (a)/(b).
-   - **B3 — per-syllable dedup token** (fix site: node 7 + the
-     `invoke("write_to_pty")` payload shape): keep the current write
-     path but tag the payload with a syllable token;
-     `onCompositionEnd` suppresses any tagged payload it sees second.
-     Most invasive — adds payload-tagging to the shim/PTY contract.
-     Pick only as a last resort.
+   - **B3 — internal last-commit dedup** (fix site: node 7 +
+     shim-internal state only): keep the current
+     `invoke("write_to_pty")` payload shape **bit-identical to today
+     — the PTY bytes never change**. Add a shim-private
+     `lastWrittenComposition: { text: string; gen: number } | null`
+     field, updated in `onCompositionEnd` AFTER each successful
+     `invoke("write_to_pty", { sessionId, data: e.data })` AND AFTER
+     the `imeFlushGen++` increment (so the stored gen is the
+     post-commit value). At the node-7 bug site, suppress the write
+     when `composed === lastWrittenComposition?.text && imeFlushGen
+     === lastWrittenComposition.gen` (i.e., `onCompositionEnd`
+     already wrote this exact text and no new composition has
+     started since to bump `imeFlushGen`). **No payload-tagging, no
+     extra bytes through `write_to_pty`, no signature change on the
+     Tauri IPC.** Most invasive of B1/B2/B3 because it requires new
+     shim state with explicit lifecycle (must reset on dispose, on
+     blur-flush, on new composition start), but the OUT-OF-SCOPE
+     boundary stays intact. Structurally close to B4 — the two CAN
+     share the same `lastWrittenComposition` state when applied
+     together per the Cross-variant scope rule below. Pick only if
+     B1/B2 cannot be made to work AND case (d) is ruled out so B4
+     is not applicable.
    - **B4 [NEW per round-2 fold] — post-compositionend defer dedup**
      (fix site: node 9, the `triggerDataEvent` wrapper at lines
      567–582): track the last `onCompositionEnd`-committed payload
-     (`lastCompositionCommit = { text, gen }` at the time
-     `compositionend` ran). In the 20 ms-defer Korean path, suppress
-     the deferred `origTrigger(data)` if `data === lastCompositionCommit.text`
-     AND `imeFlushGen === lastCompositionCommit.gen` (i.e., no new
-     composition has happened since the commit). **Pick this if the
-     validated failing sequence shows the duplicate originating from
-     xterm's `triggerDataEvent("요")` AFTER `compositionend("요")`
-     ran (case d validated)** — the duplicate appears in
-     `origTriggerCalls`, NOT in `ptyWrites()`. Preserves the
-     existing defer-gen invariant for the inverse race
-     (defer-then-composition) covered by test §"Korean
-     triggerDataEvent defer" at line 563.
+     in a shim-private `lastCompositionCommit: { text: string; gen:
+     number } | null` field. **The store must happen AFTER the
+     `imeFlushGen++` increment inside `onCompositionEnd`**, so the
+     stored `gen` matches what subsequent deferred
+     `triggerDataEvent` capture (which reads `gen = imeFlushGen` at
+     defer-schedule time — also post-increment under case (d)).
+     Pseudocode:
+     ```ts
+     // inside onCompositionEnd, after the existing body:
+     clearOverlay();
+     isComposing = false;
+     imeFlushGen++;
+     if (written !== null) {
+       lastCompositionCommit = { text: written, gen: imeFlushGen }; // post-increment
+       emitFlush(written, null);
+     }
+     ```
+     In the 20 ms-defer Korean path inside the wrapper, suppress
+     the deferred `origTrigger(data)` if `lastCompositionCommit
+     !== null && data === lastCompositionCommit.text && imeFlushGen
+     === lastCompositionCommit.gen` (i.e., no new composition has
+     happened since the commit). **Pick this if the validated
+     failing sequence shows the duplicate originating from xterm's
+     `triggerDataEvent("요")` AFTER `compositionend("요")` ran (case
+     d validated)** — the duplicate appears in `origTriggerCalls`,
+     NOT in `ptyWrites()`. Preserves the existing defer-gen
+     invariant for the inverse race (defer-then-composition)
+     covered by test §"Korean triggerDataEvent defer" at line 563:
+     in the inverse race, a new compositionend increments
+     `imeFlushGen` past the deferred-capture's `gen`, so the
+     `gen === lastCompositionCommit.gen` check intentionally
+     becomes a no-op (no false suppression).
 
    ⚠ **Cross-variant scope rule**: if the validated failing sequence
    shows the duplicate appears in BOTH `ptyWrites()` AND
@@ -413,15 +459,31 @@ falsification gate.
       from Step 4, and proceed to Step 3 (variant selection).
    3. If the duplicate does NOT reproduce, extend the dispatch
       sequence with one of the candidate additions:
-      - `fireCompositionEnd(textarea, "요")` before the arrow
-        keydown (models case b where compositionend writes "요" and
-        then the stale-state shim re-writes — though this requires
-        the arrow keydown to happen FAST ENOUGH that
-        `clearOverlay()` hasn't completed; verify trace);
-      - `cs.triggerDataEvent("요", true)` after the arrow keydown
+      - ⚠ `fireCompositionEnd(textarea, "요")` BEFORE the arrow
+        keydown — **NOT viable in JSDOM/happy-dom**:
+        `dispatchEvent` is synchronous, and `onCompositionEnd`
+        synchronously clears `imeFragment`, sets `isComposing :=
+        false`, and increments `imeFlushGen` before returning. By
+        the time the arrow keydown fires, node 7's inner `if
+        (isComposing && !isModifier)` check returns false →
+        no second write. Case (b)'s stale-state window only exists
+        in real WKWebView (where `compositionend` may be
+        asynchronous relative to keydown). Skip this candidate
+        unless you introduce an async/microtask boundary in the
+        test runtime to model that delay.
+      - `cs.triggerDataEvent("요", true)` AFTER the arrow keydown
         (models case d — xterm's CompositionHelper batched the
-        commit and emits it after compositionend);
-      - or both (cases b + d co-occurring).
+        commit and emits it after compositionend). This IS
+        reproducible in JSDOM because the wrapper's 20 ms-defer
+        path uses `setTimeout`, which Vitest can drive
+        synchronously via `vi.useFakeTimers()` + `vi.advanceTimersByTime(25)`
+        (see existing test at lines 567–595 for the pattern).
+      - **most likely path for synchronous test runtime**: model
+        case (d) via the `cs.triggerDataEvent` candidate above.
+      - if case (b) is the actually-validated production cause,
+        Phase 6 user-acceptance repro will surface it — but the
+        unit test for it requires async-aware dispatch and is
+        deferred until then.
       Re-run the baseline. Iterate until the duplicate reproduces.
    4. If NO extension reproduces the duplicate against current
       `dev` HEAD, **escalate back to the planner** — the hypothesis
@@ -462,7 +524,98 @@ falsification gate.
 | Decomposition completeness | 4 | All 11 existing handlers inventoried; primary fix site (node 7) explicitly named; 4 test nodes (T1–T4) cover the trigger family + Q3 |
 | Dependency direction | 4 | `xtermImeShim.ts` is a leaf module; consumers untouched; OUT-OF-SCOPE boundary is enforced by the "preserve terminator union" constraint |
 | Validation status | 3 | Phase 7 smoke-check passes; the harder validation (`tsc --noEmit` + Vitest) is intentionally deferred to the implementer per feature-lane spec; live macOS WKWebView repro is the user's Phase 6 acceptance gate per Constraint #6 |
-| Plan coverage (Phase-1 goal → decomposition) | 4 | Each in-scope item maps to a node; success criteria 1–5 each map to a test, compile check, or user-acceptance gate; open questions Q1/Q2/Q3 are resolved or have an explicit handoff with three named sub-variants and explicit dispatch sequences |
+| Plan coverage (Phase-1 goal → decomposition) | 4 | Each in-scope item maps to a node; success criteria 1–5 each map to a test, compile check, or user-acceptance gate; open questions Q1/Q2/Q3 are resolved or have an explicit handoff with four named sub-variants (B1/B2/B3/B4) and explicit dispatch sequences |
+
+## Round-3 peer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+
+5/5 reviewers approve direction. Convergent consensus across rounds.
+Three remaining items folded.
+
+### Convergent (3/5) — F2' B3 wording authorizes PTY contract change
+
+- **codex3 round-3 #1 (MEDIUM)** — B3's "adds payload-tagging to
+  the shim/PTY contract" conflicts with the OUT-OF-SCOPE boundary.
+- **codex4 round-3 Minor Note 2** — B3 should be planner-reopen
+  territory unless implementer can keep token internal and prove
+  PTY payload unchanged.
+- **claude3 round-3 F2' (MEDIUM)** — three sub-traces verifying
+  the violation; recommended specific internal-only rewrite.
+
+Independently verified at `src/lib/xtermImeShim.ts:466` /
+`xtermImeShim.ts:486` / `xtermImeShim.ts:546`: `data` is the
+literal payload sent to PTY; any encoded token would corrupt the
+user-visible terminal output.
+
+**Folded**: B3 rewritten as "internal last-commit dedup" with
+shim-private `lastWrittenComposition: { text, gen } | null` state.
+PTY bytes are bit-identical to today. Cross-referenced with B4 —
+the two can share the same internal state when applied together.
+
+### Convergent (4/5) — F3' `fireCompositionEnd` before arrow not viable in JSDOM
+
+- **claude4 round-3 H1 (Advisory)** — synchronous dispatch in
+  JSDOM means `onCompositionEnd` clears `isComposing` before
+  the arrow keydown runs.
+- **claude3 round-3 F3' (LOW)** — same trace; recommended
+  tightening Step 5.3.
+- **codex2 round-3 (Medium)** — same trace; recommended removing
+  or rewording.
+- **codex4 round-3 Minor Note 1** — same observation.
+
+Independently verified by tracing `fireCompositionEnd` (test
+lines 108–115) which calls `target.dispatchEvent(e)` synchronously
+→ `onCompositionEnd` body at `xtermImeShim.ts:463–479` synchronously
+clears state → subsequent arrow keydown finds `isComposing=false`
+→ node 7's inner check skipped.
+
+**Folded**: Phase 0 Step 5.3 now marks the `fireCompositionEnd`
+candidate with ⚠ "NOT viable in JSDOM/happy-dom" and steers the
+implementer toward the `cs.triggerDataEvent("요", true)` candidate
+(case d, JSDOM-reproducible via `vi.useFakeTimers()` per existing
+test §"Korean triggerDataEvent defer" at line 567).
+
+### Single-reviewer — B4 gen timing (codex2 Medium)
+
+**Folded**: B4 description now includes explicit pseudocode placing
+`lastCompositionCommit = { text: written, gen: imeFlushGen }`
+AFTER the `imeFlushGen++` increment, with a paragraph explaining
+how the post-increment value matches the deferred capture's `gen`
+under case (d) AND how the inverse race (existing test line 563)
+intentionally falls through B4's check without false suppression.
+
+### Cosmetic (2/5) — F4' "three" → "four" sub-variants
+
+**Folded**: rubric Plan-coverage cell now says "four named
+sub-variants (B1/B2/B3/B4) and explicit dispatch sequences."
+
+### Cosmetic (1) — H2 node 7 "PRIMARY" vs node 9 "maybe" asymmetry
+
+**Folded**: decomposition table row 7 relabeled
+"**CANDIDATE — case (b)**" with annotation "Co-equal with node 9
+per round-2 case (d) hypothesis; not 'primary'"; row 9 relabeled
+"**CANDIDATE — case (d)**".
+
+### Single-reviewer observation (1) — F5' case (d) blast radius (claude3 LOW)
+
+**Folded**: case (d) description now includes a "Blast-radius
+note" — if (d) is the validated mechanism, B4 may close out other
+unreported Korean-IME duplicates (Korean-syllable + pause + non-jamo
+combinations beyond period/arrow); the user's reported trigger
+family may be a visibility artifact. Worth documenting in the
+implementation report.
+
+### Architectural axis (unchanged across all 3 rounds — reviewer consensus)
+
+- Scale lane: feature (Scope=1, Risk=2, Ambiguity=2)
+- Bug sites: node 7 (case b) + node 9 (case d) — co-equal candidates
+- Variant family: Shape B family (B1/B2/B3/B4) — all body-only
+- OUT-OF-SCOPE boundary: terminator union frozen; consumers untouched
+- Invariant inventory: 5 items from prior cycle, line-cited
+- Rubric self-score: 4/4/3/4
+
+@claude3 round-3 and @claude4 round-3 both stated explicitly that
+no round-4 peer review is needed once the F2'/F3' folds land.
+Phase 8 human-confirm gate is ready.
 
 ## Round-2 peer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
 
