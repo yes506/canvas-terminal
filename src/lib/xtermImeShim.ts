@@ -32,15 +32,37 @@ export interface AttachKoreanImeShimOptions {
   defaultFontSize?: number;
 
   /**
-   * Optional callback fired AFTER the shim has written a flushed
-   * composition (composed Korean text + an optional terminating key)
-   * to the PTY via `write_to_pty`. The PTY pane uses this to update
-   * its line-buffer for in-app command detection (e.g. the
-   * `collaborator` keyword); the collaborator-pane mini terminal
-   * does not subscribe.
+   * Optional notification callback fired AFTER the shim has written a
+   * flushed composition to the PTY via `write_to_pty`. **Notification
+   * only — the callback MUST NOT itself invoke `write_to_pty` for the
+   * same payload**, otherwise the PTY receives the bytes twice.
    *
-   * @param committedText The fragment that was just sent (excluding terminator).
-   * @param terminator `\r` (Enter) | `\x1b` (Escape) | `\t` (Tab) | `null` (no terminator).
+   * **Fires for all three helper-originated PTY write paths**:
+   *   1. `compositionend` commit (e.g. user crosses a syllable boundary
+   *      and the IME finalizes the previous syllable)
+   *   2. `blur` flush (focus leaves the textarea mid-composition)
+   *   3. Terminating-key flush (Enter / Escape / Tab during composition;
+   *      the terminator is appended to the PTY write and reported here)
+   *
+   * **Subscriber responsibilities**:
+   *   - PTY pane (`terminalManager.ts`): maintain `lineBuffer` for the
+   *     in-app `collaborator` keyword detection so Korean-composed
+   *     `collaborator\r` still triggers the spawn (otherwise the
+   *     terminator-flush bypasses the `terminal.onData` lineBuffer
+   *     update at terminalManager.ts:680-697).
+   *   - Mini terminal (`AgentMiniTerminal.tsx`): call
+   *     `terminal.scrollToBottom()` so Korean-composed input still
+   *     snaps the viewport to the live prompt — matching the
+   *     "user-input intent" behavior the existing `terminal.onData`
+   *     scroll at AgentMiniTerminal.tsx:709 provides for ASCII
+   *     typing (which bypasses the helper).
+   *
+   * @param committedText The fragment that was just sent to the PTY,
+   *   EXCLUDING any terminator. Never contains `\r`, `\x1b`, or `\t` —
+   *   those go in the `terminator` argument.
+   * @param terminator `\r` (Enter), `\x1b` (Escape), `\t` (Tab), or
+   *   `null` (compositionend / blur path — no terminator was appended
+   *   to the PTY write).
    */
   onComposedFlush?: (
     committedText: string,
@@ -58,10 +80,24 @@ export interface KoreanImeShimHandle {
   /**
    * The DOM element appended under `.xterm-screen` (or the container
    * fallback when `.xterm-screen` is not yet available) that paints the
-   * in-progress composition overlay. Exposed so call sites that
-   * previously held a direct ref (e.g. `managed.imeOverlayEl`) can
-   * continue to release that ref during their own dispose path. May
-   * be `null` if the shim has already been disposed.
+   * in-progress composition overlay.
+   *
+   * **Intentionally exposed (not a backward-compat band-aid)**: the
+   * overlay's `font-size` MUST track the host terminal's font-size for
+   * the overlay glyphs to remain cell-aligned. The two existing
+   * surfaces drive this via:
+   *   - `terminalManager.ts:122-123` — `s.imeOverlayEl.style.fontSize`
+   *     updates inside `ensureGlobalSubscriptions` font-size store
+   *     listener
+   *   - `AgentMiniTerminal.tsx:914-915` — `imeOverlayRef.current.style
+   *     .fontSize` updates inside the font-size subscription effect
+   * Post-substitution those mutations route through
+   * `handle.overlayEl?.style.fontSize` (the `readonly` qualifier
+   * applies to the reference, not the element's mutable DOM state).
+   *
+   * `null` if the shim has already been disposed OR if attach happened
+   * before `.xterm-screen` was in the DOM tree AND the container
+   * itself was not attached (see Failure-modes).
    */
   readonly overlayEl: HTMLElement | null;
 
@@ -75,17 +111,40 @@ export interface KoreanImeShimHandle {
   rebind(): void;
 
   /**
-   * Tears down everything the shim attached:
-   *  - removes document-level `keydown` and `input` capture listeners
-   *  - restores `terminal._core.coreService.triggerDataEvent` to the
-   *    original implementation captured at attach time
+   * Tears down everything the shim attached. **Sole-owner cleanup
+   * contract**: after substitution (decomposition Nodes 6 & 7), callers
+   * MUST invoke `dispose()` EXACTLY ONCE in their existing teardown path
+   * and MUST NOT perform parallel manual cleanup for any of the
+   * fields below — the old `imeHandlers/rebindIme/docKeyDown/docInput/
+   * imeOverlayEl` (PTY pane) and `imeOverlayRef/docInputRef/
+   * docKeyDownRef/imeHandlersRef` (mini pane) fields/refs are replaced
+   * by the handle, not duplicated alongside it.
+   *
+   * Restoration steps performed by `dispose()`:
+   *  - removes document-level `keydown` (capture) and `input` (capture)
+   *    listeners installed at attach time
+   *  - restores the ORIGINAL `terminal._core.coreService.
+   *    triggerDataEvent` reference captured at attach time (the prior
+   *    inline shims at `terminalManager.ts:762-798` and
+   *    `AgentMiniTerminal.tsx:845-884` did NOT restore this; the
+   *    helper closes the leak)
+   *  - restores the ORIGINAL `isCursorHidden` PROPERTY DESCRIPTOR on
+   *    `terminal._core.coreService` (not just sets `_realHidden=false`
+   *    — re-defines the property via `Object.defineProperty` with the
+   *    descriptor captured at attach time, so subsequent owners see a
+   *    pristine property)
    *  - removes the overlay element from the DOM
-   *  - restores cursor visibility and unfreezes the
-   *    `isCursorHidden` getter/setter override
+   *  - restores `cursorBlink` and any other `terminal.options`
+   *    mutations to their pre-attach values
    *  - removes the `compositionend` and `blur` listeners on the helper
    *    textarea
+   *  - removes the `focus` listener and unpatches `helperTextarea.
+   *    focus` to its native bound method
    *
-   * Safe to call multiple times; subsequent calls are no-ops.
+   * Safe to call multiple times; second and subsequent calls are
+   * no-ops (idempotent). Idempotency is on the same handle instance —
+   * two handles from two attaches to the same terminal is undefined
+   * (Preconditions forbid double-attach).
    */
   dispose(): void;
 }
@@ -155,11 +214,15 @@ export interface KoreanImeShimHandle {
  *   - Korean IME composition renders the current composing text exactly
  *     once at the cursor cell, without duplicating any already-committed
  *     prefix, on both WebGL and DOM renderers.
- *   - Successful flush via `write_to_pty` is followed by the
- *     `onComposedFlush` callback (when provided) with the same payload
- *     PLUS the terminator. Caller's `onComposedFlush` MUST NOT itself
- *     write to the PTY for the same payload — it is a notification, not
- *     a forwarder.
+ *   - Every helper-originated PTY write (compositionend commit, blur
+ *     flush, terminating-key flush) is followed by exactly one
+ *     `onComposedFlush(committedText, terminator)` call when the
+ *     callback is provided. `committedText` matches the payload
+ *     written EXCLUDING any terminator; `terminator` reports the
+ *     trailing key separately (or `null` when there was none). The
+ *     callback fires AFTER the `write_to_pty` invoke is dispatched —
+ *     not after it resolves, since the helper does not await the
+ *     fire-and-forget promise.
  *   - All shim state is fully reachable from the returned handle's
  *     closure; calling `handle.dispose()` MUST leave the host application
  *     in a state equivalent to never having attached the shim (modulo

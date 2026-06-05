@@ -39,7 +39,7 @@ Canvas Terminal 사용자가 한글 IME 입력 시, PTY 터미널 패널과 coll
 | OQ1 — Tahoe 26.5.1 falsification | low-priority diagnostic, post-fix optional | implementer 여유 시 git-bisect (acceptance 게이트 아님) |
 | OQ2 — root cause | 가설 (c) Canvas Terminal 커스텀 shim의 `imeStartPos` 동기화 누락 (composition-commit 직후 다음 composition 시작 시) | implementer Node 2에서 경험적 검증 |
 | OQ3 — render-only vs write-path | render-only 가설 (셸 echo + 오버레이 misposition) | implementer Node 2 `terminal.buffer.active` 덤프 + PTY 트랜스크립트 |
-| OQ4 — JP/ZH smoke 깊이 | floor only — 코드 경로 검사 (Korean-only 정규식 `reKorean` 외 IME-언어 분기 없음) | implementer Node 10 grep + 리뷰 |
+| OQ4 — JP/ZH smoke 깊이 | **fixture floor**: Node 5 단위 fixture가 비한글 IME-like 시퀀스(`keydown(229)` + `inputType=insertReplacementText/insertText` + `compositionend`)를 헬퍼에 통과시켜 상태 머신 무회귀(중복 flush 없음, drop 없음) 검증 — 단순 grep을 fixture-기반으로 격상 (round-1 peer fold: codex2 F1, codex3 Medium #1). Ceiling: 수동 JP IME 설치 smoke는 implementer 선택. IME 미설치 환경에서는 JP/ZH 잔존 위험을 명시적으로 수용. | implementer Node 10 (fixture) + Node 5 (단위) |
 | OQ5 — lockstep vs shared-helper | shared-helper (Path B) — 200+ LOC near-identical 중복; narrow extraction은 envelope 안 | 본 plan에서 확정 (헬퍼 모듈 emit) |
 | OQ6 — controlled keystroke trace | implementer Node 1 캡쳐 필수, 가설 검증 전 코드 변경 금지 | implementer Node 1 (acceptance 선행 조건) |
 
@@ -68,16 +68,17 @@ src/
 |---|---|---|---|
 | 1 | Controlled keystroke trace 캡쳐 | implementer notes | "안녕하세요" + "한국어 입력 테스트" 풀 스트링, 각 step별 visible buffer + cursorX/Y + textarea.value + overlay text, 양 surface |
 | 2 | 버퍼/PTY 가설 검증 | implementer notes | `terminal.buffer.active` 덤프 mid-composition + PTY 트랜스크립트로 render-only vs write-path 결정 — 빗나가면 escalate |
-| 3 | `xtermImeShim.ts` 헬퍼 생성 | src/lib | overlay state, cursor hijack, isFullWidth, showOverlay, clearOverlay, onCompositionEnd, onTextareaBlur, docInput, docKeyDown, triggerDataEvent 패치, helperTextarea preventScroll 패치 — 단일 export `attachKoreanImeShim` |
-| 4 | 헬퍼 fix 적용 | src/lib | `onCompositionEnd`에 `imeStartPos = textarea.value.length` (또는 `isComposing = false`) 추가 — Node 2 결과로 정확한 변형 결정 |
-| 5 | 헬퍼 단위 테스트 | src/lib | WKWebView 시뮬레이션 fixture로 commit-boundary 시나리오 검증 (vitest) |
-| 6 | PTY pane 치환 | src/lib | `terminalManager.ts:346–697` IME 블록을 `attachKoreanImeShim` 호출로 치환, `managed.imeHandlers/rebindIme/docKeyDown/docInput/imeOverlayEl` 라이프사이클은 handle로 wrap |
-| 7 | collab pane 치환 | src/components/collaborator | `AgentMiniTerminal.tsx:448–699` IME 블록을 `attachKoreanImeShim` 호출로 치환, `imeOverlayRef/docInputRef/docKeyDownRef/imeHandlersRef` cleanup을 handle.dispose로 일원화 |
+| 3 | `xtermImeShim.ts` 헬퍼 생성 | src/lib | overlay state, cursor hijack, isFullWidth, showOverlay, clearOverlay, onCompositionEnd, onTextareaBlur, docInput, docKeyDown, triggerDataEvent 패치, helperTextarea preventScroll 패치 — 단일 export `attachKoreanImeShim`. **20ms `triggerDataEvent` deferral**은 기존 inline shim에서 carry-over; 본문에 `// FIXME: 20ms empirically tuned for WKWebView on macOS; revalidate on major macOS bumps` 주석 추가 (round-1 peer fold: claude3 N4) |
+| 4 | 헬퍼 fix 적용 | src/lib | **선호 변형: (b) `isComposing = false` in `onCompositionEnd`** — 기존 `keydown(229)` 분기의 `imeStartPos = (textarea.value.length ?? 1) - 1` 재설정 로직을 자연스럽게 활용; (a) `imeStartPos = textarea.value.length` 직접 설정은 Node 2 trace가 (b)를 falsify할 때만 (round-1 peer fold: claude2 I4). |
+| 5 | 헬퍼 단위 테스트 | src/lib | **범위 = 헬퍼 상태 머신 substate 검증** (jsdom + 합성 이벤트 — WKWebView의 `input`-before-`keydown` 순서 명시); commit-boundary 시나리오 (Korean) + 비한글 IME-like 시퀀스(OQ4 fixture floor). 실제 WKWebView 동작 smoke는 Node 8/8b가 acceptance 게이트 (round-1 peer fold: claude3 N3, claude2 I5) |
+| 6 | PTY pane 치환 | src/lib | `terminalManager.ts:346–672` IME 블록을 `attachKoreanImeShim` 호출로 치환 (line range 정정: 673–698은 `terminal.onData` 콜백으로, IME가 아님 — round-1 peer fold: claude2 I2). `managed.imeHandlers/rebindIme/docKeyDown/docInput/imeOverlayEl` 라이프사이클은 `handle.dispose()`로 **일원화** (병행 manual cleanup 금지 — round-1 peer fold: codex1 High). **`terminal.onData` 콜백은 그대로 유지**하되 lineBuffer `collaborator` 감지를 `onComposedFlush(committedText, terminator)` 콜백으로도 동기화 — 한글 음절 commit (compositionend/blur/terminator-flush) 직후 lineBuffer가 갱신되어야 "collaborator\r" 입력 시 spawn 누락 없음 (round-1 peer fold: claude3 C1, claude2 I2, codex1·codex2 callback contract). **Font-size 변형 경로**: `ensureGlobalSubscriptions`의 `s.imeOverlayEl.style.fontSize = ${state.fontSize}px` (terminalManager.ts:122-123) → `handle.overlayEl?.style.fontSize`로 치환 (round-1 peer fold: claude2 I3, codex1 Medium) |
+| 7 | collab pane 치환 | src/components/collaborator | `AgentMiniTerminal.tsx:448–699` IME 블록을 `attachKoreanImeShim` 호출로 치환, `imeOverlayRef/docInputRef/docKeyDownRef/imeHandlersRef` cleanup을 `handle.dispose()`로 일원화. **`onComposedFlush` 구독**: 콜백 내에서 `terminal.scrollToBottom()` 호출 — Korean compose가 `terminal.onData` (AgentMiniTerminal.tsx:702-710)를 우회하여 발생하는 scroll-snap 누락을 닫음 (round-1 peer fold: codex3 Medium #2). **Font-size 변형 경로**: 기존 font-size effect의 `imeOverlayRef.current.style.fontSize = ${newSize}px` (AgentMiniTerminal.tsx:914-915) → `handle.overlayEl?.style.fontSize`로 치환 (round-1 peer fold: claude2 I3, codex1 Medium) |
 | 8 | Korean accept smoke | acceptance | 양 surface "안녕하세요" / "한국어 입력 테스트" 매 step 정확 1회 렌더, 화살표키 정리 불필요 |
-| 9 | non-IME regression smoke | acceptance | ASCII, paste, 화살표키, Ctrl+C/R, Tab, shell history(↑/↓), Shift+Enter (CSI u), Cmd 단축키 양 surface |
-| 10 | JP/ZH 코드 경로 검사 (OQ4 floor) | acceptance | `xtermImeShim.ts`에 `reKorean` 외 IME-언어 분기 없음 grep 확인 |
+| 8b | **In-app keyword path acceptance** | acceptance | **NEW (round-1 peer fold: claude3 C1)**. PTY pane에서 한글 IME로 `collaborator` 키워드 입력 후 Enter → collab pane spawn 트리거 정상 동작 확인 (한글 → ASCII 모드 전환 입력 케이스 포함). `onComposedFlush` lineBuffer 동기화의 acceptance 게이트. |
+| 9 | non-IME regression smoke | acceptance | ASCII, paste, 화살표키, Ctrl+C/R, Tab, shell history(↑/↓), Shift+Enter (CSI u), Cmd 단축키 양 surface. **추가**: `handle.dispose()` 호출 후 ① `triggerDataEvent` 원복, ② `isCursorHidden` property descriptor 원복, ③ document-level listeners 제거, ④ helperTextarea `focus` 패치 원복, ⑤ overlay DOM 제거 확인 — React StrictMode remount + terminal reparenting 시나리오 포함 (round-1 peer fold: codex1 High, codex3 Low #3) |
+| 10 | **JP/ZH non-regression fixture (OQ4)** | acceptance + src/lib | **격상 (round-1 peer fold: codex2 F1, codex3 Medium #1)**. (a) `xtermImeShim.ts`에 `reKorean` 외 IME-언어 분기 없음 grep (floor 보존) **+** (b) Node 5 fixture가 비한글 `keydown(229)` + `inputType=insertReplacementText` + `compositionend` 시퀀스를 헬퍼에 통과시켜 ① 중복 flush 없음, ② drop 없음, ③ 오버레이 1회 렌더 검증. 수동 JP IME smoke (ceiling)는 implementer 가용 시 1회 — 미가용 시 잔존 위험 명시적 수용. |
 | 11 | TypeScript 컴파일 | validation | `tsc --noEmit` 통과 |
-| 12 | Vitest | validation | 기존 + 헬퍼 단위 테스트 통과 |
+| 12 | Vitest | validation | 기존 + 헬퍼 단위 테스트 통과 (Node 5 fixture + JP/ZH 시퀀스 포함) |
 
 ### Decomposition DAG
 
@@ -87,12 +88,13 @@ flowchart TD
   N2[Node 2 — buffer/PTY 가설 검증]
   N3[Node 3 — xtermImeShim.ts 헬퍼 생성]
   N4[Node 4 — 헬퍼 fix 적용 imeStartPos 동기화]
-  N5[Node 5 — 헬퍼 단위 테스트]
-  N6[Node 6 — PTY pane 치환]
-  N7[Node 7 — collab pane 치환]
+  N5[Node 5 — 헬퍼 단위 테스트 + JP/ZH fixture]
+  N6[Node 6 — PTY pane 치환 + onComposedFlush lineBuffer]
+  N7[Node 7 — collab pane 치환 + onComposedFlush scrollToBottom]
   N8[Node 8 — Korean accept smoke]
-  N9[Node 9 — non-IME regression smoke]
-  N10[Node 10 — JP/ZH 코드경로 검사]
+  N8b[Node 8b — collaborator keyword via Korean IME]
+  N9[Node 9 — non-IME regression + dispose 원복 확인]
+  N10[Node 10 — JP/ZH fixture floor + 수동 ceiling]
   N11[Node 11 — tsc noEmit]
   N12[Node 12 — Vitest]
 
@@ -104,17 +106,20 @@ flowchart TD
   N5 --> N7
   N6 --> N8
   N7 --> N8
+  N6 --> N8b
   N6 --> N9
   N7 --> N9
-  N3 --> N10
+  N5 --> N10
   N6 --> N11
   N7 --> N11
   N5 --> N12
   N8 --> N12
+  N8b --> N12
   N9 --> N12
+  N10 --> N12
 ```
 
-Interface-level DAG는 `plan.mmd` 참고 (단일 노드 `attachKoreanImeShim`).
+**plan.mmd 메모**: `plan.mmd`는 interface-level (skill의 `render_mermaid_dag.py`가 `.planner-state.json::interfaces`를 렌더 — 단일 노드 `attachKoreanImeShim`). 12-node decomposition DAG는 본 plan.md::Decomposition DAG 임베디드 Mermaid 블록이 권위본 (round-1 peer fold: codex1 Low, claude2 I6).
 
 ## Interfaces emitted
 
@@ -140,7 +145,7 @@ Interface-level DAG는 `plan.mmd` 참고 (단일 노드 `attachKoreanImeShim`).
 
 ## Rubric
 
-skeleton 발행 모드 → 시스템 lane 6-criterion 적용.
+skeleton-emission rubric (6 criterion) — feature 레인에서 skeleton emit 시 적용 (system 레인 재분류 아님 — round-1 peer fold: claude3 rubric audit, codex3 Low rename).
 
 | 기준 | 점수 (0–4) | 근거 |
 |---|---|---|
@@ -155,11 +160,14 @@ skeleton 발행 모드 → 시스템 lane 6-criterion 적용.
 
 - [ ] OQ2/OQ3 가설("imeStartPos 동기화 누락, render-only")이 합리적이라고 판단
 - [ ] Path B(shared-helper) 선택이 v0.5.x 패치 envelope 안에 있다고 판단
-- [ ] Node 1·2가 acceptance의 진정한 선행 조건이라고 판단 (가설이 빗나가면 planner escalate)
+- [ ] Node 1·2가 acceptance의 진정한 선행 조건이라고 판단 (가설 빗나가면 planner escalate)
 - [ ] 신규 `src/lib/xtermImeShim.ts` 단일 모듈 추가가 받아들일 만한 표면 변화라고 판단
-- [ ] Node 5(헬퍼 단위 테스트) 범위가 충분하다고 판단 (WKWebView fixture 시뮬레이션)
-- [ ] Node 9(non-IME 회귀 smoke)가 양 surface에서 5개 영역(ASCII/paste/hotkey/history/Shift+Enter)을 모두 cover한다고 판단
-- [ ] JP/ZH smoke가 코드 경로 검사(floor)로 충분하다고 판단 (ceiling=수동 IME 설치는 implementer 선택)
+- [ ] Node 5(헬퍼 단위 테스트) 범위가 충분 — 상태 머신 substate 검증 + 비한글 IME-like fixture(OQ4 floor); live WKWebView 동작은 Node 8/8b acceptance 게이트
+- [ ] **Node 8b** (한글 IME로 `collaborator` 키워드 입력 → spawn 트리거) acceptance가 충분 — `onComposedFlush` lineBuffer 동기화 검증 (round-1 peer fold: claude3 C1)
+- [ ] Node 9(non-IME 회귀 + `dispose()` 원복 확인)가 양 surface × 5개 영역(ASCII/paste/hotkey/history/Shift+Enter) + 5개 dispose 항목(triggerDataEvent / isCursorHidden descriptor / doc listeners / focus patch / overlay DOM)을 모두 cover
+- [ ] **JP/ZH 비회귀**: Node 10 fixture floor(비한글 keydown(229)+insertText+compositionend 시퀀스 통과)가 충분 — 수동 JP IME smoke ceiling은 implementer 가용 시
+- [ ] **`webgl?` 옵션**: implementer Node 2 trace 결과로 (a) 호출자 자기 값 전달 / (b) 옵션 drop 중 결정 가능 (본 plan은 미결정으로 carry)
+- [ ] **stale `implementation-report.md`** 제거 chore commit 동의 (mini-term-column-floor 잔존, git 히스토리 보존)
 - [ ] 본 plan이 implementer에 대한 충분한 사양이라고 판단
 
 ## Provenance
@@ -169,5 +177,7 @@ skeleton 발행 모드 → 시스템 lane 6-criterion 적용.
 - Planner ID: `18137-24973-29882`
 - Planner worktree: `.worktrees/planner-korean-ime-dup-render-18137-24973-29882`
 - Planner branch: `planner/korean-ime-dup-render-18137-24973-29882` (from `dev`)
-- Skeleton commit: `7f4675b`
+- Skeleton commit: `7f4675b` (initial); fold-commit follows
+- Round-1 peer review reviewers: @claude2 (task-69), @claude3 (feedback file), @codex1 (task-91), @codex2 (task-92), @codex3 (task-93) — 5/5
+- Round-1 peer fold scope: 9 plan.md folds + 4 skeleton TSDoc folds + worktree hygiene (`implementation-report.md` 제거)
 - Downstream handoff scope: input to `/codebase-implementer`; Phase 8 merge will emit `(plan-feature, human-confirmed)`.
