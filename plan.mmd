@@ -11,7 +11,7 @@ flowchart TD
     E -- "no" --> Eskip["skip — already in clean state"]
     E -- "yes (stale-state catch-up)" --> F{"isTerminating?"}
     F -- "yes (Enter/Esc/Tab)" --> Fwrite["write composed+suffix to PTY<br/>preventDefault, emitFlush — node 6"]
-    F -- "no (period/arrow/etc.)" --> Bug["BUG SITE — current code writes composed alone<br/>node 7 — duplicate-write site"]
+    F -- "no (period/arrow/etc.)" --> Bug["BUG SITE — writes composed + empty suffix<br/>(effectively composed alone) — node 7 duplicate-write site"]
 
     G["browser fires compositionend"] --> H["onCompositionEnd — node 5"]
     H --> H1["if e.data AND shim still composing:<br/>invoke write_to_pty(committed)"]
