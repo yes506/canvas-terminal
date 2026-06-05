@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>플랜 — korean-ime-dup-render · v2</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --fg:          #1a1a1a;
+      --fg-muted:    #5a5a5a;
+      --fg-soft:     #888;
+      --bg:          #f7f7f5;
+      --bg-card:     #fff;
+      --accent:      #2b5fb5;
+      --accent-soft: #e8f0fb;
+      --good:        #2f7c4f;
+      --good-soft:   #e6f4ec;
+      --good-line:   #b6dcc4;
+      --bad:         #b53737;
+      --bad-soft:    #fbeaea;
+      --bad-line:    #e6b8b8;
+      --warn:        #b87900;
+      --warn-soft:   #fff4d6;
+      --warn-line:   #e8c870;
+      --info:        #5a4ec0;
+      --info-soft:   #ede9fa;
+      --info-line:   #c8c0ea;
+      --border:      #e0e0dc;
+      --shadow:      0 1px 2px rgba(0,0,0,0.04);
+      --code-bg:     #f0f0ec;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
+            "Noto Sans KR", "Malgun Gothic", Roboto, "Helvetica Neue", Arial, sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+    }
+    .page { max-width: 920px; margin: 0 auto; padding: 36px 32px 60px; }
+
+    /* ── HEADER ──────────────────────────────────────────────── */
+    header.doc-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
+      margin-bottom: 24px;
+    }
+    header.doc-head h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    header.doc-head h1 .slug { color: var(--accent); }
+    .pill {
+      display: inline-block;
+      padding: 3px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      margin-left: 8px;
+    }
+    .pill.version { background: var(--info-soft); color: var(--info); }
+
+    /* ── PIPELINE BREADCRUMB (chain ubiquitous vocabulary) ───── */
+    .pipeline-wrap { margin: 0 0 18px; }
+    .pipeline-svg {
+      width: 100%; height: auto; max-height: 76px; display: block;
+    }
+
+    /* ── STAT TAPE (at-a-glance counts) ──────────────────────── */
+    .stat-tape-wrap {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 6px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .stat-tape {
+      width: 100%; height: auto; max-height: 64px; display: block;
+    }
+
+    /* ── LANE LADDER SVG (replaces text lane pill) ───────────── */
+    .lane-ladder-wrap {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 16px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .lane-ladder {
+      width: 100%; height: auto; max-width: 360px; display: block;
+    }
+
+    /* ── HERO ────────────────────────────────────────────────── */
+    .hero {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 22px 26px;
+      margin-bottom: 28px;
+      box-shadow: var(--shadow);
+    }
+    .hero .label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+      margin-bottom: 8px;
+    }
+    .hero .goal {
+      font-size: 19px;
+      font-weight: 500;
+      line-height: 1.45;
+      color: var(--fg);
+      margin: 0;
+    }
+
+    /* ── SCOPE GRID ──────────────────────────────────────────── */
+    .scope-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+    .scope-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+    }
+    .scope-col.in  { border-top: 3px solid var(--good); }
+    .scope-col.out { border-top: 3px solid var(--bad); }
+    .scope-col h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .scope-col.in  h2 { color: var(--good); }
+    .scope-col.out h2 { color: var(--bad); }
+    .scope-col ul { list-style: none; padding: 0; margin: 0; }
+    .scope-col li {
+      position: relative;
+      padding: 6px 0 6px 22px;
+      font-size: 14px;
+      line-height: 1.5;
+      border-bottom: 1px dashed var(--border);
+    }
+    .scope-col li:last-child { border-bottom: none; }
+    .scope-col.in  li::before {
+      content: "✓"; position: absolute; left: 0; top: 6px;
+      color: var(--good); font-weight: 700;
+    }
+    .scope-col.out li::before {
+      content: "✗"; position: absolute; left: 0; top: 6px;
+      color: var(--bad); font-weight: 700;
+    }
+
+    /* ── PANEL (generic) ─────────────────────────────────────── */
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .panel > h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+    }
+
+    /* ── SUCCESS CHECKLIST ───────────────────────────────────── */
+    .checklist { list-style: none; padding: 0; margin: 0; }
+    .checklist li {
+      position: relative;
+      padding: 8px 0 8px 28px;
+      font-size: 14.5px;
+      border-bottom: 1px dashed var(--border);
+    }
+    .checklist li:last-child { border-bottom: none; }
+    .checklist li::before {
+      content: ""; position: absolute; left: 0; top: 11px;
+      width: 14px; height: 14px;
+      border: 1.5px solid var(--accent);
+      border-radius: 3px;
+      background: var(--bg-card);
+    }
+
+    /* ── CONSTRAINTS ─────────────────────────────────────────── */
+    .constraint-list { list-style: none; padding: 0; margin: 0; }
+    .constraint-list li {
+      position: relative;
+      padding: 5px 0 5px 18px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .constraint-list li::before {
+      content: "▸"; position: absolute; left: 0; top: 5px;
+      color: var(--accent);
+    }
+
+    /* ── LANE REASONING CALLOUT ──────────────────────────────── */
+    .lane-callout {
+      background: var(--info-soft);
+      border: 1px solid var(--info-line);
+      border-left: 5px solid var(--info);
+      border-radius: 8px;
+      padding: 16px 22px;
+      margin-bottom: 22px;
+    }
+    .lane-callout h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--info);
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .lane-callout p {
+      margin: 0;
+      font-size: 14.5px;
+      line-height: 1.6;
+      color: var(--fg);
+    }
+
+    /* ── EVIDENCE INVENTORY TABLE ────────────────────────────── */
+    .evidence-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13.5px;
+    }
+    .evidence-table th, .evidence-table td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .evidence-table th {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+      background: var(--bg);
+    }
+    .evidence-table td.field {
+      font-weight: 600;
+      color: var(--fg);
+      white-space: nowrap;
+      width: 32%;
+    }
+    .evidence-table td.seeds .seed-row {
+      padding: 2px 0;
+      line-height: 1.5;
+    }
+    .evidence-table td.seeds .seed-row + .seed-row {
+      border-top: 1px dashed var(--border);
+      margin-top: 2px;
+      padding-top: 4px;
+    }
+    .evidence-table td.seeds code {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.92em;
+      background: var(--code-bg);
+      padding: 1px 5px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+    .evidence-table td.seeds .relevance {
+      color: var(--fg-muted);
+      font-size: 0.95em;
+    }
+    .evidence-table td.seeds .relevance.placeholder {
+      font-style: italic;
+      color: var(--fg-soft);
+    }
+    .evidence-table td.intent-only {
+      color: var(--fg-soft);
+      font-style: italic;
+    }
+    .evidence-empty {
+      padding: 16px;
+      text-align: center;
+      color: var(--fg-soft);
+      font-style: italic;
+      font-size: 13.5px;
+    }
+
+    /* ── RESOLVED AMBIGUITIES ────────────────────────────────── */
+    .resolved-list { list-style: none; padding: 0; margin: 0; }
+    .resolved-list li {
+      padding: 8px 0;
+      font-size: 14px;
+      line-height: 1.55;
+      border-bottom: 1px dashed var(--border);
+    }
+    .resolved-list li:last-child { border-bottom: none; }
+    .resolved-list .finding {
+      color: var(--fg-muted);
+    }
+    .resolved-list .resolution {
+      color: var(--fg);
+      font-weight: 500;
+    }
+    .resolved-list .resolution::before {
+      content: " → ";
+      color: var(--good);
+      font-weight: 700;
+    }
+    .resolved-list li.auto::before {
+      content: "(auto) ";
+      color: var(--fg-soft);
+      font-style: italic;
+      font-size: 12px;
+    }
+
+    /* ── OPEN QUESTIONS (loud) ───────────────────────────────── */
+    .open-questions {
+      background: var(--warn-soft);
+      border: 1px solid var(--warn-line);
+      border-left: 5px solid var(--warn);
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 28px;
+    }
+    .open-questions > h2 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--warn);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .open-questions > h2::before { content: "⚠"; font-size: 18px; }
+    .open-questions ul { list-style: none; padding: 0; margin: 0; }
+    .open-questions li {
+      padding: 6px 0;
+      font-size: 14.5px;
+      line-height: 1.5;
+      border-bottom: 1px dashed var(--warn-line);
+    }
+    .open-questions li:last-child { border-bottom: none; }
+
+    /* ── PROVENANCE FOOTER ───────────────────────────────────── */
+    footer.doc-foot {
+      margin-top: 32px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--fg-soft);
+    }
+    footer.doc-foot dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 4px 16px;
+    }
+    footer.doc-foot dt {
+      font-weight: 600;
+      color: var(--fg-muted);
+    }
+    footer.doc-foot dd {
+      margin: 0;
+      color: var(--fg);
+    }
+    footer.doc-foot code {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--code-bg);
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+
+    /* ── PLACEHOLDERS ────────────────────────────────────────── */
+    .placeholder {
+      color: var(--fg-soft);
+      font-style: italic;
+      font-size: 13.5px;
+    }
+
+    /* ── PRINT ───────────────────────────────────────────────── */
+    @media print {
+      body { background: #fff; }
+      .page { padding: 0; max-width: none; }
+      .hero, .panel, .scope-col, .lane-callout, .open-questions {
+        box-shadow: none;
+        page-break-inside: avoid;
+      }
+    }
+    /* ── NARROW ──────────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      .scope-grid { grid-template-columns: 1fr; }
+      footer.doc-foot dl { grid-template-columns: 1fr; gap: 8px; }
+      footer.doc-foot dt { margin-top: 4px; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+<div class="pipeline-wrap"><svg class="pipeline-svg" viewBox="0 0 880 76" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Pipeline position: plan"><line x1="88" y1="32" x2="792" y2="32" stroke="#d4d4cf" stroke-width="2" stroke-dasharray="4 3"/><polygon points="88,18 102,32 88,46 74,32" fill="#fff" stroke="#2b5fb5" stroke-width="1.5"/><text x="88" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">의도</text><circle cx="264" cy="32" r="14" fill="#fff" stroke="#2f7c4f" stroke-width="1.5"/><text x="264" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">씨앗</text><polygon points="440,18 454,44 426,44" fill="#7a3fb5" stroke="#7a3fb5" stroke-width="2"/><text x="440" y="62" text-anchor="middle" font-size="12" font-weight="600" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">계획</text><rect x="602" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#b87900" stroke-width="1.5"/><line x1="606" y1="29" x2="626" y2="29" stroke="#b87900" stroke-width="1.4"/><line x1="606" y1="35" x2="626" y2="35" stroke="#b87900" stroke-width="1.4"/><text x="616" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">문서 골격</text><rect x="778" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#0f7a83" stroke-width="1.5"/><line x1="792" y1="21" x2="792" y2="43" stroke="#0f7a83" stroke-width="1.4"/><text x="792" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">인터페이스</text></svg></div>
+
+<header class="doc-head">
+  <h1>
+    플랜 — <span class="slug">korean-ime-dup-render</span>
+    <span class="pill version">v2</span>
+  </h1>
+</header>
+
+<div class="stat-tape-wrap"><svg class="stat-tape" viewBox="0 0 880 64" preserveAspectRatio="xMidYMid meet" role="img" aria-label="At a glance"><text x="62" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2f7c4f" font-family="-apple-system, system-ui, sans-serif">3</text><text x="62" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">범위 안</text><line x1="125" y1="12" x2="125" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="187" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b53737" font-family="-apple-system, system-ui, sans-serif">2</text><text x="187" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">범위 밖</text><line x1="250" y1="12" x2="250" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="312" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">5</text><text x="312" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">성공 기준</text><line x1="375" y1="12" x2="375" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="437" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">5</text><text x="437" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">제약</text><line x1="500" y1="12" x2="500" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="562" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#bbb" font-family="-apple-system, system-ui, sans-serif">0</text><text x="562" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#999" font-family="-apple-system, system-ui, sans-serif">기여 시드</text><line x1="625" y1="12" x2="625" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="687" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2f7c4f" font-family="-apple-system, system-ui, sans-serif">3</text><text x="687" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">해결됨</text><line x1="750" y1="12" x2="750" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="812" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b87900" font-family="-apple-system, system-ui, sans-serif">6</text><text x="812" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">미해결</text></svg></div>
+<div class="lane-ladder-wrap"><svg class="lane-ladder" viewBox="0 0 360 64" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Scale lane: feature"><rect x="4" y="30" width="76" height="16" rx="3" fill="#fff" stroke="#0f7a83" stroke-width="1.4"/><text x="42" y="58" text-anchor="middle" font-size="11" font-weight="500" fill="#888" letter-spacing="0.04em" font-family="-apple-system, system-ui, sans-serif">마이크로</text><rect x="88" y="22" width="76" height="24" rx="3" fill="#fff" stroke="#2b5fb5" stroke-width="1.4"/><text x="126" y="58" text-anchor="middle" font-size="11" font-weight="500" fill="#888" letter-spacing="0.04em" font-family="-apple-system, system-ui, sans-serif">로컬</text><rect x="172" y="14" width="76" height="32" rx="3" fill="#7a3fb5" stroke="#7a3fb5" stroke-width="2"/><text x="210" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="#7a3fb5" letter-spacing="0.04em" font-family="-apple-system, system-ui, sans-serif">피처</text><rect x="256" y="6" width="76" height="40" rx="3" fill="#fff" stroke="#b53737" stroke-width="1.4"/><text x="294" y="58" text-anchor="middle" font-size="11" font-weight="500" fill="#888" letter-spacing="0.04em" font-family="-apple-system, system-ui, sans-serif">시스템</text></svg></div>
+
+<section class="hero"><div class="label">목표</div><p class="goal">For Canvas Terminal users typing Korean (Hangul) IME input, typed characters render in place without visual duplication or required arrow-key cleanup, in both the PTY terminal pane and the AI agent&#x27;s built-in terminal.</p></section>
+<section class="scope-grid"><div class="scope-col in"><h2>범위 안</h2><ul><li>Diagnose and fix the IME composition + buffer rendering interaction in the xterm.js + PTY pipeline used by Canvas Terminal, including the existing custom IME handling layer present in both terminal surfaces</li><li>Cover both terminal surfaces (PTY pane + collaborator-pane built-in terminals); the planner must determine whether the fix lands as parallel changes on both surfaces or via a refactor to a shared helper, given that both surfaces already implement near-identical custom IME workaround code</li><li>Ship the fix in a v0.5.x patch release (patch-release compatibility — version bump and release flow are separate work)</li></ul></div><div class="scope-col out"><h2>범위 밖</h2><ul><li>Japanese / Chinese IME functional support (user only uses Korean+English; explicitly deferred to a future intent — non-regression of these IMEs is covered separately as a constraint and success criterion)</li><li>Non-macOS platforms (Linux / Windows untested; outside user&#x27;s environment)</li></ul></div></section>
+<section class="panel"><h2>제약 사항</h2><ul class="constraint-list"><li>Must ship as a v0.5.x patch — no breaking API changes, bounded scope</li><li>No regression in non-IME typing latency or correctness</li><li>Per current repro the buffer appears correct (arrow-key redraw resolves cleanly), but this is the user&#x27;s inference, not a captured PTY/buffer transcript; the planner must empirically verify whether the bug surface is render-only (DOM/renderer reconciliation) or includes write-path duplication (e.g., compositionend → PTY → echo, or the deferred triggerDataEvent fragment) before committing to a fix strategy</li><li>Avoid xterm.js major version bump or broad architectural refactor of the IME/keystroke handling layer. Patch-release compatibility (no breaking API changes) is the hard envelope, which by SemVer convention effectively rules out a major xterm.js bump in this patch. If empirical investigation shows the only viable fix requires breaking that envelope, escalate by re-opening this intent rather than silently bumping under the guise of refactor</li><li>The fix must cover both terminal surfaces — the PTY terminal pane and the collaborator-pane built-in terminal. Landing changes on only one surface leaves half the bug present, because both surfaces currently carry parallel custom IME handling code</li></ul></section>
+<section class="panel"><h2>성공의 기준</h2><ul class="checklist"><li>While typing &quot;안녕하세요&quot; character-by-character in the PTY terminal pane, each intermediate composition/commit state renders the current Korean text (committed + in-progress composing) exactly once with no duplicated prefix anywhere in the buffer; after the final syllable the visible line reads exactly 안녕하세요 without any arrow-key cleanup</li><li>Same behavior in the AI agent&#x27;s built-in terminal (collaborator pane) — each intermediate state renders the current Korean text exactly once, and the final commit reads exactly 안녕하세요 without arrow-key cleanup</li><li>A longer phrase (e.g., &quot;한국어 입력 테스트&quot;) composes to the final string exactly once, with no accumulating duplicate prefixes at any intermediate step, on both surfaces</li><li>No regression in ASCII typing, paste, arrow keys, Ctrl+C / Ctrl+R, Tab completion, or shell history (↑/↓) on either surface</li><li>Japanese / Chinese IME rendering not visibly worsened relative to the current pre-fix baseline — verification depth is a lightweight smoke check on code paths exercised by the Korean IME fix, not full functional parity testing with Korean</li></ul></section>
+<section class="lane-callout"><h2>이 스케일 레인을 선택한 이유</h2><p>Round-2 peer review (5/5 reviewers: @codex1 task-68, @claude2 task-69, @codex2 task-70, @claude3 task-71, @codex3 task-72) and 코드 reality 검증에 따라 v1의 `system` 제안을 `feature`로 downshift합니다. 근거: (1) Touch surface는 두 기존 파일에 국한됩니다 — `src/lib/terminalManager.ts` (PTY 패널, WebGL 렌더러; line 204 `attachCustomKeyEventHandler`, 249 `new WebglAddon(false)`, 346–697 사용자 정의 IME shim with composition listeners + `triggerDataEvent` 패치), 그리고 `src/components/collaborator/AgentMiniTerminal.tsx` (collaborator 패널, 기본 렌더러; line 426 `attachCustomKeyEventHandler`, 577–672 IME shim, 652 `triggerDataEvent` 패치). 두 블록은 near-parallel 구조이며 각각 ~10–15줄 분량 수정 범위. (2) Intent의 명시적 patch-release 봉투 (v0.5.x, non-breaking API, no broad architectural refactor — Constraint #1, #4)와 `feature` 레인이 부합. `system` 레인의 interfaces-only 프로토콜 (architecture.html + architecture.mmd)은 새 cross-system 경계 도입을 위한 것이며 본 작업의 two-file bugfix 경제학과 어긋남. (3) &quot;Lockstep parallel vs shared-helper&quot; 결정 (intent.open_questions[4])은 단일 로컬 아키텍처 이진 선택으로, planner의 Phase 0.5 recon 후 해결 가능. 단, narrow 공유 헬퍼 추출만 허용되며 Constraint #4의 &quot;broad architectural refactor&quot; 금지 envelope은 그대로 유지. (4) 렌더러 비대칭(`terminalManager.ts`만 `WebglAddon` 임포트)은 shared-helper 결정 시 렌더러별 fix variant 필요 여부로 이어지며, 이 또한 단일 파일 내 분기로 처리 가능한 수준. (5) Planner Phase 0.5 부담은 무시할 수 없음 — seeds가 없으므로 6개 OQ 모두 (controlled keystroke-indexed trace 확보, render-only vs write-path 경험적 검증, Tahoe 26.5.1 falsification, JP/ZH baseline smoke, 렌더러 비대칭 확인) planner가 직접 해결해야 함. 30분 단위가 아닌 다중 시간 단위 Phase 0.5 예상. **Worktree-hygiene note (downstream codebase-planner reader 대상)**: 이 worktree 루트에는 `plan.md` (cycle F — peer-context-mirror), `plan.mmd`, `architecture.html`, `architecture.mmd`가 dev에서 상속된 cycle F 인공물로 존재하며 본 의도와 무관합니다. codebase-planner가 feature 레인으로 emit 시 `plan.md`/`plan.mmd`를 IME 컨텐츠로 덮어쓰면 됩니다 (architecture.{html,mmd}는 feature 레인에서 미사용). 사전 cleanup commit은 사용자 재량에 위임 (cycle F의 gate-marker semantics는 dev의 머지 커밋에 보존됨).</p></section>
+<section class="panel"><h2>근거 인벤토리</h2><div class="evidence-empty">(의도-단독 플랜 — 어떤 시드도 루브릭 필드에 기여하지 않음)</div></section>
+<section class="panel"><h2>해결된 모호성</h2><ul class="resolved-list"><li class="resolved"><span class="finding">v1 logged intent.open_questions carry-through as a single bundle-defer Dim-4 finding. Result: HTML renderer (which iterates state.findings where mode=deferred) showed only 1 unresolved item while Markdown showed 6. Codex2 verified the MD/HTML count mismatch (task-70 F2). The MD&#x27;s verbatim listing was correct in spirit but diverged from renderer behavior.</span><span class="resolution">v2 splits the bundle into 6 separate Dim-4 deferred findings (one per intent.open_questions[i]) so MD/HTML render identically (6 items in Remaining open questions, 6 in the unresolved stat). The single-bundle-defer rationale (&#x27;not critical for bug fix&#x27; per user) is preserved as each per-OQ finding&#x27;s resolution.text.</span></li><li class="resolved"><span class="finding">v1&#x27;s proposed `system` lane is over-budget against intent&#x27;s explicit patch-release envelope (v0.5.x, no breaking API, no broad architectural refactor of IME/keystroke handling layer). Round-2 peer review (5/5 reviewers: @codex1 task-68, @claude2 task-69, @codex2 task-70, @claude3 task-71, @codex3 task-72) converged on `feature` as the right default; code-reality grep confirms two existing near-duplicate IME shim blocks in two existing files (~10–15 lines each), with renderer asymmetry (WebGL only in terminalManager.ts) — no cross-system interface introduction. The &#x27;lockstep parallel vs shared-helper&#x27; deferred-design OQ is a single local architectural binary the planner resolves in Phase 0.5, not multi-package decomposition.</span><span class="resolution">Downshift to `feature`. Lockstep-parallel vs shared-helper remains as a planner Phase 0.5 decision (intent.open_questions[4]) but doesn&#x27;t require system-lane interfaces-only protocol (architecture.html + architecture.mmd). The plan-establisher heuristic&#x27;s literal &#x27;deferred design open question → system&#x27; trigger is interpreted in spirit as &#x27;cross-system interface design&#x27;, not &#x27;any local refactor binary&#x27;.</span></li><li class="resolved"><span class="finding">Worktree carries `plan.md`, `plan.mmd`, `architecture.html`, `architecture.mmd` inherited from dev&#x27;s peer-context-mirror Cycle F (last committed by `12f844c docs(planner): cycle F self-verification artifacts`). Their content is unrelated to korean-ime-dup-render. All 5 reviewers flagged this; @codex1/2/3 misframed it as a plan-establisher gate blocker (it&#x27;s not — plan-establisher emits slug-versioned files only), but @claude2/@claude3 correctly identified it as worktree-hygiene risk for the next reader (downstream codebase-planner may be confused about which plan.md is authoritative).</span><span class="resolution">Acknowledge as Lane-reasoning note for downstream codebase-planner reader: these cycle-F leftover files at the worktree root are unrelated to this intent. When codebase-planner emits feature-lane artifacts, plan.md/plan.mmd will be overwritten with IME content; architecture.{html,mmd} will be left untouched in feature lane (and remain as dev artifacts of cycle F regardless). Cleanup commit deferred to user discretion to avoid affecting cycle-F&#x27;s gate-marker semantics on dev.</span></li></ul></section>
+<section class="open-questions"><h2>남은 미해결 질문</h2><ul><li>Did the bug truly start with macOS Tahoe 26.5.1? Possible falsification approaches (diagnostic avenues, not mandatory preconditions before fixing): (a) git-bisect Canvas Terminal across release tags (v0.4.x → v0.5.2) to localize the regression to a code change vs. an environment change; (b) load a minimal xterm.js demo in Safari (and, if feasible, in a minimal Tauri/WKWebView harness) to separate generic WebKit/xterm/macOS behavior from Canvas Terminal&#x27;s custom IME path — Safari alone isolates upstream xterm/WebKit/macOS but is not equivalent to Tauri&#x27;s WKWebView host environment, so a positive WKWebView-only signal still requires the Tauri harness; (c) if a non-Tahoe macOS host is reachable, repro there as a tiebreaker.</li><li>Which root-cause hypothesis is correct: (a) xterm.js native IME composition overlay colliding with PTY echo of committed bytes, (b) missing row invalidation on `compositionupdate`, (c) a Canvas Terminal-specific duplicate write path in the keystroke handler (e.g., the existing custom IME shim), or (d) something else (e.g., a macOS Tahoe Cocoa input-handling change). Planner to verify empirically.</li><li>Is the underlying PTY/terminal buffer actually correct (render-only bug), or does the duplicate also exist in the buffer/write path (and only happens to be visually overwritten by shell-side reprint on arrow-key redraw)? This must be empirically verified — e.g., by dumping terminal.buffer.active mid-composition or capturing the PTY transcript — before committing to a render-only vs. write-path fix.</li><li>Japanese / Chinese IME current baseline rendering on macOS is untested. The planner must establish a lightweight baseline (smoke-only) sufficient to verify that the Korean fix does not visibly worsen these IMEs. **Bounds**: code-path inspection (confirming no JP/ZH-specific branch was touched by the Korean fix) is the floor; one manual smoke pass with a JP IME installed is the ceiling — the actual install/test scope is decided at plan time. Full functional support remains explicitly out of scope.</li><li>The two affected terminal surfaces currently implement parallel custom IME handling. Should the fix be applied in lockstep to both, or refactored into a shared helper as part of this patch? The two surfaces also use different xterm.js renderers (one with the WebGL addon, the other intentionally without), which may force renderer-specific fix variants.</li><li>The user-supplied repro trace (ㅇ → 아 → 안 → 안ㄴ → 안 안녀 → 안 안녕 → 안녕 안녕하 하) is a verbal recall, not a literal frame-by-frame capture. The planner should obtain a controlled, keystroke-indexed step-by-step trace **covering the full string 안녕하세요 from first keystroke through final compositionend** — a keystroke-numbered table with the exact visible buffer at each step, including any cursor/column hint — before committing to a specific render-vs-write-path fix hypothesis. Notable known imprecisions in the verbal trace (transition `안 → 안ㄴ` lacks the duplicated prefix that appears one step later as `안 안녀`; the trailing fragment ends mid-word at `안녕 안녕하 하`) should be specifically clarified by the controlled trace.</li></ul></section>
+
+<footer class="doc-foot">
+  <dl>
+    <dt>의도 슬러그:</dt>     <dd><code>korean-ime-dup-render</code></dd>
+    <dt>플랜 버전:</dt>    <dd><code>v2</code></dd>
+    <dt>플랜 런 ID:</dt>     <dd><code>59637-195-16359</code></dd>
+    <dt>확정 시각:</dt>  <dd><code>2026-06-04T17:15:00+09:00</code></dd>
+    <dt>포맷 버전:</dt>     <dd><code>1.0</code></dd>
+  </dl>
+</footer>
+
+</div>
+</body>
+</html>

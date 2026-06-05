@@ -42,3 +42,5 @@ npm-debug.log*
 .worktrees/
 .planner-state.json
 .implementer-state.json
+.intent-state.json
+.plan-state.json
