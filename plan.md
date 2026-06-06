@@ -1,733 +1,456 @@
-# Feature plan — korean-ime-dup-period-arrow
+# Feature plan — korean-ime-dup-space
 
 ## Goal
 
-Eliminate the Korean-IME last-syllable duplicate that surfaces after a
-composition is committed by typing a period (`.`) or pressing an arrow /
-direction key. Visible repro:
+Eliminate the Korean-IME last-syllable duplicate that surfaces in
+canvas-terminal's xterm panes when a non-Korean character (space,
+digit, ASCII punctuation that does not end composition before xterm's
+internal `setTimeout(0)` fires) is typed mid-composition. User-visible
+symptom:
 
 ```
-Step 1: type "안녕하세요"                       → screen: "안녕하세요"        (overlay shows "요")
-Step 2: type "."                                → screen: "안녕하세요."       (correct)
-Step 3: press an arrow key (←/→/↑/↓)            → screen: "안녕하세요.요"    (BUG: "요" duplicated)
+state: "안녕"   user input: <space>   observed: "안녕 녕 "   expected: "안녕 "
 ```
 
-The duplicate appears on the arrow-key press (Step 3), not on the
-period (Step 2). The exact event-ordering on macOS WKWebView that
-allows the shim's `isComposing` flag to stay stale into the arrow-key
-keydown must be confirmed empirically before any code change.
+This is the **same case (d)** mechanism the round-2 planner fold for
+`korean-ime-dup-period-arrow` (merged at `116ede7`, 24 h ago)
+documented in its blast-radius note — but the period-arrow fix only
+deduped **single-codepoint** Korean re-emits. xterm's
+`CompositionHelper._finalizeComposition(true)` schedules a
+`setTimeout(0)` that reads `textarea.value.substring(start)` (no
+`end`) and emits the result via `triggerDataEvent`. When the user
+presses a non-Korean key mid-composition, the substring is
+`<composed>+<trailing-char>` (e.g. `"녕 "`). That string is
+**length > 1**, bypassing the `data.length === 1` branch in
+`xtermImeShim.ts` that holds `lastCompositionCommit` for dedup.
 
-## In scope
+## In-scope
 
-- `src/lib/xtermImeShim.ts` — body changes inside `docKeyDown`
-  (else-branch with `isTerminating==false`) and, conditionally on
-  the empirical event-order finding, `onCompositionEnd` or the
-  `triggerDataEvent` wrapper. **Primary fix site is node 7
-  (the duplicate-write site marked red in `plan.mmd`).**
-- `src/lib/xtermImeShim.test.ts` — regression tests **T1** (compose →
-  period), **T2** (compose → arrow), **T3** (compose → period → arrow,
-  the full repro chain), **T4** (modifier-augmented arrow keys —
-  Shift+Arrow, Cmd+Arrow).
-- `src/lib/xtermImeShim.test.ts` — extend the `fireKeydown` helper
-  (currently `{keyCode, key, code, isComposing}` at test lines 92–106)
-  to also pass through `shiftKey | ctrlKey | altKey | metaKey` so T4
-  can synthesize modifier-augmented arrow keydowns. This is a
-  test-harness extension within the same file, not a new module.
+- **Multi-char prefix-strip dedup path** in
+  `attachKoreanImeShim`'s `triggerDataEvent` wrapper
+  (`src/lib/xtermImeShim.ts:607-656`). When the arriving `data`
+  starts with `lastCompositionCommit.text`, the gen matches, AND we
+  are NOT currently composing, **consume `lastCompositionCommit`
+  and `return` without calling `origTrigger`** — i.e., the entire
+  late multi-char emit is suppressed. Under the Order-B assumption
+  (see Constraints), the committed prefix was already direct-written
+  by `onCompositionEnd`'s `invoke("write_to_pty")` AND the trailing
+  character was already delivered by xterm's `_keyDown`
+  `triggerDataEvent` synchronous path; re-emitting trailing here
+  would produce a duplicate trailing character (the v1 contradiction
+  rejected by round-1 peer review — see fold appendix F1).
+- **Token-identity discipline preserved verbatim** from the round-3
+  period-arrow fold: claim only when text-prefix AND gen match;
+  non-matching multi-char events must leave the live token intact so
+  a later length-1 duplicate can still claim it. The existing 40 ms
+  safety-clear in `onCompositionEnd` remains the long-tail bound.
+- **Four new Vitest cases** under
+  `src/lib/xtermImeShim.test.ts`, in a new
+  `describe("attachKoreanImeShim — multi-char prefix strip", ...)`
+  block. Each test encodes the **full event sequence** (both
+  `triggerDataEvent` calls under Order B), not just the final
+  channel assertion, per @codex3's finding:
 
-## Out of scope
+  - **T-space (positive repro)**: the validated repro from
+    `task-1-claude1-report.md`. Dispatch sequence (mirrors task-1
+    lines 40–47):
+    ```ts
+    textarea.value = "녕"
+    fireInput(textarea, "insertText", "녕")
+    fireKeydown(textarea, { keyCode: 229 })
+    fireCompositionEnd(textarea, "녕")
+    textarea.value = "녕 "
+    cs.triggerDataEvent(" ", true)        // xterm._keyDown — ASCII space
+    cs.triggerDataEvent("녕 ", true)      // xterm.CompositionHelper setTimeout(0)
+    ```
+    Assert `directWrites` ≡ `["녕"]` (the `invoke("write_to_pty")`
+    channel) AND `indirectWrites` ≡ `[" "]` (the `origTrigger`
+    channel — exactly one space, NOT `[" ", " "]` and NOT
+    `[" ", "녕 "]`).
 
-- `src/components/collaborator/AgentMiniTerminal.tsx` and
-  `src/lib/terminalManager.ts`. They subscribe to
-  `onComposedFlush(committedText, terminator)`; the terminator union
-  `"\r" | "\x1b" | "\t" | null` is **frozen**. No signature change.
-- Browser-pane / canvas-pane IME flows (separate code paths).
-- Korean IME issues outside the period / arrow-key trigger family
-  (composition cancel, re-composition mid-fragment, etc.).
-- The `localfile://` URL-scheme three-way invariant (unrelated subsystem).
-- Japanese / Chinese IME feature support — preserved as non-regression
-  only (per the prior cycle's intent envelope).
+  - **T-digit (positive repro, generality across ASCII trailing
+    chars)**: same dispatch shape with `"2"` replacing `" "` in
+    both the `_keyDown` emission and the late substring. Assert
+    `indirectWrites` ≡ `["2"]`.
+
+  - **T-non-matching-multi-char (over-suppression guard)**:
+    after a `"녕"` commit (lastCompositionCommit set), simulate
+    an emission of `"한자"` via `cs.triggerDataEvent("한자", true)`
+    — for example, a paste landing during the dedup window. The
+    strip MUST NOT fire (text does not start with `"녕"`);
+    `"한자"` flows through `origTrigger` verbatim → `indirectWrites
+    ≡ ["한자"]`. Prevents over-suppression of legitimate
+    multi-char pastes / IME emissions.
+
+  - **T-replaced-token (defense-in-depth for token-identity
+    discipline)** — renamed from T-stale-gen per @codex1 /
+    @claude2 / @claude3 convergence on the `imeFlushGen`
+    lifecycle. Setup: after a `"녕"` commit, drive a second
+    composition that commits `"어"` (this advances `imeFlushGen`
+    AND replaces `lastCompositionCommit.text` to `"어"`). Then
+    fire `cs.triggerDataEvent("녕 ", true)` — the stale prefix
+    `"녕"` is no longer the live token's text. The strip MUST
+    NOT fire (prefix check fails first; the gen check is
+    defense-in-depth that would also catch it if `lastCompositionCommit`
+    ever decoupled from `imeFlushGen` in a future refactor).
+    Assert `"녕 "` reaches `origTrigger` verbatim.
+
+  Note on `imeFlushGen` mechanics: `imeFlushGen++` happens at
+  composition END / blur / terminator flush (`xtermImeShim.ts:482,
+  514, 587`), **not** at composition START (line 564, which only
+  sets `isComposing=true`). T-replaced-token therefore exercises
+  the replaced-token path that actually exists, not a hypothetical
+  "started-but-not-committed" gen increment.
+- **Preserve the length-1 Korean dedup path** (existing 20 ms defer
+  at `xtermImeShim.ts:610-656`) unchanged — the multi-char strip is
+  a **prepended** branch that returns early on match; the length-1
+  branch runs only when the prepended branch does not claim.
+- **Preserve JP/ZH non-Korean fall-through** pinned at
+  `xtermImeShim.test.ts:530`. Multi-char non-Korean strings continue
+  to pass through unchanged — the strip fires only when the live
+  token's Korean text is a prefix of the arriving data.
+- **Preserve blur / Enter / Escape / Tab terminator paths**. The
+  `onComposedFlush` terminator union (`"\r" | "\x1b" | "\t" | null`)
+  is unchanged; space is NOT a terminator.
+
+## Out-of-scope
+
+- Widening `KOREAN_CODEPOINT_RE` to include other CJK ranges.
+  `intent.korean-ime-dup-render.md`'s out-of-scope clause still
+  applies; the JP/ZH residual duplicate stays a documented pin at
+  `xtermImeShim.test.ts:530`.
+- Changing the `onComposedFlush` terminator union or adding space
+  to the terminator family.
+- Refactoring the 40 ms safety-clear lifecycle or the round-3
+  token-identity discipline. The new path **inherits** both; it
+  does not replace either.
+- Touching anything outside `src/lib/xtermImeShim.ts` and its test
+  file. The two subscribers (`src/lib/terminalManager.ts`,
+  `src/components/collaborator/AgentMiniTerminal.tsx`) read
+  `onComposedFlush` and `KoreanImeShimHandle`; both contracts are
+  preserved unchanged.
+- Re-architecting the IME state machine, `onCompositionEnd`,
+  `onTextareaBlur`, the `docInput` / `docKeyDown` handlers, or the
+  `isCursorHidden` descriptor swap.
 
 ## Constraints
 
-1. Single-file logic change inside `xtermImeShim.ts`; no new modules;
-   no signature changes on `attachKoreanImeShim` or the
-   `onComposedFlush` callback.
-2. Preserve the terminator union `"\r" | "\x1b" | "\t" | null`. Period
-   and arrow keys do NOT become new terminators (Shape A is rejected —
-   it would ripple to the OUT-OF-SCOPE consumers).
-3. `tsc --noEmit` must pass.
-4. Vitest suite (existing + new T1–T4) must pass in full.
-5. The `docKeyDown` capture-phase performance characteristics must not
-   degrade (no new sync DOM reads inside the hot path).
-6. Implementer cannot meaningfully execute a live macOS WKWebView
-   repro autonomously. `npm run tauri dev` is an interactive process
-   that requires a human to observe the rendered terminal and type
-   with a real Korean IME; the implementer skill has Bash access but
-   cannot observe the rendered DOM or type Korean keystrokes headlessly.
-   The live repro therefore moves to the Phase 6 user-acceptance gate
-   at `confirm merge` time — the user reproduces the original bug
-   sequence against the implementer's branch and refuses to merge if
-   the duplicate persists. The implementer is permitted to select the
-   Shape B sub-variant (B1 / B2 / B3 / B4) from architectural reasoning
-   + the unit-test suite when the live trace is unavailable, with the
-   user's Phase 6 manual repro as the falsification gate. This
-   mirrors how the prior `korean-ime-dup-render` cycle resolved the
-   same constraint.
+- Stack: TypeScript; compile gate `tsc --noEmit`; unit tests Vitest
+  (`npm run test`). Both must pass clean.
+- Must not regress any of the **32 existing tests** in
+  `xtermImeShim.test.ts` (verified: `grep -cE '^  it\(' = 32`).
+  Breakdown: attach=5, variant-(b)=1, onComposedFlush=6, JP/ZH=3,
+  Korean defer=2, dispose=6, T1=1, T2=1, T3=1, T4 (shift+meta)=2,
+  round-1 fold B4=4 — total 32. The regression suite from
+  `korean-ime-dup-period-arrow` (commit `116ede7`, 5 peer-review
+  rounds) is specifically **T1, T2, T3, T4-shift, T4-meta + B4
+  T5/T6/T7/T8 = 9 tests** (not 4 as an earlier draft said).
+- High regression sensitivity — same code path as the just-merged
+  prior cycle. Implementer is expected to run a multi-round
+  peer-review fold consistent with that history (number of rounds
+  not constrained by this planner; defer to implementer skill).
+- Headless-test ceiling: real macOS Tauri + Korean IME smoke is the
+  only authoritative acceptance for WKWebView behavior. Plan node 7
+  (live smoke) applies; passing all four new tests + the 32
+  pre-existing tests (total **36**) is necessary but not sufficient.
+- **Order-B IME-event assumption** (added per @claude3 review): this
+  plan assumes the WKWebView "Order B" sequence — `compositionend`
+  fires BEFORE the trailing key's `_keyDown` `triggerDataEvent`.
+  That makes "drop trailing" safe because the trailing character is
+  already PTY'd via the synchronous `_keyDown` path. A hypothetical
+  "Order A" host (where the trailing keydown fires while
+  `event.isComposing=true` and is therefore suppressed by xterm's
+  CompositionHelper gate) would lose the trailing char under full
+  suppression. Canvas Terminal targets macOS Tauri (WKWebView), and
+  task-1 validated Order B as the production behavior. **Re-validate
+  on any future non-WKWebView Tauri webview backend** (CEF,
+  webview-rs, Linux WebKitGTK port).
+- No new dependencies; no version bumps; no scaffold/config edits.
 
 ## Success criteria
 
-1. **Manual user-acceptance repro** at the Phase 6 `confirm merge`
-   gate (executed by the human user, not the implementer — see
-   Constraint #6). Three distinct sequences must each produce no
-   duplicate syllable on the visible terminal output:
-   - **1a** — `compose → period`: type `안녕하세요`, then `.`. Screen
-     shows `안녕하세요.` exactly once (the trailing `.요` regression
-     pattern reported in the bug must not appear).
-   - **1b** — `compose → arrow`: type `안녕하세요`, then press an arrow
-     key (←/→/↑/↓). Screen shows `안녕하세요` and the arrow navigates
-     the shell cursor without producing a trailing `요`.
-   - **1c** — `compose → period → arrow` (full original repro chain):
-     `안녕하세요` → `.` → arrow. Final screen: `안녕하세요.` with no
-     duplicate `요` appended.
-2. New unit tests **T1** (compose → period), **T2** (compose → arrow),
-   **T3** (compose → period → arrow), **T4** (modifier-augmented arrow)
-   all pass. Each test's dispatch sequence is specified explicitly in
-   "Implementer Phase 0 handoff" below; the asserted observables are
-   triple-tracked across `ptyWrites()` (direct shim writes via
-   `invoke("write_to_pty")`), `origTriggerCalls` (xterm data-event
-   passthrough), and `onComposedFlush` emissions.
-3. All existing tests in `src/lib/xtermImeShim.test.ts` still pass
-   (zero regressions). Particular non-regression floors to confirm:
-   - §"variant (b) commit-boundary fix" (line 290)
-   - §"JP/ZH non-regression fixture floor (Node 10)" (line 438)
-   - §"onComposedFlush emission" Enter/Esc/Tab cases (lines 364, 379, 393)
-   - §"Korean triggerDataEvent defer" (line 563)
-   - §"dispose restoration" (lines 603–678)
-4. `tsc --noEmit` passes.
-5. **Negative-baseline reproducibility for T3**: with the fix
-   temporarily reverted (e.g., `git stash` of the candidate fix
-   edits), the T3 dispatch sequence must reproduce the duplicate
-   syllable. **The exact duplicate signal is NOT pre-specified by
-   the planner** — the round-2 peer review (5/5 reviewers) confirmed
-   that the literal Phase 0 Step 2 dispatch sequence below cannot
-   produce two direct `ptyWrites()` entries for `"요"` against the
-   current source. The dispatch sequence below is therefore a
-   **starting hypothesis** modeling case (b); the implementer's
-   Phase 0 Step 5 explicitly requires extending or revising the
-   sequence until the duplicate reproduces, then locking the
-   discovered failing sequence into T3 with an updated case-label
-   header comment. Acceptable duplicate signals (any one is
-   sufficient):
-   - `ptyWrites().filter(c => c.data === "요").length === 2`
-     (two direct shim writes; matches case (b) if extended), OR
-   - `ptyWrites().filter(c => c.data === "요").length === 1 AND
-      origTriggerCalls.filter(c => c.data === "요").length === 1`
-     (one direct shim write + one xterm pass-through; matches case
-     (d) — defer-fire race after compositionend), OR
-   - any other combined-channel observable that the implementer
-     documents in the test header comment AND in the implementation
-     report, with a passing post-fix run and a failing pre-fix run.
-   If the implementer cannot construct ANY dispatch sequence that
-   reproduces the duplicate against current `dev` HEAD, escalate
-   back to the planner (the hypothesis tree may be incomplete).
-   Do NOT apply a fix against a non-reproducing test — the fix's
-   empirical grounding is broken without a failing baseline.
+1. **Negative baseline locked, split by polarity** (corrected per
+   @codex1 / @codex2 / @claude2 / @claude3 convergence — the
+   negative controls do not exist on baseline and therefore cannot
+   fail there):
+   - **Positive repros** (`T-space`, `T-digit`): MUST FAIL on
+     pre-implementer `dev` HEAD (current code emits the duplicate);
+     MUST PASS after the implementer's change.
+   - **Over-suppression guards** (`T-non-matching-multi-char`,
+     `T-replaced-token`): MUST PASS on `dev` HEAD AND after the fix.
+     On baseline, the strip path does not exist, so the multi-char
+     payloads `"한자"` / `"녕 "` (after a replaced token) already
+     fall through to `origTrigger` verbatim — which is precisely
+     what these tests assert. After the fix, the strip's prefix /
+     gen check rejects the same payloads, preserving fall-through.
+     This proves the fix does not over-suppress.
+2. **Non-regression**: all **32** pre-existing Vitest cases in
+   `xtermImeShim.test.ts` continue to pass (test count verified;
+   prior draft said 19, that was wrong).
+3. **Compile clean**: `tsc --noEmit` exits 0.
+4. **Test runner clean**: `npm run test` exits 0 — total
+   **36 passing** (32 pre-existing + 4 new).
+5. **Live smoke (manual, Phase 7 ceiling)**: real Tauri build, macOS
+   Korean IME, type the sequences
+   `안녕<space>`, `안녕하<space>`, `안녕2`, `안녕하세요.` —
+   no visible duplicate syllables AND no visible duplicate trailing
+   characters (specifically: `안녕<space>` produces `안녕<one
+   space>`, NOT `안녕<two spaces>`). The trailing-char
+   non-duplication check is the load-bearing live-smoke acceptance
+   for the "drop trailing" correction in P6.
 
-## Open questions
-
-All Phase 1 open questions are resolved at the **plan** level; the
-remaining ambiguity (the choice between Shape B sub-variants) is
-deferred to the implementer's Phase 0 because it depends on the
-empirical WKWebView event order, which the planner cannot capture
-without running the app.
-
-| # | Question | Resolution at plan level |
-|---|---|---|
-| Q1 | Shape A (widen terminator set) vs Shape B (tighten stale-fragment guard) | **Shape B** locked. Sub-variant (B1 / B2 / B3 / B4 — see "Implementer Phase 0 handoff" below) selected by implementer after Phase 0 dispatch-sequence reproduction. |
-| Q2 | Physical keyboard vs synthesized helper-textarea | Live macOS WKWebView repro is the user's Phase 6 acceptance gate (per Constraint #6). Unit tests use the synthesized helper-textarea harness as the implementer's reproduction surface. |
-| Q3 | Modifier-augmented arrow keys | **In scope** as test T4 (two `it()` blocks: T4-shift and T4-meta). |
+   **Additionally**, perform a **paste-immediately-after-commit
+   smoke** (cross-referenced from Risks row 1): type `녕` (let it
+   commit), then within 40 ms paste a clipboard string that starts
+   with `녕` (e.g. `녕을 입력하세요`). The paste payload must
+   appear at the terminal. If the paste is dropped, the
+   false-suppression edge documented in Risks row 1 has surfaced;
+   escalate to the planner before merging the implementer fix.
+6. **Implementer Phase 7 plan-conformance self-check**: every
+   in-scope item is either implemented, validated by an
+   implementer-emitted test, or explicitly deferred with a documented
+   reason in `implementation-report.md`.
 
 ## Package layout
 
-No new packages introduced — feature lives in `src/lib/`
-(`xtermImeShim.ts` is a leaf module; `xtermImeShim.test.ts` is its
-test sibling). Both consumers (`AgentMiniTerminal.tsx`,
-`terminalManager.ts`) remain untouched.
+No new packages introduced — feature lives in the existing
+`src/lib/` package. Both modified files (`xtermImeShim.ts`,
+`xtermImeShim.test.ts`) are already there.
+
+Dependency direction (unchanged after this plan):
 
 ```
-src/
-└── lib/
-    ├── xtermImeShim.ts          (EDIT — body changes only)
-    └── xtermImeShim.test.ts     (EDIT — append T1–T4 regression tests)
+src/lib/xtermImeShim.ts
+  ← src/lib/terminalManager.ts                       (subscriber via onComposedFlush)
+  ← src/components/collaborator/AgentMiniTerminal.tsx (subscriber via onComposedFlush)
 ```
+
+Neither subscriber is modified. The `KoreanImeShimHandle` and
+`AttachKoreanImeShimOptions` contracts are preserved verbatim.
 
 ## Decomposition
 
-The "pipeline" here is the in-shim IME event handler chain. Each node
-is one handler function or sub-branch. The same nodes appear in
-`plan.mmd`.
+One implementation node + four test nodes + two validation nodes.
+See `plan.mmd` for the DAG.
 
-| Node # | Stage | Belongs to package | Change | Notes |
+| Node # | Stage | Site | Method/Site | Depends on |
 |---|---|---|---|---|
-| 1 | shim install | `src/lib/` | none | `attachKoreanImeShim` entry |
-| 2 | helper-textarea bind | `src/lib/` | none | `bindHelperTextarea` |
-| 3 | compose / jamo update | `src/lib/` | none | `docKeyDown` (keyCode==229 branch, lines 518–527) |
-| 4 | overlay paint on input | `src/lib/` | none | `docInput` (lines 496–506) |
-| 5 | composition commit | `src/lib/` | maybe | `onCompositionEnd` (lines 463–479) — may need guard for late commits |
-| 6 | terminator flush (Enter/Esc/Tab) | `src/lib/` | none | `docKeyDown` else-branch with `isTerminating==true` |
-| **7** | **stale-state catch-up (period/arrow)** | `src/lib/` | **CANDIDATE — case (b)** | `docKeyDown` else-branch with `isTerminating==false` (lines 528–558) — duplicate-write site under case (b). Co-equal with node 9 per round-2 case (d) hypothesis; not "primary" |
-| 8 | blur flush | `src/lib/` | none | `onTextareaBlur` (lines 481–492) |
-| **9** | **xterm data-event suppress/defer** | `src/lib/` | **CANDIDATE — case (d)** | `triggerDataEvent` wrapper (lines 567–582) — duplicate-write site under case (d) defer-fire race. Co-equal with node 7 per round-2 fold |
-| 10 | overlay paint / clear | `src/lib/` | none | `showOverlay` / `clearOverlay` |
-| 11 | subscriber dispatch | `src/lib/` | none | `emitFlush` |
-| T1 | regression: compose → period (no arrow) | `src/lib/` | NEW | Triple-channel assertion: `ptyWrites()` contains exactly one entry for the committed last syllable (the `invoke("write_to_pty")` direct path); `.` flows through xterm and is captured in `origTriggerCalls` (NOT in `ptyWrites()` — different observable channel per test lines 41–46 / 127–137); `onComposedFlush` fires once with `(text, null)`. Dispatch sequence per Phase 0 handoff. |
-| T2 | regression: compose → arrow (no period) | `src/lib/` | NEW | Same triple-channel discipline. The arrow CSI sequence is NOT emitted by the shim's DOM `keydown` handler itself — it would be emitted by xterm's internal `_handleKey` calling `coreService.triggerDataEvent` downstream. If T2 needs to verify pass-through, it simulates xterm's post-keydown path with an explicit synthetic `cs.triggerDataEvent("\x1b[D", true)` call (matching the existing test pattern at lines 466–482 / 517–555). Assert: `ptyWrites()` shows one syllable entry, no second entry on arrow; `origTriggerCalls` shows the synthesized CSI passthrough; `onComposedFlush` fires once with `(text, null)`. |
-| T3 | regression: compose → period → arrow (full repro) | `src/lib/` | NEW | Canonical reproduction of the user-reported bug. Dispatch sequence per Phase 0 handoff — **MUST NOT** fire `compositionend` between period and arrow keydowns (that's the staleness window). Negative-baseline assertion per Success Criterion #5. |
-| T4 | regression: modifier-augmented arrow | `src/lib/` | NEW | T4 expects **identical** behavior to T2 — `Shift+Arrow` / `Cmd+Arrow` have `e.key === "ArrowLeft/Right/etc."` (not `"Shift"`/`"Meta"`), so `docKeyDown`'s `isModifier` check at lines 529–533 returns false and the event enters the same node-7 path as plain arrow. T4 confirms the modifier flag does NOT route around the fix. Requires the `fireKeydown` helper extension noted in "In scope" to pass `shiftKey`/`metaKey` through. |
+| N1 | Add multi-char prefix-strip dedup path | `src/lib/xtermImeShim.ts` | inside the `triggerDataEvent` wrapper at lines 607–656, **before** the existing `data.length === 1 && KOREAN_CODEPOINT_RE.test(data)` branch | — |
+| N2 | T-space regression (positive) | `src/lib/xtermImeShim.test.ts` | new `it()` under `describe("attachKoreanImeShim — multi-char prefix strip", ...)` | N1 |
+| N3 | T-digit regression (positive) | `src/lib/xtermImeShim.test.ts` | same describe block | N1 |
+| N4 | T-non-matching-multi-char (negative control) | `src/lib/xtermImeShim.test.ts` | same describe block | N1 |
+| N5 | T-replaced-token (over-suppression guard, defense-in-depth) | `src/lib/xtermImeShim.test.ts` | same describe block | N1 |
+| N6 | Validation | repo root | `npm run test` (Vitest, **32 + 4 = 36 passing**) and `tsc --noEmit` | N1, N2, N3, N4, N5 |
+| N7 | Live acceptance smoke (manual) | running app | macOS Tauri + Korean IME | N6 |
 
-## Stabilized invariants to preserve
+## N1 — Implementer guidance (body sketch, not the body itself)
 
-These were established by the prior `korean-ime-dup-render` cycle
-(merge 95651d2). Any fix at node 7 must leave them green:
+The implementer authors the exact code; the planner pins the
+**shape** so the implementer's body-generation stays inside the
+contract. Sketch (illustrative, not authoritative — implementer may
+reorder identifiers or restructure as long as the postconditions
+hold):
 
-- variant-(b) commit-boundary fix (test §"variant (b)", line 290 —
-  `imeStartPos` re-anchored at composition start so the next
-  `keydown(229)` doesn't repaint the already-committed prefix)
-- JP/ZH non-regression fixture floor (test §"Node 10", line 438 —
-  3-event sequence with exactly one PTY write; the 4-event pinned
-  residual at line 517 must remain pinned)
-- `onComposedFlush` emission contract: `(text, null)` on
-  `compositionend` / blur; `(text, "\r" | "\x1b" | "\t")` on
-  Enter/Esc/Tab mid-composition (lines 335–406)
-- 20ms-defer for single Korean codepoint with `imeFlushGen` check
-  (test §"Korean triggerDataEvent defer", line 563)
-- Dispose restoration (test §"dispose restoration", lines 603–678) —
-  document-level listeners removed, `triggerDataEvent` restored,
-  `isCursorHidden` descriptor restored, `cursorBlink` restored
+```ts
+// inside the triggerDataEvent wrapper, BEFORE the existing
+// `if (data.length === 1 && KOREAN_CODEPOINT_RE.test(data))` branch:
 
-## Implementer Phase 0 handoff
+const live = lastCompositionCommit;
+if (
+  live !== null &&
+  imeFlushGen === live.gen &&
+  data.length > live.text.length &&        // strict: trailing exists
+  data.startsWith(live.text) &&
+  !isComposing                              // a new composition must not be active
+) {
+  lastCompositionCommit = null;             // token consumed
+  return;                                   // FULL SUPPRESSION — see P6
+}
+```
 
-The implementer is autonomous (Constraint #6: cannot launch
-`npm run tauri dev` itself). Phase 0 therefore captures the
-information the unit test suite needs, not live WKWebView traces.
-The user's Phase 6 manual repro at `confirm merge` is the
-falsification gate.
+**Why full suppression (drop trailing too) — the load-bearing
+correction from peer review.** Under the validated Order B sequence
+in `task-1-claude1-report.md:40-47`, the trailing character (e.g.
+the space in `"녕 "`) has ALREADY been emitted via xterm's
+`_keyDown` synchronous path before xterm's `CompositionHelper`
+setTimeout(0) fires the late substring. Re-emitting the trailing
+via `origTrigger(trailing, wasUserInput)` would land it at the PTY
+a second time — visible `"안녕  "` (two trailing spaces) instead
+of the user-expected `"안녕 "`. The shim must drop the entire
+multi-char late emit: both the composed prefix (already invoke'd
+in `onCompositionEnd`) AND the trailing char (already emitted via
+`_keyDown`) are duplicates. xterm's own `_dataAlreadySent`
+deduction (`CompositionHelper.ts:159-160`) does not protect us
+here because `_handleAnyTextareaChanges` did not populate it for
+the case-(d) path — that's precisely the bug's root mechanism.
 
-1. **Read** the committed `intent.korean-ime-dup-render` archive at
-   `backup/intent.korean-ime-dup-render.md` and the merged prior fix
-   `src/lib/xtermImeShim.ts` lines 463–582 (the `onCompositionEnd`,
-   `docKeyDown` else-branches, and `triggerDataEvent` wrapper). The
-   bug branches off the prior cycle's variant-(b) work — Phase 0
-   builds a written hypothesis tree of upstream causes for the
-   duplicate `"요"` write on macOS WKWebView:
-   - **(a)** `compositionend` does not fire for the period at all
-     (browser ends composition synchronously without dispatching).
-     Under (a), node 7's stale-state catch-up at lines 528–558
-     writes the duplicate. Affects sub-variant B2.
-   - **(b)** `compositionend` fires AFTER the non-terminating
-     keydown (the arrow), so shim state is stale at arrow time.
-     Same write site as (a); B1's "no-write + trust compositionend"
-     fits this case if `compositionend` actually arrives.
-   - **(c)** `compositionend` fires with `e.data=""` — would NOT
-     leave the bug (state clears unconditionally at line 476);
-     likely ruled out, but the implementer documents the ruling.
-   - **(d) [NEW per round-2 fold]** `compositionend("요")` fires
-     normally and writes "요" via `invoke("write_to_pty")`, then
-     **xterm's internal `CompositionHelper` calls
-     `coreService.triggerDataEvent("요", true)` LATER** (after
-     compositionend has run and `imeFlushGen` incremented). The
-     `triggerDataEvent` wrapper at lines 567–582 captures
-     `gen = imeFlushGen` (now post-increment), schedules the
-     20 ms Korean defer, and the timer's `gen === imeFlushGen`
-     check passes (no further increment in 20 ms) → `origTrigger("요")`
-     fires → `"요"` lands a second time in the terminal via the
-     `terminal.onData → PTY` path (different observable channel
-     from node 7's direct `invoke`). This is the case the existing
-     test §"Korean triggerDataEvent defer" at line 563 pins only
-     in the inverse direction (defer-before-composition). Under
-     (d), the **bug site is node 9 (`triggerDataEvent` wrapper),
-     not node 7** — node 7's stale-state inner check fails because
-     compositionend already cleared `isComposing`. Affects new
-     sub-variant B4.
-     **Blast-radius note**: case (d) would in principle fire on
-     ANY "Korean syllable commit, then no follow-up composition
-     within 20 ms" scenario, not just the period/arrow trigger
-     specifically. If (d) is the validated mechanism, the user's
-     reported trigger family (period/arrow) may be a visibility
-     artifact (the duplicate exists but only becomes visible after
-     the arrow forces a screen redraw), not the cause. B4 may
-     therefore close out other unreported Korean-IME duplicates as
-     a side effect — a positive outcome but worth documenting in
-     the implementation report.
+Postconditions the implementer must preserve:
 
-   The Phase 0 deliverable is to identify which case (a/b/c/d) the
-   T1/T2/T3/T4 dispatch sequences actually reproduce against current
-   source. The hypothesis tree is allowed to expand if needed
-   (escalate-to-planner trigger documented in Step 5).
-2. **Specify the test dispatch sequences explicitly** so each new
-   test reproduces the failure mode (not merely an arbitrary
-   user-level sequence). The load-bearing question is: does
-   `compositionend` fire on the period keydown? If so, before or
-   after the period's keydown event? AND: does xterm's
-   `triggerDataEvent("요")` fire after compositionend
-   (case d hypothesis)?
+- **P1 (prefix suppression)**: when the conditions match, the
+  composed prefix is NOT emitted via `origTrigger` (the direct
+  `invoke("write_to_pty")` in `onCompositionEnd` is the sole
+  emission of the committed text).
+- **P2 (token consumption)**: a successful strip nulls
+  `lastCompositionCommit`, so a subsequent length-1 re-arrival of
+  the same Korean codepoint within the same gen falls through (no
+  double suppression via the existing length-1 branch).
+- **P3 (non-suppression on prefix mismatch)**: a multi-char
+  arrival whose text does NOT start with the live token's text
+  must leave the token intact (so a later length-1 duplicate can
+  still claim it via the existing branch).
+- **P4 (non-suppression on stale token)**: when `lastCompositionCommit`
+  has been replaced (or `imeFlushGen` has advanced) due to a
+  subsequent commit, the strip does not fire; fall through.
+- **P5 (non-suppression during composition)**: when `isComposing`
+  is true (the early-return guard above this block at line 608
+  already covers the typical case, but the explicit
+  `!isComposing` condition makes the postcondition local-readable
+  for implementer review).
+- **P6 (trailing-char suppression — FULL drop, NOT re-emit)**:
+  the trailing characters (`data.substring(live.text.length)`) are
+  NOT re-emitted by this branch. They have already been delivered
+  via xterm's `_keyDown` synchronous path under Order B (see
+  Constraints "Order-B IME-event assumption"). The branch returns
+  after `lastCompositionCommit = null`.
 
-   ⚠ **Important — round-2 fold acknowledgment**: the test sequences
-   below are **starting hypotheses (mostly case (b))**, NOT
-   validated reproductions. 5/5 round-2 reviewers independently
-   verified that these literal sequences do not reproduce a
-   duplicate `"요"` against current `dev` HEAD (see trace below
-   each sequence and Step 5 below). The implementer MUST extend
-   each sequence in Step 5 until the negative baseline reproduces
-   the duplicate, then lock the extended sequence into the test
-   with an updated header comment naming the case it reproduces.
+The strict `data.length > live.text.length` (NOT `>=`) means an
+exact-equal arrival is intentionally **not** handled by this
+branch — for the typical case `live.text.length === 1`, the
+existing length-1 branch at line 610 already covers it (with the
+20 ms defer). Two branches, two clean responsibilities.
 
-   **Important — `textarea.value` setup**: every `fireInput` in the
-   test harness (test lines 78–90) only dispatches an `InputEvent`;
-   it does NOT mutate `textarea.value`. Existing tests always
-   assign `textarea.value = "..."` before `fireInput(...)` (see
-   test lines 341–344, 369–371, 398–400, etc.). The sequences
-   below include those assignments explicitly. The shim reads
-   `textarea.value.substring(imeStartPos)` inside `showOverlay`
-   (line 504) to set `imeFragment` (line 401); without the
-   assignment, `imeFragment` collapses to `""` and the bug-site
-   write at line 545 is suppressed by the `if (data)` guard.
+**Known gap accepted as out-of-scope for this cycle** (per
+@claude3 P2): when `live.text.length > 1` (a hypothetical batched
+multi-syllable commit, e.g. `live.text === "안녕"` with an
+equal-length late substring `data === "안녕"`), strict `>` fails
+AND the length-1 branch's `length === 1` check fails — the
+payload falls through to `origTrigger`. In practice macOS WKWebView
+Korean IME commits one syllable per `compositionend`, so the gap
+is unobserved. Documented here so a future widening does not
+silently expand the predicate.
 
-   - **T1 (compose → period) starting hypothesis** (models case b):
-     ```
-     textarea.value = "요"
-     fireInput(textarea, "insertText", "요")
-     fireKeydown(textarea, { keyCode: 229 })            // shim: isComposing=true, imeFragment="요"
-     fireKeydown(textarea, { keyCode: 190, key: ".", code: "Period", isComposing: true })
-                                                        // browser still mid-compose at keydown time
-     textarea.value = "요."
-     fireInput(textarea, "insertText", ".")
-     fireCompositionEnd(textarea, "요")                  // compositionend FOLLOWS the non-terminating keydown
-     ```
-     Target post-fix assertions: `ptyWrites().map(c=>c.data)` equals
-     `["요"]` (one entry, not two); `onComposedFlush` fires once with
-     `("요", null)`.
-   - **T2 (compose → arrow only) starting hypothesis**:
-     ```
-     textarea.value = "요"
-     fireInput(textarea, "insertText", "요")
-     fireKeydown(textarea, { keyCode: 229 })
-     fireKeydown(textarea, { keyCode: 39, key: "ArrowRight", isComposing: false })
-                                                        // browser composition ended; shim still flagged composing
-     // NO fireCompositionEnd here — staleness window
-     cs.triggerDataEvent("\x1b[C", true)                // simulate xterm's post-keydown CSI emission
-     ```
-     Target post-fix assertions: `ptyWrites().map(c=>c.data)` equals
-     `["요"]` (one entry only); `origTriggerCalls` contains
-     `"\x1b[C"`; `onComposedFlush` fires once with `("요", null)`.
-   - **T3 (compose → period → arrow, full repro) starting hypothesis**:
-     ```
-     textarea.value = "요"
-     fireInput(textarea, "insertText", "요")
-     fireKeydown(textarea, { keyCode: 229 })
-     fireKeydown(textarea, { keyCode: 190, key: ".", code: "Period", isComposing: true })
-     // NO textarea.value mutation here — keep "요" so docInput
-     // does not repaint imeFragment to "요." (sub-issue c)
-     fireKeydown(textarea, { keyCode: 39, key: "ArrowRight", isComposing: false })
-                                                        // CRITICAL: NO fireCompositionEnd between period and arrow
-     ```
-     **Trace against current source (per round-2 reviewer verification)**:
-     this sequence produces `ptyWrites() === ["요"]` (one entry,
-     from node 7's stale-state write on the arrow keydown). The
-     negative baseline at Success Criterion #5 requires TWO `"요"`
-     emissions (across `ptyWrites` and/or `origTriggerCalls`) — so
-     **this sequence is incomplete**. Phase 0 Step 5 extends it
-     until the duplicate reproduces (likely by adding either
-     `fireCompositionEnd(textarea, "요")` before the arrow to model
-     case (b) + a stale-state shim write, or
-     `cs.triggerDataEvent("요", true)` after the arrow to model
-     case (d) — the defer-fire race).
-   - **T4 (modifier-augmented arrow)** — two separate `it()`
-     blocks, NOT `it.each` (matches existing test file style):
-     - **T4-shift**: same as T2 with `shiftKey: true` on the
-       ArrowRight keydown.
-     - **T4-meta**: same as T2 with `metaKey: true` on the
-       ArrowRight keydown.
-     Both expect identical post-fix behavior to T2 — the modifier
-     flag does NOT route around the fix because `docKeyDown`'s
-     `isModifier` check at lines 529–533 examines `e.key`, which is
-     `"ArrowRight"` (not `"Shift"` / `"Meta"`).
-3. **Select** the Shape B sub-variant based on the hypothesis tree
-   and the validated (Step 5) failing dispatch sequence. **All four
-   sub-variants below are body-only inside `src/lib/xtermImeShim.ts`
-   — Shape A remains rejected.**
-   - **B1 — non-terminating no-write** (fix site: node 7,
-     `docKeyDown` else-branch): in the non-terminating case, do NOT
-     write `composed`. Just sync state (clear overlay, set
-     `isComposing := false`, bump `imeFlushGen`). Trust
-     `onCompositionEnd` to write via invoke. **Pick this if the
-     validated failing sequence shows `compositionend` reliably
-     FOLLOWS the non-terminating keydown for the same commit (case
-     b validated).** ⚠ **Loss-of-syllable risk**: if `compositionend`
-     does NOT fire for the period at all (case a) or fires only
-     after the arrow keydown's stale state has already been cleared
-     by `if (!isModifier) isComposing = false` at line 557, B1
-     silently drops the syllable instead of duplicating it — a
-     different bug, not a fix.
-   - **B2 — conditional write with onCompositionEnd guard** (fix
-     site: node 7 + node 5): write `composed` in the non-terminating
-     case only when a per-keydown `compositionEndExpected` flag
-     indicates `compositionend` will NOT fire afterward (flag set by
-     `onCompositionEnd` itself or by an `imeFlushGen`-style sentinel).
-     Pick this if cases (a) and (b) are mixed, OR if you want defense
-     in depth against case (a). Recommended default when uncertain
-     between case (a)/(b).
-   - **B3 — internal last-commit dedup** (fix site: node 7 +
-     shim-internal state only): keep the current
-     `invoke("write_to_pty")` payload shape **bit-identical to today
-     — the PTY bytes never change**. Add a shim-private
-     `lastWrittenComposition: { text: string; gen: number } | null`
-     field, updated in `onCompositionEnd` AFTER each successful
-     `invoke("write_to_pty", { sessionId, data: e.data })` AND AFTER
-     the `imeFlushGen++` increment (so the stored gen is the
-     post-commit value). At the node-7 bug site, suppress the write
-     when `composed === lastWrittenComposition?.text && imeFlushGen
-     === lastWrittenComposition.gen` (i.e., `onCompositionEnd`
-     already wrote this exact text and no new composition has
-     started since to bump `imeFlushGen`). **No payload-tagging, no
-     extra bytes through `write_to_pty`, no signature change on the
-     Tauri IPC.** Most invasive of B1/B2/B3 because it requires new
-     shim state with explicit lifecycle (must reset on dispose, on
-     blur-flush, on new composition start), but the OUT-OF-SCOPE
-     boundary stays intact. Structurally close to B4 — the two CAN
-     share the same `lastWrittenComposition` state when applied
-     together per the Cross-variant scope rule below. Pick only if
-     B1/B2 cannot be made to work AND case (d) is ruled out so B4
-     is not applicable.
-   - **B4 [NEW per round-2 fold] — post-compositionend defer dedup**
-     (fix site: node 9, the `triggerDataEvent` wrapper at lines
-     567–582): track the last `onCompositionEnd`-committed payload
-     in a shim-private `lastCompositionCommit: { text: string; gen:
-     number } | null` field. **The store must happen AFTER the
-     `imeFlushGen++` increment inside `onCompositionEnd`**, so the
-     stored `gen` matches what subsequent deferred
-     `triggerDataEvent` capture (which reads `gen = imeFlushGen` at
-     defer-schedule time — also post-increment under case (d)).
-     Pseudocode:
-     ```ts
-     // inside onCompositionEnd, after the existing body:
-     clearOverlay();
-     isComposing = false;
-     imeFlushGen++;
-     if (written !== null) {
-       lastCompositionCommit = { text: written, gen: imeFlushGen }; // post-increment
-       emitFlush(written, null);
-     }
-     ```
-     In the 20 ms-defer Korean path inside the wrapper, suppress
-     the deferred `origTrigger(data)` if `lastCompositionCommit
-     !== null && data === lastCompositionCommit.text && imeFlushGen
-     === lastCompositionCommit.gen` (i.e., no new composition has
-     happened since the commit). **Pick this if the validated
-     failing sequence shows the duplicate originating from xterm's
-     `triggerDataEvent("요")` AFTER `compositionend("요")` ran (case
-     d validated)** — the duplicate appears in `origTriggerCalls`,
-     NOT in `ptyWrites()`. Preserves the existing defer-gen
-     invariant for the inverse race (defer-then-composition)
-     covered by test §"Korean triggerDataEvent defer" at line 563:
-     in the inverse race, a new compositionend increments
-     `imeFlushGen` past the deferred-capture's `gen`, so the
-     `gen === lastCompositionCommit.gen` check intentionally
-     becomes a no-op (no false suppression).
+## Risks and mitigations
 
-   ⚠ **Cross-variant scope rule**: if the validated failing sequence
-   shows the duplicate appears in BOTH `ptyWrites()` AND
-   `origTriggerCalls` (cases b and d are co-occurring), the
-   implementer applies the matching pair (e.g., B1 + B4) inside the
-   same edit. This is still body-only inside `xtermImeShim.ts` and
-   does not violate the OUT-OF-SCOPE boundary.
-4. **Encode the validated case-label** in a header comment block
-   above each new test stating which hypothesis case (a/b/c/d, or a
-   newly-discovered case) the dispatch sequence reproduces, so a
-   future event-order shift in xterm.js or WKWebView documents
-   itself when the test breaks.
-5. **Negative-baseline reproduction loop** (round-2 fold — replaces
-   the prior "single git stash check"):
-   1. Take the Step 2 starting hypothesis for T3, add the
-      `textarea.value` assignments, and run the unit test against
-      current `dev` HEAD (no fix applied). Capture the actual
-      `ptyWrites()` + `origTriggerCalls` + `onComposedFlush`
-      values.
-   2. If the duplicate reproduces (per any of the acceptable
-      signals in Success Criterion #5), label the case (b/d/etc.),
-      lock the dispatch sequence into T3 with the header comment
-      from Step 4, and proceed to Step 3 (variant selection).
-   3. If the duplicate does NOT reproduce, extend the dispatch
-      sequence with one of the candidate additions:
-      - ⚠ `fireCompositionEnd(textarea, "요")` BEFORE the arrow
-        keydown — **NOT viable in JSDOM/happy-dom**:
-        `dispatchEvent` is synchronous, and `onCompositionEnd`
-        synchronously clears `imeFragment`, sets `isComposing :=
-        false`, and increments `imeFlushGen` before returning. By
-        the time the arrow keydown fires, node 7's inner `if
-        (isComposing && !isModifier)` check returns false →
-        no second write. Case (b)'s stale-state window only exists
-        in real WKWebView (where `compositionend` may be
-        asynchronous relative to keydown). Skip this candidate
-        unless you introduce an async/microtask boundary in the
-        test runtime to model that delay.
-      - `cs.triggerDataEvent("요", true)` AFTER the arrow keydown
-        (models case d — xterm's CompositionHelper batched the
-        commit and emits it after compositionend). This IS
-        reproducible in JSDOM because the wrapper's 20 ms-defer
-        path uses `setTimeout`, which Vitest can drive
-        synchronously via `vi.useFakeTimers()` + `vi.advanceTimersByTime(25)`
-        (see existing test at lines 567–595 for the pattern).
-      - **most likely path for synchronous test runtime**: model
-        case (d) via the `cs.triggerDataEvent` candidate above.
-      - if case (b) is the actually-validated production cause,
-        Phase 6 user-acceptance repro will surface it — but the
-        unit test for it requires async-aware dispatch and is
-        deferred until then.
-      Re-run the baseline. Iterate until the duplicate reproduces.
-   4. If NO extension reproduces the duplicate against current
-      `dev` HEAD, **escalate back to the planner** — the hypothesis
-      tree is incomplete and the bug may live in a code path the
-      plan does not cover. Do NOT apply a fix against a
-      non-reproducing test.
-   5. Once the baseline reproduces, document the exact dispatch
-      sequence + observable values + case label in the
-      implementation report. Then apply the matching sub-variant
-      from Step 3, restore the fix, confirm the unit test now
-      passes against the post-fix code.
-   6. Apply the same loop to T1, T2, T4 (each may model a
-      different case; that's expected — T1 likely models case b,
-      T2 case b, T3 case b or d or both, T4 same as T2).
-6. **No `console.log` instrumentation in committed code.** Any
-   temporary logging used during local diagnostic runs MUST NOT land
-   on `dev`. (Phase 6 user-acceptance repro is the live falsification
-   gate; the implementer's confidence comes from the validated
-   failing baseline + the unit test suite + the sub-variant chosen
-   to match the case.)
+| Risk | Mitigation |
+|---|---|
+| Over-suppression of a legitimate user paste that coincidentally starts with the just-committed syllable (e.g. user types 녕, syllable commits, immediately pastes `녕을 입력하세요` within 40 ms) | The live token is bounded by (a) `imeFlushGen` (resets on commit / blur / terminator flush), (b) the 40 ms safety-clear timer in `onCompositionEnd`, and (c) consumption on first match. With **full suppression (P6 corrected)**, a coincident-prefix paste within 40 ms drops the **entire** paste payload (`녕을 입력하세요`) — strictly worse than the original re-emit-trailing variant for this edge case. The 40 ms bound makes it narrow but non-zero. **Live smoke must specifically test paste-immediately-after-commit (`타이핑:녕` then paste `녕을 입력하세요` within 40 ms)**. If the smoke surfaces the loss, implementer escalates back to planner — the candidate mitigation is to consume only the prefix match if the strict `==` (full payload) condition is detected, but that re-introduces the trailing-duplicate. Accepted trade-off for this cycle: bug fix takes priority over a 40 ms-window paste edge. |
+| False non-suppression: xterm emits `"녕 "` AFTER the 40 ms safety clear has nulled the token | The setTimeout(0) in xterm's CompositionHelper fires within milliseconds; 40 ms is comfortably outside the worst-case latency. If WKWebView ever delays the setTimeout past 40 ms (unlikely; node event loop), the duplicate slips through and the user sees `안녕녕` (no trailing space). This is the **same long-tail risk** the round-2 period-arrow fold accepted; not novel. |
+| New describe-block test name collision | The new `describe` block name is unique (`"attachKoreanImeShim — multi-char prefix strip"`). Vitest does not enforce uniqueness; the implementer verifies the new block is appended at the end of the file, after the existing T1-T4 block. |
+| TypeScript strict-mode drift | `tsc --noEmit` runs in CI per `npm run build`. The strip path uses no new types; it reads from the existing `lastCompositionCommit` shape. No drift expected. |
+| **Token-consumption race (Order P vs Order Q)** — forward-looking concern from @claude2 round-2. If xterm's `CompositionHelper.keydown` path for the trailing key ever fires `_finalizeComposition(false)` SYNCHRONOUSLY (emitting a length-1 `"녕"` via `triggerDataEvent` BEFORE the late `setTimeout(0)`), the existing length-1 dedup branch at `xtermImeShim.ts:610` consumes `lastCompositionCommit` first. The subsequent `"녕 "` arrival then finds `live === null` → prefix-strip cannot claim → falls through → duplicate visible. | task-1's empirical model of macOS WKWebView Korean IME shows only TWO wrapper calls reach the wrapper for the space case (Order P: `" "`, then `"녕 "`). Order Q would surface as three wrapper calls (`"녕"`, `" "`, `"녕 "`) with a different visible-output shape; task-1's repro did not observe this. **Live-smoke sequences in criterion #5 are the authoritative check** — if a duplicate surfaces despite headless tests passing, the Order-Q token-consumption race is the suspect; escalate to planner. Headless test cannot deterministically model the OS event-queue order. |
 
-## Validation
+## Open questions
 
-- Phase 6 (compile check on emitted skeletons) is skipped — no
-  skeletons emitted (feature lane, no cross-boundary contract). See
-  the `feature-lane.md` skeletons-skipped branch.
-- Phase 7 smoke-check (run before commit):
-  - `plan.md` non-empty, contains `## Goal`, `## Package layout`,
-    `## Decomposition` headers. ✓
-  - `plan.mmd` first line is `flowchart TD`. ✓
-- The full `tsc --noEmit` + Vitest validation happens in the
-  implementer's Phase 5 (post-edit validation loop), not here.
+- **Q1 (resolved post-fold)**: should the prefix-strip proactively
+  cover the period case? **Resolution**: YES, by construction —
+  with the P6 correction (drop trailing), the live token catches
+  `"요"` prefix on a `"요."` multi-char late emit, the entire
+  payload is dropped, and the `.` is delivered via xterm's
+  `_keyDown` path (same as space). Existing T1 at
+  `xtermImeShim.test.ts:723` does NOT model the late `"요."` emit
+  (per @claude3 P3 — task-1's evidence gap), so T1 will continue
+  to pass on baseline AND after the fix without exercising the
+  new strip path for period. Live smoke (success criterion #5
+  sequence `안녕하세요.`) is the authoritative period-case check.
+  Implementer MAY extend T1 to include the late `"요."` emit as a
+  defense-in-depth assertion; not gating.
+- **Q2 (dissolved post-fold)**: the strip does NOT re-emit
+  trailing chars (see P6 correction). xterm's `_keyDown` already
+  delivered them under Order B. The "single call vs split"
+  question no longer applies.
+- **Q3**: implementer peer-review round count? **Proposal**:
+  defer to implementer skill. The prior period-arrow cycle ran 3
+  implementer rounds + 5 reviewers per round; planner does not
+  constrain that schedule here.
 
-## Rubric self-score (feature lane, 4 criteria × 4 levels)
+## Sources
 
-| Criterion | Score (1–4) | Reasoning |
-|---|---|---|
-| Decomposition completeness | 4 | All 11 existing handlers inventoried; primary fix site (node 7) explicitly named; 4 test nodes (T1–T4) cover the trigger family + Q3 |
-| Dependency direction | 4 | `xtermImeShim.ts` is a leaf module; consumers untouched; OUT-OF-SCOPE boundary is enforced by the "preserve terminator union" constraint |
-| Validation status | 3 | Phase 7 smoke-check passes; the harder validation (`tsc --noEmit` + Vitest) is intentionally deferred to the implementer per feature-lane spec; live macOS WKWebView repro is the user's Phase 6 acceptance gate per Constraint #6 |
-| Plan coverage (Phase-1 goal → decomposition) | 4 | Each in-scope item maps to a node; success criteria 1–5 each map to a test, compile check, or user-acceptance gate; open questions Q1/Q2/Q3 are resolved or have an explicit handoff with four named sub-variants (B1/B2/B3/B4) and explicit dispatch sequences |
+- `[1]` file: `/Users/donghyeon/.cache/canvas-terminal/collab-memory/session-1954/task-1-claude1-report.md`
+  (single source; no cross-source conflict policy exercised)
+- Prior cycle reference (read-only, not modified): commit
+  `daf9e89` (`plan-feature, human-confirmed` for
+  `korean-ime-dup-period-arrow`) and `116ede7` (`impl-feature,
+  human-confirmed` for same).
 
-## Round-3 peer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
+## Round-1 peer-review fold
 
-5/5 reviewers approve direction. Convergent consensus across rounds.
-Three remaining items folded.
+Five reviewers (`@codex1`, `@claude2`, `@codex2`, `@claude3`,
+`@codex3`) reviewed the v1 plan; their reports live under
+`session-1954/task-{8,9,10,11,12}-*.md`. Convergence summary:
 
-### Convergent (3/5) — F2' B3 wording authorizes PTY contract change
+### Gating (P0 / P1) — all folded into v2
 
-- **codex3 round-3 #1 (MEDIUM)** — B3's "adds payload-tagging to
-  the shim/PTY contract" conflicts with the OUT-OF-SCOPE boundary.
-- **codex4 round-3 Minor Note 2** — B3 should be planner-reopen
-  territory unless implementer can keep token internal and prove
-  PTY payload unchanged.
-- **claude3 round-3 F2' (MEDIUM)** — three sub-traces verifying
-  the violation; recommended specific internal-only rewrite.
+| ID | Severity | Convergence | Verdict | Fold action |
+|---|---|---|---|---|
+| **F1** N1 sketch + P6 re-emit trailing produces duplicate trailing char under Order B (`indirectWrites=[" ", " "]` not `[" "]`) | P0 | **4/5** (codex1, claude2, claude3, codex3; codex2 missed this) | Verified by tracing seed task-1's Order B sequence + xterm `_keyDown`/`CompositionHelper.ts:165-171` source. Re-emitting trailing produces visible `안녕  ` not `안녕 `. | **N1 sketch rewritten to `return;`**; P6 reworded "FULL drop, NOT re-emit"; Q2 dissolved; load-bearing rationale added under the sketch. |
+| **F2** Test count is 32, not 19 | P1 | **2/5** (claude2, claude3) | Verified: `grep -cE '^  it\(' src/lib/xtermImeShim.test.ts` = 32. | **Three sites updated** (Constraints, Success criterion #2, N6 row). Total post-fix budget: 36. |
+| **F3** Success criterion #1 incorrectly requires negative controls to fail on baseline | P1 | **4/5** (codex1, codex2, claude2, claude3) | Verified by trace: on baseline (no strip path) `"한자"` and the replaced-token `"녕 "` already fall through, which the negative tests assert → they pass on baseline. | **Criterion #1 split by polarity**: positive repros must fail on baseline; over-suppression guards must pass on baseline and after fix. |
+| **F4** Regression suite label "T1–T4 (4 tests)" inaccurate — actual is T1, T2, T3, T4-shift, T4-meta + B4 T5/T6/T7/T8 = 9 tests | P1 | 1/5 (claude3) | Verified by per-describe breakdown. | **Constraints section corrected** to list the 9-test suite explicitly. |
 
-Independently verified at `src/lib/xtermImeShim.ts:466` /
-`xtermImeShim.ts:486` / `xtermImeShim.ts:546`: `data` is the
-literal payload sent to PTY; any encoded token would corrupt the
-user-visible terminal output.
+### Non-gating (P2 / P3) — folded selectively into v2
 
-**Folded**: B3 rewritten as "internal last-commit dedup" with
-shim-private `lastWrittenComposition: { text, gen } | null` state.
-PTY bytes are bit-identical to today. Cross-referenced with B4 —
-the two can share the same internal state when applied together.
+| ID | Severity | Convergence | Verdict | Fold action |
+|---|---|---|---|---|
+| **F5** T-stale-gen mechanism description ("new composition starts (incrementing `imeFlushGen`)") doesn't match `imeFlushGen` lifecycle — gen only advances at composition END / blur / terminator | P2 | **3/5** (codex1, claude2, claude3) | Verified by reading `xtermImeShim.ts:482,514,557,564,587`. Starting a composition sets `isComposing=true` but does NOT increment gen. | **T-stale-gen renamed → T-replaced-token** with corrected setup ("after the live token has been replaced by a subsequent commit"). Mechanism note added clarifying the gen lifecycle. |
+| **F6** Order-A vs Order-B IME-event-order sensitivity — drop-trailing is safe only under Order B | P2 | 1/5 (claude3) | Production behavior is Order B per task-1's WebKit Korean IME analysis. Order A is forward-looking (future Tauri webview backend). | **Order-B assumption added to Constraints** as a load-bearing line with a re-validate-on-port note. |
+| **F7** Strict `>` predicate has a multi-syllable equal-length gap — `live.text==="안녕"` with `data==="안녕"` falls through | P2 | 1/5 (claude3) | Real but unobserved (Korean IME commits one syllable per `compositionend` on macOS WKWebView). | **Documented as known out-of-scope** under the N1 sketch, with note explaining why a future widening should NOT silently expand the predicate. |
+| **F8** T-digit event-sequence shape needs to be explicit (codex3 wanted full dispatch, not just final channel assertion) | P2 | 1/5 (codex3) | Reasonable for implementer clarity. | **All four new test descriptions rewritten** to encode the full dispatch sequence, not just the final assertion. |
+| **F9** Q1 (period-by-construction) interacts with P0 — wrong under v1 sketch (would emit `요..`), correct under v2 (full suppression). | P3 | 2/5 (claude2, claude3) | Verified by trace. | **Q1 reworded post-fold** to explicitly note the period case is covered by the same drop-trailing mechanism; T1 evidence gap acknowledged; live smoke is the authoritative period check; implementer MAY extend T1 as defense-in-depth (non-gating). |
+| **F10** False-positive paste window risk got STRICTLY WORSE under full suppression (drops entire paste payload, not just prefix) | P3 | implicit (codex2 advisory; claude2 caveat) | The mitigation candidate (suppress prefix only on full-payload match) re-introduces the trailing duplicate. | **Risk table updated** with the new failure shape; live smoke MUST cover paste-immediately-after-commit; if it surfaces, escalate to planner. |
 
-### Convergent (4/5) — F3' `fireCompositionEnd` before arrow not viable in JSDOM
+### Not folded — out of scope or disputed
 
-- **claude4 round-3 H1 (Advisory)** — synchronous dispatch in
-  JSDOM means `onCompositionEnd` clears `isComposing` before
-  the arrow keydown runs.
-- **claude3 round-3 F3' (LOW)** — same trace; recommended
-  tightening Step 5.3.
-- **codex2 round-3 (Medium)** — same trace; recommended removing
-  or rewording.
-- **codex4 round-3 Minor Note 1** — same observation.
+- **codex3 Finding 2** (T-digit "same dispatch shape" is ambiguous):
+  partially folded into F8. The "single-emission `녕2`" path codex3
+  asked about is not validated by any seed; not added as a separate
+  test case. Implementer may add one if it surfaces in smoke.
+- **codex2's "claim only on `{text-prefix, gen, !isComposing}`,
+  consume the token on successful strip, and forward the trailing
+  bytes once via `origTrigger`"**: NOT folded — this is the
+  pre-revision v1 shape that the other 4 reviewers showed produces
+  the trailing duplicate. The v2 sketch with `return;` is correct.
+  codex2's review missed the F1 contradiction; the convergence
+  with the other 4 reviewers + verified trace + the seed task-1
+  expected output (`indirectWrites=[" "]`) all point to drop-trailing.
 
-Independently verified by tracing `fireCompositionEnd` (test
-lines 108–115) which calls `target.dispatchEvent(e)` synchronously
-→ `onCompositionEnd` body at `xtermImeShim.ts:463–479` synchronously
-clears state → subsequent arrow keydown finds `isComposing=false`
-→ node 7's inner check skipped.
+## Round-2 peer-review fold
 
-**Folded**: Phase 0 Step 5.3 now marks the `fireCompositionEnd`
-candidate with ⚠ "NOT viable in JSDOM/happy-dom" and steers the
-implementer toward the `cs.triggerDataEvent("요", true)` candidate
-(case d, JSDOM-reproducible via `vi.useFakeTimers()` per existing
-test §"Korean triggerDataEvent defer" at line 567).
+Five reviewers re-reviewed v2 (commit `9853a2d`): `@codex1`
+(task-14), `@claude2` (task-15), `@codex2` (task-16), `@claude3`
+(task-17), `@codex3` (task-18). Round-2 closure quality from round-1:
+all 4 gating findings from round-1 were closed; 2 NEW gating findings
+surfaced as artifact drift the v2 fold missed.
 
-### Single-reviewer — B4 gen timing (codex2 Medium)
+### Gating (P0 / P1) — both folded into v3
 
-**Folded**: B4 description now includes explicit pseudocode placing
-`lastCompositionCommit = { text: written, gen: imeFlushGen }`
-AFTER the `imeFlushGen++` increment, with a paragraph explaining
-how the post-increment value matches the deferred capture's `gen`
-under case (d) AND how the inverse race (existing test line 563)
-intentionally falls through B4's check without false suppression.
+| ID | Severity | Convergence | Verdict | Fold action |
+|---|---|---|---|---|
+| **F11** In-scope bullet `plan.md:29-34` still describes the v1 re-emit-trailing contract, contradicting the v2 N1 sketch (`return;`), P6, and Q2 | P0 | **3/5** (codex1 HIGH, codex2 HIGH, codex3 HIGH; claude2/claude3 verified the rest of the fold but did not re-read the In-scope bullet) | Verified: my v1→v2 fold updated the sketch, P6, Q2, criteria, and risks, but I never updated the top-level in-scope bullet — pure drift. An implementer reading In-scope before the N1 sketch could implement the disproven shape. | **In-scope bullet rewritten** to describe full suppression + the Order-B rationale, with explicit forward-pointer to the round-1 fold's F1 row for the failure trace. |
+| **F12** `plan.mmd:6` still labels N5 as `T-stale-gen` though `plan.md` renamed to `T-replaced-token` | P1 | **4/5** (codex1 MEDIUM, codex2 LOW, claude3 Nit-1 gating, codex3 MEDIUM) | Verified: drift between artifact files. Feature lane requires `plan.md` + `plan.mmd` synchronized at the commit. | **plan.mmd N5 label updated** to "T-replaced-token (over-suppression guard)". Edge structure unchanged. |
 
-### Cosmetic (2/5) — F4' "three" → "four" sub-variants
+### Non-gating (P2 / P3) — selectively folded
 
-**Folded**: rubric Plan-coverage cell now says "four named
-sub-variants (B1/B2/B3/B4) and explicit dispatch sequences."
+| ID | Severity | Convergence | Verdict | Fold action |
+|---|---|---|---|---|
+| **F13** Order-Q / token-consumption race — if `_finalizeComposition(false)` emits a length-1 `"녕"` before the late setTimeout, the existing length-1 dedup consumes the token; subsequent `"녕 "` finds `live===null` → falls through → duplicate visible | P3 | 1/5 (claude2) | task-1's empirical Order-P/B model only shows two wrapper calls; Order Q would surface as three. Headless test cannot deterministically model OS event-queue order. | **Added as a new Risks-table row** with the same routing as the existing false-suppression note (live-smoke is authoritative; escalate if visible duplicates persist). |
+| **F14** Risks-row 1 paste-smoke requirement is not cross-referenced from Success criterion #5; an implementer reading criterion #5 alone misses the paste-window check | P3 | 1/5 (claude3 Nit-3) | Real discoverability gap — the requirement is buried in the risk table. | **Cross-reference added to criterion #5** as an "Additionally" clause naming the paste-smoke sequence (`녕` then within-40 ms paste `녕을 입력하세요`). |
+| **F15** T-digit / T-non-matching / T-replaced-token only describe dispatch in prose; only T-space has the explicit `ts` code block (F8 partially applied) | P3 | 1/5 (claude3 Nit-2) | Prose form is sufficient for a careful implementer per claude3's own assessment; non-gating polish. | **Not folded** in this round — prose suffices; implementer may convert to code blocks if useful during Phase 3. |
+| **F16** T-replaced-token description does not specify `textarea.value` reset between compositions; implementer may waste a Vitest debug cycle | P3 | 1/5 (claude2 Nit-2) | Implementer-level test-authoring detail. | **Not folded** — implementer-discretion item; well-defined in xterm test helper conventions. Optional. |
+| **F17** Local `.planner-state.json` is stale (still says T-stale-gen, 19 tests, v1 criterion-1, v1 Q2) | P3 | 1/5 (codex1 LOW) | Gitignored; not in handoff. No downstream consumer reads it cross-session. Could confuse a same-session resume. | **Updated post-fold** to v3 wording for cleanliness; not commit-affecting (gitignored). |
 
-### Cosmetic (1) — H2 node 7 "PRIMARY" vs node 9 "maybe" asymmetry
+### Round-2 closure summary
 
-**Folded**: decomposition table row 7 relabeled
-"**CANDIDATE — case (b)**" with annotation "Co-equal with node 9
-per round-2 case (d) hypothesis; not 'primary'"; row 9 relabeled
-"**CANDIDATE — case (d)**".
-
-### Single-reviewer observation (1) — F5' case (d) blast radius (claude3 LOW)
-
-**Folded**: case (d) description now includes a "Blast-radius
-note" — if (d) is the validated mechanism, B4 may close out other
-unreported Korean-IME duplicates (Korean-syllable + pause + non-jamo
-combinations beyond period/arrow); the user's reported trigger
-family may be a visibility artifact. Worth documenting in the
-implementation report.
-
-### Architectural axis (unchanged across all 3 rounds — reviewer consensus)
-
-- Scale lane: feature (Scope=1, Risk=2, Ambiguity=2)
-- Bug sites: node 7 (case b) + node 9 (case d) — co-equal candidates
-- Variant family: Shape B family (B1/B2/B3/B4) — all body-only
-- OUT-OF-SCOPE boundary: terminator union frozen; consumers untouched
-- Invariant inventory: 5 items from prior cycle, line-cited
-- Rubric self-score: 4/4/3/4
-
-@claude3 round-3 and @claude4 round-3 both stated explicitly that
-no round-4 peer review is needed once the F2'/F3' folds land.
-Phase 8 human-confirm gate is ready.
-
-## Round-2 peer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
-
-All 5 round-2 reviewers approved direction; 5/5 surfaced the same
-convergent blocking finding around T3's negative-baseline
-executability against the literal Phase 0 Step 2 dispatch sequence.
-Folded.
-
-### Convergent (5/5 reviewers) — F1' executability gap
-
-- **claude4 G1 (Medium)** — dispatch sequences omit `textarea.value`
-  mutations needed for `imeFragment` to be populated.
-- **claude4 G2 (Medium)** — T3's `["요","요"]` baseline cannot be
-  reached from the literal sequence; need a Step-5b safety net.
-- **codex3 #1 (HIGH)** — same `textarea.value` omission.
-- **codex3 #2 (HIGH)** — T3 sequence cannot produce two direct
-  `ptyWrites()` entries.
-- **codex3 #3 (MEDIUM)** — period input may repaint `imeFragment` to
-  `"요."` if value mutation added naively.
-- **codex4 (Major)** — same trace; recommended escalating exact
-  sequence to implementer.
-- **codex2 (Blocking)** — same trace; offered three resolution
-  paths.
-- **claude3 F1' (HIGH)** — three sub-issues (a) `textarea.value`
-  missing, (b) baseline `length === 2` unreachable, (c) naive
-  `textarea.value` repaints to `"요."`. Recommended Option A
-  (escalate to implementer; planner provides hypothesis as starting
-  point).
-
-I independently traced the literal T3 sequence against
-`src/lib/xtermImeShim.ts:528–558` and confirmed the duplicate cannot
-be produced as specified. **Folded** Option A approach:
-
-- Phase 0 Step 1 hypothesis tree extended with **case (d)** — defer-fire
-  race in the `triggerDataEvent` wrapper after `compositionend`.
-  Under (d), the duplicate appears in `origTriggerCalls`, not
-  `ptyWrites()`. Adds new sub-variant B4 in Step 3.
-- Phase 0 Step 2 dispatch sequences now include the required
-  `textarea.value` mutations explicitly, AND state that the
-  sequences are **starting hypotheses** (not validated
-  reproductions), with the trace acknowledgment that they do not
-  produce the duplicate as-written.
-- Phase 0 Step 5 rewritten as a six-step **negative-baseline
-  reproduction loop**: implementer takes the starting hypothesis,
-  validates against current `dev`, extends with candidate additions
-  (`fireCompositionEnd` before arrow, `cs.triggerDataEvent("요")`
-  after arrow, or both) until the duplicate reproduces, locks the
-  validated sequence into the test with a case label, then applies
-  the matching sub-variant.
-- Success Criterion #5 reframed: the exact duplicate signal is NOT
-  pre-specified. Acceptable signals include direct `ptyWrites`
-  doubling, OR `ptyWrites` + `origTriggerCalls` co-occurring, OR
-  any other combined-channel observable documented by the
-  implementer. Implementer must escalate back to the planner if NO
-  extension reproduces the duplicate (hypothesis tree incomplete).
-
-### Single-reviewer cosmetic (3 reviewers — Q2 consistency)
-
-- **codex3 #4 (LOW)**, **codex2 (Minor)**, **claude3 LOW** — Q2
-  table row still said "Manual `npm run tauri dev` repro on macOS
-  required (Constraint #6)" but Constraint #6 was reframed in
-  round-1. **Folded** — Q2 row now reads "Live macOS WKWebView repro
-  is the user's Phase 6 acceptance gate (per Constraint #6). Unit
-  tests use the synthesized helper-textarea harness as the
-  implementer's reproduction surface."
-
-### Single-reviewer additions
-
-- **claude4 G3 (Minor)** — Constraint #6 mis-cited
-  `disable-model-invocation` as the reason the implementer can't
-  run `npm run tauri dev` autonomously. The real reason is
-  interactive observability (headless Bash can't see the rendered
-  DOM nor synthesize Korean keystrokes). **Folded** — Constraint #6
-  reworded to "interactive process that requires a human to observe
-  the rendered terminal and type with a real Korean IME."
-- **claude4 G4 (Nit)** — T4 should specify two `it()` blocks (vs
-  `it.each`). **Folded** — Phase 0 Step 2 T4 row now reads "two
-  separate `it()` blocks, NOT `it.each` (matches existing test file
-  style): T4-shift and T4-meta."
-- **plan.mmd** updated — node 9 (`triggerDataEvent` wrapper, defer
-  branch) now ALSO marked red as a candidate bug site under case
-  (d). This is parallel to node 7 (case b), not a replacement.
-
-### Architectural axis unchanged
-
-Bug site identification (node 7 + node 9), variant choice (Shape B
-family — B1/B2/B3/B4), OUT-OF-SCOPE boundary (terminator union
-frozen), invariant inventory (5 items), rubric self-score
-(4/4/3/4) — unchanged from round-1. The round-2 fold is purely
-test-specification and hypothesis-tree work; the planner's
-architectural commitments stand.
-
-## Round-1 peer-review fold (5 reviewers — @codex2, @claude3, @codex3, @claude4, @codex4)
-
-All 5 reviewers approved direction; all requested revisions before
-the human-confirmed gate emits. Convergent findings (3+ reviewers):
-
-- **F-A — B1 selection criterion was reversed** (claude4 F1, codex3 #1, codex4 #3, claude3 F2 implicit). Verified against source `xtermImeShim.ts` lines 463–479 vs 528–558: if `onCompositionEnd` fires first, `isComposing` is already false at the bug-site check; the bug only manifests when `compositionend` follows the non-terminating keydown. **Folded into** Step 3 / B1 — re-worded to "compositionend reliably FOLLOWS the non-terminating keydown for the same commit." Added explicit loss-of-syllable warning (claude3 F2 medium) for case (a) where `compositionend` never fires.
-- **F-B — Test channel confusion (`ptyWrites` vs `origTriggerCalls`)** (claude4 F2, codex3 #2, codex4 #2, codex2 Low, claude3 implicit). Verified `xtermImeShim.test.ts` lines 41–46 (mock terminal's `triggerDataEvent` → `origTriggerCalls`) and 127–137 (`ptyWrites()` filters for `invoke("write_to_pty")`). **Folded into** T1/T2/T3/T4 row text and Phase 0 Step 2 dispatch sequences — assertions now triple-track `ptyWrites()`, `origTriggerCalls`, and `onComposedFlush`. Plus codex2's "DOM keydown does not itself emit xterm CSI; simulate downstream with synthetic `cs.triggerDataEvent`" — folded into T2's dispatch.
-- **F-C — T4 helper extension + concrete semantics** (claude4 F3, codex3 #3, codex4 #4, claude3 F5 implicit). Verified `fireKeydown` at test lines 92–106 only passes through `{keyCode, key, code, isComposing}`. **Folded into** In-scope ("extend `fireKeydown` to pass `shiftKey | ctrlKey | altKey | metaKey`") and T4 row ("expects identical behavior to T2 — modifier flag does NOT route around the fix").
-- **F-D — Encode WKWebView event order in test dispatch sequences** (claude4 F4, codex4 #1, claude3 F1 HIGH). **Folded into** Phase 0 Step 2 — each T1/T2/T3/T4 now has an explicit `fireInput`/`fireKeydown`/`fireCompositionEnd` sequence. Plus header-comment requirement (Step 4) and negative-baseline check (Step 5 + Success Criterion #5).
-
-Single-reviewer findings folded:
-
-- **codex2 Medium — manual repro should enumerate period-alone, arrow-alone, period+arrow.** Folded into Success Criterion #1 (1a / 1b / 1c).
-- **claude3 F4 LOW — Constraint #6 not enforceable for autonomous implementer.** Folded — Constraint #6 reframed: live repro moves to Phase 6 user-acceptance gate; implementer selects B1/B2/B3 from architectural reasoning + unit tests when live trace is unavailable. References prior cycle's resolution.
-- **claude3 F1 HIGH — period-vs-compositionend ordering is the load-bearing question.** Folded into Phase 0 Step 2 ("The load-bearing question is: does compositionend fire on the period keydown? If so, before or after?") and Step 1 hypothesis tree cases (a/b/c).
-
-Cosmetic finding folded:
-
-- **claude3 F3 — Mermaid label "writes composed alone" technically writes `composed + empty suffix`.** Folded into `plan.mmd` Bug-node label.
-
-Not folded (cosmetic only, source-of-truth is committed plan.md):
-
-- **claude4 F5 — collab Phase-3 message claimed 14 rows; plan.md has 15.** No action — the historic collab message is not the source of truth.
+- All 4 round-1 gating findings (F1 drop-trailing, F2 test count, F3
+  criterion split, F4 regression-suite label) confirmed-closed by
+  all 5 round-2 reviewers.
+- Round-2's 2 NEW gating findings (F11 in-scope drift, F12 mmd
+  drift) are pure artifact-sync misses from the round-1 fold — no
+  technical disagreement. Both folded mechanically.
+- Round-2 reviewer verdicts ranged from "APPROVE WITH ONE NIT"
+  (claude3, claude2) to "minor/small revision" (codex1, codex2,
+  codex3). No reviewer disputed the round-1 technical correction.
+- codex2's round-1 outlier position (forward trailing) is now
+  cleanly resolved: codex2's round-2 review explicitly endorses
+  the v2 drop-trailing sketch ("I agree with the v2 technical
+  direction"). The 4-vs-1 round-1 convergence held under round-2
+  scrutiny.
