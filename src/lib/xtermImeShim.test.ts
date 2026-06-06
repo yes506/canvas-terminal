@@ -1166,3 +1166,191 @@ describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => 
     vi.useRealTimers();
   });
 });
+
+// ===========================================================================
+// korean-ime-dup-space: multi-char prefix-strip dedup path (N2-N5)
+// ===========================================================================
+
+describe("attachKoreanImeShim — multi-char prefix strip", () => {
+  it("T-space (positive repro): drops late '녕 ' substring; the synchronous _keyDown space survives once", () => {
+    // Repro from task-1-claude1-report.md: typing 녕 then SPACE mid-composition.
+    // Under Order B (WKWebView Korean IME) the trailing space is emitted via
+    // xterm._keyDown's synchronous triggerDataEvent(" ") BEFORE the late
+    // CompositionHelper setTimeout(0) substring "녕 " arrives. The new
+    // prefix-strip drops the entire late substring (P6 FULL SUPPRESSION) so
+    // the user sees "녕 " (one space), not "녕 녕 " (re-emitted prefix) or
+    // "녕  " (re-emitted trailing).
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    // 1. Commit "녕" via compositionend.
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    // 2. Order B trailing: xterm._keyDown synchronously emits ASCII " ".
+    textarea.value = "녕 ";
+    cs.triggerDataEvent(" ", true);
+
+    // 3. xterm CompositionHelper late substring re-emit:
+    //    textarea.value.substring(start) = "녕 ". New prefix-strip drops it.
+    cs.triggerDataEvent("녕 ", true);
+
+    // 4. Drain the 40 ms safety-clear timer cleanly.
+    vi.advanceTimersByTime(60);
+
+    // Direct PTY writes: only "녕" from onCompositionEnd's invoke().
+    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
+    // Indirect via origTrigger: exactly one space — NOT [" ", " "] (which
+    // a re-emit-trailing fix would produce) and NOT [" ", "녕 "] (which
+    // baseline produces).
+    expect(origTriggerCalls.map((c) => c.data)).toEqual([" "]);
+    expect(onComposedFlush).toHaveBeenCalledTimes(1);
+    expect(onComposedFlush).toHaveBeenCalledWith("녕", null);
+
+    vi.useRealTimers();
+  });
+
+  it("T-digit (positive repro, ASCII generality): drops late '녕2' substring; the digit survives once", () => {
+    // Same Order-B mechanism as T-space; this pins generality across ASCII
+    // trailing chars (digits are not terminators and do not end composition
+    // before xterm's setTimeout(0) fires).
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    textarea.value = "녕2";
+    cs.triggerDataEvent("2", true);
+    cs.triggerDataEvent("녕2", true);
+
+    vi.advanceTimersByTime(60);
+
+    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["2"]);
+    expect(onComposedFlush).toHaveBeenCalledTimes(1);
+    expect(onComposedFlush).toHaveBeenCalledWith("녕", null);
+
+    vi.useRealTimers();
+  });
+
+  it("T-non-matching-multi-char (over-suppression guard): an unrelated multi-char payload after a commit flows through verbatim", () => {
+    // After "녕" commits, simulate an emission of "한자" (e.g. a paste
+    // landing inside the 40 ms dedup window). The strip's prefix check
+    // ("한자".startsWith("녕")) is false, so the strip does NOT fire and
+    // the payload reaches origTrigger verbatim. Prevents over-suppression
+    // of legitimate multi-char pastes / IME emissions that happen to
+    // coincide with the dedup window.
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    // Paste of "한자" landing during the dedup window — different syllables,
+    // does not start with the live token's text.
+    cs.triggerDataEvent("한자", true);
+
+    vi.advanceTimersByTime(60);
+
+    // Strip does NOT fire (prefix mismatch); payload flows through verbatim.
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["한자"]);
+    // No additional PTY writes beyond the original commit.
+    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
+
+    vi.useRealTimers();
+  });
+
+  it("T-replaced-token (defense-in-depth): after the live token has been replaced by a subsequent commit, a stale-prefix multi-char payload flows through verbatim", () => {
+    // Setup: commit "녕" (sets live = {text:"녕", gen:1}). Drive a SECOND
+    // composition that commits "어" — this replaces lastCompositionCommit
+    // to {text:"어", gen:2} AND advances imeFlushGen. Then fire a stale-
+    // prefix multi-char payload "녕 ". The strip MUST NOT fire — the prefix
+    // check ("녕 ".startsWith("어")) fails first; the gen check is defense-
+    // in-depth that would also catch it if lastCompositionCommit ever
+    // decoupled from imeFlushGen in a future refactor.
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    // 1. First composition commits "녕".
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    // 2. Second composition commits "어" — replaces the live token's text
+    //    AND advances imeFlushGen (post-increment at compositionend).
+    textarea.value = "어";
+    fireInput(textarea, "insertText", "어");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "어");
+
+    // 3. Stale-prefix multi-char payload — first composition's text is no
+    //    longer the live token's text. Strip must not fire.
+    cs.triggerDataEvent("녕 ", true);
+
+    vi.advanceTimersByTime(60);
+
+    // Strip does NOT fire (prefix check rejects); payload flows through.
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["녕 "]);
+    // Two PTY writes from the two compositionend commits.
+    expect(ptyWrites().map((c) => c.data)).toEqual(["녕", "어"]);
+    expect(onComposedFlush).toHaveBeenCalledTimes(2);
+
+    vi.useRealTimers();
+  });
+});

@@ -606,6 +606,41 @@ export function attachKoreanImeShim(
   if (origTrigger) {
     coreService.triggerDataEvent = (data: string, wasUserInput?: boolean) => {
       if (isComposing) return;
+      // korean-ime-dup-space: multi-char prefix-strip dedup path.
+      // xterm's CompositionHelper._finalizeComposition(true) schedules a
+      // setTimeout(0) that reads textarea.value.substring(start) (no end)
+      // and re-emits the result via triggerDataEvent. When the user
+      // presses a non-Korean key (space, digit, ASCII punct that does not
+      // end composition before the setTimeout fires) mid-composition, the
+      // substring is <composed>+<trailing-char> (e.g. "녕 "). Length>1
+      // bypasses the length-1 branch below.
+      //
+      // Under Order B (macOS WKWebView Korean IME — task-1 validated),
+      // by the time this late substring arrives:
+      //   (a) the composed prefix has ALREADY been PTY'd via
+      //       onCompositionEnd's invoke("write_to_pty"), AND
+      //   (b) the trailing character has ALREADY been emitted via
+      //       xterm's _keyDown synchronous triggerDataEvent path.
+      // The full late substring is therefore a complete duplicate; we
+      // drop it (return without origTrigger) — P6 FULL SUPPRESSION.
+      //
+      // Token-identity discipline (preserved from round-3 period-arrow
+      // fold): claim only when text-prefix AND gen match the live token,
+      // and only when no new composition is active. Non-matching multi-
+      // char payloads (e.g. paste of "한자") leave the live token intact
+      // so a later length-1 duplicate can still claim it via the existing
+      // branch below.
+      const live = lastCompositionCommit;
+      if (
+        live !== null &&
+        imeFlushGen === live.gen &&
+        data.length > live.text.length &&
+        data.startsWith(live.text) &&
+        !isComposing
+      ) {
+        lastCompositionCommit = null;
+        return;
+      }
       // FIXME: 20ms empirically tuned for WKWebView on macOS; revalidate on major macOS bumps
       if (data.length === 1 && KOREAN_CODEPOINT_RE.test(data)) {
         const gen = imeFlushGen;
