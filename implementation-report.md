@@ -137,3 +137,74 @@ Tail of final `npm test`:
 - Risks-row-5 (Order-Q token-consumption race) and Risks-row-2
   (false non-suppression beyond the 40 ms safety bound) remain
   headless-undetectable; live smoke is the authoritative check.
+
+## Round-1 peer-review fold
+
+Four reviewers (`@codex1`, `@claude2`, `@claude3`, `@codex3`)
+reviewed commits `4753b16` + `2672d50`; reports live under
+`session-1954/task-{20,21,22,23}-…review-….md`. **4 / 4 reviewer
+convergence on APPROVE — no gating findings, no code-level
+blockers.** This round produces no code change; only this fold
+section is added to the report.
+
+### Convergence table
+
+| Reviewer | Verdict | Independent verification |
+|---|---|---|
+| `@codex1` (task-20) | APPROVE | Line-level diff read against N1 sketch + P1-P6 postconditions; dual-channel `ptyWrites` / `origTriggerCalls` test review; `git diff --check`, `npx tsc --noEmit`, `npx vitest run src/lib/xtermImeShim.test.ts` (36/36), `npm test` (283/283). |
+| `@claude2` (task-21) | APPROVE | **Empirical baseline-FAIL verification** — reverted `src/lib/xtermImeShim.ts` to `dev` HEAD (`d866424`), re-ran the new test block, restored. Confirmed Success criterion #1 polarity split: positive repros (T-space / T-digit) FAIL on baseline, over-suppression guards (T-non-matching / T-replaced-token) PASS on baseline. Working tree restored clean. Full validation + diff-stat re-run. |
+| `@claude3` (task-22) | APPROVE | Predicate trace against N1 sketch line-by-line; postcondition table walk-through; T-replaced-token `imeFlushGen++` post-increment lifecycle trace at `xtermImeShim.ts:482`; explicit prior-cycle B4 regression filter (`-t "B4 dedup token lifetime"` → 4/4); `grep -E "^(\+|\-)(export\|interface\|type\|function\|class)"` on diff returns empty (zero API drift). |
+| `@codex3` (task-23) | APPROVE | Line-level diff read; planner-cross-reference of Success criterion #5 + Risks row 1 (`plan.md:202-208`, `plan.md:336`); same validation suite (vitest 36/36 + 283/283, tsc clean, diff-check clean). |
+
+@claude2's revert-and-rerun is the strongest independent
+verification of the round-1 F3 split-by-polarity claim and is
+trace-concurred by @claude3's static analysis and by the
+implementer's own pre-fold analysis (the planner's draft-3
+correction predicted exactly this behavior).
+
+### Folded findings (none — APPROVE)
+
+No findings to fold. Every reviewer's predicate-, postcondition-,
+and test-level checks converged on the same conclusion: the
+implementation realizes the planner's v3 drop-trailing contract
+verbatim. The implementer's report and predicate match the planner
+sketch line-for-line; no reviewer requested any code edit.
+
+### Not folded — out-of-scope / planner-acknowledged
+
+- **Risks-row-1 paste-window edge** (cited by @claude2, @claude3,
+  @codex3): the 40 ms coincident-prefix paste drop. Planner-
+  acknowledged trade-off; routed to user via live smoke per
+  `plan.md:336`. Not a fold action; documented in the Notes section
+  above and in the implementer-report's Postcondition adherence.
+- **Risks-row-5 Order-Q race** (cited by @claude2, @claude3):
+  headless-undetectable; live smoke is authoritative per
+  `plan.md:340`. Not a fold action.
+- **Risks-row-2 long-tail false non-suppression** (cited by
+  @claude3): same long-tail as the prior period-arrow cycle;
+  planner-accepted.
+
+### Round-1 closure summary
+
+- 4/4 reviewers verified the N1 sketch shape against
+  `src/lib/xtermImeShim.ts:607-643`.
+- 4/4 reviewers verified P1-P6 postcondition adherence via the
+  new test suite.
+- 4/4 reviewers ran validation and reported
+  `Test Files 14 passed (14)`, `Tests 283 passed (283)`,
+  `tsc --noEmit` exit 0, `git diff --check` clean.
+- 4/4 reviewers reported scope-discipline checks pass (no API
+  drift, no signature changes, no `KOREAN_CODEPOINT_RE` widening,
+  no terminator-union changes, no `package-lock.json` drift).
+- 4/4 reviewers explicitly defer the final acceptance gate to live
+  macOS WKWebView Korean IME smoke per planner Success criterion
+  #5 (sequences `안녕<space>`, `안녕하<space>`, `안녕2`,
+  `안녕하세요.`, and paste-immediately-after-commit).
+
+No round-2 peer-review pass is required for this cycle: round-1
+already achieved unanimous APPROVE across two independent agent
+families (Claude × 2, Codex × 2), one of which performed an
+empirical baseline-FAIL revert. The marginal value of additional
+headless review rounds is zero given headless-test ceiling
+documented in planner Constraints. The next non-trivial signal
+must come from live smoke.
