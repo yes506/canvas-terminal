@@ -30,8 +30,15 @@ presses a non-Korean key mid-composition, the substring is
   `attachKoreanImeShim`'s `triggerDataEvent` wrapper
   (`src/lib/xtermImeShim.ts:607-656`). When the arriving `data`
   starts with `lastCompositionCommit.text`, the gen matches, AND we
-  are NOT currently composing, suppress the prefix and re-emit only
-  the trailing characters via `origTrigger`.
+  are NOT currently composing, **consume `lastCompositionCommit`
+  and `return` without calling `origTrigger`** — i.e., the entire
+  late multi-char emit is suppressed. Under the Order-B assumption
+  (see Constraints), the committed prefix was already direct-written
+  by `onCompositionEnd`'s `invoke("write_to_pty")` AND the trailing
+  character was already delivered by xterm's `_keyDown`
+  `triggerDataEvent` synchronous path; re-emitting trailing here
+  would produce a duplicate trailing character (the v1 contradiction
+  rejected by round-1 peer review — see fold appendix F1).
 - **Token-identity discipline preserved verbatim** from the round-3
   period-arrow fold: claim only when text-prefix AND gen match;
   non-matching multi-char events must leave the live token intact so
@@ -191,6 +198,14 @@ presses a non-Korean key mid-composition, the substring is
    space>`, NOT `안녕<two spaces>`). The trailing-char
    non-duplication check is the load-bearing live-smoke acceptance
    for the "drop trailing" correction in P6.
+
+   **Additionally**, perform a **paste-immediately-after-commit
+   smoke** (cross-referenced from Risks row 1): type `녕` (let it
+   commit), then within 40 ms paste a clipboard string that starts
+   with `녕` (e.g. `녕을 입력하세요`). The paste payload must
+   appear at the terminal. If the paste is dropped, the
+   false-suppression edge documented in Risks row 1 has surfaced;
+   escalate to the planner before merging the implementer fix.
 6. **Implementer Phase 7 plan-conformance self-check**: every
    in-scope item is either implemented, validated by an
    implementer-emitted test, or explicitly deferred with a documented
@@ -322,6 +337,7 @@ silently expand the predicate.
 | False non-suppression: xterm emits `"녕 "` AFTER the 40 ms safety clear has nulled the token | The setTimeout(0) in xterm's CompositionHelper fires within milliseconds; 40 ms is comfortably outside the worst-case latency. If WKWebView ever delays the setTimeout past 40 ms (unlikely; node event loop), the duplicate slips through and the user sees `안녕녕` (no trailing space). This is the **same long-tail risk** the round-2 period-arrow fold accepted; not novel. |
 | New describe-block test name collision | The new `describe` block name is unique (`"attachKoreanImeShim — multi-char prefix strip"`). Vitest does not enforce uniqueness; the implementer verifies the new block is appended at the end of the file, after the existing T1-T4 block. |
 | TypeScript strict-mode drift | `tsc --noEmit` runs in CI per `npm run build`. The strip path uses no new types; it reads from the existing `lastCompositionCommit` shape. No drift expected. |
+| **Token-consumption race (Order P vs Order Q)** — forward-looking concern from @claude2 round-2. If xterm's `CompositionHelper.keydown` path for the trailing key ever fires `_finalizeComposition(false)` SYNCHRONOUSLY (emitting a length-1 `"녕"` via `triggerDataEvent` BEFORE the late `setTimeout(0)`), the existing length-1 dedup branch at `xtermImeShim.ts:610` consumes `lastCompositionCommit` first. The subsequent `"녕 "` arrival then finds `live === null` → prefix-strip cannot claim → falls through → duplicate visible. | task-1's empirical model of macOS WKWebView Korean IME shows only TWO wrapper calls reach the wrapper for the space case (Order P: `" "`, then `"녕 "`). Order Q would surface as three wrapper calls (`"녕"`, `" "`, `"녕 "`) with a different visible-output shape; task-1's repro did not observe this. **Live-smoke sequences in criterion #5 are the authoritative check** — if a duplicate surfaces despite headless tests passing, the Order-Q token-consumption race is the suspect; escalate to planner. Headless test cannot deterministically model the OS event-queue order. |
 
 ## Open questions
 
@@ -396,3 +412,45 @@ Five reviewers (`@codex1`, `@claude2`, `@codex2`, `@claude3`,
   codex2's review missed the F1 contradiction; the convergence
   with the other 4 reviewers + verified trace + the seed task-1
   expected output (`indirectWrites=[" "]`) all point to drop-trailing.
+
+## Round-2 peer-review fold
+
+Five reviewers re-reviewed v2 (commit `9853a2d`): `@codex1`
+(task-14), `@claude2` (task-15), `@codex2` (task-16), `@claude3`
+(task-17), `@codex3` (task-18). Round-2 closure quality from round-1:
+all 4 gating findings from round-1 were closed; 2 NEW gating findings
+surfaced as artifact drift the v2 fold missed.
+
+### Gating (P0 / P1) — both folded into v3
+
+| ID | Severity | Convergence | Verdict | Fold action |
+|---|---|---|---|---|
+| **F11** In-scope bullet `plan.md:29-34` still describes the v1 re-emit-trailing contract, contradicting the v2 N1 sketch (`return;`), P6, and Q2 | P0 | **3/5** (codex1 HIGH, codex2 HIGH, codex3 HIGH; claude2/claude3 verified the rest of the fold but did not re-read the In-scope bullet) | Verified: my v1→v2 fold updated the sketch, P6, Q2, criteria, and risks, but I never updated the top-level in-scope bullet — pure drift. An implementer reading In-scope before the N1 sketch could implement the disproven shape. | **In-scope bullet rewritten** to describe full suppression + the Order-B rationale, with explicit forward-pointer to the round-1 fold's F1 row for the failure trace. |
+| **F12** `plan.mmd:6` still labels N5 as `T-stale-gen` though `plan.md` renamed to `T-replaced-token` | P1 | **4/5** (codex1 MEDIUM, codex2 LOW, claude3 Nit-1 gating, codex3 MEDIUM) | Verified: drift between artifact files. Feature lane requires `plan.md` + `plan.mmd` synchronized at the commit. | **plan.mmd N5 label updated** to "T-replaced-token (over-suppression guard)". Edge structure unchanged. |
+
+### Non-gating (P2 / P3) — selectively folded
+
+| ID | Severity | Convergence | Verdict | Fold action |
+|---|---|---|---|---|
+| **F13** Order-Q / token-consumption race — if `_finalizeComposition(false)` emits a length-1 `"녕"` before the late setTimeout, the existing length-1 dedup consumes the token; subsequent `"녕 "` finds `live===null` → falls through → duplicate visible | P3 | 1/5 (claude2) | task-1's empirical Order-P/B model only shows two wrapper calls; Order Q would surface as three. Headless test cannot deterministically model OS event-queue order. | **Added as a new Risks-table row** with the same routing as the existing false-suppression note (live-smoke is authoritative; escalate if visible duplicates persist). |
+| **F14** Risks-row 1 paste-smoke requirement is not cross-referenced from Success criterion #5; an implementer reading criterion #5 alone misses the paste-window check | P3 | 1/5 (claude3 Nit-3) | Real discoverability gap — the requirement is buried in the risk table. | **Cross-reference added to criterion #5** as an "Additionally" clause naming the paste-smoke sequence (`녕` then within-40 ms paste `녕을 입력하세요`). |
+| **F15** T-digit / T-non-matching / T-replaced-token only describe dispatch in prose; only T-space has the explicit `ts` code block (F8 partially applied) | P3 | 1/5 (claude3 Nit-2) | Prose form is sufficient for a careful implementer per claude3's own assessment; non-gating polish. | **Not folded** in this round — prose suffices; implementer may convert to code blocks if useful during Phase 3. |
+| **F16** T-replaced-token description does not specify `textarea.value` reset between compositions; implementer may waste a Vitest debug cycle | P3 | 1/5 (claude2 Nit-2) | Implementer-level test-authoring detail. | **Not folded** — implementer-discretion item; well-defined in xterm test helper conventions. Optional. |
+| **F17** Local `.planner-state.json` is stale (still says T-stale-gen, 19 tests, v1 criterion-1, v1 Q2) | P3 | 1/5 (codex1 LOW) | Gitignored; not in handoff. No downstream consumer reads it cross-session. Could confuse a same-session resume. | **Updated post-fold** to v3 wording for cleanliness; not commit-affecting (gitignored). |
+
+### Round-2 closure summary
+
+- All 4 round-1 gating findings (F1 drop-trailing, F2 test count, F3
+  criterion split, F4 regression-suite label) confirmed-closed by
+  all 5 round-2 reviewers.
+- Round-2's 2 NEW gating findings (F11 in-scope drift, F12 mmd
+  drift) are pure artifact-sync misses from the round-1 fold — no
+  technical disagreement. Both folded mechanically.
+- Round-2 reviewer verdicts ranged from "APPROVE WITH ONE NIT"
+  (claude3, claude2) to "minor/small revision" (codex1, codex2,
+  codex3). No reviewer disputed the round-1 technical correction.
+- codex2's round-1 outlier position (forward trailing) is now
+  cleanly resolved: codex2's round-2 review explicitly endorses
+  the v2 drop-trailing sketch ("I agree with the v2 technical
+  direction"). The 4-vs-1 round-1 convergence held under round-2
+  scrutiny.
