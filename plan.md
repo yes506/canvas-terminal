@@ -1,6 +1,6 @@
 # Feature plan — korean-ime-textarea-rewrite
 
-Status: plan v3.2 (5/5 reviewer convergence across 4 rounds; v3.2 folds @codex3's BLOCKING Cmd+V paste-suppression finding + @claude2/@claude3 minor non-blocking items). Implementer-facing canonical artifact.
+Status: plan v3.3 (5/5 reviewer convergence across 5 rounds; v3.3 folds @codex1's BLOCKING Ctrl-letter predicate-too-broad + @claude3's BLOCKING `routePaste` double-fire defect + factual citation correction for Cmd+C path). Implementer-facing canonical artifact.
 
 ## Goal
 
@@ -11,11 +11,12 @@ Eliminate the DMG-only Korean syllable duplication bug by replacing xterm.js's h
 - Transparent shadow `<textarea>` mounted as a sibling of `.xterm-screen`, cell-aligned to the cursor cell; owns composition events for Korean (and JP/ZH by extension — same path serves all IME locales).
 - On `compositionend` / Enter / Escape / Tab during composition, the shadow textarea's committed value is sent directly to `write_to_pty`; terminator appended atomically when applicable (matches today's `onComposedFlush` contract).
 - xterm's `.xterm-helper-textarea` becomes the input target only for non-composition input via synthesized events; never receives `compositionstart`, so `CompositionHelper._finalizeComposition → setTimeout(0) → triggerDataEvent` re-emit path is structurally unreachable.
-- Three-branch KeyRouter:
+- KeyRouter classification: native edit shortcut bypass + three branches.
+  - **Native edit shortcuts** (Cmd+V/C/X — macOS only, `metaKey && !ctrlKey && !shift && !alt`): no synthesize, no `preventDefault`. Browser fires `paste`/`copy`/`cut` events on shadow → routed via `routePaste`/`routeCopy`/`routeCut`. Ctrl+V/C/X are NOT in this bypass — they're terminal control chars.
   - **Branch A** (app-shortcut bubble): `shouldBubbleShortcut(e)` predicate returns true → no synthesize, no `preventDefault`, no `clearValue`. Original trusted event bubbles (Cmd+T opens tab, etc.).
   - **Branch B** (printable): `e.key.length === 1 && !ctrlKey && !metaKey && !altKey` (Shift allowed) → `terminal.input(e.key)` (public API; preserves `terminal.onData` so `lineBuffer` + `scrollToBottom` work). `preventDefault` + `clearValue`.
-  - **Branch C** (terminal-owned special key): everything else → `synthesizeKeydown` (`helper.dispatchEvent(new KeyboardEvent('keydown', {...12 props}))`). `preventDefault` (critical for Tab — prevents focus shift) + `clearValue`.
-- Paste routed via `terminal.paste(text)` (public API; bracketed-paste-aware).
+  - **Branch C** (terminal-owned special key): everything else (incl. Ctrl-letters which xterm encodes as C0 controls) → `synthesizeKeydown` (`helper.dispatchEvent(new KeyboardEvent('keydown', {...12 props}))`). `preventDefault` (critical for Tab — prevents focus shift) + `clearValue`.
+- Paste delegated to xterm's existing `this.element` paste listener via bubble (v3.3 fix: `routePaste` only calls `preventDefault` on shadow; xterm's `pasteHandlerWrapper` does the PTY write via `handlePasteEvent`).
 - Live composition rendering via the existing overlay span (cell-aligned glyph painting reused).
 - Focus state mirrored: `HelperTextareaIsolator.mirrorFocusState` synthesizes `FocusEvent('focus'/'blur')` on helper from shadow's actual focus state — drives xterm's `_handleTextAreaFocus`/`Blur` listeners at `Terminal.ts:467-468` (preserves `.focus` CSS class, `_onFocus`/`_onBlur` subscribers, DECSET 1004 `ESC[I/O` emission).
 - Defensive helper `compositionstart` listener: capture-phase + `stopImmediatePropagation` + sync `shadow.focus()`. Preempts xterm's bubble-phase listener at `Terminal.ts:381` if helper ever leaks focus.
@@ -61,7 +62,7 @@ Eliminate the DMG-only Korean syllable duplication bug by replacing xterm.js's h
 
 ## Open questions
 
-None at confirmation time. v3.1 absorbed every architectural and contract-level concern from the 5-reviewer × 3-round convergence. Implementer-Phase-0 questions (e.g., exact `shouldBubbleShortcut` table per call site, happy-dom `FocusEvent` fallback assertion shape, mid-composition arrow behavior on shadow's transparent caret) are properly the implementer's call.
+None at confirmation time. v3.3 absorbed every architectural and contract-level concern from the 5-reviewer × 5-round convergence. Implementer-Phase-0 questions (e.g., exact `shouldBubbleShortcut` table per call site, happy-dom `FocusEvent` fallback assertion shape, mid-composition arrow behavior on shadow's transparent caret, whether to make `routePaste` Option A or Option B — Option A locked in v3.3) are properly the implementer's call.
 
 ## Package layout
 
@@ -103,7 +104,7 @@ interface KoreanImeShimHandle {
 
 ## Decomposition
 
-6 interfaces / 22 nodes. Mermaid DAG at `plan.mmd`.
+6 interfaces / 24 nodes (KeyRouter holds 5 methods after v3.2's `routeCopy`/`routeCut` additions). Mermaid DAG at `plan.mmd`.
 
 | # | Stage | Interface | Method | File |
 |---|---|---|---|---|
@@ -139,14 +140,17 @@ Cohesion check: each interface passes ≥2 of (state, lifecycle, collaboration b
 ## KeyRouter classification rule (final, locked v3.2)
 
 ```typescript
+// v3.3 fix (@codex1 BLOCKING): macOS-only `metaKey && !ctrlKey`. Ctrl+V/C/X
+// are TERMINAL CONTROL CHARS (SYN/ETX/CAN) and must reach PTY via Branch C
+// → xterm `_keyDown` → `evaluateKeyboardEvent` encoding. Only Cmd-prefixed
+// (no Ctrl, no Shift, no Alt) are macOS clipboard shortcuts.
 function isNativePasteShortcut(e: KeyboardEvent): boolean {
-  return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey
+  return e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey
       && (e.key === 'v' || e.key === 'V');
 }
 
 function isNativeCopyOrCutShortcut(e: KeyboardEvent): boolean {
-  if (!(e.metaKey || e.ctrlKey)) return false;
-  if (e.shiftKey || e.altKey) return false;
+  if (!e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return false;
   return e.key === 'c' || e.key === 'C' || e.key === 'x' || e.key === 'X';
 }
 
@@ -176,24 +180,63 @@ function routeKey(e: KeyboardEvent) {
 }
 ```
 
-### Clipboard event handlers (KeyRouter additions)
+### Clipboard event handlers (KeyRouter additions) — v3.3 revised
 
-```typescript
-// shadow 'copy' event — Cmd+C arrives via Native-edit-shortcut bypass above
-function routeCopy(e: ClipboardEvent) {
-  const sel = terminal.getSelection();   // xterm public API
-  if (sel) {
-    e.clipboardData?.setData('text/plain', sel);
-    e.preventDefault();   // we wrote the data; suppress native copy of shadow.value (empty)
-  }
-  // else: let native copy fire (no-op — shadow has no selection)
-}
+**Critical bubble-phase topology** (v3.3 finding from @claude3):
 
-// shadow 'cut' event — same as copy; terminal can't semantically cut
-function routeCut(e: ClipboardEvent) { routeCopy(e); }
+Shadow textarea is mounted as a sibling of `.xterm-screen` → both inside `.xterm-viewport` → inside `terminal.element`. Clipboard events on shadow **bubble to xterm's existing `this.element` listeners** at `Terminal.ts:334-344`:
+
+```ts
+// Terminal.ts:334-341 (copy listener bound on this.element — fires for bubble from shadow):
+addDisposableDomListener(this.element!, 'copy', (event) => {
+  if (!this.hasSelection()) return;
+  copyHandler(event, this._selectionService!);  // Clipboard.ts:32-37: setData + preventDefault
+});
+
+// Terminal.ts:342-344 (paste listener on BOTH textarea AND this.element):
+const pasteHandlerWrapper = (event) => handlePasteEvent(event, this.textarea!, ...);
+addDisposableDomListener(this.textarea!, 'paste', pasteHandlerWrapper);
+addDisposableDomListener(this.element!, 'paste', pasteHandlerWrapper);
+//                                                  ^^^^^^^^^^^^^^ shadow's paste bubbles HERE
 ```
 
-**Why this matters**: today xterm syncs the terminal selection into `helper.value` at `Terminal.ts:530-534` and Cmd+C on helper copies that. With shadow always focused, browser's Cmd+C would copy `shadow.value` (empty) — regression vs today. The `routeCopy` handler supplies `terminal.getSelection()` to the clipboard directly, preserving the user-visible behavior.
+```typescript
+// v3.3 fix (@claude3 BLOCKING): routePaste must NOT call terminal.paste itself.
+// Shadow's paste event bubbles to `this.element` where xterm's pasteHandlerWrapper
+// runs `handlePasteEvent` → `paste()` → `triggerDataEvent` → PTY write.
+// If routePaste also calls `terminal.paste(text)`, the PTY receives TWO writes
+// (bracketed-paste appears as `\x1b[200~TEXT\x1b[201~\x1b[200~TEXT\x1b[201~`).
+// Option A locked: routePaste only suppresses native shadow.value mutation;
+// xterm's element-level handler does the actual PTY write via bubble.
+function routePaste(e: ClipboardEvent) {
+  e.preventDefault();         // suppress native paste-into-shadow.value
+  // do NOT call terminal.paste(text) — xterm's this.element listener handles it via bubble
+  shadow.clearValue();        // defensive: clear any pre-event residue
+}
+
+// v3.3 (@claude3 + @claude2): routeCopy/routeCut are DEFENSE-IN-DEPTH, not load-bearing.
+// xterm's existing `this.element` 'copy' listener (Terminal.ts:334-341) catches the
+// shadow's bubbling copy event and calls `copyHandler` which writes selectionText
+// + preventDefault. So Cmd+C ALREADY works without routeCopy. We keep routeCopy as
+// a redundant write — same data, same target — so the contract survives if xterm
+// rebinds 'copy' to the helper textarea in a future version.
+// IMPORTANT: do NOT call stopPropagation — letting bubble proceed to xterm's
+// handler is exactly the defense-in-depth: if our handler somehow fails, xterm's
+// still fires.
+function routeCopy(e: ClipboardEvent) {
+  const sel = terminal.getSelection();
+  if (sel) {
+    e.clipboardData?.setData('text/plain', sel);
+    e.preventDefault();   // suppress native copy of (empty) shadow.value
+  }
+  // else: let native copy fire on shadow.value (empty — no-op). Bubble continues
+  // regardless; xterm's this.element handler will see no selection and skip.
+}
+
+function routeCut(e: ClipboardEvent) { routeCopy(e); }  // terminal can't semantically cut
+```
+
+**Corrected rationale**: today xterm's Cmd+C path lives at `Terminal.ts:334-341` (`addDisposableDomListener(this.element!, 'copy', ...)` → `copyHandler`), NOT at `Terminal.ts:530-534` (which is the Linux middle-click selection-to-helper.value path — irrelevant on macOS). The bubble-phase topology means xterm's element-level handler already catches the shadow's copy event, so `routeCopy`/`routeCut` are redundant — but the redundancy is harmless (same `selectionText` written twice; second write idempotently overwrites) and serves as defense-in-depth against future xterm internal rebinding.
 
 ### `synthesizeKeydown` fidelity rule
 
@@ -244,7 +287,8 @@ Phase 7 smoke-check (skeletons-skipped):
 - **R-NEW-4** — Paste during `_keyDownSeen=true`: `terminal.paste()` goes via `coreService.triggerDataEvent` directly (bypasses `_inputEvent`), no intersection. Test guards it.
 - **R-NEW-5** — Cmd+V keydown could suppress browser's paste action if `preventDefault` is called. v3.2 fix: explicit `isNativePasteShortcut` bypass in `routeKey` ensures the original Cmd+V keydown is NOT `preventDefault`-ed; the browser fires the `paste` event normally, which `routePaste` handles. Test guards it.
 - **R-NEW-6** — Single rule for non-keydown text input: `beforeinput` event handler routes `inputType === 'insertReplacementText'` (autocomplete/dictation) via `terminal.paste(data)` and `inputType === 'insertText'` when no keydown was handled in the current tick (emoji palette / IME-less typed text) via `terminal.input(data)`. Implementer tracks the "keydown handled this tick" flag with a microtask-cleared bool. Documented in `routePaste` / `routePrintable` docstrings.
-- **R-NEW-7** — Copy/cut with shadow always focused: browser's Cmd+C copies `shadow.value` (empty), regressing vs today's xterm `Terminal.ts:530-534` selection-to-helper.value sync. v3.2 fix: `routeCopy` listener supplies `terminal.getSelection()` to clipboard directly. `routeCut` mirrors. Test: mouse-select on `.xterm-screen` → Cmd+C → clipboard contains the selection.
+- **R-NEW-7** — Copy/cut with shadow always focused: v3.2's framing was based on a wrong citation. The actual macOS Cmd+C path lives at `Terminal.ts:334-341` bound on `this.element` (the terminal container), NOT at `Terminal.ts:530-534` (which is the Linux middle-click path). Shadow's `copy` events bubble through `.xterm-viewport` to `this.element`, where xterm's `copyHandler` catches them and writes `selectionService.selectionText` to the clipboard. Cmd+C therefore already works correctly **without** `routeCopy`. v3.3 retains `routeCopy`/`routeCut` as defense-in-depth (redundant write, same data — survives potential future xterm rebinds) and explicitly does NOT call `stopPropagation` so xterm's listener fires as fallback. Test: mouse-select on `.xterm-screen` → Cmd+C → clipboard contains the selection; assertion against the actual clipboard (not stubbed) verifies the path end-to-end.
+- **R-NEW-8** — Shadow-as-descendant-of-`this.element` bubble pattern: any DOM event fired on shadow that xterm also binds on `this.element` will double-fire unless mitigated. Currently affected: `paste` (BLOCKING — v3.3 fixes via Option A: `routePaste` only `preventDefault`; xterm does PTY write), `copy`, `cut` (redundant but harmless — defense-in-depth keeps both). Potentially affected if shadow ever gains `pointer-events: auto`: `mousedown` (Linux/Firefox right-click), `contextmenu` (Terminal.ts:355), `auxclick` (Linux middle-click). v3.3 mitigation discipline: any new shadow event listener that intersects with an xterm `this.element` binding must explicitly pick "shadow authoritative (`stopPropagation`)" vs "xterm authoritative (no PTY-write side effect in shadow handler)" vs "defense-in-depth (both fire, idempotent operations only)". Test plan: add bubble-double-fire integration tests for paste and copy/cut against the real xterm instance, not stubbed `terminal.paste` / `terminal.getSelection`.
 
 ## Test plan
 
@@ -271,11 +315,15 @@ NEW clusters:
 - `synthesizeKeydown` CSI encoding: ArrowLeft → `\x1b[D`, DECCKM-flipped → `\x1bOD`, Ctrl+C → `\x03`, Backspace → `\x7f`, Shift+Enter → `\x1b[13;2u` via call-site custom handler
 - Branch A: Cmd+T `shouldBubbleShortcut` returns true; original bubbles; PTY receives nothing; document focus state unchanged
 - **Branch C `preventDefault` acceptance** (v3.1 fix): Tab on shadow does NOT move browser focus (`document.activeElement` stays on shadow); Enter on shadow → shadow.value empty post-route; Ctrl+A on shadow → no select-all visual artifact
-- **Cmd+V**: `isNativePasteShortcut` returns true → routeKey returns early (no synth, no preventDefault) → browser fires `paste` event → `routePaste` → `terminal.paste(text)` called once; no `v` written to PTY (v3.2 BLOCKING fix)
-- Paste during `_keyDownSeen=true` → exactly one PTY write (bracketed `\x1b[200~...\x1b[201~` or plain per mode)
-- **Cmd+C with terminal mouse-selection**: mouse-select on `.xterm-screen` → Cmd+C on shadow → `routeCopy` writes `terminal.getSelection()` to clipboard via `e.clipboardData.setData('text/plain', sel)`; clipboard content matches the selected text (v3.2 BLOCKING fix for copy regression)
-- **Cmd+C with no selection**: `routeCopy` early-exits; native copy fires on shadow.value (empty) — no-op, no error
-- **Cmd+X**: `routeCut` mirrors `routeCopy`; clipboard contains selection; terminal buffer unchanged (terminal can't semantically cut)
+- **Cmd+V**: `isNativePasteShortcut` returns true → routeKey returns early (no synth, no preventDefault) → browser fires `paste` event → `routePaste` calls only `preventDefault` + `clearValue` → event bubbles to `this.element` → xterm's `pasteHandlerWrapper` → `handlePasteEvent` → `paste()` → `triggerDataEvent` → **exactly one PTY write** (v3.3 BLOCKING fix vs double-fire)
+- **Ctrl+V** (v3.3 added test): `isNativePasteShortcut` returns FALSE (predicate is `metaKey && !ctrlKey`) → falls through to Branch C → `synthesizeKeydown` → xterm encodes `\x16` (SYN) → PTY receives `\x16`; NOT routed via paste path
+- **Ctrl+C** (v3.3 added test): same path as Ctrl+V; PTY receives `\x03` (ETX, terminal interrupt); NOT routed via copy path
+- **Ctrl+X** (v3.3 added test): same path; PTY receives `\x18` (CAN); NOT routed via cut path
+- **Paste during `_keyDownSeen=true`** → exactly one PTY write (xterm's `pasteHandlerWrapper` calls `paste()` which uses `coreService.triggerDataEvent` directly, bypassing `_inputEvent` _keyDownSeen gate)
+- **Cmd+C with terminal mouse-selection** (v3.3 production-mode test): mouse-select on `.xterm-screen` → Cmd+C on shadow → both `routeCopy` AND xterm's element-level handler fire (defense-in-depth); clipboard content matches the selected text exactly once (idempotent setData with same string). Assertion uses real clipboard or spy on `e.clipboardData.setData` — NOT a stub of `terminal.getSelection`
+- **Cmd+C with no selection**: `routeCopy` early-exits; bubble continues to xterm's listener which also sees `!this.hasSelection()` and returns; native copy fires on shadow.value (empty) — no-op
+- **Cmd+X**: `routeCut` mirrors `routeCopy`; clipboard contains selection; terminal buffer unchanged
+- **Bubble double-fire integration test** (v3.3 NEW per @claude3 R-NEW-8): paste of `한글` against the real xterm instance (not stubbed `terminal.paste`) → exactly ONE PTY write observed via `terminal.onData` listener; under bracketed-paste mode result is `\x1b[200~한글\x1b[201~` (NOT doubled)
 - Focus mirror: `shadow.focus()` → `terminal.element.classList.contains('focus')` === true
 - DECSET 1004: `terminal.write('\x1b[?1004h')` then `shadow.focus()` → onData fires `\x1b[I`
 - Defensive helper `compositionstart`: dispatched on helper → capture-phase listener fires `stopImmediatePropagation` + shadow re-focused; xterm's `_compositionHelper.compositionstart` NOT called
@@ -287,7 +335,7 @@ NEW clusters:
 
 ## LOC budget summary
 
-| File | Before | v3.1 target | Delta |
+| File | Before | v3.3 target | Delta |
 |---|---|---|---|
 | `xtermImeShim.ts` | 916 | ~370 | −546 |
 | `xtermShadowTextarea.ts` | 0 | ~280 | +280 |
@@ -304,7 +352,14 @@ Net shim+test reduction: ~815 LOC. Plan meets the "net deletion" success criteri
 - **Round 2 (v2)**: shifted to "shadow = focus owner; helper = keymap owner via synthesized keydowns". 4/5 confirmable; @claude3 surfaced blocker unique to v2's mechanism (synthesized keydown alone doesn't reach PTY for printable ASCII — `_keyDown` bails at `!result.key`).
 - **Round 3 (v3)**: added `routePrintable` via `terminal.input()` public API + `mirrorFocusState` for focus mirror + locked defensive `compositionstart` to capture-phase. @claude2 + @codex2 surfaced blocker (no `preventDefault` for synthesize breaks Tab → focus loss). @claude3 surfaced process issue (artifact is summary, not full plan).
 - **Round 4 (v3.1)**: three-branch classifier with explicit `preventDefault` discipline; `shouldBubbleShortcut` predicate added to `AttachKoreanImeShimOptions`; full plan persisted to `plan.md` per CLAUDE.md `(plan-feature, human-confirmed)` contract. 4/5 reviewers APPROVE.
-- **Round 5 (v3.2, locked)**: @codex3 surfaced BLOCKING Cmd+V paste-suppression defect (Branch C `preventDefault` on Cmd+V keydown can suppress browser's paste event in some environments). Added `isNativePasteShortcut`/`isNativeCopyOrCutShortcut` bypass before Branch C. Added `routeCopy`/`routeCut` to KeyRouter (5 methods total) to preserve Cmd+C of terminal-selection (today's helper-value sync at `Terminal.ts:530-534`). Resolved emoji/`beforeinput` rule ambiguity. Added R-NEW-4/R-NEW-7. R-NEW-3 mitigation specified (version pin + anchor probe). 5/5 reviewers expected to APPROVE.
+- **Round 5 (v3.2)**: @codex3 surfaced BLOCKING Cmd+V paste-suppression defect. Added native edit shortcut bypass and `routeCopy`/`routeCut` to KeyRouter (5 methods total). Cited `Terminal.ts:530-534` for the Cmd+C rationale — this citation was WRONG (that's the Linux middle-click path). Reviewer convergence: 2 APPROVE, 2 narrow-revise (predicate too broad, factual error), 1 revise (double-paste defect). Did NOT lock.
+- **Round 6 (v3.3, locked)**: @codex1 BLOCKING + @claude3 BLOCKING both folded.
+  - **@codex1 BLOCKING**: `isNativePasteShortcut(e)` previously included `ctrlKey`, but Ctrl+V/C/X are terminal control characters (SYN/ETX/CAN), not browser clipboard shortcuts on macOS. v3.3 restricts predicates to `metaKey && !ctrlKey`. Ctrl+letters route via Branch C → xterm encodes correctly.
+  - **@claude3 BLOCKING**: `routePaste` previously called `terminal.paste(text)` AND the event bubbled to `this.element` where xterm's `pasteHandlerWrapper` ALSO called `paste(...)` → double PTY write under bracketed-paste mode. v3.3 fix (Option A): `routePaste` only calls `preventDefault` + `clearValue`; xterm's element-level handler does the actual PTY write via bubble. Single write guaranteed.
+  - **Factual correction**: Cmd+C path lives at `Terminal.ts:334-341` bound on `this.element`, not `Terminal.ts:530-534` (Linux middle-click). `routeCopy`/`routeCut` retained as defense-in-depth (redundant but harmless; mirrors xterm's element-level handler).
+  - **R-NEW-8 added**: shadow-bubbles-to-`this.element` topology — any new shadow listener intersecting xterm's element binding must pick an explicit ownership policy.
+  - **Test plan additions**: Ctrl+V/C/X (terminal control reachability), bubble-double-fire production-mode integration test (real xterm, not stubbed).
+  - Expected: 5/5 APPROVE — design has not shifted shape since v3, only narrow defects in adjacent surfaces.
 
 ## References to existing code
 

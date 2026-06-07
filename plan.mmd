@@ -47,11 +47,11 @@ flowchart LR
     CR --> OV
 
     KR -. "Branch A: bubble (no synth no preventDefault)" .-> APP_LAYER
-    KR -. "Native edit (Cmd+V/C/X) bypass — no preventDefault" .-> APP_LAYER
+    KR -. "Cmd+V/C/X bypass: no synth, no preventDefault on keydown" .-> APP_LAYER
     KR -- "Branch B: printable" --> INPUT_API
-    KR -- "Branch C: dispatchEvent(keydown)" --> HT
-    KR -- "routePaste" --> PASTE_API
-    KR -- "routeCopy / routeCut: setData" --> CLIPBOARD
+    KR -- "Branch C: dispatchEvent(keydown) including Ctrl+letters" --> HT
+    KR -. "routePaste: preventDefault only — paste event bubbles to xterm" .-> HT
+    KR -- "routeCopy / routeCut: setData (defense-in-depth)" --> CLIPBOARD
 
     HT --> KD
     KD --> TD
