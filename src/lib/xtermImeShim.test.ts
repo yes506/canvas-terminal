@@ -1218,7 +1218,12 @@ describe("attachKoreanImeShim — multi-char prefix strip", () => {
     //    textarea.value.substring(start) = "녕 ". New prefix-strip drops it.
     cs.triggerDataEvent("녕 ", true);
 
-    // 4. Drain the 250 ms safety-clear timer cleanly.
+    // 4. Settle any synchronous follow-up. The 250 ms safety-clear is
+    //    intentionally NOT drained — vi.useRealTimers() at end-of-test
+    //    discards the pending timer, and these assertions do not depend
+    //    on the clear firing. (Was meaningful when the window was 40 ms
+    //    and 60 ms safely passed it; widened to 250 ms in
+    //    korean-ime-dmg-race, the advance is now a harmless settle step.)
     vi.advanceTimersByTime(60);
 
     // Direct PTY writes: only "녕" from onCompositionEnd's invoke().
