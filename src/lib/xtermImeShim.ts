@@ -1,10 +1,18 @@
 import { Terminal } from "@xterm/xterm";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  createShadowTextarea,
+  type ShadowTextarea,
+} from "./xtermShadowTextarea";
+
+// ===========================================================================
+// Public surface
+// ===========================================================================
 
 /**
- * Options passed to {@link attachKoreanImeShim}.
- *
- * value-object (not a method-bearing interface).
+ * Options passed to {@link attachKoreanImeShim}. Additive-only since the
+ * pre-rewrite contract — `shouldBubbleShortcut` is the only v3 addition;
+ * existing callers continue to work unmodified.
  */
 export interface AttachKoreanImeShimOptions {
   /**
@@ -15,349 +23,188 @@ export interface AttachKoreanImeShimOptions {
   sessionId: string;
 
   /**
-   * `true` when the parent Terminal has loaded `@xterm/addon-webgl`.
-   * Reserved for renderer-specific overlay/cursor adjustments. The
-   * current implementation MAY ignore this flag; preserved on the
-   * contract so future renderer-asymmetric tweaks (cursor bar color,
-   * overlay z-index against WebGL canvas, etc.) do not require a
+   * Reserved for renderer-specific overlay tweaks. The current
+   * implementation accepts but does not currently branch on this flag —
+   * preserved on the contract so future asymmetric tweaks do not require a
    * signature change.
    */
   webgl?: boolean;
 
   /**
    * Font size to use for the IME overlay when `terminal.options.fontSize`
-   * is `undefined`. PTY pane historically uses 12 (terminalManager.ts);
-   * mini terminals use 10 (AgentMiniTerminal.tsx). Defaults to 12 when
-   * omitted.
+   * is `undefined`. PTY pane uses 12 (terminalManager.ts); mini terminals
+   * use 10 (AgentMiniTerminal.tsx). Defaults to 12 when omitted.
    */
   defaultFontSize?: number;
 
   /**
-   * Optional notification callback fired AFTER the shim has written a
-   * flushed composition to the PTY via `write_to_pty`. **Notification
-   * only — the callback MUST NOT itself invoke `write_to_pty` for the
-   * same payload**, otherwise the PTY receives the bytes twice.
+   * Synchronous notification fired AFTER the shim has written a flushed
+   * composition to the PTY via `write_to_pty`. **Notification only — the
+   * callback MUST NOT itself invoke `write_to_pty` for the same payload**,
+   * otherwise the PTY receives the bytes twice.
    *
-   * **Fires for all three helper-originated PTY write paths**:
-   *   1. `compositionend` commit (e.g. user crosses a syllable boundary
-   *      and the IME finalizes the previous syllable)
-   *   2. `blur` flush (focus leaves the textarea mid-composition)
+   * Fires on the three helper-originated PTY write paths:
+   *   1. `compositionend` commit
+   *   2. `blur` flush (focus leaves the shadow textarea mid-composition)
    *   3. Terminating-key flush (Enter / Escape / Tab during composition;
-   *      the terminator is appended to the PTY write and reported here)
+   *      the terminator is reported separately).
    *
-   * **Subscriber responsibilities**:
-   *   - PTY pane (`terminalManager.ts`): maintain `lineBuffer` for the
-   *     in-app `collaborator` keyword detection so Korean-composed
-   *     `collaborator\r` still triggers the spawn (otherwise the
-   *     terminator-flush bypasses the `terminal.onData` lineBuffer
-   *     update at terminalManager.ts:680-697).
+   * Subscriber responsibilities:
+   *   - PTY pane (`terminalManager.ts`): reset `lineBuffer` on `'\r'`
+   *     terminator so a Korean → IME-off → `collaborator\r` sequence
+   *     still triggers the in-app spawn intercept.
    *   - Mini terminal (`AgentMiniTerminal.tsx`): call
-   *     `terminal.scrollToBottom()` so Korean-composed input still
-   *     snaps the viewport to the live prompt — matching the
-   *     "user-input intent" behavior the existing `terminal.onData`
-   *     scroll at AgentMiniTerminal.tsx:709 provides for ASCII
-   *     typing (which bypasses the helper).
-   *
-   * **Synchronous-only contract**: the shim invokes the callback
-   * synchronously inside its IME handlers and catches synchronous
-   * throws. The return type is `void`, not `Promise<void>` — if a
-   * subscriber needs to do async work, it MUST schedule it via its
-   * own `void Promise.resolve().then(...)` / `queueMicrotask(...)`
-   * wrapper. An unhandled rejection from an async callback would
-   * escape the shim's sync `try/catch` (and the documented exception
-   * swallow contract) on its way to the global handler.
-   *
-   * @param committedText The fragment that was just sent to the PTY,
-   *   EXCLUDING any terminator. Never contains `\r`, `\x1b`, or `\t` —
-   *   those go in the `terminator` argument.
-   * @param terminator `\r` (Enter), `\x1b` (Escape), `\t` (Tab), or
-   *   `null` (compositionend / blur path — no terminator was appended
-   *   to the PTY write).
+   *     `terminal.scrollToBottom()` so Korean composition snaps the
+   *     viewport same as ASCII keystrokes.
    */
   onComposedFlush?: (
     committedText: string,
     terminator: "\r" | "\x1b" | "\t" | null,
   ) => void;
+
+  /**
+   * Predicate that returns `true` for keyboard events the call site wants
+   * to bubble natively past xterm (Cmd+T / Cmd+W / Cmd+F / etc.). When
+   * `true`, the shim performs NO `preventDefault`, NO synthesize-to-helper,
+   * and the original trusted event bubbles up the DOM tree to the
+   * application shortcut layer.
+   *
+   * Default (callback omitted): nothing bubbles — every non-composition
+   * key goes through Branch B (`terminal.input`) or Branch C
+   * (`synthesizeKeydown`).
+   *
+   * Note: Native edit shortcuts (Cmd+V/C/X on macOS, `metaKey && !ctrlKey
+   * && !shiftKey && !altKey`) are bypassed UNCONDITIONALLY before this
+   * predicate runs — the browser fires the `paste`/`copy`/`cut` event
+   * on shadow which `routePaste`/`routeCopy`/`routeCut` handle. The
+   * predicate doesn't need to enumerate those.
+   */
+  shouldBubbleShortcut?: (e: KeyboardEvent) => boolean;
 }
 
 /**
  * Handle returned by {@link attachKoreanImeShim} for lifecycle control.
- *
- * value-object (not a method-bearing interface, but carries two
- * lifecycle methods because both must close over shim-private state).
  */
 export interface KoreanImeShimHandle {
   /**
-   * The DOM element appended under `.xterm-screen` (or the container
-   * fallback when `.xterm-screen` is not yet available) that paints the
-   * in-progress composition overlay.
+   * The composing-glyph overlay element. `null` once disposed OR when
+   * attach happened before `.xterm-screen` was reachable AND the
+   * container itself was not in the DOM tree.
    *
-   * **Intentionally exposed (not a backward-compat band-aid)**: the
-   * overlay's `font-size` MUST track the host terminal's font-size for
-   * the overlay glyphs to remain cell-aligned. The two existing
-   * surfaces drive this via:
-   *   - `terminalManager.ts:122-123` — `s.imeOverlayEl.style.fontSize`
-   *     updates inside `ensureGlobalSubscriptions` font-size store
-   *     listener
-   *   - `AgentMiniTerminal.tsx:914-915` — `imeOverlayRef.current.style
-   *     .fontSize` updates inside the font-size subscription effect
-   * Post-substitution those mutations route through
-   * `handle.overlayEl?.style.fontSize` (the `readonly` qualifier
-   * applies to the reference, not the element's mutable DOM state).
-   *
-   * `null` if the shim has already been disposed OR if attach happened
-   * before `.xterm-screen` was in the DOM tree AND the container
-   * itself was not attached (see Failure-modes).
+   * Exposed so the call sites can update `style.fontSize` reactively
+   * when the user changes terminal font size.
    */
   readonly overlayEl: HTMLElement | null;
 
   /**
-   * Re-binds the focus / preventScroll patch to the current
-   * `.xterm-helper-textarea` AND retries the overlay attach if the
-   * shim is in degraded-overlay mode (the `.xterm-screen` element was
-   * not yet in the DOM tree at attach time — see Failure-modes).
-   *
-   * Idempotent on the helper textarea (no-op when called repeatedly
-   * with the same underlying element) and on the overlay attach
-   * (no-op once overlay is attached). Call this after a terminal
-   * layout change (e.g. reattachment to a new container) that may
-   * have replaced the textarea node or made the screen element
-   * newly reachable.
+   * Re-anchor the shadow textarea + overlay against the current
+   * `.xterm-screen` element and refresh font-size styling. Idempotent;
+   * safe to call after layout changes or DOM reparenting.
    */
   rebind(): void;
 
   /**
-   * Tears down everything the shim attached. **Sole-owner cleanup
-   * contract**: after substitution (decomposition Nodes 6 & 7), callers
-   * MUST invoke `dispose()` EXACTLY ONCE in their existing teardown path
-   * and MUST NOT perform parallel manual cleanup for any of the
-   * fields below — the old `imeHandlers/rebindIme/docKeyDown/docInput/
-   * imeOverlayEl` (PTY pane) and `imeOverlayRef/docInputRef/
-   * docKeyDownRef/imeHandlersRef` (mini pane) fields/refs are replaced
-   * by the handle, not duplicated alongside it.
-   *
-   * Restoration steps performed by `dispose()`:
-   *  - removes document-level `keydown` (capture) and `input` (capture)
-   *    listeners installed at attach time
-   *  - restores the ORIGINAL `terminal._core.coreService.
-   *    triggerDataEvent` reference captured at attach time (the prior
-   *    inline shims at `terminalManager.ts:762-798` and
-   *    `AgentMiniTerminal.tsx:845-884` did NOT restore this; the
-   *    helper closes the leak)
-   *  - restores the ORIGINAL `isCursorHidden` PROPERTY DESCRIPTOR on
-   *    `terminal._core.coreService` (not just sets `_realHidden=false`
-   *    — re-defines the property via `Object.defineProperty` with the
-   *    descriptor captured at attach time, so subsequent owners see a
-   *    pristine property)
-   *  - removes the overlay element from the DOM
-   *  - restores `cursorBlink` and any other `terminal.options`
-   *    mutations to their pre-attach values
-   *  - removes the `compositionend` and `blur` listeners on the helper
-   *    textarea
-   *  - removes the `focus` listener and unpatches `helperTextarea.
-   *    focus` to its native bound method
-   *
-   * Safe to call multiple times; second and subsequent calls are
-   * no-ops (idempotent). Idempotency is on the same handle instance —
-   * two handles from two attaches to the same terminal is undefined
-   * (Preconditions forbid double-attach).
+   * Tear down everything the shim attached. Removes the shadow
+   * textarea, the overlay span, the helper-focus patch, the focus
+   * mirror, the defensive helper-`compositionstart` listener, and the
+   * runtime CSS rule. Idempotent.
    */
   dispose(): void;
+
+  /**
+   * `true` when the shadow textarea owns DOM focus. Call sites use this
+   * for the visual focus border AND for the
+   * "is the user actively typing" check that gates the live
+   * scroll-to-bottom behavior.
+   */
+  isFocused(): boolean;
 }
 
+// ===========================================================================
+// Constants + helpers (kept module-local)
+// ===========================================================================
+
+const STYLE_BLOCK_ID = "ime-cursor-blink-style";
+const HIDDEN_CURSOR_CSS_CLASS = "ime-cursor-hidden";
+const DEFAULT_CELL_WIDTH = 8;
+const DEFAULT_CELL_HEIGHT = 16;
+
 const KOREAN_CODEPOINT_RE = /[ᄀ-ᇿㄱ-ㆎ가-힣]/;
+// Exported for the test surface — the JP/ZH fixture asserts the predicate
+// shape stays in step with the shim's classification.
+export { KOREAN_CODEPOINT_RE };
 
 function isFullWidth(ch: string): boolean {
   const cp = ch.codePointAt(0) ?? 0;
   return (
-    (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
-    (cp >= 0x2e80 && cp <= 0x303e) || // CJK Radicals, Kangxi, CJK Symbols
-    (cp >= 0x3040 && cp <= 0x33bf) || // Hiragana, Katakana, CJK Compat
-    (cp >= 0x3400 && cp <= 0x4dbf) || // CJK Unified Ext A
-    (cp >= 0x4e00 && cp <= 0xa4cf) || // CJK Unified, Yi
-    (cp >= 0xa960 && cp <= 0xa97c) || // Hangul Jamo Extended-A
-    (cp >= 0xac00 && cp <= 0xd7af) || // Hangul Syllables
-    (cp >= 0xd7b0 && cp <= 0xd7ff) || // Hangul Jamo Extended-B
-    (cp >= 0xf900 && cp <= 0xfaff) || // CJK Compat Ideographs
-    (cp >= 0xfe30 && cp <= 0xfe6f) || // CJK Compat Forms
-    (cp >= 0xff01 && cp <= 0xff60) || // Fullwidth Forms
-    (cp >= 0xffe0 && cp <= 0xffe6) || // Fullwidth Signs
-    (cp >= 0x20000 && cp <= 0x2fa1f) //  CJK Ext B-F, Compat Supplement
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3040 && cp <= 0x33bf) ||
+    (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0xa4cf) ||
+    (cp >= 0xa960 && cp <= 0xa97c) ||
+    (cp >= 0xac00 && cp <= 0xd7af) ||
+    (cp >= 0xd7b0 && cp <= 0xd7ff) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff01 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x20000 && cp <= 0x2fa1f)
   );
 }
 
-/**
- * Responsibility: Install Canvas Terminal's Korean IME composition shim on the
- *   given xterm.js Terminal so that in-progress and committed Hangul render
- *   exactly once in WKWebView (Tauri on macOS), without the duplicate-prefix
- *   visual artefact triggered at composition-commit boundaries.
- *
- * Pipeline-position: Terminal construction (caller creates `terminal`,
- *   attaches addons, calls `terminal.open(container)`) -> THIS -> call site's
- *   own `terminal.onData` PTY forwarder. The shim sits between xterm.js's
- *   internal `triggerDataEvent` and the PTY by patching that method on
- *   `terminal._core.coreService`, intercepting Korean codepoints during
- *   composition.
- *
- * Inputs:
- *   - terminal: Terminal — an already-opened xterm.js Terminal whose
- *     `.textarea` is queryable (i.e. `terminal.open(container)` has been
- *     called). MUST have `allowProposedApi: true` if the caller depends on
- *     `_core` access, which this shim does. Caller must not double-attach
- *     the shim; behaviour with two concurrent attachments on the same
- *     Terminal is undefined.
- *   - container: HTMLElement — the DOM element passed to `terminal.open()`
- *     (or its parent that contains `.xterm-screen`). The shim queries
- *     `container.querySelector(".xterm-screen")` to position the overlay
- *     against the cell grid; falls back to `container` itself when the
- *     screen element is not yet rendered.
- *   - options: AttachKoreanImeShimOptions — see field-level docs above.
- *     `sessionId` is required; `webgl`, `defaultFontSize`,
- *     `onComposedFlush` are optional and have documented defaults /
- *     no-op semantics.
- *
- * Outputs: KoreanImeShimHandle — see type-level docs above. The handle's
- *   `dispose()` MUST be invoked during the caller's own teardown to avoid
- *   leaking document-level listeners across Terminal lifecycles.
- *
- * Side-effects:
- *   - mutates `terminal._core.coreService.triggerDataEvent` (replaces with a
- *     wrapper that defers single-codepoint Hangul characters by 20 ms to
- *     compensate for WKWebView's input-before-keydown event order)
- *   - mutates `terminal._core.coreService.isCursorHidden` (replaces the
- *     property with a getter/setter pair so shell-emitted DECTCEM cannot
- *     un-hide the cursor mid-composition)
- *   - appends a `<span>` overlay element under `.xterm-screen` (or the
- *     fallback container) and a `<style id="ime-cursor-blink-style">`
- *     element to `document.head` (only on first attach across the
- *     process; subsequent attachments reuse the existing style block)
- *   - adds document-level capture-phase `keydown` and `input` listeners
- *     (the only reliable way to observe WKWebView IME events) plus a
- *     `compositionend` and `blur` listener on `terminal.textarea`
- *   - invokes Tauri command `write_to_pty` when flushing committed
- *     compositions or terminator-suffixed flushes
- *
- * Preconditions:
- *   - `terminal.open(container)` has already been called (so
- *     `terminal.textarea` is non-null at first composition; for the
- *     edge case where the helper textarea is created lazily, the shim
- *     queries again at attach time and the caller MAY follow up with
- *     `handle.rebind()` once the textarea exists).
- *   - `terminal._core` is accessible (i.e. the caller has not enabled a
- *     stricter xterm.js wrapper that intercepts the private surface).
- *   - The shim is invoked at most once per Terminal instance.
- *
- * Postconditions:
- *   - Korean IME composition renders the current composing text exactly
- *     once at the cursor cell, without duplicating any already-committed
- *     prefix, on both WebGL and DOM renderers.
- *   - Every helper-originated PTY write (compositionend commit, blur
- *     flush, terminating-key flush) is followed by exactly one
- *     `onComposedFlush(committedText, terminator)` call when the
- *     callback is provided. `committedText` matches the payload
- *     written EXCLUDING any terminator; `terminator` reports the
- *     trailing key separately (or `null` when there was none). The
- *     callback fires AFTER the `write_to_pty` invoke is dispatched —
- *     not after it resolves, since the helper does not await the
- *     fire-and-forget promise.
- *   - All shim state is fully reachable from the returned handle's
- *     closure; calling `handle.dispose()` MUST leave the host application
- *     in a state equivalent to never having attached the shim (modulo
- *     the global `<style id="ime-cursor-blink-style">` block which is
- *     intentionally process-lifetime).
- *
- * Failure-modes:
- *   - Throws `TypeError` if `terminal._core?.coreService` is not
- *     accessible at attach time (xterm.js internal API drift). Caller
- *     should treat this as a hard upgrade-required signal; the shim
- *     refuses to attach silently because a partial attach would leave
- *     the visual bug present without any indication of why.
- *   - Degraded-overlay mode (NOT a true no-op) if
- *     `container.querySelector(".xterm-screen")` returns null AND
- *     `container` itself is not in the DOM tree: the overlay is not
- *     painted, but the `triggerDataEvent` patch, `isCursorHidden`
- *     descriptor swap, document-level capture listeners, and helper
- *     textarea bindings are STILL installed. `handle.rebind()` will
- *     retry the overlay attach once the screen/container becomes
- *     reachable, in addition to re-binding the helper textarea —
- *     callers can use this to recover overlay rendering after a
- *     deferred `terminal.open(...)` or layout change.
- *   - The `write_to_pty` invocation is fire-and-forget; rejected
- *     promises are swallowed (matching existing call sites). The shim
- *     does NOT surface PTY write failures because there is no useful
- *     recovery at this layer.
- *
- * Collaborators:
- *   - `@tauri-apps/api/core::invoke("write_to_pty", { sessionId, data })` —
- *     the only outbound IPC the shim performs.
- *   - `terminal._core._renderService.dimensions` (read-only) — for cell
- *     size used in overlay positioning.
- *   - `terminal.options.theme` (read-only) — for overlay fg/bg/cursor
- *     colors matching the host xterm theme.
- *   - `terminal.buffer.active.cursorX/Y` (read-only) — for overlay
- *     anchor coordinates.
- */
-export function attachKoreanImeShim(
+interface RenderDimensions {
+  css: { cell: { width: number; height: number } };
+}
+
+interface XtermCoreShape {
+  _renderService?: { dimensions?: RenderDimensions };
+}
+
+function readCellDimensions(terminal: Terminal): { w: number; h: number } {
+  const dims = (
+    terminal as unknown as { _core?: XtermCoreShape }
+  )._core?._renderService?.dimensions;
+  if (!dims) return { w: DEFAULT_CELL_WIDTH, h: DEFAULT_CELL_HEIGHT };
+  return { w: dims.css.cell.width, h: dims.css.cell.height };
+}
+
+function ensureStyleBlock(): void {
+  if (document.getElementById(STYLE_BLOCK_ID)) return;
+  const styleEl = document.createElement("style");
+  styleEl.id = STYLE_BLOCK_ID;
+  styleEl.textContent =
+    `@keyframes ime-cursor-blink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }\n` +
+    // Hide xterm's DOM-renderer cursor layer while a composition is
+    // active. WebGL renderer paints into canvas so this rule is a no-op
+    // there — the overlay span's solid background covers the cell.
+    `.${HIDDEN_CURSOR_CSS_CLASS} .xterm-cursor-layer { visibility: hidden; }\n`;
+  document.head.appendChild(styleEl);
+}
+
+// ===========================================================================
+// CursorOverlay — paints in-progress composition glyphs at the cursor cell
+// ===========================================================================
+
+interface CursorOverlay {
+  readonly overlayEl: HTMLElement;
+  readonly attached: boolean;
+  tryAttach(): void;
+  show(text: string): void;
+  clear(): void;
+  reposition(): void;
+  updateStyle(): void;
+  dispose(): void;
+}
+
+function createCursorOverlay(
   terminal: Terminal,
   container: HTMLElement,
-  options: AttachKoreanImeShimOptions,
-): KoreanImeShimHandle {
-  const { sessionId, defaultFontSize = 12, onComposedFlush } = options;
-  // `options.webgl` is intentionally accepted but currently unused — preserved on
-  // the contract per the skeleton's TSDoc for future renderer-asymmetric tweaks.
-  void options.webgl;
-
-  const core = (terminal as unknown as { _core?: { coreService?: CoreService } })
-    ._core;
-  const coreService = core?.coreService;
-  if (!coreService) {
-    throw new TypeError(
-      "attachKoreanImeShim: terminal._core.coreService is not accessible " +
-        "(xterm.js internal API drift)",
-    );
-  }
-
-  let disposed = false;
-  let isComposing = false;
-  let imeStartPos = 0;
-  let imeFlushGen = 0;
-  let imeFragment = "";
-  // B4 (korean-ime-dup-period-arrow): tracks the most recent committed IME
-  // text + post-increment imeFlushGen so the triggerDataEvent wrapper's
-  // 20ms defer can suppress xterm's CompositionHelper post-commit re-emit
-  // (case d defer fire-after-compositionend race). `committedAt` is added
-  // for korean-ime-dmg-race diagnostics — lets the strip-hit/strip-miss
-  // instrumentation report total commit→arrival gapMs (vs only ageMs since
-  // safety-clear), which is the quantity that adjudicates which WebKit
-  // sub-mechanism (clamping vs tolerance-batched vs microtask defer) is
-  // firing in the DMG race.
-  let lastCompositionCommit:
-    | { text: string; gen: number; committedAt: number }
-    | null = null;
-  // korean-ime-dmg-race: when imeDebug is set, the safety-clear callback
-  // snapshots the cleared commit here so the prefix-strip fall-through
-  // path can detect "this WOULD have suppressed if the token were still
-  // live" — the strip-miss case the 40→250 ms ceiling extension is meant
-  // to eliminate. The snapshot lives ~500 ms so the late re-emit can
-  // arrive after the safety-clear and still be counted.
-  let lastClearedCommit:
-    | { text: string; gen: number; committedAt: number; clearedAt: number }
-    | null = null;
-  // Cached at attach time per round-2 perf concern — avoids a
-  // localStorage round-trip on every triggerDataEvent. Setting the flag
-  // mid-session does NOT enable counters until the shim re-attaches
-  // (recreate terminal session, reload WebView, or restart the app).
-  const imeDebug = (() => {
-    try {
-      return localStorage.getItem("canvasTerminal_imeDebug") === "1";
-    } catch {
-      return false;
-    }
-  })();
-  let stripHitCounter = 0;
-  let stripMissCounter = 0;
-
+  defaultFontSize: number,
+): CursorOverlay {
   const overlayEl = document.createElement("span");
+  const fakeCursorEl = document.createElement("span");
+
   overlayEl.style.cssText =
     `position:absolute;color:inherit;` +
     `font-family:${terminal.options.fontFamily ?? "monospace"};` +
@@ -365,126 +212,590 @@ export function attachKoreanImeShim(
     `font-weight:${terminal.options.fontWeight ?? "normal"};` +
     `-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;` +
     `pointer-events:none;` +
-    `z-index:10;white-space:pre;display:none;padding:0;margin:0;`;
-  const fakeCursorEl = document.createElement("span");
+    `z-index:11;white-space:pre;display:none;padding:0;margin:0;`;
   fakeCursorEl.style.cssText =
     `display:inline-block;width:2px;vertical-align:top;` +
     `animation:ime-cursor-blink 1s step-end infinite;`;
   overlayEl.appendChild(fakeCursorEl);
-  if (!document.getElementById("ime-cursor-blink-style")) {
-    const styleEl = document.createElement("style");
-    styleEl.id = "ime-cursor-blink-style";
-    styleEl.textContent =
-      `@keyframes ime-cursor-blink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }`;
-    document.head.appendChild(styleEl);
-  }
 
-  let overlayAttached = false;
-  const tryAttachOverlay = () => {
-    if (overlayAttached || disposed) return;
-    const screenElNow = container.querySelector(
-      ".xterm-screen",
-    ) as HTMLElement | null;
-    if (screenElNow) {
-      screenElNow.style.position = "relative";
-      screenElNow.appendChild(overlayEl);
-      overlayAttached = true;
-    } else if (container.isConnected) {
-      container.style.position = "relative";
+  let attached = false;
+  let mountedParent: HTMLElement | null = null;
+  let lastText = "";
+
+  function tryAttach(): void {
+    const screenEl = container.querySelector<HTMLElement>(".xterm-screen");
+    // Round-1 fold (convergent LOW-MED from @claude2 / @claude3 /
+    // @codex1): re-anchor from container fallback to .xterm-screen when
+    // it becomes available. Mirrors ShadowTextarea.tryMount.
+    if (mountedParent && screenEl && mountedParent !== screenEl) {
+      if (!screenEl.style.position || screenEl.style.position === "static") {
+        screenEl.style.position = "relative";
+      }
+      screenEl.appendChild(overlayEl);
+      mountedParent = screenEl;
+      attached = true;
+      return;
+    }
+    if (attached) return;
+    if (screenEl) {
+      if (!screenEl.style.position || screenEl.style.position === "static") {
+        screenEl.style.position = "relative";
+      }
+      screenEl.appendChild(overlayEl);
+      mountedParent = screenEl;
+      attached = true;
+      return;
+    }
+    if (container.isConnected) {
+      if (!container.style.position || container.style.position === "static") {
+        container.style.position = "relative";
+      }
       container.appendChild(overlayEl);
-      overlayAttached = true;
+      mountedParent = container;
+      attached = true;
     }
-  };
-  tryAttachOverlay();
+  }
+  tryAttach();
 
-  const origIsCursorHiddenDesc = Object.getOwnPropertyDescriptor(
-    coreService,
-    "isCursorHidden",
-  );
-  let _realHidden: boolean = Boolean(coreService.isCursorHidden);
-  let cursorHidden = false;
-  let cursorHiddenLock = false;
-  Object.defineProperty(coreService, "isCursorHidden", {
-    get() {
-      return cursorHiddenLock ? true : _realHidden;
-    },
-    set(v: boolean) {
-      if (!cursorHiddenLock) _realHidden = v;
-    },
-    configurable: true,
-  });
-
-  const origCursorBlink = terminal.options.cursorBlink;
-
-  const hideCursor = () => {
-    if (!cursorHidden) {
-      cursorHiddenLock = true;
-      terminal.options.cursorBlink = false;
-      cursorHidden = true;
-    }
-  };
-  const restoreCursorBlink = () => {
-    if (cursorHidden) {
-      cursorHiddenLock = false;
-      terminal.options.cursorBlink = origCursorBlink ?? true;
-      cursorHidden = false;
-    }
-  };
-
-  const showOverlay = (text: string) => {
-    imeFragment = text;
+  function paint(text: string): void {
     while (overlayEl.firstChild && overlayEl.firstChild !== fakeCursorEl) {
       overlayEl.removeChild(overlayEl.firstChild);
     }
     if (!fakeCursorEl.parentNode) overlayEl.appendChild(fakeCursorEl);
-    const dims = (
-      terminal as unknown as {
-        _core?: { _renderService?: { dimensions?: RenderDimensions } };
-      }
-    )._core?._renderService?.dimensions;
-    if (dims) {
-      const cx = terminal.buffer.active.cursorX;
-      const cy = terminal.buffer.active.cursorY;
-      const cellW = dims.css.cell.width;
-      const cellH = dims.css.cell.height;
-      const cursorColor = terminal.options.theme?.cursor ?? "#ffffff";
-      overlayEl.style.fontSize = `${terminal.options.fontSize ?? defaultFontSize}px`;
-      overlayEl.style.lineHeight = `${cellH}px`;
-      overlayEl.style.height = `${cellH}px`;
-      overlayEl.style.left = `${cx * cellW}px`;
-      overlayEl.style.top = `${cy * cellH}px`;
-      const bg = terminal.options.theme?.background ?? "#1a1a1a";
-      const fg = terminal.options.theme?.foreground ?? "#e0e0e0";
-      overlayEl.style.color = fg;
-      for (const ch of text) {
-        const charSpan = document.createElement("span");
-        charSpan.textContent = ch;
-        const w = isFullWidth(ch) ? cellW * 2 : cellW;
-        charSpan.style.cssText =
-          `display:inline-block;width:${w}px;height:${cellH}px;` +
-          `text-align:center;background:${bg};`;
-        overlayEl.insertBefore(charSpan, fakeCursorEl);
-      }
-      fakeCursorEl.style.height = `${cellH}px`;
-      fakeCursorEl.style.backgroundColor = cursorColor;
+    const { w: cellW, h: cellH } = readCellDimensions(terminal);
+    const bg = terminal.options.theme?.background ?? "#1a1a1a";
+    const fg = terminal.options.theme?.foreground ?? "#e0e0e0";
+    const cursorColor = terminal.options.theme?.cursor ?? "#ffffff";
+    overlayEl.style.color = fg;
+    overlayEl.style.lineHeight = `${cellH}px`;
+    overlayEl.style.height = `${cellH}px`;
+    for (const ch of text) {
+      const charSpan = document.createElement("span");
+      charSpan.textContent = ch;
+      const w = isFullWidth(ch) ? cellW * 2 : cellW;
+      charSpan.style.cssText =
+        `display:inline-block;width:${w}px;height:${cellH}px;` +
+        `text-align:center;background:${bg};`;
+      overlayEl.insertBefore(charSpan, fakeCursorEl);
     }
-    overlayEl.style.display = text ? "" : "none";
-    if (text) hideCursor();
-  };
+    fakeCursorEl.style.height = `${cellH}px`;
+    fakeCursorEl.style.backgroundColor = cursorColor;
+  }
 
-  const clearOverlay = () => {
+  function repositionInternal(): void {
+    const { w: cellW, h: cellH } = readCellDimensions(terminal);
+    const cx = terminal.buffer.active.cursorX;
+    const cy = terminal.buffer.active.cursorY;
+    overlayEl.style.left = `${cx * cellW}px`;
+    overlayEl.style.top = `${cy * cellH}px`;
+  }
+
+  function show(text: string): void {
+    lastText = text;
+    paint(text);
+    repositionInternal();
+    overlayEl.style.display = text ? "" : "none";
+    if (text) {
+      container.classList.add(HIDDEN_CURSOR_CSS_CLASS);
+    }
+  }
+
+  function clear(): void {
+    lastText = "";
     while (overlayEl.firstChild && overlayEl.firstChild !== fakeCursorEl) {
       overlayEl.removeChild(overlayEl.firstChild);
     }
     overlayEl.style.display = "none";
-    imeFragment = "";
-    restoreCursorBlink();
+    container.classList.remove(HIDDEN_CURSOR_CSS_CLASS);
+  }
+
+  function reposition(): void {
+    repositionInternal();
+  }
+
+  function updateStyle(): void {
+    overlayEl.style.fontSize = `${terminal.options.fontSize ?? defaultFontSize}px`;
+    overlayEl.style.fontFamily = terminal.options.fontFamily ?? "monospace";
+    overlayEl.style.fontWeight = String(
+      terminal.options.fontWeight ?? "normal",
+    );
+    if (lastText) paint(lastText);
+  }
+
+  function dispose(): void {
+    if (overlayEl.parentNode) {
+      overlayEl.parentNode.removeChild(overlayEl);
+    }
+    attached = false;
+    mountedParent = null;
+    container.classList.remove(HIDDEN_CURSOR_CSS_CLASS);
+  }
+
+  return {
+    overlayEl,
+    get attached() {
+      return attached;
+    },
+    tryAttach,
+    show,
+    clear,
+    reposition,
+    updateStyle,
+    dispose,
   };
+}
+
+// ===========================================================================
+// HelperTextareaIsolator — patches helper.focus(), mirrors focus state
+// ===========================================================================
+
+interface HelperTextareaIsolator {
+  helper: HTMLTextAreaElement | null;
+  rebind(): void;
+  dispose(): void;
+}
+
+function createHelperTextareaIsolator(
+  terminal: Terminal,
+  container: HTMLElement,
+  shadow: ShadowTextarea,
+): HelperTextareaIsolator {
+  let helper: HTMLTextAreaElement | null = null;
+  let nativeFocus: HTMLTextAreaElement["focus"] | null = null;
+  let onShadowFocus: (() => void) | null = null;
+  let onShadowBlur: (() => void) | null = null;
+  let onHelperCompositionStart: ((e: CompositionEvent) => void) | null = null;
+
+  function findHelper(): HTMLTextAreaElement | null {
+    return (
+      terminal.textarea ??
+      container.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")
+    );
+  }
+
+  function dispatchFocusOnHelper(type: "focus" | "blur"): void {
+    if (!helper) return;
+    try {
+      helper.dispatchEvent(new FocusEvent(type, { bubbles: false }));
+    } catch {
+      // happy-dom may reject some FocusEvent shapes; fall back to Event.
+      helper.dispatchEvent(new Event(type));
+    }
+  }
+
+  function installFocusRedirect(): void {
+    if (!helper) return;
+    // Capture the native focus method ONCE per helper element — repeated
+    // rebinds against the same element are no-ops. The patched function
+    // forwards into the original (bound) focus with preventScroll forced
+    // on so xterm's auto-focus on container clicks doesn't scroll the
+    // page.
+    if (!nativeFocus) {
+      nativeFocus = helper.focus.bind(helper);
+    }
+    helper.focus = ((opts?: FocusOptions): void => {
+      // Redirect helper.focus() to shadow.focus() so anything that
+      // synchronously focuses the helper (xterm's `_keyDown` early-out,
+      // container click handlers) lands focus on the shadow instead.
+      shadow.focus();
+      void opts;
+    }) as HTMLTextAreaElement["focus"];
+  }
+
+  function installFocusMirror(): void {
+    const ta = shadow.textareaEl;
+    if (!ta) return;
+    onShadowFocus = () => dispatchFocusOnHelper("focus");
+    onShadowBlur = () => dispatchFocusOnHelper("blur");
+    ta.addEventListener("focus", onShadowFocus);
+    ta.addEventListener("blur", onShadowBlur);
+  }
+
+  function installDefensiveCompositionStart(): void {
+    if (!helper) return;
+    // Capture-phase listener on helper. If helper ever receives a
+    // `compositionstart` (e.g. xterm internally calls helper.focus
+    // outside our patch path), intercept it before xterm's own
+    // listener runs and bounce focus back to shadow so the IME's
+    // composition target stays where we expect.
+    onHelperCompositionStart = (e: CompositionEvent) => {
+      e.stopImmediatePropagation();
+      shadow.focus();
+    };
+    helper.addEventListener(
+      "compositionstart",
+      onHelperCompositionStart as EventListener,
+      true,
+    );
+  }
+
+  function rebind(): void {
+    const next = findHelper();
+    if (helper === next) {
+      // Helper element unchanged — re-install focus redirect (idempotent)
+      // and ensure the focus mirror is wired on the current shadow
+      // element. Defensive compositionstart re-installs only if no
+      // existing listener.
+      installFocusRedirect();
+      return;
+    }
+    // Helper changed (e.g. xterm reattached). Tear down the prior
+    // bindings, then install fresh ones against the new element.
+    if (helper) {
+      if (nativeFocus) {
+        helper.focus = nativeFocus;
+      }
+      if (onHelperCompositionStart) {
+        helper.removeEventListener(
+          "compositionstart",
+          onHelperCompositionStart as EventListener,
+          true,
+        );
+      }
+    }
+    helper = next;
+    nativeFocus = null;
+    if (helper) {
+      installFocusRedirect();
+      installDefensiveCompositionStart();
+    }
+  }
+
+  // Initial wire-up.
+  helper = findHelper();
+  if (helper) {
+    installFocusRedirect();
+    installDefensiveCompositionStart();
+  }
+  installFocusMirror();
+
+  function dispose(): void {
+    const ta = shadow.textareaEl;
+    if (ta) {
+      if (onShadowFocus) ta.removeEventListener("focus", onShadowFocus);
+      if (onShadowBlur) ta.removeEventListener("blur", onShadowBlur);
+    }
+    onShadowFocus = null;
+    onShadowBlur = null;
+    if (helper) {
+      if (nativeFocus) helper.focus = nativeFocus;
+      if (onHelperCompositionStart) {
+        helper.removeEventListener(
+          "compositionstart",
+          onHelperCompositionStart as EventListener,
+          true,
+        );
+      }
+    }
+    helper = null;
+    nativeFocus = null;
+    onHelperCompositionStart = null;
+  }
+
+  return {
+    get helper() {
+      return helper;
+    },
+    rebind,
+    dispose,
+  };
+}
+
+// ===========================================================================
+// CompositionRouter — owns composition state machine on the shadow textarea
+// ===========================================================================
+
+interface CompositionRouter {
+  readonly isComposing: boolean;
+  onCompositionStart(e: CompositionEvent): void;
+  onCompositionUpdate(e: CompositionEvent): void;
+  onCompositionEnd(e: CompositionEvent): void;
+  onTerminatingKey(e: KeyboardEvent, terminator: "\r" | "\x1b" | "\t"): void;
+  onBlurDuringComposition(): void;
+}
+
+function createCompositionRouter(args: {
+  sessionId: string;
+  overlay: CursorOverlay;
+  shadow: ShadowTextarea;
+  emitFlush: (text: string, terminator: "\r" | "\x1b" | "\t" | null) => void;
+}): CompositionRouter {
+  const { sessionId, overlay, shadow, emitFlush } = args;
+  let composing = false;
+  let fragment = "";
+
+  function flushToPty(data: string): void {
+    if (!data) return;
+    invoke("write_to_pty", { sessionId, data }).catch(() => {});
+  }
+
+  function onCompositionStart(_e: CompositionEvent): void {
+    composing = true;
+    fragment = "";
+    overlay.reposition();
+    overlay.show("");
+  }
+
+  function onCompositionUpdate(e: CompositionEvent): void {
+    // event.data is the canonical "what's in the composition right now"
+    // signal — preferred over reading `textareaEl.value` because the
+    // textarea may carry a stale value between IME engines.
+    const data = e.data ?? "";
+    fragment = data;
+    overlay.show(data);
+  }
+
+  function onCompositionEnd(e: CompositionEvent): void {
+    const written = (e.data ?? fragment) || "";
+    if (composing && written) {
+      flushToPty(written);
+      emitFlush(written, null);
+    }
+    overlay.clear();
+    composing = false;
+    fragment = "";
+    shadow.clearValue();
+  }
+
+  function onTerminatingKey(
+    _e: KeyboardEvent,
+    terminator: "\r" | "\x1b" | "\t",
+  ): void {
+    const composed = fragment;
+    overlay.clear();
+    composing = false;
+    fragment = "";
+    const data = composed + terminator;
+    flushToPty(data);
+    emitFlush(composed, terminator);
+    shadow.clearValue();
+  }
+
+  function onBlurDuringComposition(): void {
+    if (!composing) return;
+    const composed = fragment;
+    overlay.clear();
+    composing = false;
+    fragment = "";
+    if (composed) {
+      flushToPty(composed);
+      emitFlush(composed, null);
+    }
+    shadow.clearValue();
+  }
+
+  return {
+    get isComposing() {
+      return composing;
+    },
+    onCompositionStart,
+    onCompositionUpdate,
+    onCompositionEnd,
+    onTerminatingKey,
+    onBlurDuringComposition,
+  };
+}
+
+// ===========================================================================
+// KeyRouter — keydown / clipboard / beforeinput routing on shadow
+// ===========================================================================
+
+const SYNTH_PROPS = [
+  "key",
+  "code",
+  "keyCode",
+  "which",
+  "shiftKey",
+  "ctrlKey",
+  "altKey",
+  "metaKey",
+  "location",
+  "repeat",
+] as const;
+
+function buildSyntheticKeydown(src: KeyboardEvent): KeyboardEvent {
+  const init: KeyboardEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+  };
+  for (const prop of SYNTH_PROPS) {
+    // `which` is deprecated but xterm still reads it in some code paths;
+    // mirror verbatim from the source.
+    (init as Record<string, unknown>)[prop] = (
+      src as unknown as Record<string, unknown>
+    )[prop];
+  }
+  return new KeyboardEvent("keydown", init);
+}
+
+interface KeyRouter {
+  routePrintable(key: string): void;
+  synthesizeKeydown(src: KeyboardEvent): void;
+  routePaste(e: ClipboardEvent): void;
+  routeBeforeInputReplace(e: InputEvent): void;
+  routeCopy(e: ClipboardEvent): void;
+  routeCut(e: ClipboardEvent): void;
+}
+
+function createKeyRouter(args: {
+  terminal: Terminal;
+  shadow: ShadowTextarea;
+  isolator: HelperTextareaIsolator;
+}): KeyRouter {
+  const { terminal, shadow, isolator } = args;
+
+  function routePrintable(key: string): void {
+    terminal.input(key, true);
+    shadow.clearValue();
+  }
+
+  function synthesizeKeydown(src: KeyboardEvent): void {
+    const helper = isolator.helper;
+    if (!helper) {
+      // Helper not bound yet (e.g. terminal.open() happened with no
+      // textarea). Fall through to terminal.input for printable-ish
+      // keys; otherwise drop. This is a degraded path; the orchestrator's
+      // rebind() should restore the helper on the next layout tick.
+      if (src.key.length === 1) {
+        terminal.input(src.key, true);
+      }
+      shadow.clearValue();
+      return;
+    }
+    const synthetic = buildSyntheticKeydown(src);
+    helper.dispatchEvent(synthetic);
+    shadow.clearValue();
+  }
+
+  function routePaste(e: ClipboardEvent): void {
+    // v3.3 contract: do NOT call terminal.paste(text). The event bubbles
+    // through `.xterm-viewport` to xterm's `this.element` paste listener
+    // which performs the actual PTY write via `handlePasteEvent` →
+    // `paste()` → `triggerDataEvent`. Calling `terminal.paste` here
+    // would double-fire under bracketed-paste mode.
+    e.preventDefault();
+    shadow.clearValue();
+  }
+
+  function routeBeforeInputReplace(e: InputEvent): void {
+    // No xterm bubble path exists for `beforeinput` (xterm does not
+    // bind a `beforeinput` listener on `this.element`). Shadow owns
+    // the PTY write here via `terminal.paste(data)`.
+    const data = e.data ?? "";
+    e.preventDefault();
+    if (data) terminal.paste(data);
+    shadow.clearValue();
+  }
+
+  function routeCopy(e: ClipboardEvent): void {
+    // Defense-in-depth: xterm's `this.element` 'copy' listener already
+    // catches the shadow's bubbling copy event and writes the selection
+    // via `copyHandler`. We MAY also write here so the contract survives
+    // a future xterm refactor that rebinds 'copy' to the helper. Do NOT
+    // call `stopPropagation` — the bubble path to xterm must continue.
+    const sel = terminal.getSelection();
+    if (sel) {
+      try {
+        e.clipboardData?.setData("text/plain", sel);
+      } catch {
+        // happy-dom may not support setData; the bubble path still
+        // delivers via xterm's listener under real browsers.
+      }
+      e.preventDefault();
+    }
+    // else: no selection — let the native copy fire on the empty
+    // shadow.value (no-op). Bubble continues regardless.
+  }
+
+  function routeCut(e: ClipboardEvent): void {
+    // Terminal cannot semantically cut — same behavior as copy.
+    routeCopy(e);
+  }
+
+  return {
+    routePrintable,
+    synthesizeKeydown,
+    routePaste,
+    routeBeforeInputReplace,
+    routeCopy,
+    routeCut,
+  };
+}
+
+// ===========================================================================
+// ImeShimOrchestrator — wires subsystems, returns the public handle
+// ===========================================================================
+
+function isNativePasteShortcut(e: KeyboardEvent): boolean {
+  return (
+    e.metaKey &&
+    !e.ctrlKey &&
+    !e.shiftKey &&
+    !e.altKey &&
+    (e.key === "v" || e.key === "V")
+  );
+}
+
+function isNativeCopyOrCutShortcut(e: KeyboardEvent): boolean {
+  if (!e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return false;
+  return e.key === "c" || e.key === "C" || e.key === "x" || e.key === "X";
+}
+
+/**
+ * Install Canvas Terminal's Korean IME composition shim on the given
+ * xterm.js Terminal. Replaces the helper-textarea-owned input path with
+ * a transparent shadow textarea that owns composition + keydown +
+ * clipboard + beforeinput events. The structural fix makes the WKWebView
+ * CFRunLoop coalescing race that drove `korean-ime-dup-*` unreachable
+ * rather than window-tuned around.
+ *
+ * Architecture (5 logical modules wired by this function):
+ *   - `ShadowTextarea` — transparent textarea sibling of `.xterm-screen`,
+ *     focus owner, composition target.
+ *   - `CursorOverlay` — paints composition glyphs at the cursor cell.
+ *   - `HelperTextareaIsolator` — patches `helper.focus` to redirect to
+ *     shadow; mirrors shadow's focus state onto helper so xterm's
+ *     focus listeners + `.focus` CSS + DECSET 1004 keep working.
+ *   - `CompositionRouter` — `composition*` event state machine on shadow.
+ *   - `KeyRouter` — `keydown` / `paste` / `copy` / `cut` / `beforeinput`
+ *     routing on shadow with the three-branch classifier (bubble,
+ *     printable, special) + native edit shortcut bypass.
+ *
+ * Preconditions: `terminal.open(container)` has already been called;
+ *   `terminal._core` is accessible; the shim is invoked at most once per
+ *   Terminal instance.
+ */
+export function attachKoreanImeShim(
+  terminal: Terminal,
+  container: HTMLElement,
+  options: AttachKoreanImeShimOptions,
+): KoreanImeShimHandle {
+  const {
+    sessionId,
+    defaultFontSize = 12,
+    onComposedFlush,
+    shouldBubbleShortcut,
+  } = options;
+  void options.webgl; // Reserved for future renderer-asymmetric tweaks.
+
+  ensureStyleBlock();
+
+  // --- Subsystems ----------------------------------------------------------
+  const overlay = createCursorOverlay(terminal, container, defaultFontSize);
+  const shadow = createShadowTextarea(terminal, container, defaultFontSize);
+  const isolator = createHelperTextareaIsolator(terminal, container, shadow);
+
+  // Cursor blink saved so dispose can restore. The overlay's blinking
+  // caret paints during composition; xterm's native cursor is hidden
+  // via the runtime CSS class — but we also flip cursorBlink off so
+  // WebGL's static-cursor mode doesn't fight the overlay caret.
+  const origCursorBlink = terminal.options.cursorBlink;
 
   const emitFlush = (
     committedText: string,
     terminator: "\r" | "\x1b" | "\t" | null,
-  ) => {
+  ): void => {
     if (!onComposedFlush) return;
     try {
       onComposedFlush(committedText, terminator);
@@ -494,422 +805,209 @@ export function attachKoreanImeShim(
     }
   };
 
-  const onCompositionEnd = (e: CompositionEvent) => {
-    let written: string | null = null;
-    if (e.data && isComposing && imeFragment) {
-      invoke("write_to_pty", { sessionId, data: e.data }).catch(() => {});
-      written = e.data;
-    }
-    // Variant (b) per plan node 4: reset composition flag and overlay at the
-    // syllable boundary so the next keydown(229) re-enters the
-    // `if (!isComposing)` branch that updates imeStartPos. Without this,
-    // imeStartPos stays anchored at the previous composition's start and
-    // showOverlay(textarea.value.substring(imeStartPos)) re-paints the
-    // already-committed prefix on top of the shell-echoed buffer.
-    clearOverlay();
-    isComposing = false;
-    imeFlushGen++;
-    if (written !== null) {
-      // B4: record AFTER imeFlushGen++ so the stored gen matches the value
-      // captured by the deferred triggerDataEvent path (which also reads
-      // imeFlushGen at defer-schedule time — post-increment under case d).
-      const commit = {
-        text: written,
-        gen: imeFlushGen,
-        committedAt: performance.now(),
-      };
-      lastCompositionCommit = commit;
-      // korean-ime-dmg-race fold: time-bound dedup at 250 ms (was 40 ms in
-      // korean-ime-dup-space round-1). Production WKWebView CFRunLoop can
-      // coalesce xterm's CompositionHelper setTimeout(0) past the old 40 ms
-      // window when the main thread is idle (no HMR WS keeping the loop
-      // hot), causing the multi-char prefix-strip to miss the late re-emit.
-      // 250 ms covers observed adaptive throttling while the trailing-slack
-      // cap at the strip predicate bounds the wider false-suppression
-      // exposure. Token-identity check (`lastCompositionCommit === commit`)
-      // ensures a stale 250 ms timer cannot null a newer commit's token.
-      setTimeout(() => {
-        if (!disposed && lastCompositionCommit === commit) {
-          if (imeDebug) {
-            lastClearedCommit = {
-              text: commit.text,
-              gen: commit.gen,
-              committedAt: commit.committedAt,
-              clearedAt: performance.now(),
-            };
-          }
-          lastCompositionCommit = null;
-        }
-      }, 250);
-      emitFlush(written, null);
-    }
-  };
+  const composition = createCompositionRouter({
+    sessionId,
+    overlay,
+    shadow,
+    emitFlush,
+  });
+  const keyRouter = createKeyRouter({ terminal, shadow, isolator });
 
-  const onTextareaBlur = () => {
-    if (isComposing) {
-      const composed = imeFragment;
-      clearOverlay();
-      if (composed) {
-        invoke("write_to_pty", { sessionId, data: composed }).catch(() => {});
-      }
-      isComposing = false;
-      imeFlushGen++;
-      if (composed) {
-        // B4: blur-commit is a valid IME commit path; record so xterm's
-        // CompositionHelper post-commit triggerDataEvent (if any) is
-        // deduped consistently with onCompositionEnd.
-        const commit = {
-          text: composed,
-          gen: imeFlushGen,
-          committedAt: performance.now(),
-        };
-        lastCompositionCommit = commit;
-        // korean-ime-dmg-race fold: 250 ms safety-clear mirrors the
-        // onCompositionEnd path. Same CFRunLoop coalescing concern; same
-        // token-identity safety. Snapshot on clear is debug-flag-gated
-        // for instrumentation.
-        setTimeout(() => {
-          if (!disposed && lastCompositionCommit === commit) {
-            if (imeDebug) {
-              lastClearedCommit = {
-                text: commit.text,
-                gen: commit.gen,
-                committedAt: commit.committedAt,
-                clearedAt: performance.now(),
-              };
-            }
-            lastCompositionCommit = null;
-          }
-        }, 250);
-        emitFlush(composed, null);
-      }
-    }
-  };
-
-  let helperTextarea: HTMLTextAreaElement | null = null;
-
-  const docInput = (e: Event) => {
-    if (e.target !== helperTextarea || !isComposing) return;
-    const ie = e as InputEvent;
-    if (
-      ie.inputType === "insertReplacementText" ||
-      ie.inputType === "insertText"
-    ) {
-      const ta = helperTextarea;
-      if (ta) showOverlay(ta.value.substring(imeStartPos));
-    }
-  };
-  document.addEventListener("input", docInput, true);
-
-  const docKeyDown = (e: KeyboardEvent) => {
-    if (e.target !== helperTextarea) return;
-    const isEnter = e.key === "Enter" || e.code === "Enter";
-    const isTerminating =
-      isEnter ||
-      e.key === "Escape" ||
-      e.code === "Escape" ||
-      e.key === "Tab" ||
-      e.code === "Tab";
-    if (e.keyCode === 229 && !isTerminating) {
-      if (!isComposing) {
-        // Variant (b): -1 because WKWebView fires `input` BEFORE `keydown`, so
-        // textarea.value at keydown(229) time already contains the just-typed
-        // jamo. Subtracting 1 anchors imeStartPos at the composition start.
-        imeStartPos = Math.max(0, (helperTextarea?.value.length ?? 1) - 1);
-      }
-      isComposing = true;
-      const ta = helperTextarea;
-      if (ta) showOverlay(ta.value.substring(imeStartPos));
-    } else if (!e.isComposing || isTerminating) {
-      const isModifier =
-        e.key === "Shift" ||
-        e.key === "Control" ||
-        e.key === "Alt" ||
-        e.key === "Meta";
-      if (isComposing && !isModifier) {
-        const composed = imeFragment;
-        clearOverlay();
-        const keySuffix: "\r" | "\x1b" | "\t" | "" = isTerminating
-          ? isEnter
-            ? "\r"
-            : e.key === "Escape" || e.code === "Escape"
-              ? "\x1b"
-              : "\t"
-          : "";
-        const data = composed + keySuffix;
-        if (data) {
-          invoke("write_to_pty", { sessionId, data }).catch(() => {});
-        }
-        imeFlushGen++;
-        if (isTerminating) {
-          e.stopImmediatePropagation();
-          e.preventDefault();
-        }
-        if (composed || keySuffix) {
-          emitFlush(composed, keySuffix === "" ? null : keySuffix);
-        }
-      }
-      if (!isModifier) isComposing = false;
-    }
-  };
-  document.addEventListener("keydown", docKeyDown, true);
-
-  // Keep the raw original reference (for restoration on dispose) AND a bound
-  // copy (for safe invocation through the wrapper — calling the raw function
-  // via `origTriggerRaw(data)` would lose `this=coreService`).
-  const origTriggerRaw = coreService.triggerDataEvent ?? null;
-  const origTrigger = origTriggerRaw ? origTriggerRaw.bind(coreService) : null;
-  if (origTrigger) {
-    coreService.triggerDataEvent = (data: string, wasUserInput?: boolean) => {
-      if (isComposing) return;
-      // korean-ime-dup-space: multi-char prefix-strip dedup path.
-      // xterm's CompositionHelper._finalizeComposition(true) schedules a
-      // setTimeout(0) that reads textarea.value.substring(start) (no end)
-      // and re-emits the result via triggerDataEvent. When the user
-      // presses a non-Korean key (space, digit, ASCII punct that does not
-      // end composition before the setTimeout fires) mid-composition, the
-      // substring is <composed>+<trailing-char> (e.g. "녕 "). Length>1
-      // bypasses the length-1 branch below.
-      //
-      // Under Order B (macOS WKWebView Korean IME — task-1 validated),
-      // by the time this late substring arrives:
-      //   (a) the composed prefix has ALREADY been PTY'd via
-      //       onCompositionEnd's invoke("write_to_pty"), AND
-      //   (b) the trailing character has ALREADY been emitted via
-      //       xterm's _keyDown synchronous triggerDataEvent path.
-      // The full late substring is therefore a complete duplicate; we
-      // drop it (return without origTrigger) — P6 FULL SUPPRESSION.
-      //
-      // Token-identity discipline (preserved from round-3 period-arrow
-      // fold): claim only when text-prefix AND gen match the live token,
-      // and only when no new composition is active. Non-matching multi-
-      // char payloads (e.g. paste of "한자") leave the live token intact
-      // so a later length-1 duplicate can still claim it via the existing
-      // branch below.
-      // Trailing-slack cap: the realistic CompositionHelper substring is
-      // composed-prefix + 1–2 trailing ASCII chars (the trigger key that
-      // ended composition before xterm's setTimeout(0) fired). Cap at +4
-      // to bound false-suppression of long pastes that incidentally start
-      // with the just-committed syllable (e.g. paste of "녕 hello world"
-      // within the 250 ms safety window). Cap is orthogonal to Order-Q:
-      // that race is handled by the length-1 path's claim-at-schedule
-      // discipline below, not by anything this cap affects.
-      const live = lastCompositionCommit;
-      if (
-        live !== null &&
-        imeFlushGen === live.gen &&
-        data.length > live.text.length &&
-        data.length <= live.text.length + 4 &&
-        data.startsWith(live.text) &&
-        !isComposing
-      ) {
-        if (imeDebug) {
-          stripHitCounter++;
-          const gapMs = performance.now() - live.committedAt;
-          // eslint-disable-next-line no-console
-          console.warn("[ime] strip-hit", {
-            data,
-            gapMs,
-            gen: live.gen,
-            count: stripHitCounter,
-          });
-        }
-        lastCompositionCommit = null;
-        return;
-      }
-      // FIXME: 20ms empirically tuned for WKWebView on macOS; revalidate on major macOS bumps
-      if (data.length === 1 && KOREAN_CODEPOINT_RE.test(data)) {
-        const gen = imeFlushGen;
-        // B4 (korean-ime-dup-period-arrow): xterm's CompositionHelper
-        // batches the IME commit and re-emits it via triggerDataEvent
-        // AFTER onCompositionEnd already wrote via invoke (case d
-        // defer fire-after-compositionend race). If we recognize the
-        // arriving payload as the live commit's matching duplicate
-        // candidate (text + gen both equal), we capture the token
-        // into the defer closure AND null the live token atomically —
-        // the captured `claim` then drives the suppression decision
-        // inside the deferred callback, race-free against the 250 ms
-        // safety clear (round-2 introduced the time-bound clear;
-        // korean-ime-dmg-race extended 40→250 ms).
-        //
-        // Round-3 implementer-review fold (3/5 convergent: @codex2 MED,
-        // @codex3 MED, @codex4 LOW): only claim when the data + gen
-        // actually match. The unconditional capture from round-2 let a
-        // non-matching single-Hangul event arriving before the actual
-        // duplicate consume the token (e.g. paste of "한" between
-        // compositionend("요") and xterm's case-d re-emit of "요"). A
-        // non-matching event now leaves the live token intact and
-        // passes through after the normal 20 ms defer; the matching
-        // duplicate later captures and suppresses.
-        //
-        // Inverse-race coverage: when there's no prior commit (live
-        // null) OR the prior commit is for a different syllable / gen,
-        // isCandidate is false → claim stays null → defer falls through
-        // to origTrigger. Existing §"Korean triggerDataEvent defer"
-        // tests remain green.
-        const live = lastCompositionCommit;
-        const isCandidate =
-          live !== null && data === live.text && gen === live.gen;
-        const claim = isCandidate ? live : null;
-        if (isCandidate) {
-          lastCompositionCommit = null;
-        }
-        setTimeout(() => {
-          if (!disposed && !isComposing && gen === imeFlushGen) {
-            if (claim !== null) {
-              return;
-            }
-            origTrigger(data, wasUserInput);
-          }
-        }, 20);
-        return;
-      }
-      // korean-ime-dmg-race: strip-miss detection. Reached only when the
-      // multi-char prefix-strip above did NOT fire — either because live
-      // was null (the race we extended the window to close) or because
-      // the predicate didn't match. If `live` was null AND a recent
-      // cleared snapshot's predicate WOULD have matched, that's a miss
-      // the 250 ms ceiling failed to catch — the next regression cycle
-      // can read these to decide whether to widen further. Snapshot
-      // lifetime is bounded at 500 ms; older snapshots are garbage-
-      // collected here so they don't accumulate.
-      if (imeDebug && lastClearedCommit !== null) {
-        const now = performance.now();
-        const ageMs = now - lastClearedCommit.clearedAt;
-        if (ageMs > 500) {
-          lastClearedCommit = null;
-        } else if (
-          data.length > lastClearedCommit.text.length &&
-          data.length <= lastClearedCommit.text.length + 4 &&
-          data.startsWith(lastClearedCommit.text) &&
-          imeFlushGen === lastClearedCommit.gen
-        ) {
-          stripMissCounter++;
-          const gapMs = now - lastClearedCommit.committedAt;
-          // eslint-disable-next-line no-console
-          console.warn("[ime] strip-miss", {
-            data,
-            gapMs,
-            ageMs,
-            gen: lastClearedCommit.gen,
-            count: stripMissCounter,
-          });
-        }
-      }
-      origTrigger(data, wasUserInput);
-    };
+  // --- Per-tick "did we handle a keydown this microtask" flag --------------
+  // Used by the `beforeinput insertText` path (R-NEW-6): if a keydown was
+  // already routed in this tick (printable / synthesize), suppress the
+  // `insertText` event so the same input doesn't fire twice. Reset on a
+  // microtask after each keydown so subsequent ticks see a clean slate.
+  let keydownHandledThisTick = false;
+  function markKeydownHandled(): void {
+    keydownHandledThisTick = true;
+    queueMicrotask(() => {
+      keydownHandledThisTick = false;
+    });
   }
 
-  let nativeFocus: ((opts?: FocusOptions) => void) | null = null;
-  let onFocus: (() => void) | null = null;
+  // --- Event listeners on shadow -------------------------------------------
+  const shadowEl = shadow.textareaEl;
 
-  const bindHelperTextarea = () => {
-    if (disposed) return;
-    const ta =
-      terminal.textarea ??
-      container.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
-    if (!ta) return;
-    if (helperTextarea === ta) return;
+  function onShadowCompositionStart(e: CompositionEvent): void {
+    if (terminal.options.cursorBlink) {
+      terminal.options.cursorBlink = false;
+    }
+    composition.onCompositionStart(e);
+  }
 
-    if (helperTextarea) {
-      if (nativeFocus) helperTextarea.focus = nativeFocus;
-      if (onFocus) helperTextarea.removeEventListener("focus", onFocus);
-      helperTextarea.removeEventListener("compositionend", onCompositionEnd);
-      helperTextarea.removeEventListener("blur", onTextareaBlur);
+  function onShadowCompositionUpdate(e: CompositionEvent): void {
+    composition.onCompositionUpdate(e);
+  }
+
+  function onShadowCompositionEnd(e: CompositionEvent): void {
+    composition.onCompositionEnd(e);
+    terminal.options.cursorBlink = origCursorBlink;
+  }
+
+  function onShadowBlur(): void {
+    composition.onBlurDuringComposition();
+    terminal.options.cursorBlink = origCursorBlink;
+  }
+
+  function routeKey(e: KeyboardEvent): void {
+    // Mid-composition terminator (Enter / Esc / Tab) — flush + suppress.
+    //
+    // CRITICAL ORDERING (round-1 fold, convergent BLOCKING from
+    // @claude3 / @codex1 / @codex3): real IME terminator keydowns on
+    // WKWebView commonly carry `isComposing: true`, and on Chromium
+    // during pending composition they often carry `keyCode: 229`. If we
+    // run the generic `isComposing || keyCode === 229` early-return
+    // FIRST, those production-shaped events get dropped and the atomic
+    // flush + Tab focus-shift suppression never fire. So this branch
+    // MUST run before the generic early-return when composition is
+    // active.
+    if (composition.isComposing) {
+      const isEnter = e.key === "Enter" || e.code === "Enter";
+      const isEsc = e.key === "Escape" || e.code === "Escape";
+      const isTab = e.key === "Tab" || e.code === "Tab";
+      if (isEnter || isEsc || isTab) {
+        const term: "\r" | "\x1b" | "\t" = isEnter ? "\r" : isEsc ? "\x1b" : "\t";
+        composition.onTerminatingKey(e, term);
+        e.preventDefault();
+        markKeydownHandled();
+        return;
+      }
+      // Mid-composition non-terminator — IME may still consume; let
+      // composition* events drive state.
+      if (e.isComposing || e.keyCode === 229) return;
+      // Mid-composition modifier or other key — pass through.
+      return;
     }
 
-    helperTextarea = ta;
+    // Composition path (non-composing router state but the event itself
+    // is IME-marked) — IME consumed the key; let composition* events
+    // drive state.
+    if (e.isComposing || e.keyCode === 229) return;
 
-    nativeFocus = ta.focus.bind(ta);
-    const patchedFocus = (opts?: FocusOptions): void => {
-      nativeFocus?.({ ...opts, preventScroll: true });
-    };
-    ta.focus = patchedFocus as typeof ta.focus;
+    // Native edit shortcut bypass — Cmd+V/C/X on macOS. Browser fires
+    // paste/copy/cut on shadow which routePaste/routeCopy/routeCut owns.
+    if (isNativePasteShortcut(e) || isNativeCopyOrCutShortcut(e)) {
+      return;
+    }
 
-    onFocus = () => {
-      requestAnimationFrame(() => {
-        document.documentElement.scrollTop = 0;
-        document.documentElement.scrollLeft = 0;
-        document.body.scrollTop = 0;
-        document.body.scrollLeft = 0;
-      });
-    };
-    ta.addEventListener("focus", onFocus);
-    ta.addEventListener("compositionend", onCompositionEnd);
-    ta.addEventListener("blur", onTextareaBlur);
-  };
-  bindHelperTextarea();
+    // Branch A: app-shortcut bubble (Cmd+T / Cmd+W / etc.). No synth,
+    // no preventDefault — original trusted event bubbles natively.
+    if (shouldBubbleShortcut?.(e)) {
+      return;
+    }
 
+    // Branch B: printable single-character key (Shift allowed). Goes
+    // through `terminal.input` which preserves `terminal.onData` so
+    // call sites' `lineBuffer` + `scrollToBottom` work.
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      keyRouter.routePrintable(e.key);
+      e.preventDefault();
+      markKeydownHandled();
+      return;
+    }
+
+    // Branch C: special / modifier / Ctrl-letter. Synthesize a keydown
+    // on helper so xterm's `_keyDown` runs its normal keymap (Tab → `\t`,
+    // Ctrl+C → `\x03`, ArrowLeft → CSI, etc.). preventDefault on the
+    // ORIGINAL shadow event so Tab does not move browser focus.
+    keyRouter.synthesizeKeydown(e);
+    e.preventDefault();
+    markKeydownHandled();
+  }
+
+  function onShadowPaste(e: Event): void {
+    keyRouter.routePaste(e as ClipboardEvent);
+  }
+  function onShadowCopy(e: Event): void {
+    keyRouter.routeCopy(e as ClipboardEvent);
+  }
+  function onShadowCut(e: Event): void {
+    keyRouter.routeCut(e as ClipboardEvent);
+  }
+
+  function onShadowBeforeInput(e: Event): void {
+    const ie = e as InputEvent;
+    if (ie.inputType === "insertReplacementText") {
+      keyRouter.routeBeforeInputReplace(ie);
+      return;
+    }
+    if (ie.inputType === "insertText" && !keydownHandledThisTick) {
+      // Emoji palette / pen-input / no-keydown text injection. xterm
+      // has no `beforeinput` listener, so shadow owns the write here
+      // (mirrors `routeBeforeInputReplace` topology). Use
+      // `terminal.input` (not `paste`) because emoji panel insertion
+      // is "user-input intent" — `lineBuffer` / `scrollToBottom`
+      // should fire.
+      const data = ie.data ?? "";
+      e.preventDefault();
+      if (data) terminal.input(data, true);
+      shadow.clearValue();
+    }
+  }
+
+  if (shadowEl) {
+    shadowEl.addEventListener("compositionstart", onShadowCompositionStart);
+    shadowEl.addEventListener("compositionupdate", onShadowCompositionUpdate);
+    shadowEl.addEventListener("compositionend", onShadowCompositionEnd);
+    shadowEl.addEventListener("blur", onShadowBlur);
+    shadowEl.addEventListener("keydown", routeKey);
+    shadowEl.addEventListener("paste", onShadowPaste);
+    shadowEl.addEventListener("copy", onShadowCopy);
+    shadowEl.addEventListener("cut", onShadowCut);
+    shadowEl.addEventListener("beforeinput", onShadowBeforeInput);
+  }
+
+  // Focus shadow at attach time so the first composition starts on it.
+  shadow.repositionToCursor();
+  shadow.focus();
+
+  // --- Public handle -------------------------------------------------------
+  let disposed = false;
   const handle: KoreanImeShimHandle = {
     get overlayEl() {
-      return disposed || !overlayAttached ? null : overlayEl;
+      return disposed || !overlay.attached ? null : overlay.overlayEl;
     },
-    rebind() {
-      // Retry overlay attach in case `.xterm-screen` was not yet in the
-      // DOM tree at attach time (degraded-overlay mode — see Failure-modes).
-      // Idempotent: tryAttachOverlay short-circuits if already attached.
-      tryAttachOverlay();
-      bindHelperTextarea();
+    rebind(): void {
+      if (disposed) return;
+      overlay.tryAttach();
+      isolator.rebind();
+      shadow.repositionToCursor();
+      overlay.reposition();
+      overlay.updateStyle();
     },
-    dispose() {
+    dispose(): void {
       if (disposed) return;
       disposed = true;
-
-      document.removeEventListener("input", docInput, true);
-      document.removeEventListener("keydown", docKeyDown, true);
-
-      if (origTriggerRaw) {
-        coreService.triggerDataEvent = origTriggerRaw;
-      }
-
-      if (origIsCursorHiddenDesc) {
-        Object.defineProperty(
-          coreService,
-          "isCursorHidden",
-          origIsCursorHiddenDesc,
+      if (shadowEl) {
+        shadowEl.removeEventListener(
+          "compositionstart",
+          onShadowCompositionStart,
         );
-      } else {
-        delete (coreService as { isCursorHidden?: boolean }).isCursorHidden;
+        shadowEl.removeEventListener(
+          "compositionupdate",
+          onShadowCompositionUpdate,
+        );
+        shadowEl.removeEventListener(
+          "compositionend",
+          onShadowCompositionEnd,
+        );
+        shadowEl.removeEventListener("blur", onShadowBlur);
+        shadowEl.removeEventListener("keydown", routeKey);
+        shadowEl.removeEventListener("paste", onShadowPaste);
+        shadowEl.removeEventListener("copy", onShadowCopy);
+        shadowEl.removeEventListener("cut", onShadowCut);
+        shadowEl.removeEventListener("beforeinput", onShadowBeforeInput);
       }
-
+      isolator.dispose();
+      shadow.dispose();
+      overlay.dispose();
       terminal.options.cursorBlink = origCursorBlink;
-      cursorHiddenLock = false;
-      cursorHidden = false;
-
-      if (overlayAttached && overlayEl.parentNode) {
-        overlayEl.parentNode.removeChild(overlayEl);
-      }
-      overlayAttached = false;
-
-      if (helperTextarea) {
-        if (nativeFocus) helperTextarea.focus = nativeFocus;
-        if (onFocus) helperTextarea.removeEventListener("focus", onFocus);
-        helperTextarea.removeEventListener("compositionend", onCompositionEnd);
-        helperTextarea.removeEventListener("blur", onTextareaBlur);
-        helperTextarea = null;
-      }
-      nativeFocus = null;
-      onFocus = null;
+    },
+    isFocused(): boolean {
+      return !disposed && shadow.isFocused();
     },
   };
 
   return handle;
-}
-
-// xterm.js does not export TypeScript types for its `_core` private API.
-// We declare the narrowest shapes we touch — kept inside this module so
-// they don't leak into the public surface.
-
-interface CoreService {
-  isCursorHidden: boolean;
-  triggerDataEvent?: (data: string, wasUserInput?: boolean) => void;
-}
-
-interface RenderDimensions {
-  css: {
-    cell: {
-      width: number;
-      height: number;
-    };
-  };
 }
