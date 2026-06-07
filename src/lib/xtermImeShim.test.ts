@@ -450,6 +450,15 @@ describe("attachKoreanImeShim — composition state machine", () => {
   });
 
   it("Tab mid-composition with keyCode=229 still flushes atomically (Chromium shape)", () => {
+    // ROUND-2 NOTE (@claude2 C1): this synthesizes a hybrid shape —
+    // `key: "Tab"` + `keyCode: 229` — purely as a routing-contract
+    // pin. Real Chromium during pending composition typically issues
+    // `key: "Process", keyCode: 229` first (IME consumes), then a
+    // fresh `key: "Tab", keyCode: 9, isComposing: false` post-commit.
+    // The implementation must handle a terminator-shaped event with
+    // `keyCode === 229` correctly regardless of which path real
+    // browsers take; this test pins the rule so a future change to
+    // the early-return ordering can't quietly drop the case.
     const fx = makeMockTerminal();
     attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
     fireCompositionStart(shadowEl(fx));

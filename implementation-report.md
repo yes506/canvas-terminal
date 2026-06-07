@@ -338,3 +338,68 @@ Expected 5/5 APPROVE post-fold (all BLOCKING findings resolved with
 regression tests; the two remaining deferrals — sibling-vs-child
 plan-deviation and real-xterm paste test — are conscious trade-offs
 documented here for traceability).
+
+---
+
+## Round 2 — peer review fold verification
+
+All 5 reviewers (@claude2, @claude3, @codex1, @codex2, @codex3)
+re-audited the worktree at HEAD `2bb8163`. **5/5 APPROVE.**
+
+| Reviewer | Round 2 verdict |
+|---|---|
+| @claude2 | **APPROVE** — all 4 round-1 actioned findings landed cleanly; 3 non-blocking concerns (C1 test-shape comment, C2 safe edge case, C3 negligible perf) — only C1 actionable |
+| @claude3 | **APPROVE** — F1/F2/F4/F5 all closed; F3 sibling-vs-child accepted as documented conscious deviation |
+| @codex1 | **Approve with release-gate notes** — no remaining merge-blocking finding; DMG smoke + R3 probe + LOC target still residual but documented |
+| @codex2 | **Approve with notes** — convergent blocker + shifted-key parity + rebind re-anchor + stale comments all fixed; real-xterm paste / R3 / DMG remain deferred per documentation |
+| @codex3 | **APPROVE with notes** — routeKey ordering verified, terminator regression coverage adequate; deferrals accepted |
+
+### Round 2 actionable items applied
+
+- **@claude2 C1** (optional cleanup): added a 9-line comment to the
+  `Tab mid-composition with keyCode=229` regression test at
+  `src/lib/xtermImeShim.test.ts` clarifying that the test synthesizes
+  a hybrid shape (`key: "Tab"` + `keyCode: 229`) as a routing-contract
+  pin. Real Chromium during pending composition typically issues
+  `key: "Process"` first (IME consumes), then a fresh `key: "Tab",
+  keyCode: 9, isComposing: false` post-commit. The implementation must
+  handle a terminator-shaped event with `keyCode === 229` correctly
+  regardless of which event flow real browsers produce; this comment
+  prevents a future maintainer from mis-reading the test as "real
+  Chromium hits this exact path".
+
+### Round 2 concerns accepted as-is
+
+- **@claude2 C2** (`keydownHandledThisTick` not set on mid-composition
+  non-terminator returns): @claude2 self-marked "No action recommended
+  — preemptively setting the flag in the no-op return path would mask
+  real beforeinput events. The current behavior is safe." Concur.
+- **@claude2 C3** (`tryMount` calls `querySelector` every
+  `repositionToCursor`): @claude2 self-marked "No action recommended
+  unless profiling shows it matters." The fold's correctness gain
+  (rebind contract honored) far outweighs the microsecond-scale
+  perf cost. Concur.
+
+### Validation after round-2 fold
+
+- `npx tsc --noEmit`: exit 0
+- `npm test`: 334/334 (unchanged — C1 is comment-only)
+- Production app build (`npm run build:app`): exit 0
+
+### Round-1 → Round-2 verdict evolution
+
+| Reviewer | Pre-fold (round 1) | Post-fold round 1 (round 2) |
+|---|---|---|
+| @claude2 | APPROVE with notes | APPROVE |
+| @claude3 | Revise before merge | APPROVE |
+| @codex1 | Revise before merge | Approve with release-gate notes |
+| @codex2 | Request changes | Approve with notes |
+| @codex3 | Not ready to merge | APPROVE with notes |
+
+**Net**: 1 BLOCKING (3 reviewers convergent) + 1 MED parity + 1 LOW-MED
+rebind re-anchor + 1 LOW stale-comment all resolved in round 1. Round 2
+adds a single documentation-only test comment (@claude2 C1). All
+deferrals (sibling-vs-child, dispose position leak, no-selection copy,
+real-xterm test, R3 probe, DMG smoke, LOC target) are documented
+trade-offs or release-gate prerequisites — none reopen the rewrite's
+correctness contract.
