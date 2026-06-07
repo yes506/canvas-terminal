@@ -9,7 +9,7 @@ flowchart LR
     subgraph ShimFile["xtermImeShim.ts (REWRITTEN)"]
         ISO["ImeShimOrchestrator<br/>attach (==attachKoreanImeShim)<br/>rebind / dispose"]
         CR["CompositionRouter<br/>onCompositionStart<br/>onCompositionUpdate<br/>onCompositionEnd<br/>onTerminatingKey<br/>onBlurDuringComposition"]
-        KR["KeyRouter (3 methods)<br/>routePrintable<br/>synthesizeKeydown<br/>routePaste"]
+        KR["KeyRouter (5 methods)<br/>routePrintable<br/>synthesizeKeydown<br/>routePaste<br/>routeCopy / routeCut"]
         OV["CursorOverlay<br/>show / clear<br/>reposition / updateStyle"]
         HTI["HelperTextareaIsolator<br/>installFocusRedirect<br/>mirrorFocusState<br/>restoreNativeFocus"]
     end
@@ -22,6 +22,10 @@ flowchart LR
         TD["coreService.triggerDataEvent"]
         OD["terminal.onData"]
         BUF["buffer.active.cursorX/Y"]
+    end
+    subgraph BrowserNative["browser/OS native handlers (Branch A + native edit shortcuts)"]
+        APP_LAYER["app/window shortcut layer<br/>(Cmd+T, Cmd+W, Cmd+F, etc.)"]
+        CLIPBOARD["system clipboard"]
     end
     subgraph Tauri["Tauri IPC"]
         PTY["write_to_pty"]
@@ -37,15 +41,17 @@ flowchart LR
 
     ST -. "compositionstart/update/end blur during composing" .-> CR
     ST -. "keydown (non-composing)" .-> KR
-    ST -. "paste / beforeinput insertReplacementText" .-> KR
+    ST -. "paste / copy / cut / beforeinput insertReplacementText" .-> KR
 
     CR --> PTY
     CR --> OV
 
-    KR -- "Branch A: bubble (no synth no preventDefault)" --> HT
+    KR -. "Branch A: bubble (no synth no preventDefault)" .-> APP_LAYER
+    KR -. "Native edit (Cmd+V/C/X) bypass — no preventDefault" .-> APP_LAYER
     KR -- "Branch B: printable" --> INPUT_API
     KR -- "Branch C: dispatchEvent(keydown)" --> HT
-    KR -- "paste" --> PASTE_API
+    KR -- "routePaste" --> PASTE_API
+    KR -- "routeCopy / routeCut: setData" --> CLIPBOARD
 
     HT --> KD
     KD --> TD

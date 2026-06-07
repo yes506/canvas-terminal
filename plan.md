@@ -1,6 +1,6 @@
 # Feature plan — korean-ime-textarea-rewrite
 
-Status: plan v3.1 (5/5 reviewer convergence across 3 rounds). Implementer-facing canonical artifact.
+Status: plan v3.2 (5/5 reviewer convergence across 4 rounds; v3.2 folds @codex3's BLOCKING Cmd+V paste-suppression finding + @claude2/@claude3 minor non-blocking items). Implementer-facing canonical artifact.
 
 ## Goal
 
@@ -129,16 +129,39 @@ interface KoreanImeShimHandle {
 | 20 | Patch `helper.focus()` → `shadow.focus()` (focus redirect; no listener removal) | `HelperTextareaIsolator` | `installFocusRedirect` | `xtermImeShim.ts` |
 | 21 | Synthesize `FocusEvent` on helper from shadow's actual focus/blur (drives xterm's focus listeners, `.focus` CSS, DECSET 1004) | `HelperTextareaIsolator` | `mirrorFocusState` | `xtermImeShim.ts` |
 | 22 | Restore native `focus` method; unsubscribe focus mirror | `HelperTextareaIsolator` | `restoreNativeFocus` | `xtermImeShim.ts` |
+| 23 | `copy` event on shadow → write `terminal.getSelection()` to clipboard (preserves xterm-selection copy with shadow always focused) | `KeyRouter` | `routeCopy` | `xtermImeShim.ts` |
+| 24 | `cut` event on shadow → same as copy (terminal can't semantically cut) | `KeyRouter` | `routeCut` | `xtermImeShim.ts` |
+
+Total: 6 interfaces / 24 nodes. KeyRouter holds 5 methods (`routePrintable`, `synthesizeKeydown`, `routePaste`, `routeCopy`, `routeCut`).
 
 Cohesion check: each interface passes ≥2 of (state, lifecycle, collaboration boundary, failure domain). No god-interface (max 5 methods); no method-shaped class; no hidden orchestration in method bodies.
 
-## KeyRouter classification rule (final, locked v3.1)
+## KeyRouter classification rule (final, locked v3.2)
 
 ```typescript
+function isNativePasteShortcut(e: KeyboardEvent): boolean {
+  return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey
+      && (e.key === 'v' || e.key === 'V');
+}
+
+function isNativeCopyOrCutShortcut(e: KeyboardEvent): boolean {
+  if (!(e.metaKey || e.ctrlKey)) return false;
+  if (e.shiftKey || e.altKey) return false;
+  return e.key === 'c' || e.key === 'C' || e.key === 'x' || e.key === 'X';
+}
+
 function routeKey(e: KeyboardEvent) {
   if (e.isComposing || e.keyCode === 229) return;       // composition path on shadow
 
-  if (options.shouldBubbleShortcut?.(e)) return;        // Branch A: bubble, no action
+  // v3.2 fix: native edit shortcuts bypass — do NOT preventDefault, so the
+  // browser's paste/copy/cut event still fires on the shadow textarea and
+  // routes via routePaste / routeCopy / routeCut. Without this branch,
+  // Branch C's preventDefault on Cmd+V can suppress the paste event in
+  // some browser environments (spec is loose; behavior differs across
+  // Chromium/WebKit/Tauri WKWebView versions).
+  if (isNativePasteShortcut(e) || isNativeCopyOrCutShortcut(e)) return;
+
+  if (options.shouldBubbleShortcut?.(e)) return;        // Branch A: app-shortcut bubble
 
   if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
     routePrintable(e.key);                              // Branch B: Shift allowed
@@ -152,6 +175,25 @@ function routeKey(e: KeyboardEvent) {
   shadow.clearValue();
 }
 ```
+
+### Clipboard event handlers (KeyRouter additions)
+
+```typescript
+// shadow 'copy' event — Cmd+C arrives via Native-edit-shortcut bypass above
+function routeCopy(e: ClipboardEvent) {
+  const sel = terminal.getSelection();   // xterm public API
+  if (sel) {
+    e.clipboardData?.setData('text/plain', sel);
+    e.preventDefault();   // we wrote the data; suppress native copy of shadow.value (empty)
+  }
+  // else: let native copy fire (no-op — shadow has no selection)
+}
+
+// shadow 'cut' event — same as copy; terminal can't semantically cut
+function routeCut(e: ClipboardEvent) { routeCopy(e); }
+```
+
+**Why this matters**: today xterm syncs the terminal selection into `helper.value` at `Terminal.ts:530-534` and Cmd+C on helper copies that. With shadow always focused, browser's Cmd+C would copy `shadow.value` (empty) — regression vs today. The `routeCopy` handler supplies `terminal.getSelection()` to the clipboard directly, preserving the user-visible behavior.
 
 ### `synthesizeKeydown` fidelity rule
 
@@ -172,7 +214,9 @@ Missing any of `key/code/keyCode/modifier flags` silently breaks xterm's keymap.
 | Branch A (bubble) | Skipped — original event bubbles natively; no shadow mutation expected |
 | Branch B (printable) | Immediately after `terminal.input(e.key)` and `preventDefault()` |
 | Branch C (terminal-owned) | Immediately after `synthesizeKeydown(e)` + `preventDefault()` (defensive backstop) |
+| Native-edit-shortcut bypass (Cmd+V/C/X) | Skipped — original event bubbles natively to fire paste/copy/cut events |
 | `routePaste` | Immediately after `terminal.paste(text)` + `preventDefault()` |
+| `routeCopy` / `routeCut` | Skipped — these write to clipboard, not to shadow.value (which stays empty) |
 
 ## Interfaces emitted
 
@@ -190,16 +234,17 @@ Phase 7 smoke-check (skeletons-skipped):
 ## Risks
 
 - **R1** — `compositionupdate.data` timing on shadow under WKWebView. Verify same DOM contract holds; fallback: snapshot `textarea.value` at `requestAnimationFrame`.
-- **R2** — happy-dom composition + FocusEvent support may be incomplete. Tests synthesize events directly; if happy-dom doesn't fire listeners reliably, switch IME suite to jsdom OR fall back to behavioral assertion (`coreBrowserService.isFocused === true`).
-- **R3** — synthesize fidelity drift on future xterm versions (e.g., new `isTrusted` gate, new event prop read). Mitigation: pin tests to representative CSI encodings (Arrow → `\x1b[D`, Ctrl+C → `\x03`, Shift+Enter → `\x1b[13;2u`); fail loudly if xterm version drifts.
+- **R2** — happy-dom composition + FocusEvent support may be incomplete. Tests synthesize events directly; if happy-dom doesn't fire listeners reliably, switch IME suite to jsdom OR fall back to behavioral assertion. Recommended order: (1) spy on `_handleTextAreaFocus`/`_handleTextAreaBlur` via xterm internals to verify the synthesized FocusEvent reached them; (2) if spy isn't viable, assert `terminal.element.classList.contains('focus')` as a behavioral proxy.
+- **R3** — synthesize fidelity drift on future xterm versions (e.g., new `isTrusted` gate, new event prop read). Mitigation: (a) pin `@xterm/xterm` version exactly in `package.json` (no `^` range); (b) add a vitest "xterm anchor probe" test that asserts the four load-bearing source-level facts the rewrite depends on — `Terminal.ts:379` keydown binding on helper, `Terminal.ts:1046` early-return on `!result.key`, `Terminal.ts:467-468` focus/blur on helper, `Terminal.ts:381` compositionstart on helper. Test fails loudly on xterm upgrade if any anchor moves.
 - **R4** — Focus model: `terminal.focus()` → patched `helper.focus()` → `shadow.focus()`. Confirmed end-to-end.
 - **R5** — `AgentMiniTerminal` focus-state proxy needed at TWO touchpoints: the visual focus border (`setFocused`) AND the `writeWithFollowBottom` `document.activeElement === terminal.textarea` check. Both updated via `imeHandle.isFocused()` proxy.
 - **R6** — `pointer-events` arbitration on `.xterm-screen` for mouse selection drag and wheel/touchpad scroll. Shadow uses `pointer-events: none` by default + `overflow: hidden`; wheel events bubble naturally to `.xterm-viewport`.
 - **R7** — Synthesized event default action: xterm doesn't depend on it (computes from props directly). Verified across representative key set.
 - **R8** — Helper retains xterm's bound listeners (we can't remove them — bound via private `register()` at `Terminal.ts:379`). Defense-in-depth via capture-phase `compositionstart` listener on helper with `stopImmediatePropagation` + sync `shadow.focus()`.
-- **R-NEW-3** — Paste during `_keyDownSeen=true`: `terminal.paste()` goes via `coreService.triggerDataEvent` directly (bypasses `_inputEvent`), no intersection. Test guards it.
-- **R-NEW-5** — Cmd+V false-positive (browser would insert 'v' into shadow before paste fires): classifier `hasModifier → Branch C synthesize` → xterm bails on `!result.key` for plain printable + modifier; then `paste` event fires → `routePaste`. Test guards it.
-- **R-NEW-6** — `beforeinput` ordering before `keydown` on some WebKit paths: ignore `beforeinput` except for `inputType === 'insertReplacementText'` (autocomplete/dictation/emoji) which routes via `routePaste`. Documented in `routePaste` docstring.
+- **R-NEW-4** — Paste during `_keyDownSeen=true`: `terminal.paste()` goes via `coreService.triggerDataEvent` directly (bypasses `_inputEvent`), no intersection. Test guards it.
+- **R-NEW-5** — Cmd+V keydown could suppress browser's paste action if `preventDefault` is called. v3.2 fix: explicit `isNativePasteShortcut` bypass in `routeKey` ensures the original Cmd+V keydown is NOT `preventDefault`-ed; the browser fires the `paste` event normally, which `routePaste` handles. Test guards it.
+- **R-NEW-6** — Single rule for non-keydown text input: `beforeinput` event handler routes `inputType === 'insertReplacementText'` (autocomplete/dictation) via `terminal.paste(data)` and `inputType === 'insertText'` when no keydown was handled in the current tick (emoji palette / IME-less typed text) via `terminal.input(data)`. Implementer tracks the "keydown handled this tick" flag with a microtask-cleared bool. Documented in `routePaste` / `routePrintable` docstrings.
+- **R-NEW-7** — Copy/cut with shadow always focused: browser's Cmd+C copies `shadow.value` (empty), regressing vs today's xterm `Terminal.ts:530-534` selection-to-helper.value sync. v3.2 fix: `routeCopy` listener supplies `terminal.getSelection()` to clipboard directly. `routeCut` mirrors. Test: mouse-select on `.xterm-screen` → Cmd+C → clipboard contains the selection.
 
 ## Test plan
 
@@ -226,12 +271,16 @@ NEW clusters:
 - `synthesizeKeydown` CSI encoding: ArrowLeft → `\x1b[D`, DECCKM-flipped → `\x1bOD`, Ctrl+C → `\x03`, Backspace → `\x7f`, Shift+Enter → `\x1b[13;2u` via call-site custom handler
 - Branch A: Cmd+T `shouldBubbleShortcut` returns true; original bubbles; PTY receives nothing; document focus state unchanged
 - **Branch C `preventDefault` acceptance** (v3.1 fix): Tab on shadow does NOT move browser focus (`document.activeElement` stays on shadow); Enter on shadow → shadow.value empty post-route; Ctrl+A on shadow → no select-all visual artifact
-- Cmd+V → paste event → `routePaste` → `terminal.paste` called once; no `v` written to PTY
+- **Cmd+V**: `isNativePasteShortcut` returns true → routeKey returns early (no synth, no preventDefault) → browser fires `paste` event → `routePaste` → `terminal.paste(text)` called once; no `v` written to PTY (v3.2 BLOCKING fix)
 - Paste during `_keyDownSeen=true` → exactly one PTY write (bracketed `\x1b[200~...\x1b[201~` or plain per mode)
+- **Cmd+C with terminal mouse-selection**: mouse-select on `.xterm-screen` → Cmd+C on shadow → `routeCopy` writes `terminal.getSelection()` to clipboard via `e.clipboardData.setData('text/plain', sel)`; clipboard content matches the selected text (v3.2 BLOCKING fix for copy regression)
+- **Cmd+C with no selection**: `routeCopy` early-exits; native copy fires on shadow.value (empty) — no-op, no error
+- **Cmd+X**: `routeCut` mirrors `routeCopy`; clipboard contains selection; terminal buffer unchanged (terminal can't semantically cut)
 - Focus mirror: `shadow.focus()` → `terminal.element.classList.contains('focus')` === true
 - DECSET 1004: `terminal.write('\x1b[?1004h')` then `shadow.focus()` → onData fires `\x1b[I`
 - Defensive helper `compositionstart`: dispatched on helper → capture-phase listener fires `stopImmediatePropagation` + shadow re-focused; xterm's `_compositionHelper.compositionstart` NOT called
-- emoji via `beforeinput` `insertText` (surrogate-pair) → `terminal.input(data)`; single PTY write
+- emoji via `beforeinput` `insertText` (no preceding keydown) → `terminal.input(data)`; single PTY write
+- autocomplete/dictation via `beforeinput` `insertReplacementText` → `terminal.paste(data)`; single PTY write
 - collaborator\r intercept after Korean: `안녕<bs><bs>collaborator\r` triggers `openCollaboratorSplit`
 - Wheel/touchpad scroll passthrough: wheel event on shadow does not eat xterm viewport scroll
 - Mid-composition Tab: composition state preserved, no focus shift
@@ -254,7 +303,8 @@ Net shim+test reduction: ~815 LOC. Plan meets the "net deletion" success criteri
 - **Round 1 (v1)**: 5/5 REQUEST CHANGES on input-ownership contradiction. v1's "shadow = sole input sink with `triggerDataEvent` bypass" would have required 150-250 LOC of `_keyDown` reimplementation. Reviewers: @codex1, @codex2, @codex3, @claude2, @claude3.
 - **Round 2 (v2)**: shifted to "shadow = focus owner; helper = keymap owner via synthesized keydowns". 4/5 confirmable; @claude3 surfaced blocker unique to v2's mechanism (synthesized keydown alone doesn't reach PTY for printable ASCII — `_keyDown` bails at `!result.key`).
 - **Round 3 (v3)**: added `routePrintable` via `terminal.input()` public API + `mirrorFocusState` for focus mirror + locked defensive `compositionstart` to capture-phase. @claude2 + @codex2 surfaced blocker (no `preventDefault` for synthesize breaks Tab → focus loss). @claude3 surfaced process issue (artifact is summary, not full plan).
-- **Round 4 (v3.1, locked)**: three-branch classifier with explicit `preventDefault` discipline; `shouldBubbleShortcut` predicate added to `AttachKoreanImeShimOptions`; full plan persisted to `plan.md` (this file) per CLAUDE.md `(plan-feature, human-confirmed)` contract.
+- **Round 4 (v3.1)**: three-branch classifier with explicit `preventDefault` discipline; `shouldBubbleShortcut` predicate added to `AttachKoreanImeShimOptions`; full plan persisted to `plan.md` per CLAUDE.md `(plan-feature, human-confirmed)` contract. 4/5 reviewers APPROVE.
+- **Round 5 (v3.2, locked)**: @codex3 surfaced BLOCKING Cmd+V paste-suppression defect (Branch C `preventDefault` on Cmd+V keydown can suppress browser's paste event in some environments). Added `isNativePasteShortcut`/`isNativeCopyOrCutShortcut` bypass before Branch C. Added `routeCopy`/`routeCut` to KeyRouter (5 methods total) to preserve Cmd+C of terminal-selection (today's helper-value sync at `Terminal.ts:530-534`). Resolved emoji/`beforeinput` rule ambiguity. Added R-NEW-4/R-NEW-7. R-NEW-3 mitigation specified (version pin + anchor probe). 5/5 reviewers expected to APPROVE.
 
 ## References to existing code
 
