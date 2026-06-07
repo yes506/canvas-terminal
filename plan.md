@@ -1,6 +1,6 @@
 # Feature plan — korean-ime-textarea-rewrite
 
-Status: plan v3.3 (5/5 reviewer convergence across 5 rounds; v3.3 folds @codex1's BLOCKING Ctrl-letter predicate-too-broad + @claude3's BLOCKING `routePaste` double-fire defect + factual citation correction for Cmd+C path). Implementer-facing canonical artifact.
+Status: plan v3.4 (5/5 reviewer convergence across 6 rounds; v3.4 folds the convergent v3.3 BLOCKING — @codex1/@codex2/@codex3/@claude3 all flagged that Node 15 + clearValue cadence table still said `terminal.paste(text)` despite v3.3's prose locking Option A. v3.4 splits Node 15 into `routePaste` (ClipboardEvent — preventDefault only) + new node 15b `routeBeforeInputReplace` (autocorrect/dictation — `terminal.paste(data)` because no xterm bubble path) so the canonical artifact no longer self-contradicts). Implementer-facing canonical artifact.
 
 ## Goal
 
@@ -122,7 +122,8 @@ interface KoreanImeShimHandle {
 | 12 | Blur during composition → flush + clear + notify + `clearValue` | `CompositionRouter` | `onBlurDuringComposition` | `xtermImeShim.ts` |
 | 13 | Printable (Branch B): `terminal.input(e.key)` + `preventDefault` + `clearValue` | `KeyRouter` | `routePrintable` | `xtermImeShim.ts` |
 | 14 | Special/modifier (Branch C): `helper.dispatchEvent` with 12 props + `preventDefault` + `clearValue` | `KeyRouter` | `synthesizeKeydown` | `xtermImeShim.ts` |
-| 15 | Paste (incl. `insertReplacementText`): `terminal.paste(text)` + `preventDefault` + `clearValue` | `KeyRouter` | `routePaste` | `xtermImeShim.ts` |
+| 15 | `ClipboardEvent('paste')` on shadow (Cmd+V via native edit shortcut bypass): `preventDefault` + `clearValue` ONLY. Event bubbles to xterm's `this.element` paste listener which calls `handlePasteEvent` → `paste()` → `triggerDataEvent` (single PTY write). Must NOT call `terminal.paste(text)` (would double-fire — see R-NEW-8). Must NOT call `stopPropagation` (would block xterm's listener — no PTY write at all). | `KeyRouter` | `routePaste` | `xtermImeShim.ts` |
+| 15b | `InputEvent('beforeinput')` with `inputType === 'insertReplacementText'` (autocorrect / dictation): `e.preventDefault()` + `terminal.paste(data)` + `clearValue`. xterm has NO `beforeinput` listener at `this.element`, so no bubble path — shadow MUST own the PTY write here. Distinct from Node 15 because the bubble topology differs. | `KeyRouter` | `routeBeforeInputReplace` | `xtermImeShim.ts` |
 | 16 | Paint composition glyphs at cursor cell; add `ime-cursor-hidden` CSS class to xterm container | `CursorOverlay` | `show` | `xtermImeShim.ts` |
 | 17 | Hide overlay; remove CSS class | `CursorOverlay` | `clear` | `xtermImeShim.ts` |
 | 18 | Move overlay to new cell when xterm cursor advances | `CursorOverlay` | `reposition` | `xtermImeShim.ts` |
@@ -133,7 +134,7 @@ interface KoreanImeShimHandle {
 | 23 | `copy` event on shadow → write `terminal.getSelection()` to clipboard (preserves xterm-selection copy with shadow always focused) | `KeyRouter` | `routeCopy` | `xtermImeShim.ts` |
 | 24 | `cut` event on shadow → same as copy (terminal can't semantically cut) | `KeyRouter` | `routeCut` | `xtermImeShim.ts` |
 
-Total: 6 interfaces / 24 nodes. KeyRouter holds 5 methods (`routePrintable`, `synthesizeKeydown`, `routePaste`, `routeCopy`, `routeCut`).
+Total: 6 interfaces / 25 nodes. KeyRouter holds 6 methods (`routePrintable`, `synthesizeKeydown`, `routePaste`, `routeBeforeInputReplace`, `routeCopy`, `routeCut`).
 
 Cohesion check: each interface passes ≥2 of (state, lifecycle, collaboration boundary, failure domain). No god-interface (max 5 methods); no method-shaped class; no hidden orchestration in method bodies.
 
@@ -258,7 +259,8 @@ Missing any of `key/code/keyCode/modifier flags` silently breaks xterm's keymap.
 | Branch B (printable) | Immediately after `terminal.input(e.key)` and `preventDefault()` |
 | Branch C (terminal-owned) | Immediately after `synthesizeKeydown(e)` + `preventDefault()` (defensive backstop) |
 | Native-edit-shortcut bypass (Cmd+V/C/X) | Skipped — original event bubbles natively to fire paste/copy/cut events |
-| `routePaste` | Immediately after `terminal.paste(text)` + `preventDefault()` |
+| `routePaste` (ClipboardEvent paste, Cmd+V) | Immediately after `preventDefault()`; NO `terminal.paste(text)` call — xterm's `this.element` paste listener owns the PTY write via bubble |
+| `routeBeforeInputReplace` (autocorrect/dictation) | Immediately after `terminal.paste(data)` + `preventDefault()`; shadow OWNS the PTY write (no xterm bubble path for `beforeinput`) |
 | `routeCopy` / `routeCut` | Skipped — these write to clipboard, not to shadow.value (which stays empty) |
 
 ## Interfaces emitted
@@ -278,7 +280,7 @@ Phase 7 smoke-check (skeletons-skipped):
 
 - **R1** — `compositionupdate.data` timing on shadow under WKWebView. Verify same DOM contract holds; fallback: snapshot `textarea.value` at `requestAnimationFrame`.
 - **R2** — happy-dom composition + FocusEvent support may be incomplete. Tests synthesize events directly; if happy-dom doesn't fire listeners reliably, switch IME suite to jsdom OR fall back to behavioral assertion. Recommended order: (1) spy on `_handleTextAreaFocus`/`_handleTextAreaBlur` via xterm internals to verify the synthesized FocusEvent reached them; (2) if spy isn't viable, assert `terminal.element.classList.contains('focus')` as a behavioral proxy.
-- **R3** — synthesize fidelity drift on future xterm versions (e.g., new `isTrusted` gate, new event prop read). Mitigation: (a) pin `@xterm/xterm` version exactly in `package.json` (no `^` range); (b) add a vitest "xterm anchor probe" test that asserts the four load-bearing source-level facts the rewrite depends on — `Terminal.ts:379` keydown binding on helper, `Terminal.ts:1046` early-return on `!result.key`, `Terminal.ts:467-468` focus/blur on helper, `Terminal.ts:381` compositionstart on helper. Test fails loudly on xterm upgrade if any anchor moves.
+- **R3** — synthesize fidelity drift on future xterm versions (e.g., new `isTrusted` gate, new event prop read). Primary mitigation: add a vitest "xterm anchor probe" test that asserts the seven load-bearing source-level facts the rewrite depends on — (1) `Terminal.ts:379` keydown binding on helper, (2) `Terminal.ts:1046` early-return on `!result.key`, (3) `Terminal.ts:467-468` focus/blur on helper, (4) `Terminal.ts:381` compositionstart on helper, (5) `Terminal.ts:344` paste binding on `this.element` (R-NEW-8 dependency), (6) `Terminal.ts:334-341` copy binding on `this.element` with `copyHandler`, (7) `CoreTerminal.ts:171` public `input()` API shape. Test fails loudly on xterm upgrade if any anchor moves. Secondary mitigation (recommended, not committed by the planner per scope discipline — implementer can land if they choose): pin `@xterm/xterm` version exactly in `package.json` (currently `^5.5.0`; `5.5.0` would prevent accidental minor-bump drift). Anchor probe test alone is sufficient even without the pin.
 - **R4** — Focus model: `terminal.focus()` → patched `helper.focus()` → `shadow.focus()`. Confirmed end-to-end.
 - **R5** — `AgentMiniTerminal` focus-state proxy needed at TWO touchpoints: the visual focus border (`setFocused`) AND the `writeWithFollowBottom` `document.activeElement === terminal.textarea` check. Both updated via `imeHandle.isFocused()` proxy.
 - **R6** — `pointer-events` arbitration on `.xterm-screen` for mouse selection drag and wheel/touchpad scroll. Shadow uses `pointer-events: none` by default + `overflow: hidden`; wheel events bubble naturally to `.xterm-viewport`.
@@ -286,7 +288,7 @@ Phase 7 smoke-check (skeletons-skipped):
 - **R8** — Helper retains xterm's bound listeners (we can't remove them — bound via private `register()` at `Terminal.ts:379`). Defense-in-depth via capture-phase `compositionstart` listener on helper with `stopImmediatePropagation` + sync `shadow.focus()`.
 - **R-NEW-4** — Paste during `_keyDownSeen=true`: `terminal.paste()` goes via `coreService.triggerDataEvent` directly (bypasses `_inputEvent`), no intersection. Test guards it.
 - **R-NEW-5** — Cmd+V keydown could suppress browser's paste action if `preventDefault` is called. v3.2 fix: explicit `isNativePasteShortcut` bypass in `routeKey` ensures the original Cmd+V keydown is NOT `preventDefault`-ed; the browser fires the `paste` event normally, which `routePaste` handles. Test guards it.
-- **R-NEW-6** — Single rule for non-keydown text input: `beforeinput` event handler routes `inputType === 'insertReplacementText'` (autocomplete/dictation) via `terminal.paste(data)` and `inputType === 'insertText'` when no keydown was handled in the current tick (emoji palette / IME-less typed text) via `terminal.input(data)`. Implementer tracks the "keydown handled this tick" flag with a microtask-cleared bool. Documented in `routePaste` / `routePrintable` docstrings.
+- **R-NEW-6** — Single rule for non-keydown text input: `beforeinput` event handler routes `inputType === 'insertReplacementText'` (autocomplete/dictation) via `routeBeforeInputReplace` → `terminal.paste(data)` (shadow OWNS the write — no xterm bubble path for `beforeinput`); and `inputType === 'insertText'` when no keydown was handled in the current tick (emoji palette / IME-less typed text) via `terminal.input(data)`. Implementer tracks the "keydown handled this tick" flag with a microtask-cleared bool. Distinct from Node 15 (`routePaste`) where the ClipboardEvent path bubbles to xterm.
 - **R-NEW-7** — Copy/cut with shadow always focused: v3.2's framing was based on a wrong citation. The actual macOS Cmd+C path lives at `Terminal.ts:334-341` bound on `this.element` (the terminal container), NOT at `Terminal.ts:530-534` (which is the Linux middle-click path). Shadow's `copy` events bubble through `.xterm-viewport` to `this.element`, where xterm's `copyHandler` catches them and writes `selectionService.selectionText` to the clipboard. Cmd+C therefore already works correctly **without** `routeCopy`. v3.3 retains `routeCopy`/`routeCut` as defense-in-depth (redundant write, same data — survives potential future xterm rebinds) and explicitly does NOT call `stopPropagation` so xterm's listener fires as fallback. Test: mouse-select on `.xterm-screen` → Cmd+C → clipboard contains the selection; assertion against the actual clipboard (not stubbed) verifies the path end-to-end.
 - **R-NEW-8** — Shadow-as-descendant-of-`this.element` bubble pattern: any DOM event fired on shadow that xterm also binds on `this.element` will double-fire unless mitigated. Currently affected: `paste` (BLOCKING — v3.3 fixes via Option A: `routePaste` only `preventDefault`; xterm does PTY write), `copy`, `cut` (redundant but harmless — defense-in-depth keeps both). Potentially affected if shadow ever gains `pointer-events: auto`: `mousedown` (Linux/Firefox right-click), `contextmenu` (Terminal.ts:355), `auxclick` (Linux middle-click). v3.3 mitigation discipline: any new shadow event listener that intersects with an xterm `this.element` binding must explicitly pick "shadow authoritative (`stopPropagation`)" vs "xterm authoritative (no PTY-write side effect in shadow handler)" vs "defense-in-depth (both fire, idempotent operations only)". Test plan: add bubble-double-fire integration tests for paste and copy/cut against the real xterm instance, not stubbed `terminal.paste` / `terminal.getSelection`.
 
@@ -328,7 +330,7 @@ NEW clusters:
 - DECSET 1004: `terminal.write('\x1b[?1004h')` then `shadow.focus()` → onData fires `\x1b[I`
 - Defensive helper `compositionstart`: dispatched on helper → capture-phase listener fires `stopImmediatePropagation` + shadow re-focused; xterm's `_compositionHelper.compositionstart` NOT called
 - emoji via `beforeinput` `insertText` (no preceding keydown) → `terminal.input(data)`; single PTY write
-- autocomplete/dictation via `beforeinput` `insertReplacementText` → `terminal.paste(data)`; single PTY write
+- autocomplete/dictation via `beforeinput` `insertReplacementText` → `routeBeforeInputReplace` → `terminal.paste(data)`; single PTY write (shadow owns; no bubble path)
 - collaborator\r intercept after Korean: `안녕<bs><bs>collaborator\r` triggers `openCollaboratorSplit`
 - Wheel/touchpad scroll passthrough: wheel event on shadow does not eat xterm viewport scroll
 - Mid-composition Tab: composition state preserved, no focus shift
@@ -360,6 +362,12 @@ Net shim+test reduction: ~815 LOC. Plan meets the "net deletion" success criteri
   - **R-NEW-8 added**: shadow-bubbles-to-`this.element` topology — any new shadow listener intersecting xterm's element binding must pick an explicit ownership policy.
   - **Test plan additions**: Ctrl+V/C/X (terminal control reachability), bubble-double-fire production-mode integration test (real xterm, not stubbed).
   - Expected: 5/5 APPROVE — design has not shifted shape since v3, only narrow defects in adjacent surfaces.
+- **Round 6 (v3.4, locked)**: 4/5 reviewers (@codex1, @codex2, @codex3, @claude3) convergent on the same residual defect — v3.3 prose locked routePaste Option A but the decomposition table (Node 15) and clearValue cadence table still read `terminal.paste(text)` (the v3.2 double-fire shape). Artifact contradiction would have caused the implementer to ship the bug. @claude2 verified the BLOCKING fixes against xterm source and APPROVED — they reviewed the prose, not the tables. v3.4 amendments:
+  - **Node 15 split into 15 + 15b**: Node 15 (`routePaste` for ClipboardEvent — `preventDefault` + `clearValue` ONLY; xterm's `this.element` listener does the PTY write via bubble); Node 15b (`routeBeforeInputReplace` for `beforeinput insertReplacementText` — `terminal.paste(data)` because there's no xterm bubble path for `beforeinput`). The conflation in v3.3's Node 15 was the bug.
+  - **clearValue cadence table**: `routePaste` row corrected to "no `terminal.paste(text)` call"; new row for `routeBeforeInputReplace`.
+  - **plan.mmd**: routePaste edge corrected — Cmd+V bubbles from shadow to `this.element`'s `PASTE_API`, not from KeyRouter directly; `routeBeforeInputReplace` retains the direct `→ PASTE_API` edge.
+  - **R3 mitigation reframed**: anchor probe test is the load-bearing mitigation (primary); `@xterm/xterm` exact version pin is recommended but not committed by planner per scope discipline.
+  - Total interfaces / nodes: 6 / 25. KeyRouter: 6 methods.
 
 ## References to existing code
 

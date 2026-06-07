@@ -9,7 +9,7 @@ flowchart LR
     subgraph ShimFile["xtermImeShim.ts (REWRITTEN)"]
         ISO["ImeShimOrchestrator<br/>attach (==attachKoreanImeShim)<br/>rebind / dispose"]
         CR["CompositionRouter<br/>onCompositionStart<br/>onCompositionUpdate<br/>onCompositionEnd<br/>onTerminatingKey<br/>onBlurDuringComposition"]
-        KR["KeyRouter (5 methods)<br/>routePrintable<br/>synthesizeKeydown<br/>routePaste<br/>routeCopy / routeCut"]
+        KR["KeyRouter (6 methods)<br/>routePrintable<br/>synthesizeKeydown<br/>routePaste (ClipboardEvent)<br/>routeBeforeInputReplace (autocorrect)<br/>routeCopy / routeCut"]
         OV["CursorOverlay<br/>show / clear<br/>reposition / updateStyle"]
         HTI["HelperTextareaIsolator<br/>installFocusRedirect<br/>mirrorFocusState<br/>restoreNativeFocus"]
     end
@@ -50,7 +50,9 @@ flowchart LR
     KR -. "Cmd+V/C/X bypass: no synth, no preventDefault on keydown" .-> APP_LAYER
     KR -- "Branch B: printable" --> INPUT_API
     KR -- "Branch C: dispatchEvent(keydown) including Ctrl+letters" --> HT
-    KR -. "routePaste: preventDefault only — paste event bubbles to xterm" .-> HT
+    KR -. "routePaste (Cmd+V): only preventDefault on shadow event" .-> KR
+    HT -. "paste event bubbles from shadow to this.element listener" .-> PASTE_API
+    KR -- "routeBeforeInputReplace (autocorrect/dictation): terminal.paste(data)" --> PASTE_API
     KR -- "routeCopy / routeCut: setData (defense-in-depth)" --> CLIPBOARD
 
     HT --> KD
