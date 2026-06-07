@@ -30,6 +30,14 @@ body,
 
 .xterm-viewport {
   overflow-y: auto !important;
+  /* Separate terminal scroll from any ancestor scroll container so wheel
+     events that hit the scrollback boundary don't chain out and scroll the
+     surrounding pane. Load-bearing for the collaborator pane after the
+     task-1 grid-overflow change: with >4 mini-agents the parent grid
+     scrolls, and without this contain the wheel would drive both contexts
+     at once. No-op for the main terminal (no scrollable ancestor today)
+     but keeps the rule a single source of truth. */
+  overscroll-behavior: contain;
 }
 
 /* xterm positions this textarea at the cursor for IME popup placement.
