@@ -54,6 +54,14 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
 
   const [spawns, setSpawns] = useState<Spawn[]>([]);
   const mountedRef = useRef(false);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  // Tracks the grid scroll-container's content-box height so we can fix
+  // row height to the "4-agent target" once spawns.length > 4. Null until
+  // the first ResizeObserver tick — we fall back to minmax(220px, 1fr)
+  // in the interim, which is what ≤4 agents use anyway, so the only
+  // first-paint mismatch is a single frame when a pane mounts already
+  // holding >4 agents (rare).
+  const [contentHeight, setContentHeight] = useState<number | null>(null);
   const collabId = paneSessionId;
   const statusMessage = useCollaboratorStore((s) => s.statusMessages[collabId] ?? null);
 
@@ -154,6 +162,21 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
     })();
   }, []);
 
+  // Observe the scroll container's content-box height so we can pin
+  // grid row height to the 4-agent target when spawns.length > 4.
+  // Fires once on attach with the initial size, then on every layout
+  // change (window resize, pane split drag, sidebar toggle, etc.).
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (entry) setContentHeight(entry.contentRect.height);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   // Close a single agent
   const handleClose = useCallback((sessionId: string) => {
     setSpawns((prev) => prev.filter((s) => s.sessionId !== sessionId));
@@ -205,7 +228,7 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
         <AgentToolbar onSpawn={handleSpawn} agents={agents} />
 
         {/* Mini terminal grid */}
-        <div className="flex-1 min-h-0 overflow-auto p-2">
+        <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-auto p-2">
           {spawns.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-text-dim text-sm font-mono gap-2">
               <Cpu size={24} className="opacity-50" />
@@ -222,10 +245,17 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                 // TUIs collapse into 1-char-wide hard-newline output that
                 // can never reflow on re-expand. See the constant's docstring
                 // for the cascade and the b261437 row-floor precedent.
-                // `gridAutoRows: minmax(220px, 1fr)` enforces the symmetric
-                // vertical floor (b261437): below ~10–13 rows Claude/Codex
-                // TUIs draw their header/transcript/prompt/footer regions on
-                // top of each other.
+                // `gridAutoRows` rule:
+                //   ≤4 agents → minmax(220px, 1fr): rows stretch to fill,
+                //   220px floor (b261437) protects the Claude/Codex TUI
+                //   header/transcript/prompt/footer stacking edge.
+                //   >4 agents → pin each row to the 4-agent target height
+                //   ((contentHeight - one 8px gap) / 2). This stops the
+                //   transition from 4 → 5 agents from squishing every tile
+                //   down to the 220px floor; instead the grid overflows and
+                //   the parent `overflow-auto` provides a vertical scrollbar
+                //   on the right. Still clamped at 220px for sanity when the
+                //   pane itself is tiny.
                 // The parent already has `overflow-auto`, so the pane scrolls
                 // when many agents push the grid past viewport (or when a
                 // narrow window can't fit two min-width columns) instead of
@@ -234,7 +264,10 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                   spawns.length === 1
                     ? `minmax(${MIN_AGENT_TILE_WIDTH_PX}px, 1fr)`
                     : `repeat(2, minmax(${MIN_AGENT_TILE_WIDTH_PX}px, 1fr))`,
-                gridAutoRows: "minmax(220px, 1fr)",
+                gridAutoRows:
+                  spawns.length > 4 && contentHeight !== null
+                    ? `${Math.max(220, (contentHeight - 8) / 2)}px`
+                    : "minmax(220px, 1fr)",
               }}
             >
               {spawns.map((spawn) =>
