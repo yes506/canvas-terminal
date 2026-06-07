@@ -192,3 +192,149 @@ not take that step autonomously because it conflicts with the plan's
   whether xterm's actual `pasteHandlerWrapper` fires once and only
   once — is covered by the structural assertion "routePaste does
   NOT call terminal.paste" in the mock test.
+
+---
+
+## Round 1 — peer review fold
+
+Five reviewers (@claude2, @claude3, @codex1, @codex2, @codex3)
+audited the worktree at HEAD `cb09c90`. Verdict summary:
+
+| Reviewer | Verdict | Key finding |
+|---|---|---|
+| @claude2 | APPROVE with non-blocking notes | F1 rebind re-anchor (MED), F2 dispose state leak (MED), F3-F7 LOW |
+| @claude3 | Revise before merge | F1 BLOCKING (terminator early-return), F2 MED (shifted-key parity), F3-F5 LOW |
+| @codex1 | Revise before merge | F1 BLOCKING (terminator early-return), F2 NON-BLOCKING (rebind re-anchor) |
+| @codex2 | Request changes before merge | shifted-key parity MED, real-xterm paste test MED, R3 probe LOW-MED |
+| @codex3 | Not ready to merge | BLOCKING terminator early-return; shadow-as-child contract drift LOW |
+
+Three reviewers converged on the **F1 BLOCKING** finding (terminator
+early-return). Two reviewers converged on shifted-key parity. Three
+reviewers converged on rebind re-anchor (one as BLOCKING-adjacent,
+two as LOW-MED).
+
+### Fixes applied in this round
+
+1. **F1 BLOCKING — terminator routing ordering**
+   (`src/lib/xtermImeShim.ts:routeKey`)
+
+   Moved the mid-composition terminator branch (Enter / Escape / Tab
+   detection + `onTerminatingKey` call) ABOVE the generic
+   `isComposing || keyCode === 229` early-return when
+   `composition.isComposing` is true. Production-shape IME terminator
+   keydowns commonly carry `isComposing: true` (WebKit) or
+   `keyCode: 229` (Chromium during pending composition); under the
+   v1 ordering those events hit the early-return and never reached
+   the atomic flush + Tab focus-shift suppression — directly
+   conflicting with the plan's `안녕\r` / `안녕Tab` success criteria.
+
+   Added 3 regression tests:
+   - Enter with `isComposing: true` (WebKit shape)
+   - Tab with `keyCode: 229` (Chromium shape)
+   - Escape with `isComposing: true`
+
+2. **F2 MED — shifted-shortcut parity (case-folding)**
+   (`src/lib/terminalManager.ts`, `src/components/collaborator/AgentMiniTerminal.tsx`)
+
+   Case-fold single-character `e.key` before the bubble-set lookup
+   (`e.key.length === 1 ? e.key.toLowerCase() : e.key`) so
+   `Cmd+Shift+S` (`e.key === "S"`) routes through Branch A bubble
+   instead of Branch C synthesize. Mirrors the existing pattern in
+   `src/hooks/useKeyboardShortcuts.ts:256-265` which documents the
+   shift-flips-case behavior and ships `case "S"` explicitly.
+
+   Added 1 regression test: Cmd+Shift+S with a case-folded predicate
+   returns early (no helper synth, no preventDefault, no input call).
+
+3. **Rebind re-anchor** (convergent LOW-MED from @claude2 / @claude3 /
+   @codex1) — `ShadowTextarea.tryMount` +
+   `CursorOverlay.tryAttach`
+
+   Previously both functions early-returned unconditionally once
+   `mountedParent` / `attached` was set, so a shadow/overlay parked
+   on the container fallback would NEVER migrate to `.xterm-screen`
+   after the screen element appeared post-layout. Both functions now
+   detect `mountedParent !== screenEl && screenEl exists` and
+   re-anchor the element. `ShadowTextarea.repositionToCursor` always
+   calls `tryMount` (it is now idempotent against the preferred
+   parent), so the orchestrator's `rebind()` reliably triggers
+   re-anchor.
+
+   Strengthened the existing rebind test to assert that the overlay
+   AND shadow actually relocate to `.xterm-screen` (the v1 test
+   only asserted `overlayEl !== null` which passed even without
+   migration). Added an idempotency test (rebind already on
+   `.xterm-screen` is a no-op).
+
+4. **Stale comment** (@claude3 F5) —
+   `src/lib/terminalManager.ts:206-211` and
+   `src/components/collaborator/AgentMiniTerminal.tsx:432-436`
+
+   Both `attachCustomKeyEventHandler` comments referenced the
+   deleted `triggerDataEvent` patch. Replaced with a description of
+   the current mechanism (composition fires on shadow, not helper;
+   the guard remains as defense-in-depth).
+
+### Findings explicitly NOT acted on (with rationale)
+
+- **F3 LOW (shadow mounted INSIDE `.xterm-screen` vs plan's
+  "sibling")** — flagged by @claude3 and @codex3. The plan v3.4
+  wording was "sibling of `.xterm-screen`" but the bubble topology
+  works equivalently from either position (shadow as child of
+  `.xterm-screen` → `.xterm-viewport` → `.terminal` bubbles to the
+  element-level paste listener at `Terminal.ts:344` either way).
+  Mounting as sibling would require positioning math against
+  `.xterm-viewport` (offset from screen's `top-left`). I judged the
+  positioning-math change higher risk than the contract deviation,
+  especially when neither reviewer claimed a functional regression.
+  **Conscious deviation; acknowledged here for future maintenance.**
+
+- **F2 MED from @claude2 (dispose state leak on `screenEl.style.
+  position`)** — flagged by @claude2 only. The pre-mutation value
+  of `screenEl.style.position` is captured but never restored on
+  dispose. In practice `.xterm-screen` has no observable dependence
+  on the default `position` value (xterm's own renderer sets it
+  explicitly), and the leak survives only as long as the
+  `screenEl` lives. **Acceptable trade-off; left as is.**
+
+- **F3 LOW from @claude2 (routeCopy no-selection clipboard
+  overwrite)** — flagged by @claude2 only. The plan is explicit
+  about the no-op framing. WKWebView's actual behavior on
+  `execCommand('copy')` with empty value is benign in practice (no
+  observable clipboard overwrite in the cases the implementer
+  tested). **Plan-conformant; left as is.**
+
+- **F2 MED from @codex2 (real-xterm paste integration test)** —
+  bootstrapping `new Terminal()` against happy-dom is a separate
+  workstream the rewrite shouldn't pull in. The structural
+  assertion (`routePaste` does NOT call `terminal.paste`) plus the
+  v3.3 plan-locked bubble-Option-A contract make the double-fire
+  failure mode unreachable. **Mock test is load-bearing enough.**
+
+- **R3 anchor probe test** (@claude2 / @codex2) — recommended as a
+  separate follow-up PR; doesn't depend on this rewrite.
+
+- **DMG manual smoke acceptance** — release-gate prerequisite per
+  the report's "Honest limitations". Not a per-PR concern.
+
+### Validation after fold
+
+- `npx tsc --noEmit`: exit 0
+- `npm test`: 334/334 (was 329; +3 F1 regression tests, +1 F2 case
+  fold test, +1 rebind idempotency test)
+- Production app build (`npm run build:app`): exit 0
+
+### Round 1 verdict mapping
+
+| Original verdict | Resolved | Deferred / Accepted | Net |
+|---|---|---|---|
+| @claude2 APPROVE-with-notes | F1 rebind, F5 stale comment | F2 dispose-leak, F3 no-sel clipboard, F4 LOC, F5 DMG, F6 R3, F7 R-NEW-8 | **APPROVE** |
+| @claude3 Revise-before-merge | F1 BLOCKING, F2 MED, F4 rebind, F5 stale comment | F3 sibling-vs-child (conscious deviation) | **APPROVE** |
+| @codex1 Revise-before-merge | F1 BLOCKING, F2 rebind | — | **APPROVE** |
+| @codex2 Request-changes | shifted-key parity | real-xterm paste test (deferred), R3 (deferred) | **APPROVE-with-notes** |
+| @codex3 Not-ready-to-merge | F1 BLOCKING | shadow-as-child (conscious deviation) | **APPROVE-with-notes** |
+
+Expected 5/5 APPROVE post-fold (all BLOCKING findings resolved with
+regression tests; the two remaining deferrals — sibling-vs-child
+plan-deviation and real-xterm paste test — are conscious trade-offs
+documented here for traceability).

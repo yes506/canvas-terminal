@@ -219,16 +219,30 @@ function createCursorOverlay(
   overlayEl.appendChild(fakeCursorEl);
 
   let attached = false;
+  let mountedParent: HTMLElement | null = null;
   let lastText = "";
 
   function tryAttach(): void {
-    if (attached) return;
     const screenEl = container.querySelector<HTMLElement>(".xterm-screen");
+    // Round-1 fold (convergent LOW-MED from @claude2 / @claude3 /
+    // @codex1): re-anchor from container fallback to .xterm-screen when
+    // it becomes available. Mirrors ShadowTextarea.tryMount.
+    if (mountedParent && screenEl && mountedParent !== screenEl) {
+      if (!screenEl.style.position || screenEl.style.position === "static") {
+        screenEl.style.position = "relative";
+      }
+      screenEl.appendChild(overlayEl);
+      mountedParent = screenEl;
+      attached = true;
+      return;
+    }
+    if (attached) return;
     if (screenEl) {
       if (!screenEl.style.position || screenEl.style.position === "static") {
         screenEl.style.position = "relative";
       }
       screenEl.appendChild(overlayEl);
+      mountedParent = screenEl;
       attached = true;
       return;
     }
@@ -237,6 +251,7 @@ function createCursorOverlay(
         container.style.position = "relative";
       }
       container.appendChild(overlayEl);
+      mountedParent = container;
       attached = true;
     }
   }
@@ -312,6 +327,7 @@ function createCursorOverlay(
       overlayEl.parentNode.removeChild(overlayEl);
     }
     attached = false;
+    mountedParent = null;
     container.classList.remove(HIDDEN_CURSOR_CSS_CLASS);
   }
 
@@ -835,11 +851,17 @@ export function attachKoreanImeShim(
   }
 
   function routeKey(e: KeyboardEvent): void {
-    // Composition path — IME consumed the key; let composition* events
-    // drive state.
-    if (e.isComposing || e.keyCode === 229) return;
-
     // Mid-composition terminator (Enter / Esc / Tab) — flush + suppress.
+    //
+    // CRITICAL ORDERING (round-1 fold, convergent BLOCKING from
+    // @claude3 / @codex1 / @codex3): real IME terminator keydowns on
+    // WKWebView commonly carry `isComposing: true`, and on Chromium
+    // during pending composition they often carry `keyCode: 229`. If we
+    // run the generic `isComposing || keyCode === 229` early-return
+    // FIRST, those production-shaped events get dropped and the atomic
+    // flush + Tab focus-shift suppression never fire. So this branch
+    // MUST run before the generic early-return when composition is
+    // active.
     if (composition.isComposing) {
       const isEnter = e.key === "Enter" || e.code === "Enter";
       const isEsc = e.key === "Escape" || e.code === "Escape";
@@ -851,9 +873,17 @@ export function attachKoreanImeShim(
         markKeydownHandled();
         return;
       }
-      // Mid-composition modifier — pass through (IME may still consume).
+      // Mid-composition non-terminator — IME may still consume; let
+      // composition* events drive state.
+      if (e.isComposing || e.keyCode === 229) return;
+      // Mid-composition modifier or other key — pass through.
       return;
     }
+
+    // Composition path (non-composing router state but the event itself
+    // is IME-marked) — IME consumed the key; let composition* events
+    // drive state.
+    if (e.isComposing || e.keyCode === 229) return;
 
     // Native edit shortcut bypass — Cmd+V/C/X on macOS. Browser fires
     // paste/copy/cut on shadow which routePaste/routeCopy/routeCut owns.

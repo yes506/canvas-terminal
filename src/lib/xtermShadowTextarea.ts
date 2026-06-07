@@ -135,8 +135,25 @@ export function createShadowTextarea(
   textareaEl.style.cssText = baseStyle;
 
   function tryMount(): void {
-    if (!textareaEl || mountedParent || disposed) return;
+    if (!textareaEl || disposed) return;
     const screenEl = container.querySelector<HTMLElement>(".xterm-screen");
+    // Round-1 fold (convergent LOW-MED from @claude2 / @claude3 /
+    // @codex1): if currently parked on the container fallback AND
+    // `.xterm-screen` is now reachable, re-anchor under it. The
+    // previous version short-circuited unconditionally on
+    // `mountedParent`, so a deferred layout that brought
+    // `.xterm-screen` into view never moved the textarea — breaking
+    // the rebind contract.
+    if (mountedParent && screenEl && mountedParent !== screenEl) {
+      // Re-anchor to the preferred parent.
+      if (!screenEl.style.position || screenEl.style.position === "static") {
+        screenEl.style.position = "relative";
+      }
+      screenEl.appendChild(textareaEl);
+      mountedParent = screenEl;
+      return;
+    }
+    if (mountedParent) return;
     if (screenEl) {
       const prevPosition = screenEl.style.position;
       if (!prevPosition || prevPosition === "static") {
@@ -159,10 +176,11 @@ export function createShadowTextarea(
 
   function repositionToCursor(): void {
     if (disposed || !textareaEl) return;
-    // Retry mount: orchestrator may call us after a deferred layout.
-    if (!mountedParent) {
-      tryMount();
-    }
+    // Always re-run tryMount — it is now idempotent against the
+    // preferred parent AND re-anchors from container fallback to
+    // .xterm-screen when the screen element appears after attach time
+    // (round-1 fold per @claude2 / @claude3 / @codex1).
+    tryMount();
     const { width: cellW, height: cellH } = readCellDimensions(terminal);
     const cx = terminal.buffer.active.cursorX;
     const cy = terminal.buffer.active.cursorY;

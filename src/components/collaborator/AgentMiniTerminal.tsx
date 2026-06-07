@@ -428,9 +428,11 @@ export function AgentMiniTerminal({
 
       // Let app-level shortcuts bubble past xterm
       terminal.attachCustomKeyEventHandler((e) => {
-        // Return true so xterm does NOT call preventDefault() on IME
-        // key events — preventDefault() blocks the IME from composing.
-        // The triggerDataEvent patch handles suppressing IME output.
+        // textarea-rewrite v3.4: composition events fire on the shadow
+        // textarea (not the helper), so xterm's `_handleKey` never runs
+        // for IME keystrokes. Keeping the guard is harmless and defends
+        // against any future xterm path that synchronously dispatches
+        // an IME-marked keydown.
         if (e.isComposing || e.keyCode === 229) return true;
         // Shift+Enter → CSI u escape for tools like Claude Code
         if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey) {
@@ -469,9 +471,15 @@ export function AgentMiniTerminal({
           terminal.scrollToBottom();
         },
         shouldBubbleShortcut: (e) => {
+          // Round-1 fold (convergent MED from @claude3 / @codex2): case-
+          // fold single-char keys before set lookup. Under Shift, e.key
+          // flips to uppercase (Cmd+Shift+S → e.key === "S"), which the
+          // lowercase-only list would miss. useKeyboardShortcuts.ts
+          // documents this case explicitly (case "S" branch).
+          const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
           if (
             (e.metaKey || e.ctrlKey) &&
-            ["t","w","f","d","e","z","s","o","=","-","0","1","2","3","4","5","6","7","8","9","Enter"].includes(e.key)
+            ["t","w","f","d","e","z","s","o","=","-","0","1","2","3","4","5","6","7","8","9","Enter"].includes(k)
           ) {
             return true;
           }

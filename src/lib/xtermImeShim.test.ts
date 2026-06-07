@@ -428,6 +428,55 @@ describe("attachKoreanImeShim — composition state machine", () => {
     expect(ev.defaultPrevented).toBe(true);
   });
 
+  // ROUND-1 FOLD (convergent BLOCKING from @claude3 / @codex1 / @codex3):
+  // production-shape IME terminator events carry `isComposing: true`
+  // (WebKit) and/or `keyCode: 229` (Chromium during pending composition).
+  // These two tests cover the production shape that was unreachable in
+  // the v1 ordering (early-return ran before the terminator branch).
+
+  it("Enter mid-composition with isComposing=true still flushes atomically (WebKit shape)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안녕");
+    const ev = fireKeydown(shadowEl(fx), {
+      key: "Enter",
+      code: "Enter",
+      keyCode: 13,
+      isComposing: true,
+    });
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "안녕\r" }]);
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("Tab mid-composition with keyCode=229 still flushes atomically (Chromium shape)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "구");
+    const ev = fireKeydown(shadowEl(fx), {
+      key: "Tab",
+      code: "Tab",
+      keyCode: 229,
+    });
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "구\t" }]);
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("Escape mid-composition with isComposing=true still flushes atomically", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "한");
+    fireKeydown(shadowEl(fx), {
+      key: "Escape",
+      code: "Escape",
+      keyCode: 27,
+      isComposing: true,
+    });
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "한\x1b" }]);
+  });
+
   it("compositionupdate paints the overlay with event.data (canonical)", () => {
     const fx = makeMockTerminal();
     const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
@@ -664,6 +713,38 @@ describe("attachKoreanImeShim — KeyRouter Branch A (shouldBubbleShortcut)", ()
     });
     fireKeydown(shadowEl(fx), { key: "a", code: "KeyA", keyCode: 65 });
     expect(fx.inputCalls).toEqual([{ data: "a", wasUserInput: true }]);
+  });
+
+  // ROUND-1 FOLD (convergent MED from @claude3 / @codex2): under Shift,
+  // e.key flips to uppercase. The production call sites' bubble
+  // predicates must be case-insensitive on single-char keys. This test
+  // pins the shim's contract: if the call-site predicate is
+  // case-folded, Cmd+Shift+S correctly bubbles. The matching call-site
+  // edits in terminalManager.ts and AgentMiniTerminal.tsx case-fold via
+  // `e.key.length === 1 ? e.key.toLowerCase() : e.key`.
+  it("Cmd+Shift+S bubbles when predicate is case-folded (parity with useKeyboardShortcuts)", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    const SET = new Set(["s", "t", "w", "f"]);
+    const shouldBubbleShortcut: AttachKoreanImeShimOptions["shouldBubbleShortcut"] = (e) => {
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      return (e.metaKey || e.ctrlKey) && SET.has(k);
+    };
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      shouldBubbleShortcut,
+    });
+    const ev = fireKeydown(shadowEl(fx), {
+      key: "S",
+      code: "KeyS",
+      keyCode: 83,
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(helperKeydowns.length).toBe(0);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(fx.inputCalls).toEqual([]);
   });
 });
 
@@ -1011,16 +1092,30 @@ describe("attachKoreanImeShim — degraded mode + rebind retry", () => {
     expect(h.overlayEl).toBeNull();
   });
 
-  it("rebind after .xterm-screen appears attaches the overlay", () => {
+  it("rebind after .xterm-screen appears RELOCATES overlay + shadow to .xterm-screen", () => {
     const fx = makeMockTerminal();
     fx.screenEl.remove();
     const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
-    // Overlay landed on container fallback.
+    // Overlay landed on container fallback (no .xterm-screen yet).
     expect(h.overlayEl).not.toBeNull();
+    expect(h.overlayEl?.parentNode).toBe(fx.container);
+    const shadow = fx.container.querySelector(".xterm-shadow-textarea")!;
+    expect(shadow.parentNode).toBe(fx.container);
+    // .xterm-screen appears post-layout.
     fx.container.appendChild(fx.screenEl);
     h.rebind();
-    // The screen is now in the DOM; rebind is idempotent — overlay is
-    // still considered attached, getter returns the overlay element.
-    expect(h.overlayEl).not.toBeNull();
+    // Round-1 fold: rebind MUST move overlay + shadow under the new
+    // .xterm-screen (the contract said "re-anchor on layout change").
+    expect(h.overlayEl?.parentNode).toBe(fx.screenEl);
+    expect(shadow.parentNode).toBe(fx.screenEl);
+  });
+
+  it("rebind is a no-op when already mounted on .xterm-screen", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(h.overlayEl?.parentNode).toBe(fx.screenEl);
+    h.rebind();
+    h.rebind();
+    expect(h.overlayEl?.parentNode).toBe(fx.screenEl);
   });
 });

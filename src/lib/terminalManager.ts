@@ -203,10 +203,12 @@ export async function createSession(
 
   // Let app-level shortcuts bubble past xterm
   terminal.attachCustomKeyEventHandler((e) => {
-    // Return true so xterm does NOT call preventDefault() on IME key
-    // events.  preventDefault() blocks the browser from initiating IME
-    // composition entirely.  The triggerDataEvent patch below handles
-    // suppressing any output xterm's _handleKey produces for IME keys.
+    // textarea-rewrite v3.4: composition events fire on the shadow
+    // textarea (not the helper), so xterm's `_handleKey` never runs
+    // for IME keystrokes — there is no IME-time triggerDataEvent
+    // suppression needed here. Keeping this guard is harmless and
+    // defends against any future xterm path that synchronously
+    // dispatches an IME-marked keydown.
     if (e.isComposing || e.keyCode === 229) return true;
 
     // Shift+Enter → CSI u escape sequence
@@ -371,7 +373,13 @@ export async function createSession(
       }
     },
     shouldBubbleShortcut: (e) => {
-      if ((e.metaKey || e.ctrlKey) && INTERCEPTED_KEYS.has(e.key)) return true;
+      // Round-1 fold (convergent MED from @claude3 / @codex2): case-fold
+      // single-character keys before INTERCEPTED_KEYS lookup. Under
+      // Shift, `e.key` flips to uppercase (Cmd+Shift+S → e.key === "S"),
+      // which the lowercase-only set would miss. useKeyboardShortcuts.ts
+      // documents this case explicitly (case "S" branch).
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if ((e.metaKey || e.ctrlKey) && INTERCEPTED_KEYS.has(k)) return true;
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "[" || e.key === "]")) return true;
       if ((e.metaKey || e.ctrlKey) && e.altKey && e.key.startsWith("Arrow")) return true;
       // Shift+Enter is NOT a bubble — it goes through Branch C so xterm's
