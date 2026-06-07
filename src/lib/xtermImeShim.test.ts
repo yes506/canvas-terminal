@@ -27,6 +27,10 @@ interface MockTerminalFixture {
   pasteCalls: Array<{ data: string }>;
   selectionRef: { value: string };
   cursorRef: { x: number; y: number };
+  /** Fire registered onCursorMove listeners (simulates PTY echo advancing the xterm cursor). */
+  fireCursorMove: () => void;
+  /** Number of registered onCursorMove listeners — for dispose-leak coverage. */
+  cursorMoveListenerCount: () => number;
 }
 
 function makeMockTerminal(): MockTerminalFixture {
@@ -47,6 +51,7 @@ function makeMockTerminal(): MockTerminalFixture {
   const pasteCalls: Array<{ data: string }> = [];
   const selectionRef = { value: "" };
   const cursorRef = { x: 0, y: 0 };
+  const cursorMoveListeners = new Set<() => void>();
 
   const terminal = {
     options: {
@@ -76,6 +81,14 @@ function makeMockTerminal(): MockTerminalFixture {
     getSelection(): string {
       return selectionRef.value;
     },
+    onCursorMove(cb: () => void): { dispose(): void } {
+      cursorMoveListeners.add(cb);
+      return {
+        dispose: () => {
+          cursorMoveListeners.delete(cb);
+        },
+      };
+    },
     _core: {
       _renderService: {
         dimensions: { css: { cell: { width: 8, height: 16 } } },
@@ -92,6 +105,10 @@ function makeMockTerminal(): MockTerminalFixture {
     pasteCalls,
     selectionRef,
     cursorRef,
+    fireCursorMove: () => {
+      for (const cb of cursorMoveListeners) cb();
+    },
+    cursorMoveListenerCount: () => cursorMoveListeners.size,
   };
 }
 
@@ -1043,6 +1060,88 @@ describe("attachKoreanImeShim — dispose", () => {
 // `triggerDataEvent` patch and no late re-emit from xterm's
 // CompositionHelper (composition lives on shadow, not helper).
 // ===========================================================================
+
+// ===========================================================================
+// Live cursor tracking during composition
+//
+// In dev mode (Vite + Tauri round-trip), the PTY echo of a just-committed
+// Korean syllable can arrive AFTER the next compositionstart fires, so the
+// overlay paints at a stale cursor position and covers the just-arrived
+// character. The shim subscribes to terminal.onCursorMove during composition
+// so the overlay snaps forward when xterm advances its cursor.
+// ===========================================================================
+
+describe("attachKoreanImeShim — overlay live cursor tracking", () => {
+  it("subscribes to onCursorMove on compositionstart, unsubscribes on compositionend", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(fx.cursorMoveListenerCount()).toBe(0);
+    fireCompositionStart(shadowEl(fx));
+    expect(fx.cursorMoveListenerCount()).toBe(1);
+    fireCompositionEnd(shadowEl(fx), "안");
+    expect(fx.cursorMoveListenerCount()).toBe(0);
+  });
+
+  it("unsubscribes on mid-composition terminator (Enter)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안");
+    expect(fx.cursorMoveListenerCount()).toBe(1);
+    fireKeydown(shadowEl(fx), { key: "Enter", code: "Enter", keyCode: 13 });
+    expect(fx.cursorMoveListenerCount()).toBe(0);
+  });
+
+  it("unsubscribes on blur during composition", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    expect(fx.cursorMoveListenerCount()).toBe(1);
+    fireBlur(shadowEl(fx));
+    expect(fx.cursorMoveListenerCount()).toBe(0);
+  });
+
+  it("unsubscribes on dispose", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    expect(fx.cursorMoveListenerCount()).toBe(1);
+    h.dispose();
+    expect(fx.cursorMoveListenerCount()).toBe(0);
+  });
+
+  it("PTY echo race: cursor advances during composition → overlay snaps to new position", () => {
+    // Reproduces the dev-mode bug: compositionstart fires before the
+    // previous syllable's PTY echo lands. The overlay initially paints
+    // at the stale cursor=1 position; when the PTY echo advances xterm's
+    // cursor to 2, the overlay must snap forward.
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // Simulate that "안" was just committed; cursor SHOULD be at 2 (full-
+    // width Korean = 2 cells), but PTY echo hasn't arrived yet → cursor
+    // still at 0.
+    fx.cursorRef.x = 0;
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "녕");
+    const overlay = h.overlayEl!;
+    // Overlay painted at cell 0 — stale.
+    expect(overlay.style.left).toBe("0px");
+    // PTY echo lands: xterm advances cursor to 2. Fire onCursorMove.
+    fx.cursorRef.x = 2;
+    fx.fireCursorMove();
+    // Overlay snapped to cell 2 (cellW=8 in the mock).
+    expect(overlay.style.left).toBe(`${2 * 8}px`);
+  });
+
+  it("does NOT subscribe outside composition (no listener leak)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // Type printable + emit non-composition keys: no listener should
+    // ever be registered.
+    fireKeydown(shadowEl(fx), { key: "a", code: "KeyA", keyCode: 65 });
+    expect(fx.cursorMoveListenerCount()).toBe(0);
+  });
+});
 
 describe("attachKoreanImeShim — no late re-emit duplicate (structural)", () => {
   it("composing 안 → committing → typing space → exactly one PTY write of '안' (commit)", () => {

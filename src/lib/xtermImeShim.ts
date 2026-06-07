@@ -829,11 +829,40 @@ export function attachKoreanImeShim(
   // --- Event listeners on shadow -------------------------------------------
   const shadowEl = shadow.textareaEl;
 
+  // Live cursor tracking during composition.
+  //
+  // In production WKWebView and especially in dev mode (Vite + Tauri
+  // round-trip), Korean composition can produce this race:
+  //   1. compositionend("안") → invoke("write_to_pty", "안") (async)
+  //   2. compositionstart("녕") fires BEFORE the PTY echo of "안"
+  //      arrives back at xterm (round-trip can be 30-100ms in dev).
+  //   3. overlay.reposition reads terminal.buffer.active.cursorX —
+  //      still STALE (where "안" will go), so the overlay paints
+  //      ON TOP of the just-arriving "안" character.
+  //   4. User sees the overlay glyph instead of "안" → visible
+  //      character drop / drift across multi-syllable composition.
+  // Subscribing to terminal.onCursorMove keeps the overlay glued to
+  // the live cursor; when the PTY echo lands and xterm advances the
+  // cursor, the overlay snaps forward. Dispose on every composition
+  // exit path so we don't burn cycles outside composition.
+  let cursorMoveDisposable: { dispose(): void } | null = null;
+  function attachCursorTracker(): void {
+    if (cursorMoveDisposable) return;
+    cursorMoveDisposable = terminal.onCursorMove(() => {
+      overlay.reposition();
+    });
+  }
+  function detachCursorTracker(): void {
+    cursorMoveDisposable?.dispose();
+    cursorMoveDisposable = null;
+  }
+
   function onShadowCompositionStart(e: CompositionEvent): void {
     if (terminal.options.cursorBlink) {
       terminal.options.cursorBlink = false;
     }
     composition.onCompositionStart(e);
+    attachCursorTracker();
   }
 
   function onShadowCompositionUpdate(e: CompositionEvent): void {
@@ -842,11 +871,13 @@ export function attachKoreanImeShim(
 
   function onShadowCompositionEnd(e: CompositionEvent): void {
     composition.onCompositionEnd(e);
+    detachCursorTracker();
     terminal.options.cursorBlink = origCursorBlink;
   }
 
   function onShadowBlur(): void {
     composition.onBlurDuringComposition();
+    detachCursorTracker();
     terminal.options.cursorBlink = origCursorBlink;
   }
 
@@ -869,6 +900,7 @@ export function attachKoreanImeShim(
       if (isEnter || isEsc || isTab) {
         const term: "\r" | "\x1b" | "\t" = isEnter ? "\r" : isEsc ? "\x1b" : "\t";
         composition.onTerminatingKey(e, term);
+        detachCursorTracker();
         e.preventDefault();
         markKeydownHandled();
         return;
@@ -999,6 +1031,7 @@ export function attachKoreanImeShim(
         shadowEl.removeEventListener("cut", onShadowCut);
         shadowEl.removeEventListener("beforeinput", onShadowBeforeInput);
       }
+      detachCursorTracker();
       isolator.dispose();
       shadow.dispose();
       overlay.dispose();
