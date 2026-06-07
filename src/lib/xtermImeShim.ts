@@ -325,8 +325,37 @@ export function attachKoreanImeShim(
   // B4 (korean-ime-dup-period-arrow): tracks the most recent committed IME
   // text + post-increment imeFlushGen so the triggerDataEvent wrapper's
   // 20ms defer can suppress xterm's CompositionHelper post-commit re-emit
-  // (case d defer fire-after-compositionend race).
-  let lastCompositionCommit: { text: string; gen: number } | null = null;
+  // (case d defer fire-after-compositionend race). `committedAt` is added
+  // for korean-ime-dmg-race diagnostics — lets the strip-hit/strip-miss
+  // instrumentation report total commit→arrival gapMs (vs only ageMs since
+  // safety-clear), which is the quantity that adjudicates which WebKit
+  // sub-mechanism (clamping vs tolerance-batched vs microtask defer) is
+  // firing in the DMG race.
+  let lastCompositionCommit:
+    | { text: string; gen: number; committedAt: number }
+    | null = null;
+  // korean-ime-dmg-race: when imeDebug is set, the safety-clear callback
+  // snapshots the cleared commit here so the prefix-strip fall-through
+  // path can detect "this WOULD have suppressed if the token were still
+  // live" — the strip-miss case the 40→250 ms ceiling extension is meant
+  // to eliminate. The snapshot lives ~500 ms so the late re-emit can
+  // arrive after the safety-clear and still be counted.
+  let lastClearedCommit:
+    | { text: string; gen: number; committedAt: number; clearedAt: number }
+    | null = null;
+  // Cached at attach time per round-2 perf concern — avoids a
+  // localStorage round-trip on every triggerDataEvent. Setting the flag
+  // mid-session does NOT enable counters until the shim re-attaches
+  // (recreate terminal session, reload WebView, or restart the app).
+  const imeDebug = (() => {
+    try {
+      return localStorage.getItem("canvasTerminal_imeDebug") === "1";
+    } catch {
+      return false;
+    }
+  })();
+  let stripHitCounter = 0;
+  let stripMissCounter = 0;
 
   const overlayEl = document.createElement("span");
   overlayEl.style.cssText =
@@ -484,21 +513,34 @@ export function attachKoreanImeShim(
       // B4: record AFTER imeFlushGen++ so the stored gen matches the value
       // captured by the deferred triggerDataEvent path (which also reads
       // imeFlushGen at defer-schedule time — post-increment under case d).
-      const commit = { text: written, gen: imeFlushGen };
+      const commit = {
+        text: written,
+        gen: imeFlushGen,
+        committedAt: performance.now(),
+      };
       lastCompositionCommit = commit;
-      // Round-1 implementer-review fold (4/5 convergent: codex2, codex3,
-      // codex4, claude4): time-bound the dedup window so the token cannot
-      // suppress a later legitimate same-syllable triggerDataEvent in the
-      // same generation. xterm's CompositionHelper post-commit re-emit
-      // arrives within ~1 frame (≪ 20 ms defer + a small margin); 40 ms is
-      // 2× the defer window — comfortable for the case-(d) race while
-      // tightly bounding false-suppression long-tail. The token-identity
-      // check prevents a stale 40 ms timer from clobbering a newer commit.
+      // korean-ime-dmg-race fold: time-bound dedup at 250 ms (was 40 ms in
+      // korean-ime-dup-space round-1). Production WKWebView CFRunLoop can
+      // coalesce xterm's CompositionHelper setTimeout(0) past the old 40 ms
+      // window when the main thread is idle (no HMR WS keeping the loop
+      // hot), causing the multi-char prefix-strip to miss the late re-emit.
+      // 250 ms covers observed adaptive throttling while the trailing-slack
+      // cap at the strip predicate bounds the wider false-suppression
+      // exposure. Token-identity check (`lastCompositionCommit === commit`)
+      // ensures a stale 250 ms timer cannot null a newer commit's token.
       setTimeout(() => {
         if (!disposed && lastCompositionCommit === commit) {
+          if (imeDebug) {
+            lastClearedCommit = {
+              text: commit.text,
+              gen: commit.gen,
+              committedAt: commit.committedAt,
+              clearedAt: performance.now(),
+            };
+          }
           lastCompositionCommit = null;
         }
-      }, 40);
+      }, 250);
       emitFlush(written, null);
     }
   };
@@ -516,15 +558,29 @@ export function attachKoreanImeShim(
         // B4: blur-commit is a valid IME commit path; record so xterm's
         // CompositionHelper post-commit triggerDataEvent (if any) is
         // deduped consistently with onCompositionEnd.
-        const commit = { text: composed, gen: imeFlushGen };
+        const commit = {
+          text: composed,
+          gen: imeFlushGen,
+          committedAt: performance.now(),
+        };
         lastCompositionCommit = commit;
-        // Round-1 implementer-review fold: same time-bound clear as
-        // onCompositionEnd — keeps the dedup window tight.
+        // korean-ime-dmg-race fold: 250 ms safety-clear mirrors the
+        // onCompositionEnd path. Same CFRunLoop coalescing concern; same
+        // token-identity safety. Snapshot on clear is debug-flag-gated
+        // for instrumentation.
         setTimeout(() => {
           if (!disposed && lastCompositionCommit === commit) {
+            if (imeDebug) {
+              lastClearedCommit = {
+                text: commit.text,
+                gen: commit.gen,
+                committedAt: commit.committedAt,
+                clearedAt: performance.now(),
+              };
+            }
             lastCompositionCommit = null;
           }
-        }, 40);
+        }, 250);
         emitFlush(composed, null);
       }
     }
@@ -630,14 +686,34 @@ export function attachKoreanImeShim(
       // char payloads (e.g. paste of "한자") leave the live token intact
       // so a later length-1 duplicate can still claim it via the existing
       // branch below.
+      // Trailing-slack cap: the realistic CompositionHelper substring is
+      // composed-prefix + 1–2 trailing ASCII chars (the trigger key that
+      // ended composition before xterm's setTimeout(0) fired). Cap at +4
+      // to bound false-suppression of long pastes that incidentally start
+      // with the just-committed syllable (e.g. paste of "녕 hello world"
+      // within the 250 ms safety window). Cap is orthogonal to Order-Q:
+      // that race is handled by the length-1 path's claim-at-schedule
+      // discipline below, not by anything this cap affects.
       const live = lastCompositionCommit;
       if (
         live !== null &&
         imeFlushGen === live.gen &&
         data.length > live.text.length &&
+        data.length <= live.text.length + 4 &&
         data.startsWith(live.text) &&
         !isComposing
       ) {
+        if (imeDebug) {
+          stripHitCounter++;
+          const gapMs = performance.now() - live.committedAt;
+          // eslint-disable-next-line no-console
+          console.warn("[ime] strip-hit", {
+            data,
+            gapMs,
+            gen: live.gen,
+            count: stripHitCounter,
+          });
+        }
         lastCompositionCommit = null;
         return;
       }
@@ -652,8 +728,9 @@ export function attachKoreanImeShim(
         // candidate (text + gen both equal), we capture the token
         // into the defer closure AND null the live token atomically —
         // the captured `claim` then drives the suppression decision
-        // inside the deferred callback, race-free against the 40 ms
-        // safety clear (round-2 fold).
+        // inside the deferred callback, race-free against the 250 ms
+        // safety clear (round-2 introduced the time-bound clear;
+        // korean-ime-dmg-race extended 40→250 ms).
         //
         // Round-3 implementer-review fold (3/5 convergent: @codex2 MED,
         // @codex3 MED, @codex4 LOW): only claim when the data + gen
@@ -686,6 +763,38 @@ export function attachKoreanImeShim(
           }
         }, 20);
         return;
+      }
+      // korean-ime-dmg-race: strip-miss detection. Reached only when the
+      // multi-char prefix-strip above did NOT fire — either because live
+      // was null (the race we extended the window to close) or because
+      // the predicate didn't match. If `live` was null AND a recent
+      // cleared snapshot's predicate WOULD have matched, that's a miss
+      // the 250 ms ceiling failed to catch — the next regression cycle
+      // can read these to decide whether to widen further. Snapshot
+      // lifetime is bounded at 500 ms; older snapshots are garbage-
+      // collected here so they don't accumulate.
+      if (imeDebug && lastClearedCommit !== null) {
+        const now = performance.now();
+        const ageMs = now - lastClearedCommit.clearedAt;
+        if (ageMs > 500) {
+          lastClearedCommit = null;
+        } else if (
+          data.length > lastClearedCommit.text.length &&
+          data.length <= lastClearedCommit.text.length + 4 &&
+          data.startsWith(lastClearedCommit.text) &&
+          imeFlushGen === lastClearedCommit.gen
+        ) {
+          stripMissCounter++;
+          const gapMs = now - lastClearedCommit.committedAt;
+          // eslint-disable-next-line no-console
+          console.warn("[ime] strip-miss", {
+            data,
+            gapMs,
+            ageMs,
+            gen: lastClearedCommit.gen,
+            count: stripMissCounter,
+          });
+        }
       }
       origTrigger(data, wasUserInput);
     };

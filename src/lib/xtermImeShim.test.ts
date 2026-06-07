@@ -959,16 +959,19 @@ describe("attachKoreanImeShim — T4: modifier-augmented arrow (no duplicate)", 
 //      the B4 inner check matches, clear `lastCompositionCommit` before
 //      `return`. The first xterm CompositionHelper post-commit re-emit
 //      is suppressed; any subsequent same-syllable trigger passes through.
-//   2. **Time-bound (40 ms)** — `onCompositionEnd` / `onTextareaBlur`
-//      schedule a `setTimeout(40)` that nulls `lastCompositionCommit` if
+//   2. **Time-bound (250 ms)** — `onCompositionEnd` / `onTextareaBlur`
+//      schedule a `setTimeout(250)` that nulls `lastCompositionCommit` if
 //      it still references the same commit (token-identity check keeps
-//      a newer commit safe from a stale clear).
+//      a newer commit safe from a stale clear). Extended from 40 ms by
+//      the korean-ime-dmg-race fold; CFRunLoop timer coalescing in idle
+//      WKWebView can defer xterm's setTimeout(0) past the old 40 ms
+//      ceiling, manifesting as a DMG-only race the dev mode doesn't hit.
 // Combined, both close the "second trigger in same gen" and "no trigger
 // ever arrives" long-tail windows.
 // ===========================================================================
 
 describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => {
-  it("T5 (time-bound): a later legitimate triggerDataEvent('요') passes through after the 40ms post-commit dedup window expires", () => {
+  it("T5 (time-bound): a later legitimate triggerDataEvent('요') passes through after the 250ms post-commit dedup window expires", () => {
     const { terminal, container, textarea, origTriggerCalls } =
       makeMockTerminal();
     const onComposedFlush = vi.fn();
@@ -985,16 +988,16 @@ describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => 
     )._core.coreService;
 
     // 1. Commit "요" via compositionend. Sets lastCompositionCommit and
-    //    schedules the 40 ms safety clear.
+    //    schedules the 250 ms safety clear.
     textarea.value = "요";
     fireInput(textarea, "insertText", "요");
     fireKeydown(textarea, { keyCode: 229 });
     fireCompositionEnd(textarea, "요");
 
-    // 2. Drive past the 40 ms safety window. No xterm CompositionHelper
+    // 2. Drive past the 250 ms safety window. No xterm CompositionHelper
     //    re-emit arrives (the case-(d) window passed unused). The safety
     //    timer fires → lastCompositionCommit cleared.
-    vi.advanceTimersByTime(60);
+    vi.advanceTimersByTime(300);
 
     // 3. Later legitimate triggerDataEvent("요") (e.g., single-Hangul
     //    paste, plugin emission, or programmatic terminal input). With
@@ -1057,7 +1060,9 @@ describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => 
     vi.advanceTimersByTime(15);
     cs.triggerDataEvent("요", true);
 
-    // 4. Advance past both 20 ms defers AND the 40 ms safety clear.
+    // 4. Advance past both 20 ms defers (and well within the 250 ms
+    //    safety-clear window — the test does not depend on the safety
+    //    clear firing; claim-at-schedule is the mechanism under test).
     vi.advanceTimersByTime(30);
 
     // POST-FOLD: "한" passes through (non-matching); "요" duplicate
@@ -1074,15 +1079,18 @@ describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => 
     vi.useRealTimers();
   });
 
-  it("T7 (delayed duplicate inside 40ms window): a delayed xterm CompositionHelper re-emit at t=25ms is suppressed via claim-at-schedule (race-free against safety clear)", () => {
+  it("T7 (delayed duplicate inside 250ms window): a delayed xterm CompositionHelper re-emit at t=25ms is suppressed via claim-at-schedule (race-free against safety clear)", () => {
     // Round-2 implementer-review fold (3/5 convergent: @codex2 MEDIUM,
-    // @codex3 HIGH, @codex4 HIGH). Pre-fold (round-1) failed this case:
-    // the 40 ms safety clear runs at t=40 ms (15 ms BEFORE the duplicate's
-    // 20 ms defer callback at t=45 ms), nulling lastCompositionCommit
-    // before suppression can fire → duplicate escapes via origTrigger.
-    // Round-2 fix: claim-at-schedule binds the live token into the defer
-    // closure at trigger-arrival time, so the suppression decision is
-    // race-free against the safety clear.
+    // @codex3 HIGH, @codex4 HIGH). Pre-fold (round-1) of the round-2
+    // cycle failed when the safety-clear window was 40 ms: the clear at
+    // t=40 ran 15 ms BEFORE the duplicate's 20 ms defer callback at
+    // t=45 ms, nulling lastCompositionCommit before suppression could
+    // fire → duplicate escaped via origTrigger. Round-2 fix:
+    // claim-at-schedule binds the live token into the defer closure at
+    // trigger-arrival time, so the suppression decision is race-free
+    // against the safety clear regardless of window width. The
+    // korean-ime-dmg-race fold widened the window 40→250 ms but the
+    // claim-at-schedule mechanism this test exercises is unchanged.
     const { terminal, container, textarea, origTriggerCalls } =
       makeMockTerminal();
     const onComposedFlush = vi.fn();
@@ -1098,8 +1106,8 @@ describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => 
       }
     )._core.coreService;
 
-    // 1. Commit "요" at t=0. Sets lastCompositionCommit; schedules 40 ms
-    //    safety clear for t=40.
+    // 1. Commit "요" at t=0. Sets lastCompositionCommit; schedules 250 ms
+    //    safety clear for t=250.
     textarea.value = "요";
     fireInput(textarea, "insertText", "요");
     fireKeydown(textarea, { keyCode: 229 });
@@ -1107,15 +1115,16 @@ describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => 
 
     // 2. Simulate xterm's CompositionHelper post-commit latency — the
     //    duplicate re-emit arrives at t=25 ms, well inside the documented
-    //    40 ms dedup window. Its own 20 ms defer schedules for t=45 ms.
+    //    250 ms dedup window. Its own 20 ms defer schedules for t=45 ms.
     vi.advanceTimersByTime(25);
     cs.triggerDataEvent("요", true);
 
-    // 3. Advance past both the safety timer (fires at t=40) AND the
-    //    defer (fires at t=45). Pre-fold: safety fires first, nullifies
-    //    token, defer sees null → origTrigger("요"). Post-fold: claim
-    //    was captured at t=25 (in-closure), so defer at t=45 still
-    //    matches → suppress.
+    // 3. Advance past the defer (fires at t=45). The safety clear does
+    //    NOT fire in this advance (it's scheduled for t=250); under the
+    //    OLD 40 ms window the safety clear would fire at t=40 (5 ms
+    //    before the defer) — the round-2 fold made suppression
+    //    race-free against that scenario via the captured claim. The
+    //    claim-at-schedule mechanism passes both windows identically.
     vi.advanceTimersByTime(25);
 
     expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
@@ -1209,7 +1218,7 @@ describe("attachKoreanImeShim — multi-char prefix strip", () => {
     //    textarea.value.substring(start) = "녕 ". New prefix-strip drops it.
     cs.triggerDataEvent("녕 ", true);
 
-    // 4. Drain the 40 ms safety-clear timer cleanly.
+    // 4. Drain the 250 ms safety-clear timer cleanly.
     vi.advanceTimersByTime(60);
 
     // Direct PTY writes: only "녕" from onCompositionEnd's invoke().
@@ -1264,7 +1273,7 @@ describe("attachKoreanImeShim — multi-char prefix strip", () => {
 
   it("T-non-matching-multi-char (over-suppression guard): an unrelated multi-char payload after a commit flows through verbatim", () => {
     // After "녕" commits, simulate an emission of "한자" (e.g. a paste
-    // landing inside the 40 ms dedup window). The strip's prefix check
+    // landing inside the 250 ms dedup window). The strip's prefix check
     // ("한자".startsWith("녕")) is false, so the strip does NOT fire and
     // the payload reaches origTrigger verbatim. Prevents over-suppression
     // of legitimate multi-char pastes / IME emissions that happen to
@@ -1351,6 +1360,285 @@ describe("attachKoreanImeShim — multi-char prefix strip", () => {
     expect(ptyWrites().map((c) => c.data)).toEqual(["녕", "어"]);
     expect(onComposedFlush).toHaveBeenCalledTimes(2);
 
+    vi.useRealTimers();
+  });
+
+  it("T-space-late-arrival: prefix-strip catches late re-emit at t=200ms (race vs prod-style setTimeout deferral)", () => {
+    // Production WKWebView in idle main-thread state can coalesce xterm's
+    // CompositionHelper setTimeout(0) past the safety-clear window. This
+    // test simulates the DMG repro: at t=200 ms (past the old 40 ms clear,
+    // inside the new 250 ms clear), the late "녕 " must still be
+    // suppressed. Failing-now/passing-after: this test FAILS before the
+    // 40→250 literal change in xtermImeShim.ts:501; PASSES after.
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    // 1. Commit "녕" via compositionend at t=0.
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    // 2. Order B trailing: xterm._keyDown synchronously emits ASCII " ".
+    textarea.value = "녕 ";
+    cs.triggerDataEvent(" ", true);
+
+    // 3. Advance fake clock 200 ms — past the OLD 40 ms safety clear,
+    //    inside the NEW 250 ms safety clear. Simulates DMG WKWebView's
+    //    delayed setTimeout(0) firing.
+    vi.advanceTimersByTime(200);
+
+    // 4. Late CompositionHelper re-emit arrives. With the 250 ms ceiling,
+    //    lastCompositionCommit is still live → strip fires → suppressed.
+    cs.triggerDataEvent("녕 ", true);
+
+    // 5. Drain the safety-clear timer cleanly.
+    vi.advanceTimersByTime(300);
+
+    // Direct PTY writes: only "녕" from onCompositionEnd's invoke().
+    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
+    // Indirect via origTrigger: exactly one space — NOT [" ", "녕 "]
+    // (which the pre-fix 40 ms clear would produce at t=200).
+    expect(origTriggerCalls.map((c) => c.data)).toEqual([" "]);
+    expect(onComposedFlush).toHaveBeenCalledTimes(1);
+    expect(onComposedFlush).toHaveBeenCalledWith("녕", null);
+
+    vi.useRealTimers();
+  });
+
+  it("T-space-out-of-window: at t=500ms safety-clear has fired; late re-emit falls through", () => {
+    // Demonstrative — proves the safety-clear DOES eventually nullify
+    // the token so a paste of the same syllable (without an intervening
+    // new composition) is not suppressed indefinitely. t=500 gives
+    // 250 ms of slack against the new ceiling, so a future fold-round
+    // can widen the window up to ~450 ms without breaking this test
+    // (the rationale comment is the actual forcing function on the
+    // ceiling, not this test).
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    textarea.value = "녕 ";
+    cs.triggerDataEvent(" ", true);
+
+    vi.advanceTimersByTime(500);
+
+    cs.triggerDataEvent("녕 ", true);
+
+    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
+    expect(origTriggerCalls.map((c) => c.data)).toEqual([" ", "녕 "]);
+    expect(onComposedFlush).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+  });
+
+  it("T-prefix-strip-cap: long paste starting with the committed syllable falls through (over-suppression guard for the trailing-slack cap)", () => {
+    // The trailing-slack cap caps the multi-char strip at
+    // `data.length <= live.text.length + 4`. A 12-char paste
+    // "녕 hello world" starts with the committed "녕" but exceeds the
+    // cap (12 > 1 + 4 = 5) — strip must NOT fire. Without the cap,
+    // the wider 250 ms window would suppress this legitimate paste.
+    const { terminal, container, textarea, origTriggerCalls } =
+      makeMockTerminal();
+    const onComposedFlush = vi.fn();
+    attach(terminal, container, { sessionId: "s1", onComposedFlush });
+    vi.useFakeTimers();
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    // 12-char paste inside the dedup window. Prefix matches but length
+    // exceeds cap → strip must NOT fire.
+    cs.triggerDataEvent("녕 hello world", true);
+
+    vi.advanceTimersByTime(300);
+
+    // The paste reaches origTrigger verbatim.
+    expect(origTriggerCalls.map((c) => c.data)).toEqual(["녕 hello world"]);
+    // Only the commit's direct PTY write.
+    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
+
+    vi.useRealTimers();
+  });
+});
+
+describe("attachKoreanImeShim — A.3 instrumentation (debug-flag gated)", () => {
+  // happy-dom v20 ships `localStorage` as an empty plain object without a
+  // real Storage prototype, so the shim's `localStorage.getItem(...)` call
+  // throws. Install a Map-backed stub for the duration of each test and
+  // restore in afterEach so the stub doesn't leak into other suites.
+  const makeMapStorage = () => {
+    const m = new Map<string, string>();
+    return {
+      getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+      setItem: (k: string, v: string) => {
+        m.set(k, String(v));
+      },
+      removeItem: (k: string) => {
+        m.delete(k);
+      },
+      clear: () => m.clear(),
+      key: (i: number) => Array.from(m.keys())[i] ?? null,
+      get length() {
+        return m.size;
+      },
+    } as unknown as Storage;
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("strip-hit: logs gapMs when the multi-char prefix-strip fires", () => {
+    // Vitest 4.x's default toFake set may not include 'performance';
+    // explicit toFake keeps gapMs deterministic when we advance the
+    // fake clock.
+    const ls = makeMapStorage();
+    ls.setItem("canvasTerminal_imeDebug", "1");
+    vi.stubGlobal("localStorage", ls);
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "performance", "Date"],
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { terminal, container, textarea } = makeMockTerminal();
+    attach(terminal, container, { sessionId: "s1" });
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    textarea.value = "녕 ";
+    cs.triggerDataEvent(" ", true);
+
+    // Advance ~200 ms so the gap is measurable but inside the window.
+    vi.advanceTimersByTime(200);
+
+    cs.triggerDataEvent("녕 ", true);
+
+    // Find the strip-hit log line.
+    const hit = warnSpy.mock.calls.find((c) => c[0] === "[ime] strip-hit");
+    expect(hit).toBeDefined();
+    const payload = hit![1] as {
+      data: string;
+      gapMs: number;
+      gen: number;
+      count: number;
+    };
+    expect(payload.data).toBe("녕 ");
+    expect(payload.gapMs).toBeGreaterThanOrEqual(200);
+    expect(payload.count).toBe(1);
+
+    warnSpy.mockRestore();
+    vi.advanceTimersByTime(300);
+    vi.useRealTimers();
+  });
+
+  it("strip-miss: logs gapMs and ageMs when a late re-emit arrives after the safety-clear", () => {
+    // Race the safety-clear by advancing past 250 ms BEFORE emitting
+    // the duplicate. The miss-detector reads `lastClearedCommit`
+    // (snapshot taken at safety-clear time) and reports both
+    // gapMs (commit→arrival) and ageMs (clear→arrival).
+    const ls = makeMapStorage();
+    ls.setItem("canvasTerminal_imeDebug", "1");
+    vi.stubGlobal("localStorage", ls);
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "performance", "Date"],
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { terminal, container, textarea } = makeMockTerminal();
+    attach(terminal, container, { sessionId: "s1" });
+    const cs = (
+      terminal as unknown as {
+        _core: {
+          coreService: {
+            triggerDataEvent: (d: string, w?: boolean) => void;
+          };
+        };
+      }
+    )._core.coreService;
+
+    textarea.value = "녕";
+    fireInput(textarea, "insertText", "녕");
+    fireKeydown(textarea, { keyCode: 229 });
+    fireCompositionEnd(textarea, "녕");
+
+    textarea.value = "녕 ";
+    cs.triggerDataEvent(" ", true);
+
+    // Advance past 250 ms → safety-clear fires → snapshot taken.
+    vi.advanceTimersByTime(300);
+
+    cs.triggerDataEvent("녕 ", true);
+
+    const miss = warnSpy.mock.calls.find((c) => c[0] === "[ime] strip-miss");
+    expect(miss).toBeDefined();
+    const payload = miss![1] as {
+      data: string;
+      gapMs: number;
+      ageMs: number;
+      gen: number;
+      count: number;
+    };
+    expect(payload.data).toBe("녕 ");
+    // gapMs is commit→arrival, ~300 ms.
+    expect(payload.gapMs).toBeGreaterThanOrEqual(300);
+    // ageMs is clear→arrival; safety-clear ran at t=250, arrival at t=300.
+    expect(payload.ageMs).toBeGreaterThanOrEqual(50);
+    expect(payload.ageMs).toBeLessThan(500);
+    expect(payload.count).toBe(1);
+
+    warnSpy.mockRestore();
     vi.useRealTimers();
   });
 });
