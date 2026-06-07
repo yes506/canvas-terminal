@@ -203,10 +203,12 @@ export async function createSession(
 
   // Let app-level shortcuts bubble past xterm
   terminal.attachCustomKeyEventHandler((e) => {
-    // Return true so xterm does NOT call preventDefault() on IME key
-    // events.  preventDefault() blocks the browser from initiating IME
-    // composition entirely.  The triggerDataEvent patch below handles
-    // suppressing any output xterm's _handleKey produces for IME keys.
+    // textarea-rewrite v3.4: composition events fire on the shadow
+    // textarea (not the helper), so xterm's `_handleKey` never runs
+    // for IME keystrokes — there is no IME-time triggerDataEvent
+    // suppression needed here. Keeping this guard is harmless and
+    // defends against any future xterm path that synchronously
+    // dispatches an IME-marked keydown.
     if (e.isComposing || e.keyCode === 229) return true;
 
     // Shift+Enter → CSI u escape sequence
@@ -340,15 +342,22 @@ export async function createSession(
   // Track line buffer for "collaborator" command detection
   let lineBuffer = "";
 
-  // Korean IME shim — single helper, single dispose() path. See
-  // src/lib/xtermImeShim.ts for the bug context (compositionend duplicate-
-  // prefix render) and the full dispose restoration contract.
+  // Korean IME shim (textarea-rewrite v3.4) — shadow textarea owns
+  // composition events; xterm helper textarea no longer receives
+  // compositionstart. See src/lib/xtermImeShim.ts for the architecture.
   //
   // Korean compositions DO NOT flow through `terminal.onData`; they take
   // the shim's direct `invoke("write_to_pty")` path. The `onComposedFlush`
   // subscription below keeps `lineBuffer` in sync so a Korean → IME-off →
   // ASCII "collaborator\r" sequence still triggers the in-app spawn
-  // intercept below (plan node 8b sub-case i).
+  // intercept below.
+  //
+  // `shouldBubbleShortcut` mirrors the bubble decisions in
+  // `attachCustomKeyEventHandler` above so app-level shortcuts (Cmd+T,
+  // Cmd+W, Cmd+F, etc.) continue to bubble past the shadow textarea
+  // unchanged. The shadow handler must opt these out of its Branch C
+  // synthesize-to-helper path, otherwise the synthesized keydown reaches
+  // xterm and the app shortcut layer never sees the original event.
   managed.imeHandle = attachKoreanImeShim(terminal, containerEl, {
     sessionId,
     webgl: true,
@@ -362,6 +371,20 @@ export async function createSession(
       if (terminator === "\r") {
         lineBuffer = "";
       }
+    },
+    shouldBubbleShortcut: (e) => {
+      // Round-1 fold (convergent MED from @claude3 / @codex2): case-fold
+      // single-character keys before INTERCEPTED_KEYS lookup. Under
+      // Shift, `e.key` flips to uppercase (Cmd+Shift+S → e.key === "S"),
+      // which the lowercase-only set would miss. useKeyboardShortcuts.ts
+      // documents this case explicitly (case "S" branch).
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if ((e.metaKey || e.ctrlKey) && INTERCEPTED_KEYS.has(k)) return true;
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "[" || e.key === "]")) return true;
+      if ((e.metaKey || e.ctrlKey) && e.altKey && e.key.startsWith("Arrow")) return true;
+      // Shift+Enter is NOT a bubble — it goes through Branch C so xterm's
+      // attachCustomKeyEventHandler can emit `CSI 13;2u`.
+      return false;
     },
   });
 

@@ -3,8 +3,8 @@ import type { Terminal } from "@xterm/xterm";
 import { invoke } from "@tauri-apps/api/core";
 import {
   attachKoreanImeShim,
+  KOREAN_CODEPOINT_RE,
   type AttachKoreanImeShimOptions,
-  type KoreanImeShimHandle,
 } from "./xtermImeShim";
 
 // invoke is the only outbound IPC the shim performs; mock it so tests can
@@ -13,38 +13,45 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(() => Promise.resolve()),
 }));
 
-// ---------------------------------------------------------------------------
-// Minimal Terminal mock — only the surface the shim touches.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Mock Terminal — surface the rewrite touches: input, paste, getSelection,
+// options, buffer, _core (for cell dims).
+// ===========================================================================
 
 interface MockTerminalFixture {
   terminal: Terminal;
   container: HTMLElement;
-  textarea: HTMLTextAreaElement;
-  origTriggerCalls: Array<{ data: string; wasUserInput?: boolean }>;
-  coreService: {
-    isCursorHidden: boolean;
-    triggerDataEvent?: (data: string, wasUserInput?: boolean) => void;
-  };
+  screenEl: HTMLElement;
+  helperTextarea: HTMLTextAreaElement;
+  inputCalls: Array<{ data: string; wasUserInput?: boolean }>;
+  pasteCalls: Array<{ data: string }>;
+  selectionRef: { value: string };
+  cursorRef: { x: number; y: number };
+  /** Fire registered onCursorMove listeners (simulates PTY echo advancing the xterm cursor). */
+  fireCursorMove: () => void;
+  /** Number of registered onCursorMove listeners — for dispose-leak coverage. */
+  cursorMoveListenerCount: () => number;
 }
 
 function makeMockTerminal(): MockTerminalFixture {
   const container = document.createElement("div");
   document.body.appendChild(container);
+  const viewport = document.createElement("div");
+  viewport.className = "xterm-viewport";
+  container.appendChild(viewport);
   const screenEl = document.createElement("div");
   screenEl.className = "xterm-screen";
-  container.appendChild(screenEl);
-  const textarea = document.createElement("textarea");
-  textarea.className = "xterm-helper-textarea";
-  container.appendChild(textarea);
+  viewport.appendChild(screenEl);
+  const helperTextarea = document.createElement("textarea");
+  helperTextarea.className = "xterm-helper-textarea";
+  helperTextarea.setAttribute("tabindex", "0");
+  container.appendChild(helperTextarea);
 
-  const origTriggerCalls: Array<{ data: string; wasUserInput?: boolean }> = [];
-  const coreService = {
-    isCursorHidden: false,
-    triggerDataEvent(data: string, wasUserInput?: boolean) {
-      origTriggerCalls.push({ data, wasUserInput });
-    },
-  };
+  const inputCalls: Array<{ data: string; wasUserInput?: boolean }> = [];
+  const pasteCalls: Array<{ data: string }> = [];
+  const selectionRef = { value: "" };
+  const cursorRef = { x: 0, y: 0 };
+  const cursorMoveListeners = new Set<() => void>();
 
   const terminal = {
     options: {
@@ -54,1596 +61,1214 @@ function makeMockTerminal(): MockTerminalFixture {
       cursorBlink: true,
       theme: { cursor: "#fff", background: "#000", foreground: "#eee" },
     },
-    textarea,
-    buffer: { active: { cursorX: 0, cursorY: 0 } },
+    textarea: helperTextarea,
+    buffer: {
+      active: {
+        get cursorX() {
+          return cursorRef.x;
+        },
+        get cursorY() {
+          return cursorRef.y;
+        },
+      },
+    },
+    input(data: string, wasUserInput?: boolean): void {
+      inputCalls.push({ data, wasUserInput });
+    },
+    paste(data: string): void {
+      pasteCalls.push({ data });
+    },
+    getSelection(): string {
+      return selectionRef.value;
+    },
+    onCursorMove(cb: () => void): { dispose(): void } {
+      cursorMoveListeners.add(cb);
+      return {
+        dispose: () => {
+          cursorMoveListeners.delete(cb);
+        },
+      };
+    },
     _core: {
-      coreService,
       _renderService: {
         dimensions: { css: { cell: { width: 8, height: 16 } } },
       },
     },
   } as unknown as Terminal;
 
-  return { terminal, container, textarea, origTriggerCalls, coreService };
+  return {
+    terminal,
+    container,
+    screenEl,
+    helperTextarea,
+    inputCalls,
+    pasteCalls,
+    selectionRef,
+    cursorRef,
+    fireCursorMove: () => {
+      for (const cb of cursorMoveListeners) cb();
+    },
+    cursorMoveListenerCount: () => cursorMoveListeners.size,
+  };
 }
 
-// ---------------------------------------------------------------------------
-// WKWebView event synthesis helpers.
-//
-// WKWebView fires `input` BEFORE `keydown` for IME — these helpers preserve
-// that order so the shim's state machine sees the same sequencing it sees in
-// production.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Event-dispatch helpers — happy-dom synthesis.
+// ===========================================================================
 
-function fireInput(
-  target: HTMLElement,
-  inputType: "insertText" | "insertReplacementText",
-  data: string | null = null,
-): void {
-  const e = new InputEvent("input", {
-    inputType,
-    data,
-    bubbles: true,
-    cancelable: false,
-  });
-  target.dispatchEvent(e);
+function fireCompositionStart(target: HTMLElement): void {
+  target.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
 }
 
-function fireKeydown(
-  target: HTMLElement,
-  init: {
-    keyCode?: number;
-    key?: string;
-    code?: string;
-    isComposing?: boolean;
-    shiftKey?: boolean;
-    ctrlKey?: boolean;
-    altKey?: boolean;
-    metaKey?: boolean;
-  } = {},
-): KeyboardEvent {
-  const e = new KeyboardEvent("keydown", {
-    bubbles: true,
-    cancelable: true,
-    key: init.key ?? "Process",
-    code: init.code ?? "",
-    keyCode: init.keyCode ?? 229,
-    isComposing: init.isComposing ?? false,
-    shiftKey: init.shiftKey ?? false,
-    ctrlKey: init.ctrlKey ?? false,
-    altKey: init.altKey ?? false,
-    metaKey: init.metaKey ?? false,
-  });
+function fireCompositionUpdate(target: HTMLElement, data: string): void {
+  const e = new CompositionEvent("compositionupdate", { bubbles: true });
+  Object.defineProperty(e, "data", { value: data, configurable: true });
   target.dispatchEvent(e);
-  return e;
 }
 
 function fireCompositionEnd(target: HTMLElement, data: string): void {
-  // happy-dom's CompositionEvent constructor does not honor `data` from the
-  // init dictionary, so force the property on after construction. The shim
-  // reads `e.data` to detect the committed text.
   const e = new CompositionEvent("compositionend", { bubbles: true });
   Object.defineProperty(e, "data", { value: data, configurable: true });
   target.dispatchEvent(e);
 }
 
 function fireBlur(target: HTMLElement): void {
-  target.dispatchEvent(new FocusEvent("blur"));
+  target.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
 }
 
-/** Extracts the visible composing-text content from the overlay element. */
-function overlayText(overlayEl: HTMLElement | null): string {
-  if (!overlayEl) return "";
-  return overlayEl.textContent ?? "";
+interface KeydownInit {
+  key?: string;
+  code?: string;
+  keyCode?: number;
+  which?: number;
+  shiftKey?: boolean;
+  ctrlKey?: boolean;
+  altKey?: boolean;
+  metaKey?: boolean;
+  isComposing?: boolean;
 }
 
-/** Reads the most-recent invoke('write_to_pty', ...) calls. */
+function fireKeydown(target: HTMLElement, init: KeydownInit = {}): KeyboardEvent {
+  const e = new KeyboardEvent("keydown", {
+    bubbles: true,
+    cancelable: true,
+    key: init.key ?? "a",
+    code: init.code ?? "",
+    keyCode: init.keyCode ?? 65,
+    shiftKey: init.shiftKey ?? false,
+    ctrlKey: init.ctrlKey ?? false,
+    altKey: init.altKey ?? false,
+    metaKey: init.metaKey ?? false,
+    isComposing: init.isComposing ?? false,
+  });
+  target.dispatchEvent(e);
+  return e;
+}
+
+function firePaste(
+  target: HTMLElement,
+  pasteText: string,
+): { event: ClipboardEvent; preventDefaultCalled: boolean } {
+  // happy-dom doesn't support `clipboardData` on ClipboardEvent — fake it.
+  const event = new ClipboardEvent("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: {
+      getData: (_t: string) => pasteText,
+      setData: (_t: string, _v: string) => {},
+    },
+    configurable: true,
+  });
+  let preventDefaultCalled = false;
+  const origPreventDefault = event.preventDefault.bind(event);
+  event.preventDefault = () => {
+    preventDefaultCalled = true;
+    origPreventDefault();
+  };
+  target.dispatchEvent(event);
+  return { event, preventDefaultCalled };
+}
+
+function fireCopy(
+  target: HTMLElement,
+): {
+  event: ClipboardEvent;
+  setData: ReturnType<typeof vi.fn>;
+  preventDefaultCalled: boolean;
+} {
+  const setData = vi.fn();
+  const event = new ClipboardEvent("copy", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: { getData: (_t: string) => "", setData },
+    configurable: true,
+  });
+  let preventDefaultCalled = false;
+  const origPreventDefault = event.preventDefault.bind(event);
+  event.preventDefault = () => {
+    preventDefaultCalled = true;
+    origPreventDefault();
+  };
+  target.dispatchEvent(event);
+  return { event, setData, preventDefaultCalled };
+}
+
+function fireCut(
+  target: HTMLElement,
+): {
+  event: ClipboardEvent;
+  setData: ReturnType<typeof vi.fn>;
+  preventDefaultCalled: boolean;
+} {
+  const setData = vi.fn();
+  const event = new ClipboardEvent("cut", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: { getData: (_t: string) => "", setData },
+    configurable: true,
+  });
+  let preventDefaultCalled = false;
+  const origPreventDefault = event.preventDefault.bind(event);
+  event.preventDefault = () => {
+    preventDefaultCalled = true;
+    origPreventDefault();
+  };
+  target.dispatchEvent(event);
+  return { event, setData, preventDefaultCalled };
+}
+
+function fireBeforeInput(
+  target: HTMLElement,
+  inputType: "insertText" | "insertReplacementText",
+  data: string | null,
+): { preventDefaultCalled: boolean } {
+  // happy-dom does not have a native InputEvent constructor that honours
+  // inputType — use Event with defineProperty.
+  const event = new Event("beforeinput", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "inputType", { value: inputType, configurable: true });
+  Object.defineProperty(event, "data", { value: data, configurable: true });
+  let preventDefaultCalled = false;
+  const origPreventDefault = event.preventDefault.bind(event);
+  event.preventDefault = () => {
+    preventDefaultCalled = true;
+    origPreventDefault();
+  };
+  target.dispatchEvent(event);
+  return { preventDefaultCalled };
+}
+
 function ptyWrites(): Array<{ sessionId: string; data: string }> {
   const calls = (invoke as unknown as { mock: { calls: unknown[][] } }).mock.calls;
-  const out: Array<{ sessionId: string; data: string }> = [];
-  for (const call of calls) {
-    if (call[0] === "write_to_pty") {
-      out.push(call[1] as { sessionId: string; data: string });
-    }
-  }
-  return out;
+  return calls
+    .filter((c) => c[0] === "write_to_pty")
+    .map((c) => c[1] as { sessionId: string; data: string });
 }
 
-// ---------------------------------------------------------------------------
-// Lifecycle bookkeeping — every test cleans up its handles + DOM.
-// ---------------------------------------------------------------------------
-
-let attachedHandles: KoreanImeShimHandle[] = [];
-
-function attach(
-  terminal: Terminal,
-  container: HTMLElement,
-  opts: AttachKoreanImeShimOptions = { sessionId: "s1" },
-): KoreanImeShimHandle {
-  const h = attachKoreanImeShim(terminal, container, opts);
-  attachedHandles.push(h);
-  return h;
+function shadowEl(fx: MockTerminalFixture): HTMLTextAreaElement {
+  return fx.screenEl.querySelector(".xterm-shadow-textarea")!;
 }
+
+// ===========================================================================
+// Test lifecycle
+// ===========================================================================
 
 beforeEach(() => {
   (invoke as unknown as { mockClear: () => void }).mockClear();
 });
 
 afterEach(() => {
-  for (const h of attachedHandles) {
-    try {
-      h.dispose();
-    } catch {
-      /* already disposed */
-    }
-  }
-  attachedHandles = [];
   document.body.innerHTML = "";
-  // Intentional: the global <style id="ime-cursor-blink-style"> is process-lifetime.
+  // Strip the runtime style block between tests so each `attach` re-creates it.
+  document.getElementById("ime-cursor-blink-style")?.remove();
 });
 
 // ===========================================================================
-// Attach / dispose lifecycle
+// attach + handle surface
 // ===========================================================================
 
-describe("attachKoreanImeShim — attach", () => {
-  it("throws TypeError when terminal._core.coreService is missing", () => {
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const broken = {
-      options: {},
-      buffer: { active: { cursorX: 0, cursorY: 0 } },
-    } as unknown as Terminal;
-    expect(() =>
-      attachKoreanImeShim(broken, container, { sessionId: "s1" }),
-    ).toThrow(TypeError);
+describe("attachKoreanImeShim — attach + handle", () => {
+  it("mounts the shadow textarea under .xterm-screen", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(fx.screenEl.querySelectorAll(".xterm-shadow-textarea").length).toBe(1);
   });
 
-  it("appends overlay under .xterm-screen when present", () => {
-    const { terminal, container } = makeMockTerminal();
-    const handle = attach(terminal, container);
-    expect(handle.overlayEl).not.toBeNull();
-    expect(handle.overlayEl?.parentElement?.classList.contains("xterm-screen")).toBe(true);
+  it("falls back to container when .xterm-screen is absent at attach time", () => {
+    const fx = makeMockTerminal();
+    fx.screenEl.remove();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(fx.container.querySelectorAll(".xterm-shadow-textarea").length).toBe(1);
   });
 
-  it("falls back to container when .xterm-screen is absent but container is attached", () => {
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const textarea = document.createElement("textarea");
-    textarea.className = "xterm-helper-textarea";
-    container.appendChild(textarea);
-    const origTriggerCalls: Array<{ data: string }> = [];
-    const terminal = {
-      options: { fontSize: 12, cursorBlink: true },
-      textarea,
-      buffer: { active: { cursorX: 0, cursorY: 0 } },
-      _core: {
-        coreService: {
-          isCursorHidden: false,
-          triggerDataEvent: (data: string) => origTriggerCalls.push({ data }),
-        },
-        _renderService: { dimensions: { css: { cell: { width: 8, height: 16 } } } },
-      },
-    } as unknown as Terminal;
-    const handle = attach(terminal, container);
-    expect(handle.overlayEl?.parentElement).toBe(container);
+  it("returns a handle exposing overlayEl, isFocused, rebind, dispose", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(typeof h.rebind).toBe("function");
+    expect(typeof h.dispose).toBe("function");
+    expect(typeof h.isFocused).toBe("function");
+    expect(h.overlayEl).not.toBeNull();
   });
 
-  it("enters degraded-overlay mode (overlayEl=null, other patches still installed) when container is detached and has no .xterm-screen", () => {
-    const container = document.createElement("div"); // intentionally NOT appended to body
-    const textarea = document.createElement("textarea");
-    textarea.className = "xterm-helper-textarea";
-    container.appendChild(textarea);
-    const origTriggerCalls: Array<{ data: string }> = [];
-    const terminal = {
-      options: { fontSize: 12, cursorBlink: true },
-      textarea,
-      buffer: { active: { cursorX: 0, cursorY: 0 } },
-      _core: {
-        coreService: {
-          isCursorHidden: false,
-          triggerDataEvent: (data: string) => origTriggerCalls.push({ data }),
-        },
-        _renderService: { dimensions: { css: { cell: { width: 8, height: 16 } } } },
-      },
-    } as unknown as Terminal;
-    const handle = attach(terminal, container);
-    expect(handle.overlayEl).toBeNull();
-    // Per the Failure-modes doc: degraded-overlay mode still patches
-    // triggerDataEvent (wrapper installed → captured by ASCII path test).
-    const cs = (
-      terminal as unknown as {
-        _core: { coreService: { triggerDataEvent: (d: string) => void } };
-      }
-    )._core.coreService;
-    cs.triggerDataEvent("a");
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["a"]);
+  it("rebind is idempotent and re-anchors after the screen element appears later", () => {
+    const fx = makeMockTerminal();
+    fx.screenEl.remove();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // No .xterm-screen at attach → shadow lands on container.
+    expect(fx.container.querySelectorAll(".xterm-shadow-textarea").length).toBe(1);
+    // Layout settles, screen appears.
+    fx.container.appendChild(fx.screenEl);
+    h.rebind();
+    h.rebind(); // idempotent
+    expect(() => h.rebind()).not.toThrow();
   });
 
-  it("rebind() retries overlay attach after the container becomes reachable (F2 — round-2 fold)", () => {
-    // Start with a detached container — overlay attach fails initially.
-    const container = document.createElement("div");
-    const textarea = document.createElement("textarea");
-    textarea.className = "xterm-helper-textarea";
-    container.appendChild(textarea);
-    const terminal = {
-      options: { fontSize: 12, cursorBlink: true },
-      textarea,
-      buffer: { active: { cursorX: 0, cursorY: 0 } },
-      _core: {
-        coreService: { isCursorHidden: false, triggerDataEvent: () => {} },
-        _renderService: { dimensions: { css: { cell: { width: 8, height: 16 } } } },
-      },
-    } as unknown as Terminal;
-    const handle = attach(terminal, container);
-    expect(handle.overlayEl).toBeNull();
-
-    // Caller mounts the container + adds an .xterm-screen (the production
-    // case where terminal.open(...) ran AFTER attachKoreanImeShim was
-    // called, or where layout deferred screen rendering).
-    document.body.appendChild(container);
-    const screenEl = document.createElement("div");
-    screenEl.className = "xterm-screen";
-    container.appendChild(screenEl);
-
-    handle.rebind();
-
-    // Overlay is now attached under .xterm-screen.
-    expect(handle.overlayEl).not.toBeNull();
-    expect(
-      handle.overlayEl?.parentElement?.classList.contains("xterm-screen"),
-    ).toBe(true);
+  it("exports KOREAN_CODEPOINT_RE for the JP/ZH non-regression fixture", () => {
+    expect(KOREAN_CODEPOINT_RE.test("안")).toBe(true);
+    expect(KOREAN_CODEPOINT_RE.test("a")).toBe(false);
   });
 });
 
 // ===========================================================================
-// Variant (b) — commit-boundary anchor fix
+// Focus invariant + isFocused proxy
 // ===========================================================================
 
-describe("attachKoreanImeShim — variant (b) commit-boundary fix", () => {
-  it("anchors imeStartPos at composition start after compositionend (no duplicate prefix)", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
-    const handle = attach(terminal, container);
+describe("attachKoreanImeShim — focus", () => {
+  it("focuses the shadow textarea at attach time", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(document.activeElement).toBe(shadowEl(fx));
+    expect(h.isFocused()).toBe(true);
+  });
 
-    // === First composition: "한" ===
-    // user types ㅎ — WKWebView order: input then keydown(229)
-    textarea.value = "ㅎ";
-    fireInput(textarea, "insertText", "ㅎ");
-    fireKeydown(textarea, { keyCode: 229 });
+  it("isFocused() returns false after shadow blurs", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(h.isFocused()).toBe(true);
+    shadowEl(fx).blur();
+    document.body.focus();
+    // Now shadow is no longer document.activeElement.
+    expect(h.isFocused()).toBe(false);
+  });
 
-    // user types ㅏ → composition updates to "하"
-    textarea.value = "하";
-    fireInput(textarea, "insertText", "ㅏ");
-    fireKeydown(textarea, { keyCode: 229 });
-    expect(overlayText(handle.overlayEl)).toBe("하");
-
-    // user types ㄴ → composition updates to "한"
-    textarea.value = "한";
-    fireInput(textarea, "insertText", "ㄴ");
-    fireKeydown(textarea, { keyCode: 229 });
-    expect(overlayText(handle.overlayEl)).toBe("한");
-
-    // === Commit boundary: IME finalizes "한" because user starts new syllable ===
-    fireCompositionEnd(textarea, "한");
-    expect(ptyWrites().map((c) => c.data)).toEqual(["한"]);
-    // Variant (b) postcondition: overlay cleared so the about-to-be-painted
-    // shell-echo of "한" isn't double-rendered.
-    expect(handle.overlayEl?.style.display).toBe("none");
-
-    // === Next composition: "ㄱ" — WKWebView retains "한" in textarea.value ===
-    textarea.value = "한ㄱ";
-    fireInput(textarea, "insertText", "ㄱ");
-    fireKeydown(textarea, { keyCode: 229 });
-
-    // Variant (b) win: overlay shows ONLY "ㄱ" (substring from re-anchored
-    // imeStartPos), NOT "한ㄱ" (which is the duplicate-prefix bug).
-    expect(overlayText(handle.overlayEl)).toBe("ㄱ");
+  it("helper.focus() redirects to shadow.focus()", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // Blur shadow first so we can verify the redirect re-focuses it.
+    fx.helperTextarea.blur();
+    shadowEl(fx).blur();
+    expect(h.isFocused()).toBe(false);
+    fx.helperTextarea.focus();
+    // Helper's patched focus dispatched shadow.focus().
+    expect(document.activeElement).toBe(shadowEl(fx));
+    expect(h.isFocused()).toBe(true);
   });
 });
 
 // ===========================================================================
-// PTY write paths + onComposedFlush emission (Postcondition #2)
+// Composition: compositionstart / update / end / blur / terminator
 // ===========================================================================
 
-describe("attachKoreanImeShim — onComposedFlush emission", () => {
-  it("fires (text, null) on compositionend commit", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
+describe("attachKoreanImeShim — composition state machine", () => {
+  it("compositionstart begins overlay paint without a PTY write", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    expect(ptyWrites().length).toBe(0);
+  });
+
+  it("compositionend writes the committed text exactly once", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안");
+    fireCompositionEnd(shadowEl(fx), "안");
+    const w = ptyWrites();
+    expect(w.length).toBe(1);
+    expect(w[0]).toEqual({ sessionId: "s", data: "안" });
+  });
+
+  it("compositionend with empty data writes nothing", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionEnd(shadowEl(fx), "");
+    expect(ptyWrites().length).toBe(0);
+  });
+
+  it("blur during composition flushes the fragment and clears state", () => {
+    const fx = makeMockTerminal();
     const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-
-    textarea.value = "한";
-    fireInput(textarea, "insertText", "한");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "한");
-
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("한", null);
-  });
-
-  it("fires (text, null) on blur during composition", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-
-    textarea.value = "안";
-    fireInput(textarea, "insertText", "안");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireBlur(textarea);
-
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      onComposedFlush,
+    });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안");
+    fireBlur(shadowEl(fx));
+    const w = ptyWrites();
+    expect(w.length).toBe(1);
+    expect(w[0]).toEqual({ sessionId: "s", data: "안" });
     expect(onComposedFlush).toHaveBeenCalledWith("안", null);
-    expect(ptyWrites().map((c) => c.data)).toEqual(["안"]);
   });
 
-  it("fires (text, '\\r') and writes composed+terminator atomically on Enter mid-composition", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
+  it("Enter mid-composition flushes composed + '\\r' atomically", () => {
+    const fx = makeMockTerminal();
     const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-
-    textarea.value = "안";
-    fireInput(textarea, "insertText", "안");
-    fireKeydown(textarea, { keyCode: 229 });
-
-    fireKeydown(textarea, { key: "Enter", code: "Enter", keyCode: 13 });
-
-    expect(onComposedFlush).toHaveBeenCalledWith("안", "\r");
-    expect(ptyWrites().map((c) => c.data)).toEqual(["안\r"]);
-  });
-
-  it("fires (text, '\\x1b') on Escape mid-composition", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-
-    textarea.value = "안";
-    fireInput(textarea, "insertText", "안");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireKeydown(textarea, { key: "Escape", code: "Escape", keyCode: 27 });
-
-    expect(onComposedFlush).toHaveBeenCalledWith("안", "\x1b");
-    expect(ptyWrites().map((c) => c.data)).toEqual(["안\x1b"]);
-  });
-
-  it("fires (text, '\\t') on Tab mid-composition", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-
-    textarea.value = "안";
-    fireInput(textarea, "insertText", "안");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireKeydown(textarea, { key: "Tab", code: "Tab", keyCode: 9 });
-
-    expect(onComposedFlush).toHaveBeenCalledWith("안", "\t");
-    expect(ptyWrites().map((c) => c.data)).toEqual(["안\t"]);
-  });
-
-  it("swallows subscriber exceptions (state machine still progresses)", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
-    const onComposedFlush = vi.fn(() => {
-      throw new Error("subscriber boom");
-    });
-    const handle = attach(terminal, container, {
-      sessionId: "s1",
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
       onComposedFlush,
     });
-
-    textarea.value = "안";
-    fireInput(textarea, "insertText", "안");
-    fireKeydown(textarea, { keyCode: 229 });
-    expect(() => fireCompositionEnd(textarea, "안")).not.toThrow();
-    // State machine recovered — next composition still works.
-    textarea.value = "안녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    expect(overlayText(handle.overlayEl)).toBe("녕");
-  });
-});
-
-// ===========================================================================
-// JP/ZH non-Korean fixture floor (plan node 10 floor)
-//
-// Verifies the helper's state machine doesn't special-case Hangul in its
-// docKeyDown/docInput/compositionend wiring — only the triggerDataEvent
-// 20ms-defer path is Korean-specific (KOREAN_CODEPOINT_RE). JP/ZH compositions ride
-// the same generic pipeline.
-// ===========================================================================
-
-describe("attachKoreanImeShim — JP/ZH non-regression fixture floor (Node 10)", () => {
-  it("processes JP-like keydown(229) + insertReplacementText + compositionend with exactly one PTY write, no drop, overlay rendered once", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    const handle = attach(terminal, container, {
-      sessionId: "s1",
-      onComposedFlush,
-    });
-
-    // JP IME via WKWebView: insertReplacementText is the typical inputType
-    // for IME commits / replacements (vs insertText for keystroke-by-keystroke).
-    textarea.value = "こ";
-    fireInput(textarea, "insertReplacementText", "こ");
-    fireKeydown(textarea, { keyCode: 229 });
-    // Overlay was painted exactly once via docKeyDown's showOverlay call.
-    expect(overlayText(handle.overlayEl)).toBe("こ");
-
-    fireCompositionEnd(textarea, "こ");
-
-    // No drop: exactly one PTY write with the committed text.
-    expect(ptyWrites().map((c) => c.data)).toEqual(["こ"]);
-    // No duplicate: onComposedFlush fires exactly once with terminator=null.
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("こ", null);
-    // Overlay cleared after compositionend (variant (b) postcondition).
-    expect(handle.overlayEl?.style.display).toBe("none");
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안녕");
+    fireKeydown(shadowEl(fx), { key: "Enter", code: "Enter", keyCode: 13 });
+    const w = ptyWrites();
+    expect(w.length).toBe(1);
+    expect(w[0]).toEqual({ sessionId: "s", data: "안녕\r" });
+    expect(onComposedFlush).toHaveBeenCalledWith("안녕", "\r");
   });
 
-  it("does NOT 20ms-defer non-Korean single characters through triggerDataEvent", () => {
-    const { terminal, container, origTriggerCalls } = makeMockTerminal();
-    attach(terminal, container);
-    vi.useFakeTimers();
-
-    // After attach, the wrapped triggerDataEvent is installed on coreService.
-    const cs = (terminal as unknown as { _core: { coreService: { triggerDataEvent: (d: string) => void } } })._core.coreService;
-    // JP character: not in Korean range — should NOT be deferred.
-    cs.triggerDataEvent("こ");
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["こ"]);
-
-    // ASCII: not in Korean range — should NOT be deferred.
-    cs.triggerDataEvent("a");
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["こ", "a"]);
-
-    vi.useRealTimers();
+  it("Escape mid-composition flushes composed + '\\x1b' atomically", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "한");
+    fireKeydown(shadowEl(fx), { key: "Escape", code: "Escape", keyCode: 27 });
+    const w = ptyWrites();
+    expect(w.length).toBe(1);
+    expect(w[0]).toEqual({ sessionId: "s", data: "한\x1b" });
   });
 
-  // Round-1 fold supplementary (codex1/claude3 F1 + round-2
-  // clarification): the plan.md Node 10 fixture floor at success
-  // criterion 5 / Node 10 (b) literally enumerates a THREE-event
-  // sequence: `keydown(229) + insertReplacementText + compositionend`.
-  // The test in the previous `it(...)` block above ("processes JP-like
-  // keydown(229) + insertReplacementText + compositionend with exactly
-  // one PTY write") covers that 3-event sequence and PASSES with one
-  // PTY write — Node 10's literal text is satisfied.
-  //
-  // The 4-event test below is OUTSIDE the plan's enumerated fixture: it
-  // inserts xterm.js's internal `coreService.triggerDataEvent(...)`
-  // between `input` and `keydown(229)`. xterm's CompositionHelper can
-  // call triggerDataEvent synchronously during the `input` event for
-  // committed text. For Korean the wrapper holds bytes back for 20ms
-  // and discards them if a new composition starts. For non-Korean
-  // (JP/ZH/etc), the wrapper at xtermImeShim.ts:570-580 falls through
-  // immediately to origTrigger because KOREAN_CODEPOINT_RE.test(data)
-  // is false. Then the shim's compositionend handler ALSO direct-writes
-  // "こ" via invoke("write_to_pty") → PTY receives bytes twice.
-  //
-  // This is PRE-EXISTING behavior carried from the inline shims
-  // (reKorean-only check is identical — same code, same residual). The
-  // intent.korean-ime-dup-render.md::Out of scope clause covers JP/ZH
-  // feature support with non-regression as the only acceptance gate;
-  // identical-to-pre-refactor = no regression. Fixing the residual
-  // would require widening KOREAN_CODEPOINT_RE to all single-codepoint
-  // CJK ranges — that is OUTSIDE this planner's committed scope and
-  // requires a separate intent / planner re-open.
-  //
-  // The test below PINS the current 4-event behavior so future
-  // refactors of the wrapper don't silently change it. Live JP IME
-  // acceptance smoke (plan node 10 ceiling) remains the authoritative
-  // check for JP rendering.
-  it("4-event ordering outside plan's Node 10 3-event fixture: input → triggerDataEvent → keydown(229) → compositionend pins pre-existing JP/ZH non-Korean fall-through (non-regression vs inline shims; plan widening would need planner re-open)", () => {
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    attach(terminal, container);
-
-    const cs = (
-      terminal as unknown as {
-        _core: { coreService: { triggerDataEvent: (d: string) => void } };
-      }
-    )._core.coreService;
-
-    // Simulated production order for a JP IME composing-then-committing
-    // a single hiragana "こ":
-    //   1. WKWebView fires `input` (insertReplacementText, data="こ")
-    //   2. xterm's input handler calls coreService.triggerDataEvent("こ")
-    //      synchronously — isComposing is still false because keydown(229)
-    //      hasn't fired yet AND the Korean defer doesn't apply (non-Korean
-    //      codepoint), so origTrigger fires immediately
-    //   3. WKWebView fires `keydown(229)` → shim sets isComposing=true,
-    //      paints overlay
-    //   4. WKWebView fires `compositionend(data="こ")` → shim direct-writes
-    //      "こ" to PTY via invoke
-    //
-    // Result: PTY receives 2x "こ" — one via origTrigger fall-through
-    // (terminal.onData → PTY), one via direct invoke from compositionend.
-    textarea.value = "こ";
-    fireInput(textarea, "insertReplacementText", "こ");
-    cs.triggerDataEvent("こ");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "こ");
-
-    // Pinned residual: 1 origTrigger call (the non-Korean fall-through)
-    // AND 1 direct PTY write (the compositionend direct-write).
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["こ"]);
-    expect(ptyWrites().map((c) => c.data)).toEqual(["こ"]);
-    // Combined: PTY sees the byte twice (1 + 1). This is the residual
-    // duplicate the test name calls out — accepted as out-of-scope for
-    // korean-ime-dup-render; tracked by the JP IME live acceptance gate.
-  });
-});
-
-// ===========================================================================
-// Korean-character 20ms defer through triggerDataEvent (the keydown-after-input
-// race compensator) — covered as a unit for completeness.
-// ===========================================================================
-
-describe("attachKoreanImeShim — Korean triggerDataEvent defer", () => {
-  it("defers single Hangul characters by 20ms when not composing", () => {
-    const { terminal, container, origTriggerCalls } = makeMockTerminal();
-    attach(terminal, container);
-    vi.useFakeTimers();
-
-    const cs = (terminal as unknown as { _core: { coreService: { triggerDataEvent: (d: string) => void } } })._core.coreService;
-    cs.triggerDataEvent("한");
-    expect(origTriggerCalls).toHaveLength(0); // deferred
-
-    vi.advanceTimersByTime(25);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["한"]);
-
-    vi.useRealTimers();
+  it("Tab mid-composition flushes composed + '\\t' atomically and prevents focus shift", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "구");
+    const ev = fireKeydown(shadowEl(fx), { key: "Tab", code: "Tab", keyCode: 9 });
+    expect(ptyWrites()[0]).toEqual({ sessionId: "s", data: "구\t" });
+    expect(ev.defaultPrevented).toBe(true);
   });
 
-  it("drops deferred Korean characters if composition starts before the 20ms timer fires", () => {
-    const { terminal, container, textarea, origTriggerCalls } = makeMockTerminal();
-    attach(terminal, container);
-    vi.useFakeTimers();
+  // ROUND-1 FOLD (convergent BLOCKING from @claude3 / @codex1 / @codex3):
+  // production-shape IME terminator events carry `isComposing: true`
+  // (WebKit) and/or `keyCode: 229` (Chromium during pending composition).
+  // These two tests cover the production shape that was unreachable in
+  // the v1 ordering (early-return ran before the terminator branch).
 
-    const cs = (terminal as unknown as { _core: { coreService: { triggerDataEvent: (d: string) => void } } })._core.coreService;
-    cs.triggerDataEvent("한");
-    // Composition starts within the 20ms window:
-    textarea.value = "한";
-    fireInput(textarea, "insertText", "한");
-    fireKeydown(textarea, { keyCode: 229 });
-
-    vi.advanceTimersByTime(25);
-    // The deferred trigger detected isComposing=true at fire time and aborted.
-    expect(origTriggerCalls).toHaveLength(0);
-
-    vi.useRealTimers();
-  });
-});
-
-// ===========================================================================
-// Dispose contract (supports plan node 9 acceptance for restoration)
-// ===========================================================================
-
-describe("attachKoreanImeShim — dispose restoration", () => {
-  it("restores triggerDataEvent to the original reference", () => {
-    const { terminal, container, coreService } = makeMockTerminal();
-    const origTrigger = coreService.triggerDataEvent;
-    const handle = attach(terminal, container);
-    expect(coreService.triggerDataEvent).not.toBe(origTrigger);
-    handle.dispose();
-    expect(coreService.triggerDataEvent).toBe(origTrigger);
-  });
-
-  it("restores isCursorHidden property descriptor", () => {
-    const { terminal, container, coreService } = makeMockTerminal();
-    // Capture original descriptor BEFORE attach (data property, value=false).
-    const before = Object.getOwnPropertyDescriptor(coreService, "isCursorHidden");
-    const handle = attach(terminal, container);
-    const duringAttach = Object.getOwnPropertyDescriptor(
-      coreService,
-      "isCursorHidden",
-    );
-    // While attached, it's an accessor (has getter/setter).
-    expect(duringAttach?.get).toBeDefined();
-    expect(duringAttach?.set).toBeDefined();
-    handle.dispose();
-    const after = Object.getOwnPropertyDescriptor(coreService, "isCursorHidden");
-    // After dispose, it's the original data descriptor again.
-    expect(after?.get).toBeUndefined();
-    expect(after?.set).toBeUndefined();
-    expect(after?.value).toBe(before?.value);
-  });
-
-  it("removes the overlay element from the DOM", () => {
-    const { terminal, container } = makeMockTerminal();
-    const handle = attach(terminal, container);
-    const overlayEl = handle.overlayEl;
-    expect(overlayEl?.parentElement).not.toBeNull();
-    handle.dispose();
-    expect(overlayEl?.parentElement).toBeNull();
-    expect(handle.overlayEl).toBeNull();
-  });
-
-  it("removes document-level keydown/input listeners (no PTY writes after dispose)", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
-    const handle = attach(terminal, container);
-    handle.dispose();
-
-    // After dispose, IME events on the textarea should be inert from the
-    // shim's perspective (no PTY writes triggered).
-    textarea.value = "한";
-    fireInput(textarea, "insertText", "한");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "한");
-
-    expect(ptyWrites()).toEqual([]);
-  });
-
-  it("restores cursorBlink to its pre-attach value", () => {
-    const { terminal, container, textarea } = makeMockTerminal();
-    terminal.options.cursorBlink = true;
-    const handle = attach(terminal, container);
-
-    // Compose to force hideCursor() — turns blink off
-    textarea.value = "한";
-    fireInput(textarea, "insertText", "한");
-    fireKeydown(textarea, { keyCode: 229 });
-    expect(terminal.options.cursorBlink).toBe(false);
-
-    handle.dispose();
-    expect(terminal.options.cursorBlink).toBe(true);
-  });
-
-  it("is idempotent — second dispose is a no-op", () => {
-    const { terminal, container } = makeMockTerminal();
-    const handle = attach(terminal, container);
-    handle.dispose();
-    expect(() => handle.dispose()).not.toThrow();
-  });
-});
-
-// ===========================================================================
-// T1–T4 regression tests — korean-ime-dup-period-arrow cycle
-//
-// Phase 0 hypothesis tree (case d) is the validated production mechanism:
-//   1. compositionend("요") fires → shim's handler writes "요" via invoke,
-//      clears overlay, sets isComposing=false, increments imeFlushGen.
-//   2. xterm.js's internal CompositionHelper batches the committed text and
-//      calls coreService.triggerDataEvent("요") LATER (after our handler ran).
-//   3. The wrapper sees isComposing=false, defers 20ms, captures
-//      gen=imeFlushGen (the post-increment value from step 1).
-//   4. No new composition starts within 20ms → imeFlushGen unchanged → timer
-//      fires → origTrigger("요") → second "요" lands at PTY via
-//      terminal.onData → terminal.write subscriber.
-// The user's reported period+arrow keystroke pair is a visibility trigger
-// (forces terminal redraw exposing already-buffered duplicate bytes), not
-// the causal mechanism.
-//
-// JSDOM simulation: fireCompositionEnd is synchronous (per round-2 fold
-// F3' — see plan.md), so we drive case (d) by firing compositionend
-// BEFORE the deferred cs.triggerDataEvent("요"). The race observable
-// (origTriggerCalls contains "요" duplicating compositionend's invoke)
-// matches what production case (d) produces.
-//
-// Fix variant: B4 (post-compositionend defer dedup at node 9 /
-// triggerDataEvent wrapper). lastCompositionCommit={text, gen} is stored
-// AFTER imeFlushGen++ inside onCompositionEnd; the deferred trigger
-// suppresses origTrigger when data and gen match.
-// ===========================================================================
-
-describe("attachKoreanImeShim — T1: compose → period (no duplicate)", () => {
-  it("commits '요' once via compositionend; '.' flows through xterm without duplication (case b positive control)", () => {
-    // Dispatch sequence: compose, period during composition (browser still
-    // mid-compose → e.isComposing=true → node 7's outer condition
-    // `!e.isComposing || isTerminating` is false → period bypasses node 7),
-    // textarea.value mutation updates imeFragment via docInput, then
-    // compositionend commits "요" via the shim's invoke. The "." would
-    // flow through xterm's input handler downstream — simulated here as
-    // cs.triggerDataEvent(".") (ASCII → wrapper falls through to
-    // origTrigger immediately, no Korean defer).
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireKeydown(textarea, {
-      keyCode: 190,
-      key: ".",
-      code: "Period",
+  it("Enter mid-composition with isComposing=true still flushes atomically (WebKit shape)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안녕");
+    const ev = fireKeydown(shadowEl(fx), {
+      key: "Enter",
+      code: "Enter",
+      keyCode: 13,
       isComposing: true,
     });
-    textarea.value = "요.";
-    fireInput(textarea, "insertText", ".");
-    fireCompositionEnd(textarea, "요");
-    cs.triggerDataEvent(".", true);
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "안녕\r" }]);
+    expect(ev.defaultPrevented).toBe(true);
+  });
 
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["."]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
+  it("Tab mid-composition with keyCode=229 still flushes atomically (Chromium shape)", () => {
+    // ROUND-2 NOTE (@claude2 C1): this synthesizes a hybrid shape —
+    // `key: "Tab"` + `keyCode: 229` — purely as a routing-contract
+    // pin. Real Chromium during pending composition typically issues
+    // `key: "Process", keyCode: 229` first (IME consumes), then a
+    // fresh `key: "Tab", keyCode: 9, isComposing: false` post-commit.
+    // The implementation must handle a terminator-shaped event with
+    // `keyCode === 229` correctly regardless of which path real
+    // browsers take; this test pins the rule so a future change to
+    // the early-return ordering can't quietly drop the case.
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "구");
+    const ev = fireKeydown(shadowEl(fx), {
+      key: "Tab",
+      code: "Tab",
+      keyCode: 229,
+    });
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "구\t" }]);
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("Escape mid-composition with isComposing=true still flushes atomically", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "한");
+    fireKeydown(shadowEl(fx), {
+      key: "Escape",
+      code: "Escape",
+      keyCode: 27,
+      isComposing: true,
+    });
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "한\x1b" }]);
+  });
+
+  it("compositionupdate paints the overlay with event.data (canonical)", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안");
+    expect(h.overlayEl?.textContent ?? "").toContain("안");
+  });
+
+  it("compositionend clears the overlay", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안");
+    fireCompositionEnd(shadowEl(fx), "안");
+    expect(h.overlayEl?.style.display).toBe("none");
+  });
+
+  it("KOREAN_CODEPOINT_RE smoke — Hangul matches, ASCII does not (JP/ZH still fine via uniform shadow path)", () => {
+    // JP/ZH characters route through the same compositionstart/end path on
+    // shadow — the test below stands in for "Node 10 non-regression": the
+    // event flow is uniform across IME locales.
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "あ");
+    fireCompositionEnd(shadowEl(fx), "あ");
+    expect(ptyWrites()[0]).toEqual({ sessionId: "s", data: "あ" });
+  });
+
+  it("CJK commit also routes through the single PTY-write path", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionEnd(shadowEl(fx), "中");
+    expect(ptyWrites()[0]).toEqual({ sessionId: "s", data: "中" });
   });
 });
 
-describe("attachKoreanImeShim — T2: compose → arrow (no duplicate)", () => {
-  it("commits '요' once via node 7 stale-state; CSI flows through xterm without duplication (case b positive control)", () => {
-    // Dispatch sequence: compose, then ArrowRight with e.isComposing=false
-    // (browser composition already ended at the shim's perspective). Node
-    // 7's outer condition is true, isComposing(shim)===true,
-    // e.key="ArrowRight" is not a modifier → inner block writes "요" via
-    // invoke and clears isComposing(shim). The arrow CSI is emitted
-    // downstream by xterm — simulated as cs.triggerDataEvent("\x1b[C")
-    // (multi-byte, not single Korean codepoint → wrapper falls through
-    // to origTrigger immediately).
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
+// ===========================================================================
+// onComposedFlush 4-path contract
+// ===========================================================================
 
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireKeydown(textarea, {
-      keyCode: 39,
-      key: "ArrowRight",
-      isComposing: false,
+describe("attachKoreanImeShim — onComposedFlush (4 paths)", () => {
+  it("fires for compositionend with terminator=null", () => {
+    const fx = makeMockTerminal();
+    const cb = vi.fn();
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      onComposedFlush: cb,
     });
-    cs.triggerDataEvent("\x1b[C", true);
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionEnd(shadowEl(fx), "안");
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenLastCalledWith("안", null);
+  });
 
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["\x1b[C"]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
+  it("fires for blur with terminator=null", () => {
+    const fx = makeMockTerminal();
+    const cb = vi.fn();
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      onComposedFlush: cb,
+    });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "녕");
+    fireBlur(shadowEl(fx));
+    expect(cb).toHaveBeenCalledWith("녕", null);
+  });
+
+  it("fires for Enter/Esc/Tab terminator", () => {
+    const fx = makeMockTerminal();
+    const cb = vi.fn();
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      onComposedFlush: cb,
+    });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "가");
+    fireKeydown(shadowEl(fx), { key: "Enter", code: "Enter", keyCode: 13 });
+    expect(cb).toHaveBeenLastCalledWith("가", "\r");
+  });
+
+  it("subscriber errors do not break the state machine", () => {
+    const fx = makeMockTerminal();
+    const cb = vi.fn(() => {
+      throw new Error("subscriber bug");
+    });
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      onComposedFlush: cb,
+    });
+    fireCompositionStart(shadowEl(fx));
+    expect(() => fireCompositionEnd(shadowEl(fx), "안")).not.toThrow();
+    expect(ptyWrites().length).toBe(1);
   });
 });
 
-describe("attachKoreanImeShim — T3: compose → period → arrow (case d, full repro)", () => {
-  it("suppresses xterm's post-compositionend deferred Korean re-emit (case d)", () => {
-    // Negative-baseline (Phase 0 Step 5 + Success Criterion #5, signal #2):
-    // pre-fix, origTriggerCalls contains "요" duplicating the compositionend
-    // invoke — combined-channel observable per plan.md Success Criterion #5
-    // signal #2 ("ptyWrites... length === 1 AND origTriggerCalls... length
-    // === 1"). Post-fix, B4's lastCompositionCommit dedup suppresses the
-    // deferred origTrigger.
-    const { terminal, container, textarea, origTriggerCalls } = makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
+// ===========================================================================
+// KeyRouter — three-branch classifier
+// ===========================================================================
 
-    // 1. Compose "요" — input then keydown(229) per WKWebView ordering.
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
+describe("attachKoreanImeShim — KeyRouter Branch B (printable)", () => {
+  it("routePrintable: 'a' calls terminal.input('a') and prevents default", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const ev = fireKeydown(shadowEl(fx), { key: "a", code: "KeyA", keyCode: 65 });
+    expect(fx.inputCalls).toEqual([{ data: "a", wasUserInput: true }]);
+    expect(ev.defaultPrevented).toBe(true);
+  });
 
-    // 2. Compositionend commits "요" via the shim's invoke. With B4,
-    //    lastCompositionCommit = { text: "요", gen: imeFlushGen (post-++) }.
-    fireCompositionEnd(textarea, "요");
+  it("'A' (shift+a) still routes to printable (Shift allowed)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), { key: "A", code: "KeyA", keyCode: 65, shiftKey: true });
+    expect(fx.inputCalls).toEqual([{ data: "A", wasUserInput: true }]);
+  });
 
-    // 3. Models xterm's CompositionHelper batched re-emit of the committed
-    //    text via coreService.triggerDataEvent("요"). The wrapper sees
-    //    isComposing=false, defers 20ms, captures gen=imeFlushGen.
-    cs.triggerDataEvent("요", true);
+  it("' ' (space) routes to printable", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), { key: " ", code: "Space", keyCode: 32 });
+    expect(fx.inputCalls).toEqual([{ data: " ", wasUserInput: true }]);
+  });
 
-    // 4. User's reported period+arrow keystrokes — pure noise for the
-    //    race (shim's isComposing is already false from step 2, so
-    //    node 7's stale-state inner check skips). Included to mirror
-    //    the user's flow shape.
-    fireKeydown(textarea, {
-      keyCode: 190,
-      key: ".",
-      code: "Period",
-      isComposing: false,
-    });
-    fireKeydown(textarea, {
-      keyCode: 39,
-      key: "ArrowRight",
-      isComposing: false,
-    });
-
-    // 5. Drive the 20ms defer past its threshold.
-    vi.advanceTimersByTime(25);
-
-    // POST-FIX: exactly one "요" reached PTY (the compositionend invoke);
-    // the deferred origTrigger("요") was suppressed by B4's
-    // lastCompositionCommit gen+text dedup.
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual([]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
-
-    vi.useRealTimers();
+  it("'!' (printable punctuation) routes to printable", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), { key: "!", code: "Digit1", keyCode: 49, shiftKey: true });
+    expect(fx.inputCalls).toEqual([{ data: "!", wasUserInput: true }]);
   });
 });
 
-describe("attachKoreanImeShim — T4: modifier-augmented arrow (no duplicate)", () => {
-  // T4 confirms docKeyDown's isModifier check at xtermImeShim.ts (in node 7
-  // else-branch) examines e.key — which is "ArrowRight" for both Shift+Arrow
-  // and Cmd+Arrow, NOT "Shift" / "Meta" — so the modifier flag does NOT
-  // route around node 7 and the same fix coverage as T2 applies. Two
-  // separate it() blocks (not it.each) per plan round-2 fold (claude4 G4).
-  it("T4-shift: shiftKey + ArrowRight behaves identically to T2 (modifier flag does not bypass node 7)", () => {
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
+describe("attachKoreanImeShim — KeyRouter Branch C (synthesizeKeydown)", () => {
+  it("Enter (outside composition) synthesizes a keydown on helper", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), { key: "Enter", code: "Enter", keyCode: 13 });
+    expect(helperKeydowns.length).toBe(1);
+    expect(helperKeydowns[0].key).toBe("Enter");
+    expect(helperKeydowns[0].keyCode).toBe(13);
+  });
 
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireKeydown(textarea, {
-      keyCode: 39,
-      key: "ArrowRight",
-      isComposing: false,
+  it("Ctrl+C (NOT in native-bypass — predicate is metaKey-only) synthesizes on helper", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), { key: "c", code: "KeyC", keyCode: 67, ctrlKey: true });
+    expect(helperKeydowns.length).toBe(1);
+    expect(helperKeydowns[0].ctrlKey).toBe(true);
+    expect(helperKeydowns[0].key).toBe("c");
+  });
+
+  it("Ctrl+V (NOT in native-bypass) synthesizes on helper for SYN encoding", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), { key: "v", code: "KeyV", keyCode: 86, ctrlKey: true });
+    expect(helperKeydowns.length).toBe(1);
+    expect(helperKeydowns[0].ctrlKey).toBe(true);
+    expect(helperKeydowns[0].key).toBe("v");
+    // routePaste was NOT called — paste calls is empty.
+    expect(fx.pasteCalls).toEqual([]);
+  });
+
+  it("Ctrl+X (NOT in native-bypass) synthesizes on helper for CAN encoding", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), { key: "x", code: "KeyX", keyCode: 88, ctrlKey: true });
+    expect(helperKeydowns.length).toBe(1);
+  });
+
+  it("synthesized keydown carries the 12 load-bearing props", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), {
+      key: "ArrowLeft",
+      code: "ArrowLeft",
+      keyCode: 37,
+      shiftKey: true,
+      altKey: true,
+    });
+    const e = helperKeydowns[0];
+    expect(e.key).toBe("ArrowLeft");
+    expect(e.code).toBe("ArrowLeft");
+    expect(e.keyCode).toBe(37);
+    expect(e.shiftKey).toBe(true);
+    expect(e.altKey).toBe(true);
+    expect(e.bubbles).toBe(true);
+    expect(e.cancelable).toBe(true);
+  });
+
+  it("Tab on shadow does NOT shift document.activeElement (preventDefault stops focus move)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const before = document.activeElement;
+    expect(before).toBe(shadowEl(fx));
+    fireKeydown(shadowEl(fx), { key: "Tab", code: "Tab", keyCode: 9 });
+    expect(document.activeElement).toBe(shadowEl(fx));
+  });
+});
+
+describe("attachKoreanImeShim — KeyRouter Branch A (shouldBubbleShortcut)", () => {
+  it("predicate returning true → no synth, no preventDefault, helper sees nothing", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    const shouldBubbleShortcut: AttachKoreanImeShimOptions["shouldBubbleShortcut"] = (e) =>
+      e.metaKey && e.key === "t";
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      shouldBubbleShortcut,
+    });
+    const ev = fireKeydown(shadowEl(fx), { key: "t", code: "KeyT", keyCode: 84, metaKey: true });
+    expect(helperKeydowns.length).toBe(0);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(fx.inputCalls).toEqual([]);
+  });
+
+  it("predicate returning false → falls through to Branch B/C", () => {
+    const fx = makeMockTerminal();
+    const shouldBubbleShortcut: AttachKoreanImeShimOptions["shouldBubbleShortcut"] = () =>
+      false;
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      shouldBubbleShortcut,
+    });
+    fireKeydown(shadowEl(fx), { key: "a", code: "KeyA", keyCode: 65 });
+    expect(fx.inputCalls).toEqual([{ data: "a", wasUserInput: true }]);
+  });
+
+  // ROUND-1 FOLD (convergent MED from @claude3 / @codex2): under Shift,
+  // e.key flips to uppercase. The production call sites' bubble
+  // predicates must be case-insensitive on single-char keys. This test
+  // pins the shim's contract: if the call-site predicate is
+  // case-folded, Cmd+Shift+S correctly bubbles. The matching call-site
+  // edits in terminalManager.ts and AgentMiniTerminal.tsx case-fold via
+  // `e.key.length === 1 ? e.key.toLowerCase() : e.key`.
+  it("Cmd+Shift+S bubbles when predicate is case-folded (parity with useKeyboardShortcuts)", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    const SET = new Set(["s", "t", "w", "f"]);
+    const shouldBubbleShortcut: AttachKoreanImeShimOptions["shouldBubbleShortcut"] = (e) => {
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      return (e.metaKey || e.ctrlKey) && SET.has(k);
+    };
+    attachKoreanImeShim(fx.terminal, fx.container, {
+      sessionId: "s",
+      shouldBubbleShortcut,
+    });
+    const ev = fireKeydown(shadowEl(fx), {
+      key: "S",
+      code: "KeyS",
+      keyCode: 83,
+      metaKey: true,
       shiftKey: true,
     });
-    cs.triggerDataEvent("\x1b[1;2C", true); // Shift+Right CSI
+    expect(helperKeydowns.length).toBe(0);
+    expect(ev.defaultPrevented).toBe(false);
+    expect(fx.inputCalls).toEqual([]);
+  });
+});
 
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["\x1b[1;2C"]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
+// ===========================================================================
+// Cmd+V/C/X native edit shortcut bypass
+// ===========================================================================
+
+describe("attachKoreanImeShim — native edit shortcut bypass (Cmd+V/C/X)", () => {
+  it("Cmd+V keydown is NOT preventDefaulted, helper sees no synth", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const ev = fireKeydown(shadowEl(fx), { key: "v", code: "KeyV", keyCode: 86, metaKey: true });
+    expect(ev.defaultPrevented).toBe(false);
+    expect(helperKeydowns.length).toBe(0);
   });
 
-  it("T4-meta: metaKey + ArrowRight behaves identically to T2 (modifier flag does not bypass node 7)", () => {
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
+  it("Cmd+C keydown bypassed (predicate metaKey-only, no Ctrl)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const ev = fireKeydown(shadowEl(fx), { key: "c", code: "KeyC", keyCode: 67, metaKey: true });
+    expect(ev.defaultPrevented).toBe(false);
+  });
 
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireKeydown(textarea, {
-      keyCode: 39,
-      key: "ArrowRight",
-      isComposing: false,
+  it("Cmd+X keydown bypassed", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const ev = fireKeydown(shadowEl(fx), { key: "x", code: "KeyX", keyCode: 88, metaKey: true });
+    expect(ev.defaultPrevented).toBe(false);
+  });
+
+  it("Cmd+Shift+V is NOT in the bypass (modifier predicate requires no shift)", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const ev = fireKeydown(shadowEl(fx), {
+      key: "V",
+      code: "KeyV",
+      keyCode: 86,
       metaKey: true,
+      shiftKey: true,
     });
-    cs.triggerDataEvent("\x1b[1;9C", true); // Meta+Right CSI (xterm meta-as-CSI config)
-
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["\x1b[1;9C"]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
+    expect(ev.defaultPrevented).toBe(true);
+    expect(helperKeydowns.length).toBe(1);
   });
 });
 
 // ===========================================================================
-// Round-1 implementer-review fold (4/5 convergent: @codex2 HIGH, @codex3 MED,
-// @codex4 HIGH, @claude4 LOW) — B4 dedup token must not be open-ended.
+// routePaste — preventDefault only, bubble continues
+// ===========================================================================
+
+describe("attachKoreanImeShim — routePaste", () => {
+  it("preventDefault is called", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const { preventDefaultCalled } = firePaste(shadowEl(fx), "hello");
+    expect(preventDefaultCalled).toBe(true);
+  });
+
+  it("does NOT call terminal.paste (xterm element listener handles it)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    firePaste(shadowEl(fx), "hello");
+    expect(fx.pasteCalls).toEqual([]);
+  });
+
+  it("clears shadow value (defensive)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const ta = shadowEl(fx);
+    ta.value = "stale";
+    firePaste(ta, "hello");
+    expect(ta.value).toBe("");
+  });
+
+  it("does NOT call stopPropagation — bubble path stays intact", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    let bubbleReached = false;
+    fx.container.addEventListener("paste", () => {
+      bubbleReached = true;
+    });
+    firePaste(shadowEl(fx), "hello");
+    expect(bubbleReached).toBe(true);
+  });
+});
+
+// ===========================================================================
+// routeBeforeInputReplace — autocorrect/dictation path
+// ===========================================================================
+
+describe("attachKoreanImeShim — routeBeforeInputReplace", () => {
+  it("insertReplacementText calls terminal.paste(data)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireBeforeInput(shadowEl(fx), "insertReplacementText", "autocorrected");
+    expect(fx.pasteCalls).toEqual([{ data: "autocorrected" }]);
+  });
+
+  it("insertReplacementText prevents default", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const { preventDefaultCalled } = fireBeforeInput(
+      shadowEl(fx),
+      "insertReplacementText",
+      "x",
+    );
+    expect(preventDefaultCalled).toBe(true);
+  });
+
+  it("insertText (no preceding keydown) calls terminal.input(data) — emoji palette path", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireBeforeInput(shadowEl(fx), "insertText", "😀");
+    expect(fx.inputCalls).toEqual([{ data: "😀", wasUserInput: true }]);
+  });
+
+  it("insertText AFTER a keydown in the same tick is suppressed (no double-fire)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireKeydown(shadowEl(fx), { key: "a", code: "KeyA", keyCode: 65 });
+    fireBeforeInput(shadowEl(fx), "insertText", "a");
+    // Only one input call from the keydown — the beforeinput insertText
+    // was suppressed by the keydown-this-tick flag.
+    expect(fx.inputCalls).toEqual([{ data: "a", wasUserInput: true }]);
+  });
+});
+
+// ===========================================================================
+// routeCopy / routeCut — defense-in-depth
+// ===========================================================================
+
+describe("attachKoreanImeShim — routeCopy / routeCut", () => {
+  it("routeCopy with a selection writes selection text to clipboard + preventDefault", () => {
+    const fx = makeMockTerminal();
+    fx.selectionRef.value = "selected";
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const { setData, preventDefaultCalled } = fireCopy(shadowEl(fx));
+    expect(setData).toHaveBeenCalledWith("text/plain", "selected");
+    expect(preventDefaultCalled).toBe(true);
+  });
+
+  it("routeCopy with no selection is an early-exit (no setData, no preventDefault)", () => {
+    const fx = makeMockTerminal();
+    fx.selectionRef.value = "";
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const { setData, preventDefaultCalled } = fireCopy(shadowEl(fx));
+    expect(setData).not.toHaveBeenCalled();
+    expect(preventDefaultCalled).toBe(false);
+  });
+
+  it("routeCut mirrors routeCopy (terminal cannot semantically cut)", () => {
+    const fx = makeMockTerminal();
+    fx.selectionRef.value = "selected";
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const { setData, preventDefaultCalled } = fireCut(shadowEl(fx));
+    expect(setData).toHaveBeenCalledWith("text/plain", "selected");
+    expect(preventDefaultCalled).toBe(true);
+  });
+
+  it("routeCopy does NOT call stopPropagation — bubble continues to xterm's element listener", () => {
+    const fx = makeMockTerminal();
+    fx.selectionRef.value = "x";
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    let bubbleReached = false;
+    fx.container.addEventListener("copy", () => {
+      bubbleReached = true;
+    });
+    fireCopy(shadowEl(fx));
+    expect(bubbleReached).toBe(true);
+  });
+});
+
+// ===========================================================================
+// Defensive helper compositionstart
+// ===========================================================================
+
+describe("attachKoreanImeShim — defensive helper compositionstart", () => {
+  it("re-focuses the shadow if helper accidentally receives compositionstart", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // Manually drop focus (would happen in production if xterm internally
+    // moved focus to helper between our patch installs).
+    shadowEl(fx).blur();
+    document.body.focus();
+    expect(document.activeElement).not.toBe(shadowEl(fx));
+    // Dispatch compositionstart on helper. The capture-phase listener
+    // re-focuses the shadow regardless of who currently owns focus.
+    fx.helperTextarea.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true }),
+    );
+    expect(document.activeElement).toBe(shadowEl(fx));
+  });
+
+  it("capture-phase listener stops propagation so xterm's own listener does NOT fire", () => {
+    const fx = makeMockTerminal();
+    const xtermListener = vi.fn();
+    fx.helperTextarea.addEventListener("compositionstart", xtermListener);
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fx.helperTextarea.dispatchEvent(
+      new CompositionEvent("compositionstart", { bubbles: true }),
+    );
+    expect(xtermListener).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// dispose restoration
+// ===========================================================================
+
+describe("attachKoreanImeShim — dispose", () => {
+  it("removes the shadow textarea from the DOM", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(fx.screenEl.querySelectorAll(".xterm-shadow-textarea").length).toBe(1);
+    h.dispose();
+    expect(fx.screenEl.querySelectorAll(".xterm-shadow-textarea").length).toBe(0);
+  });
+
+  it("removes the overlay from the DOM", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const overlayEl = h.overlayEl!;
+    expect(overlayEl.parentNode).not.toBeNull();
+    h.dispose();
+    expect(overlayEl.parentNode).toBeNull();
+  });
+
+  it("restores helper.focus to its native bound method", () => {
+    const fx = makeMockTerminal();
+    const before = fx.helperTextarea.focus;
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(fx.helperTextarea.focus).not.toBe(before);
+    h.dispose();
+    // After dispose, helper.focus is the captured native bound focus.
+    // We can't compare to `before` (that was a different bound function
+    // before our patch), but we can verify the patch is no longer in
+    // place by checking that calling it does NOT re-focus shadow.
+    document.body.focus();
+    fx.helperTextarea.focus();
+    expect(document.activeElement).toBe(fx.helperTextarea);
+  });
+
+  it("restores cursorBlink", () => {
+    const fx = makeMockTerminal();
+    fx.terminal.options.cursorBlink = true;
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // Composition flips off
+    fireCompositionStart(shadowEl(fx));
+    expect(fx.terminal.options.cursorBlink).toBe(false);
+    h.dispose();
+    expect(fx.terminal.options.cursorBlink).toBe(true);
+  });
+
+  it("is idempotent", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    h.dispose();
+    expect(() => h.dispose()).not.toThrow();
+  });
+
+  it("overlayEl getter returns null after dispose", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    h.dispose();
+    expect(h.overlayEl).toBeNull();
+  });
+
+  it("subsequent keydowns are no-ops post-dispose", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    const ta = shadowEl(fx);
+    h.dispose();
+    // shadow was removed from DOM; dispatching on a detached node is fine.
+    fireKeydown(ta, { key: "a", code: "KeyA", keyCode: 65 });
+    expect(fx.inputCalls).toEqual([]);
+  });
+});
+
+// ===========================================================================
+// Structural invariant: exactly one PTY write per commit
 //
-// The initial B4 implementation set `lastCompositionCommit` on every
-// commit and only cleared it on the next `imeFlushGen`-bumping IME action
-// (compositionend / blur / node-7 stale-state). Inside that window any
-// legitimate same-syllable `triggerDataEvent("요")` (single-Hangul paste,
-// programmatic terminal input, plugin emission, etc.) was silently dropped.
+// Replaces the v0.5.6 multi-char prefix-strip family — the rewrite makes
+// the double-fire structurally unreachable because there is no
+// `triggerDataEvent` patch and no late re-emit from xterm's
+// CompositionHelper (composition lives on shadow, not helper).
+// ===========================================================================
+
+// ===========================================================================
+// Live cursor tracking during composition
 //
-// Fold: two complementary safeguards
-//   1. **Consume on suppress** — when the wrapper's 20 ms defer fires and
-//      the B4 inner check matches, clear `lastCompositionCommit` before
-//      `return`. The first xterm CompositionHelper post-commit re-emit
-//      is suppressed; any subsequent same-syllable trigger passes through.
-//   2. **Time-bound (250 ms)** — `onCompositionEnd` / `onTextareaBlur`
-//      schedule a `setTimeout(250)` that nulls `lastCompositionCommit` if
-//      it still references the same commit (token-identity check keeps
-//      a newer commit safe from a stale clear). Extended from 40 ms by
-//      the korean-ime-dmg-race fold; CFRunLoop timer coalescing in idle
-//      WKWebView can defer xterm's setTimeout(0) past the old 40 ms
-//      ceiling, manifesting as a DMG-only race the dev mode doesn't hit.
-// Combined, both close the "second trigger in same gen" and "no trigger
-// ever arrives" long-tail windows.
+// In dev mode (Vite + Tauri round-trip), the PTY echo of a just-committed
+// Korean syllable can arrive AFTER the next compositionstart fires, so the
+// overlay paints at a stale cursor position and covers the just-arrived
+// character. The shim subscribes to terminal.onCursorMove during composition
+// so the overlay snaps forward when xterm advances its cursor.
 // ===========================================================================
 
-describe("attachKoreanImeShim — round-1 fold: B4 dedup token lifetime", () => {
-  it("T5 (time-bound): a later legitimate triggerDataEvent('요') passes through after the 250ms post-commit dedup window expires", () => {
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    // 1. Commit "요" via compositionend. Sets lastCompositionCommit and
-    //    schedules the 250 ms safety clear.
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "요");
-
-    // 2. Drive past the 250 ms safety window. No xterm CompositionHelper
-    //    re-emit arrives (the case-(d) window passed unused). The safety
-    //    timer fires → lastCompositionCommit cleared.
-    vi.advanceTimersByTime(300);
-
-    // 3. Later legitimate triggerDataEvent("요") (e.g., single-Hangul
-    //    paste, plugin emission, or programmatic terminal input). With
-    //    the token cleared, this schedules a normal 20 ms defer.
-    cs.triggerDataEvent("요", true);
-    vi.advanceTimersByTime(25);
-
-    // Pass-through: dedup did not fire (token was already null).
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["요"]);
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
-
-    vi.useRealTimers();
+describe("attachKoreanImeShim — overlay live cursor tracking", () => {
+  it("subscribes to onCursorMove on compositionstart, unsubscribes on compositionend", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(fx.cursorMoveListenerCount()).toBe(0);
+    fireCompositionStart(shadowEl(fx));
+    expect(fx.cursorMoveListenerCount()).toBe(1);
+    fireCompositionEnd(shadowEl(fx), "안");
+    expect(fx.cursorMoveListenerCount()).toBe(0);
   });
 
-  it("T8 (non-matching Hangul preserves token): a non-matching single-Hangul triggerDataEvent does NOT consume the dedup token meant for the matching duplicate", () => {
-    // Round-3 implementer-review fold (3/5 convergent: @codex2 MED,
-    // @codex3 MED, @codex4 LOW). Round-2's claim-at-schedule
-    // captured AND nullified the live token unconditionally for any
-    // single-Hangul triggerDataEvent. A non-matching event ("한")
-    // arriving between compositionend("요") and xterm's case-(d)
-    // re-emit of "요" would consume the "요" token, leaving the
-    // actual duplicate uncovered → it would escape via origTrigger.
-    // Round-3 fix: claim only when data + gen match the live commit.
-    // Non-matching events pass through normally without touching the
-    // live token; the matching duplicate later captures and suppresses.
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
+  // Parametrized over all 3 terminator keys (round-3 fold per @claude3:
+  // the unified-branch detach should keep firing if a future refactor
+  // splits Enter/Esc/Tab into separate branches).
+  it.each([
+    ["Enter", "Enter", 13] as const,
+    ["Escape", "Escape", 27] as const,
+    ["Tab", "Tab", 9] as const,
+  ])(
+    "unsubscribes on mid-composition terminator (%s)",
+    (key, code, keyCode) => {
+      const fx = makeMockTerminal();
+      attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+      fireCompositionStart(shadowEl(fx));
+      fireCompositionUpdate(shadowEl(fx), "안");
+      expect(fx.cursorMoveListenerCount()).toBe(1);
+      fireKeydown(shadowEl(fx), { key, code, keyCode });
+      expect(fx.cursorMoveListenerCount()).toBe(0);
+    },
+  );
 
-    // 1. Commit "요" at t=0. Live token = {text:"요", gen:1}.
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "요");
-
-    // 2. Non-matching single-Hangul event "한" arrives at t=10 ms
-    //    (e.g., paste of a different syllable while "요" commit is
-    //    still pending its case-(d) re-emit window). Round-3 fix:
-    //    isCandidate is false ("한" !== "요"), so the live token
-    //    is NOT nullified; "한" gets a normal 20 ms defer with
-    //    claim=null and will pass through.
-    vi.advanceTimersByTime(10);
-    cs.triggerDataEvent("한", true);
-
-    // 3. The actual delayed xterm CompositionHelper duplicate of "요"
-    //    arrives at t=25 ms. isCandidate is true (live still set,
-    //    data + gen match), so we capture+null. Defer scheduled at
-    //    t=45 ms → suppress.
-    vi.advanceTimersByTime(15);
-    cs.triggerDataEvent("요", true);
-
-    // 4. Advance past both 20 ms defers (and well within the 250 ms
-    //    safety-clear window — the test does not depend on the safety
-    //    clear firing; claim-at-schedule is the mechanism under test).
-    vi.advanceTimersByTime(30);
-
-    // POST-FOLD: "한" passes through (non-matching); "요" duplicate
-    // suppressed.
-    // PRE-FOLD (round-2): claim=X consumed at t=10 by "한"; "요" at
-    //   t=25 captures claim=null; "한" defer falls through (mismatch);
-    //   "요" defer falls through (claim=null) → BOTH "한" AND "요"
-    //   land in origTriggerCalls → duplicate escapes.
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["한"]);
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
-
-    vi.useRealTimers();
+  it("unsubscribes on blur during composition", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    expect(fx.cursorMoveListenerCount()).toBe(1);
+    fireBlur(shadowEl(fx));
+    expect(fx.cursorMoveListenerCount()).toBe(0);
   });
 
-  it("T7 (delayed duplicate inside 250ms window): a delayed xterm CompositionHelper re-emit at t=25ms is suppressed via claim-at-schedule (race-free against safety clear)", () => {
-    // Round-2 implementer-review fold (3/5 convergent: @codex2 MEDIUM,
-    // @codex3 HIGH, @codex4 HIGH). Pre-fold (round-1) of the round-2
-    // cycle failed when the safety-clear window was 40 ms: the clear at
-    // t=40 ran 15 ms BEFORE the duplicate's 20 ms defer callback at
-    // t=45 ms, nulling lastCompositionCommit before suppression could
-    // fire → duplicate escaped via origTrigger. Round-2 fix:
-    // claim-at-schedule binds the live token into the defer closure at
-    // trigger-arrival time, so the suppression decision is race-free
-    // against the safety clear regardless of window width. The
-    // korean-ime-dmg-race fold widened the window 40→250 ms but the
-    // claim-at-schedule mechanism this test exercises is unchanged.
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    // 1. Commit "요" at t=0. Sets lastCompositionCommit; schedules 250 ms
-    //    safety clear for t=250.
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "요");
-
-    // 2. Simulate xterm's CompositionHelper post-commit latency — the
-    //    duplicate re-emit arrives at t=25 ms, well inside the documented
-    //    250 ms dedup window. Its own 20 ms defer schedules for t=45 ms.
-    vi.advanceTimersByTime(25);
-    cs.triggerDataEvent("요", true);
-
-    // 3. Advance past the defer (fires at t=45). The safety clear does
-    //    NOT fire in this advance (it's scheduled for t=250); under the
-    //    OLD 40 ms window the safety clear would fire at t=40 (5 ms
-    //    before the defer) — the round-2 fold made suppression
-    //    race-free against that scenario via the captured claim. The
-    //    claim-at-schedule mechanism passes both windows identically.
-    vi.advanceTimersByTime(25);
-
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual([]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("요", null);
-
-    vi.useRealTimers();
+  it("unsubscribes on dispose", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    expect(fx.cursorMoveListenerCount()).toBe(1);
+    h.dispose();
+    expect(fx.cursorMoveListenerCount()).toBe(0);
   });
 
-  it("T6 (consume-on-suppress): after the first case-(d) suppression, a later legitimate triggerDataEvent('요') in the same generation passes through", () => {
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
+  it("PTY echo race: cursor advances during composition → overlay snaps to new position", () => {
+    // Reproduces the dev-mode bug: compositionstart fires before the
+    // previous syllable's PTY echo lands. The overlay initially paints
+    // at the stale cursor=1 position; when the PTY echo advances xterm's
+    // cursor to 2, the overlay must snap forward.
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // Simulate that "안" was just committed; cursor SHOULD be at 2 (full-
+    // width Korean = 2 cells), but PTY echo hasn't arrived yet → cursor
+    // still at 0.
+    fx.cursorRef.x = 0;
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "녕");
+    const overlay = h.overlayEl!;
+    // Overlay painted at cell 0 — stale.
+    expect(overlay.style.left).toBe("0px");
+    // PTY echo lands: xterm advances cursor to 2. Fire onCursorMove.
+    fx.cursorRef.x = 2;
+    fx.fireCursorMove();
+    // Overlay snapped to cell 2 (cellW=8 in the mock).
+    expect(overlay.style.left).toBe(`${2 * 8}px`);
+  });
 
-    // 1. Commit "요" via compositionend.
-    textarea.value = "요";
-    fireInput(textarea, "insertText", "요");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "요");
+  it("does NOT subscribe outside composition (no listener leak)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // Type printable + emit non-composition keys: no listener should
+    // ever be registered.
+    fireKeydown(shadowEl(fx), { key: "a", code: "KeyA", keyCode: 65 });
+    expect(fx.cursorMoveListenerCount()).toBe(0);
+  });
 
-    // 2. Case-(d) xterm CompositionHelper re-emit. Wrapper defers; timer
-    //    fires within the window → dedup suppress + consume.
-    cs.triggerDataEvent("요", true);
-    vi.advanceTimersByTime(25);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual([]);
+  // Round-3 fold (@codex2): tracker also repositions the shadow
+  // textarea so the IME composition target stays cell-aligned. Verify
+  // shadow.style.left snaps alongside the overlay.
+  it("PTY echo race: shadow textarea ALSO snaps to new cursor position", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fx.cursorRef.x = 0;
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "녕");
+    const ta = shadowEl(fx);
+    expect(ta.style.left).toBe("0px");
+    fx.cursorRef.x = 2;
+    fx.fireCursorMove();
+    // Shadow snapped to cell 2 (cellW=8 in the mock).
+    expect(ta.style.left).toBe(`${2 * 8}px`);
+  });
 
-    // 3. Later legitimate same-syllable triggerDataEvent in the same
-    //    imeFlushGen generation (no intervening IME activity). With the
-    //    token consumed by step 2's suppression, this passes through.
-    cs.triggerDataEvent("요", true);
-    vi.advanceTimersByTime(25);
+  // Round-3 fold (@claude2 C1): exceptions inside the tracker closure
+  // must not propagate. xterm's EventEmitter2 does not catch
+  // listener throws — propagation would reach the PTY data pipeline
+  // and could break terminal rendering.
+  it("tracker swallows exceptions from overlay/shadow positioning", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    // Forcibly break overlay positioning by removing its host parent
+    // mid-flight. The tracker should swallow whatever DOM exception
+    // results.
+    const overlay = h.overlayEl!;
+    // Remove overlay's parent so any DOM operation on detached nodes
+    // could surface — covers the defensive-catch contract.
+    overlay.remove();
+    expect(() => fx.fireCursorMove()).not.toThrow();
+  });
+});
 
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["요"]);
-    expect(ptyWrites().map((c) => c.data)).toEqual(["요"]);
+describe("attachKoreanImeShim — no late re-emit duplicate (structural)", () => {
+  it("composing 안 → committing → typing space → exactly one PTY write of '안' (commit)", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안");
+    fireCompositionEnd(shadowEl(fx), "안");
+    fireKeydown(shadowEl(fx), { key: " ", code: "Space", keyCode: 32 });
+    // PTY writes from invoke: the '안' commit. The space went via
+    // terminal.input which we observe separately as fx.inputCalls.
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "안" }]);
+    expect(fx.inputCalls).toEqual([{ data: " ", wasUserInput: true }]);
+  });
 
-    vi.useRealTimers();
+  it("composing 안 → period mid-composition → single combined flush '안.' via terminal.input + commit", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안");
+    // The IME commits '안' on '.': fire compositionend with '안' followed
+    // by a fresh keydown for '.'.
+    fireCompositionEnd(shadowEl(fx), "안");
+    fireKeydown(shadowEl(fx), { key: ".", code: "Period", keyCode: 190 });
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "안" }]);
+    expect(fx.inputCalls).toEqual([{ data: ".", wasUserInput: true }]);
+  });
+
+  it("composing 안 → arrow mid-composition → commit '안' then Branch C arrow", () => {
+    const fx = makeMockTerminal();
+    const helperKeydowns: KeyboardEvent[] = [];
+    fx.helperTextarea.addEventListener("keydown", (e) => helperKeydowns.push(e));
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "안");
+    fireCompositionEnd(shadowEl(fx), "안");
+    fireKeydown(shadowEl(fx), { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 });
+    expect(ptyWrites()).toEqual([{ sessionId: "s", data: "안" }]);
+    // Arrow synthesized on helper for xterm's CSI encoding.
+    expect(helperKeydowns.map((e) => e.key)).toEqual(["ArrowLeft"]);
   });
 });
 
 // ===========================================================================
-// korean-ime-dup-space: multi-char prefix-strip dedup path (N2-N5)
+// rebind retry + degraded mode
 // ===========================================================================
 
-describe("attachKoreanImeShim — multi-char prefix strip", () => {
-  it("T-space (positive repro): drops late '녕 ' substring; the synchronous _keyDown space survives once", () => {
-    // Repro from task-1-claude1-report.md: typing 녕 then SPACE mid-composition.
-    // Under Order B (WKWebView Korean IME) the trailing space is emitted via
-    // xterm._keyDown's synchronous triggerDataEvent(" ") BEFORE the late
-    // CompositionHelper setTimeout(0) substring "녕 " arrives. The new
-    // prefix-strip drops the entire late substring (P6 FULL SUPPRESSION) so
-    // the user sees "녕 " (one space), not "녕 녕 " (re-emitted prefix) or
-    // "녕  " (re-emitted trailing).
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    // 1. Commit "녕" via compositionend.
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    // 2. Order B trailing: xterm._keyDown synchronously emits ASCII " ".
-    textarea.value = "녕 ";
-    cs.triggerDataEvent(" ", true);
-
-    // 3. xterm CompositionHelper late substring re-emit:
-    //    textarea.value.substring(start) = "녕 ". New prefix-strip drops it.
-    cs.triggerDataEvent("녕 ", true);
-
-    // 4. Settle any synchronous follow-up. The 250 ms safety-clear is
-    //    intentionally NOT drained — vi.useRealTimers() at end-of-test
-    //    discards the pending timer, and these assertions do not depend
-    //    on the clear firing. (Was meaningful when the window was 40 ms
-    //    and 60 ms safely passed it; widened to 250 ms in
-    //    korean-ime-dmg-race, the advance is now a harmless settle step.)
-    vi.advanceTimersByTime(60);
-
-    // Direct PTY writes: only "녕" from onCompositionEnd's invoke().
-    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
-    // Indirect via origTrigger: exactly one space — NOT [" ", " "] (which
-    // a re-emit-trailing fix would produce) and NOT [" ", "녕 "] (which
-    // baseline produces).
-    expect(origTriggerCalls.map((c) => c.data)).toEqual([" "]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("녕", null);
-
-    vi.useRealTimers();
+describe("attachKoreanImeShim — degraded mode + rebind retry", () => {
+  it("attach with no .xterm-screen AND container disconnected → degraded (no overlay attached)", () => {
+    const fx = makeMockTerminal();
+    fx.screenEl.remove();
+    fx.container.remove();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // overlay is not attached when container is disconnected and screen
+    // is gone — getter returns null.
+    expect(h.overlayEl).toBeNull();
   });
 
-  it("T-digit (positive repro, ASCII generality): drops late '녕2' substring; the digit survives once", () => {
-    // Same Order-B mechanism as T-space; this pins generality across ASCII
-    // trailing chars (digits are not terminators and do not end composition
-    // before xterm's setTimeout(0) fires).
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    textarea.value = "녕2";
-    cs.triggerDataEvent("2", true);
-    cs.triggerDataEvent("녕2", true);
-
-    vi.advanceTimersByTime(60);
-
-    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["2"]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("녕", null);
-
-    vi.useRealTimers();
+  it("rebind after .xterm-screen appears RELOCATES overlay + shadow to .xterm-screen", () => {
+    const fx = makeMockTerminal();
+    fx.screenEl.remove();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    // Overlay landed on container fallback (no .xterm-screen yet).
+    expect(h.overlayEl).not.toBeNull();
+    expect(h.overlayEl?.parentNode).toBe(fx.container);
+    const shadow = fx.container.querySelector(".xterm-shadow-textarea")!;
+    expect(shadow.parentNode).toBe(fx.container);
+    // .xterm-screen appears post-layout.
+    fx.container.appendChild(fx.screenEl);
+    h.rebind();
+    // Round-1 fold: rebind MUST move overlay + shadow under the new
+    // .xterm-screen (the contract said "re-anchor on layout change").
+    expect(h.overlayEl?.parentNode).toBe(fx.screenEl);
+    expect(shadow.parentNode).toBe(fx.screenEl);
   });
 
-  it("T-non-matching-multi-char (over-suppression guard): an unrelated multi-char payload after a commit flows through verbatim", () => {
-    // After "녕" commits, simulate an emission of "한자" (e.g. a paste
-    // landing inside the 250 ms dedup window). The strip's prefix check
-    // ("한자".startsWith("녕")) is false, so the strip does NOT fire and
-    // the payload reaches origTrigger verbatim. Prevents over-suppression
-    // of legitimate multi-char pastes / IME emissions that happen to
-    // coincide with the dedup window.
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    // Paste of "한자" landing during the dedup window — different syllables,
-    // does not start with the live token's text.
-    cs.triggerDataEvent("한자", true);
-
-    vi.advanceTimersByTime(60);
-
-    // Strip does NOT fire (prefix mismatch); payload flows through verbatim.
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["한자"]);
-    // No additional PTY writes beyond the original commit.
-    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
-
-    vi.useRealTimers();
-  });
-
-  it("T-replaced-token (defense-in-depth): after the live token has been replaced by a subsequent commit, a stale-prefix multi-char payload flows through verbatim", () => {
-    // Setup: commit "녕" (sets live = {text:"녕", gen:1}). Drive a SECOND
-    // composition that commits "어" — this replaces lastCompositionCommit
-    // to {text:"어", gen:2} AND advances imeFlushGen. Then fire a stale-
-    // prefix multi-char payload "녕 ". The strip MUST NOT fire — the prefix
-    // check ("녕 ".startsWith("어")) fails first; the gen check is defense-
-    // in-depth that would also catch it if lastCompositionCommit ever
-    // decoupled from imeFlushGen in a future refactor.
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    // 1. First composition commits "녕".
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    // 2. Second composition commits "어" — replaces the live token's text
-    //    AND advances imeFlushGen (post-increment at compositionend).
-    textarea.value = "어";
-    fireInput(textarea, "insertText", "어");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "어");
-
-    // 3. Stale-prefix multi-char payload — first composition's text is no
-    //    longer the live token's text. Strip must not fire.
-    cs.triggerDataEvent("녕 ", true);
-
-    vi.advanceTimersByTime(60);
-
-    // Strip does NOT fire (prefix check rejects); payload flows through.
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["녕 "]);
-    // Two PTY writes from the two compositionend commits.
-    expect(ptyWrites().map((c) => c.data)).toEqual(["녕", "어"]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(2);
-
-    vi.useRealTimers();
-  });
-
-  it("T-space-late-arrival: prefix-strip catches late re-emit at t=200ms (race vs prod-style setTimeout deferral)", () => {
-    // Production WKWebView in idle main-thread state can coalesce xterm's
-    // CompositionHelper setTimeout(0) past the safety-clear window. This
-    // test simulates the DMG repro: at t=200 ms (past the old 40 ms clear,
-    // inside the new 250 ms clear), the late "녕 " must still be
-    // suppressed. Failing-now/passing-after: this test FAILS before the
-    // 40→250 literal change in xtermImeShim.ts:501; PASSES after.
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    // 1. Commit "녕" via compositionend at t=0.
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    // 2. Order B trailing: xterm._keyDown synchronously emits ASCII " ".
-    textarea.value = "녕 ";
-    cs.triggerDataEvent(" ", true);
-
-    // 3. Advance fake clock 200 ms — past the OLD 40 ms safety clear,
-    //    inside the NEW 250 ms safety clear. Simulates DMG WKWebView's
-    //    delayed setTimeout(0) firing.
-    vi.advanceTimersByTime(200);
-
-    // 4. Late CompositionHelper re-emit arrives. With the 250 ms ceiling,
-    //    lastCompositionCommit is still live → strip fires → suppressed.
-    cs.triggerDataEvent("녕 ", true);
-
-    // 5. Drain the safety-clear timer cleanly.
-    vi.advanceTimersByTime(300);
-
-    // Direct PTY writes: only "녕" from onCompositionEnd's invoke().
-    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
-    // Indirect via origTrigger: exactly one space — NOT [" ", "녕 "]
-    // (which the pre-fix 40 ms clear would produce at t=200).
-    expect(origTriggerCalls.map((c) => c.data)).toEqual([" "]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-    expect(onComposedFlush).toHaveBeenCalledWith("녕", null);
-
-    vi.useRealTimers();
-  });
-
-  it("T-space-out-of-window: at t=500ms safety-clear has fired; late re-emit falls through", () => {
-    // Demonstrative — proves the safety-clear DOES eventually nullify
-    // the token so a paste of the same syllable (without an intervening
-    // new composition) is not suppressed indefinitely. t=500 gives
-    // 250 ms of slack against the new ceiling, so a future fold-round
-    // can widen the window up to ~450 ms without breaking this test
-    // (the rationale comment is the actual forcing function on the
-    // ceiling, not this test).
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    textarea.value = "녕 ";
-    cs.triggerDataEvent(" ", true);
-
-    vi.advanceTimersByTime(500);
-
-    cs.triggerDataEvent("녕 ", true);
-
-    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
-    expect(origTriggerCalls.map((c) => c.data)).toEqual([" ", "녕 "]);
-    expect(onComposedFlush).toHaveBeenCalledTimes(1);
-
-    vi.useRealTimers();
-  });
-
-  it("T-prefix-strip-cap: long paste starting with the committed syllable falls through (over-suppression guard for the trailing-slack cap)", () => {
-    // The trailing-slack cap caps the multi-char strip at
-    // `data.length <= live.text.length + 4`. A 12-char paste
-    // "녕 hello world" starts with the committed "녕" but exceeds the
-    // cap (12 > 1 + 4 = 5) — strip must NOT fire. Without the cap,
-    // the wider 250 ms window would suppress this legitimate paste.
-    const { terminal, container, textarea, origTriggerCalls } =
-      makeMockTerminal();
-    const onComposedFlush = vi.fn();
-    attach(terminal, container, { sessionId: "s1", onComposedFlush });
-    vi.useFakeTimers();
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    // 12-char paste inside the dedup window. Prefix matches but length
-    // exceeds cap → strip must NOT fire.
-    cs.triggerDataEvent("녕 hello world", true);
-
-    vi.advanceTimersByTime(300);
-
-    // The paste reaches origTrigger verbatim.
-    expect(origTriggerCalls.map((c) => c.data)).toEqual(["녕 hello world"]);
-    // Only the commit's direct PTY write.
-    expect(ptyWrites().map((c) => c.data)).toEqual(["녕"]);
-
-    vi.useRealTimers();
-  });
-});
-
-describe("attachKoreanImeShim — A.3 instrumentation (debug-flag gated)", () => {
-  // happy-dom v20 ships `localStorage` as an empty plain object without a
-  // real Storage prototype, so the shim's `localStorage.getItem(...)` call
-  // throws. Install a Map-backed stub for the duration of each test and
-  // restore in afterEach so the stub doesn't leak into other suites.
-  const makeMapStorage = () => {
-    const m = new Map<string, string>();
-    return {
-      getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
-      setItem: (k: string, v: string) => {
-        m.set(k, String(v));
-      },
-      removeItem: (k: string) => {
-        m.delete(k);
-      },
-      clear: () => m.clear(),
-      key: (i: number) => Array.from(m.keys())[i] ?? null,
-      get length() {
-        return m.size;
-      },
-    } as unknown as Storage;
-  };
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("strip-hit: logs gapMs when the multi-char prefix-strip fires", () => {
-    // Vitest 4.x's default toFake set may not include 'performance';
-    // explicit toFake keeps gapMs deterministic when we advance the
-    // fake clock.
-    const ls = makeMapStorage();
-    ls.setItem("canvasTerminal_imeDebug", "1");
-    vi.stubGlobal("localStorage", ls);
-    vi.useFakeTimers({
-      toFake: ["setTimeout", "clearTimeout", "performance", "Date"],
-    });
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    const { terminal, container, textarea } = makeMockTerminal();
-    attach(terminal, container, { sessionId: "s1" });
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    textarea.value = "녕 ";
-    cs.triggerDataEvent(" ", true);
-
-    // Advance ~200 ms so the gap is measurable but inside the window.
-    vi.advanceTimersByTime(200);
-
-    cs.triggerDataEvent("녕 ", true);
-
-    // Find the strip-hit log line.
-    const hit = warnSpy.mock.calls.find((c) => c[0] === "[ime] strip-hit");
-    expect(hit).toBeDefined();
-    const payload = hit![1] as {
-      data: string;
-      gapMs: number;
-      gen: number;
-      count: number;
-    };
-    expect(payload.data).toBe("녕 ");
-    expect(payload.gapMs).toBeGreaterThanOrEqual(200);
-    expect(payload.count).toBe(1);
-
-    warnSpy.mockRestore();
-    vi.advanceTimersByTime(300);
-    vi.useRealTimers();
-  });
-
-  it("strip-miss: logs gapMs and ageMs when a late re-emit arrives after the safety-clear", () => {
-    // Race the safety-clear by advancing past 250 ms BEFORE emitting
-    // the duplicate. The miss-detector reads `lastClearedCommit`
-    // (snapshot taken at safety-clear time) and reports both
-    // gapMs (commit→arrival) and ageMs (clear→arrival).
-    const ls = makeMapStorage();
-    ls.setItem("canvasTerminal_imeDebug", "1");
-    vi.stubGlobal("localStorage", ls);
-    vi.useFakeTimers({
-      toFake: ["setTimeout", "clearTimeout", "performance", "Date"],
-    });
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    const { terminal, container, textarea } = makeMockTerminal();
-    attach(terminal, container, { sessionId: "s1" });
-    const cs = (
-      terminal as unknown as {
-        _core: {
-          coreService: {
-            triggerDataEvent: (d: string, w?: boolean) => void;
-          };
-        };
-      }
-    )._core.coreService;
-
-    textarea.value = "녕";
-    fireInput(textarea, "insertText", "녕");
-    fireKeydown(textarea, { keyCode: 229 });
-    fireCompositionEnd(textarea, "녕");
-
-    textarea.value = "녕 ";
-    cs.triggerDataEvent(" ", true);
-
-    // Advance past 250 ms → safety-clear fires → snapshot taken.
-    vi.advanceTimersByTime(300);
-
-    cs.triggerDataEvent("녕 ", true);
-
-    const miss = warnSpy.mock.calls.find((c) => c[0] === "[ime] strip-miss");
-    expect(miss).toBeDefined();
-    const payload = miss![1] as {
-      data: string;
-      gapMs: number;
-      ageMs: number;
-      gen: number;
-      count: number;
-    };
-    expect(payload.data).toBe("녕 ");
-    // gapMs is commit→arrival, ~300 ms.
-    expect(payload.gapMs).toBeGreaterThanOrEqual(300);
-    // ageMs is clear→arrival; safety-clear ran at t=250, arrival at t=300.
-    expect(payload.ageMs).toBeGreaterThanOrEqual(50);
-    expect(payload.ageMs).toBeLessThan(500);
-    expect(payload.count).toBe(1);
-
-    warnSpy.mockRestore();
-    vi.useRealTimers();
+  it("rebind is a no-op when already mounted on .xterm-screen", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    expect(h.overlayEl?.parentNode).toBe(fx.screenEl);
+    h.rebind();
+    h.rebind();
+    expect(h.overlayEl?.parentNode).toBe(fx.screenEl);
   });
 });

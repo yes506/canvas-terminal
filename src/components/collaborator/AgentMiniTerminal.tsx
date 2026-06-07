@@ -245,9 +245,12 @@ export function AgentMiniTerminal({
       // it's in scope for the early write sites at L142, L162, L205.
       const writeWithFollowBottom = (payload: string) => {
         const buf = terminal.buffer.active;
+        // textarea-rewrite v3.4: focus owner is the shadow textarea
+        // managed by attachKoreanImeShim, not xterm's helper. Use
+        // `imeHandleRef.current?.isFocused()` as the source of truth.
         const shouldFollow =
           buf.baseY - buf.viewportY <= 2 ||
-          document.activeElement === terminal.textarea;
+          (imeHandleRef.current?.isFocused() ?? false);
         terminal.write(payload, () => {
           if (!isCurrentRun()) return;
           if (shouldFollow) terminal.scrollToBottom();
@@ -425,9 +428,11 @@ export function AgentMiniTerminal({
 
       // Let app-level shortcuts bubble past xterm
       terminal.attachCustomKeyEventHandler((e) => {
-        // Return true so xterm does NOT call preventDefault() on IME
-        // key events — preventDefault() blocks the IME from composing.
-        // The triggerDataEvent patch handles suppressing IME output.
+        // textarea-rewrite v3.4: composition events fire on the shadow
+        // textarea (not the helper), so xterm's `_handleKey` never runs
+        // for IME keystrokes. Keeping the guard is harmless and defends
+        // against any future xterm path that synchronously dispatches
+        // an IME-marked keydown.
         if (e.isComposing || e.keyCode === 229) return true;
         // Shift+Enter → CSI u escape for tools like Claude Code
         if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey) {
@@ -447,20 +452,41 @@ export function AgentMiniTerminal({
       });
 
 
-      // Korean IME shim — single helper, single dispose() path. See
-      // src/lib/xtermImeShim.ts for the bug context and the full
-      // dispose restoration contract. The `onComposedFlush` subscription
-      // closes the parity gap with ASCII input: `terminal.onData` (below
-      // at line 702) snaps the viewport to the bottom on every keystroke,
-      // but Korean compositions take a direct PTY write path that bypasses
-      // it — so the helper notifies us per-flush and we mirror the scroll
-      // behavior here (plan node 7).
+      // Korean IME shim (textarea-rewrite v3.4) — shadow textarea owns
+      // composition events. The `onComposedFlush` subscription closes
+      // the parity gap with ASCII input: `terminal.onData` (below)
+      // snaps the viewport on every keystroke, but Korean compositions
+      // take a direct PTY write path that bypasses it — so the helper
+      // notifies us per-flush and we mirror the scroll behavior here.
+      //
+      // `shouldBubbleShortcut` mirrors the bubble decisions in
+      // `attachCustomKeyEventHandler` above so app-level shortcuts
+      // (Cmd+T, Cmd+W, etc.) continue to bubble past the shadow
+      // textarea unchanged.
       imeHandleRef.current = attachKoreanImeShim(terminal, termRef.current!, {
         sessionId,
         webgl: false,
         defaultFontSize: 10,
         onComposedFlush: () => {
           terminal.scrollToBottom();
+        },
+        shouldBubbleShortcut: (e) => {
+          // Round-1 fold (convergent MED from @claude3 / @codex2): case-
+          // fold single-char keys before set lookup. Under Shift, e.key
+          // flips to uppercase (Cmd+Shift+S → e.key === "S"), which the
+          // lowercase-only list would miss. useKeyboardShortcuts.ts
+          // documents this case explicitly (case "S" branch).
+          const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+          if (
+            (e.metaKey || e.ctrlKey) &&
+            ["t","w","f","d","e","z","s","o","=","-","0","1","2","3","4","5","6","7","8","9","Enter"].includes(k)
+          ) {
+            return true;
+          }
+          if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "[" || e.key === "]")) {
+            return true;
+          }
+          return false;
         },
       });
 
@@ -480,10 +506,17 @@ export function AgentMiniTerminal({
       // which suppresses the browser's natural scroll-caret-into-view).
       // Do it on the next animation frame so xterm has settled, and guard
       // disposal so a refocus that races a unmount doesn't throw.
+      // textarea-rewrite v3.4: focus events on `terminal.textarea` are
+      // synthesized by the shim's `mirrorFocusState` from the shadow's
+      // actual focus/blur, so the visual focus border + scroll snap
+      // continue to fire. The post-focus `requestAnimationFrame`
+      // guard uses `imeHandleRef.current?.isFocused()` instead of
+      // `document.activeElement === terminal.textarea` because focus
+      // now lives on the shadow textarea, not the helper.
       terminal.textarea?.addEventListener("focus", () => {
         setFocused(true);
         requestAnimationFrame(() => {
-          if (isCurrentRun() && document.activeElement === terminal.textarea) {
+          if (isCurrentRun() && (imeHandleRef.current?.isFocused() ?? false)) {
             terminal.scrollToBottom();
           }
         });

@@ -1,18 +1,68 @@
-flowchart TD
-  N1["N1 — prefix-strip dedup<br/>xtermImeShim.ts:607-656"]
-  N2["N2 — T-space (positive)<br/>xtermImeShim.test.ts"]
-  N3["N3 — T-digit (positive)<br/>xtermImeShim.test.ts"]
-  N4["N4 — T-non-matching-multi-char (negative)<br/>xtermImeShim.test.ts"]
-  N5["N5 — T-replaced-token (over-suppression guard)<br/>xtermImeShim.test.ts"]
-  N6["N6 — Validation<br/>npm run test + tsc --noEmit"]
-  N7["N7 — Live smoke (manual)<br/>macOS Tauri + Korean IME"]
+flowchart LR
+    subgraph CallSites["call sites (additive option/handle changes)"]
+        TM["terminalManager.ts"]
+        AMT["AgentMiniTerminal.tsx"]
+    end
+    subgraph ShadowFile["xtermShadowTextarea.ts (NEW)"]
+        ST["ShadowTextarea<br/>mount / repositionToCursor<br/>clearValue / dispose"]
+    end
+    subgraph ShimFile["xtermImeShim.ts (REWRITTEN)"]
+        ISO["ImeShimOrchestrator<br/>attach (==attachKoreanImeShim)<br/>rebind / dispose"]
+        CR["CompositionRouter<br/>onCompositionStart<br/>onCompositionUpdate<br/>onCompositionEnd<br/>onTerminatingKey<br/>onBlurDuringComposition"]
+        KR["KeyRouter (6 methods)<br/>routePrintable<br/>synthesizeKeydown<br/>routePaste (ClipboardEvent)<br/>routeBeforeInputReplace (autocorrect)<br/>routeCopy / routeCut"]
+        OV["CursorOverlay<br/>show / clear<br/>reposition / updateStyle"]
+        HTI["HelperTextareaIsolator<br/>installFocusRedirect<br/>mirrorFocusState<br/>restoreNativeFocus"]
+    end
+    subgraph XtermInternals["xterm.js (listeners untouched)"]
+        HT[".xterm-helper-textarea"]
+        KD["_keyDown<br/>(Terminal.ts:379)"]
+        INPUT_API["terminal.input(data)<br/>(public, CoreTerminal.ts:171)"]
+        PASTE_API["terminal.paste(text)<br/>(public, Terminal.ts:890)"]
+        FOCUS_LIS["focus/blur listeners<br/>(Terminal.ts:467-468)"]
+        TD["coreService.triggerDataEvent"]
+        OD["terminal.onData"]
+        BUF["buffer.active.cursorX/Y"]
+    end
+    subgraph BrowserNative["browser/OS native handlers (Branch A + native edit shortcuts)"]
+        APP_LAYER["app/window shortcut layer<br/>(Cmd+T, Cmd+W, Cmd+F, etc.)"]
+        CLIPBOARD["system clipboard"]
+    end
+    subgraph Tauri["Tauri IPC"]
+        PTY["write_to_pty"]
+    end
 
-  N1 --> N2
-  N1 --> N3
-  N1 --> N4
-  N1 --> N5
-  N2 --> N6
-  N3 --> N6
-  N4 --> N6
-  N5 --> N6
-  N6 --> N7
+    TM --> ISO
+    AMT --> ISO
+    ISO --> ST
+    ISO --> CR
+    ISO --> KR
+    ISO --> OV
+    ISO --> HTI
+
+    ST -. "compositionstart/update/end blur during composing" .-> CR
+    ST -. "keydown (non-composing)" .-> KR
+    ST -. "paste / copy / cut / beforeinput insertReplacementText" .-> KR
+
+    CR --> PTY
+    CR --> OV
+
+    KR -. "Branch A: bubble (no synth no preventDefault)" .-> APP_LAYER
+    KR -. "Cmd+V/C/X bypass: no synth, no preventDefault on keydown" .-> APP_LAYER
+    KR -- "Branch B: printable" --> INPUT_API
+    KR -- "Branch C: dispatchEvent(keydown) including Ctrl+letters" --> HT
+    KR -. "routePaste (Cmd+V): only preventDefault on shadow event" .-> KR
+    HT -. "paste event bubbles from shadow to this.element listener" .-> PASTE_API
+    KR -- "routeBeforeInputReplace (autocorrect/dictation): terminal.paste(data)" --> PASTE_API
+    KR -- "routeCopy / routeCut: setData (defense-in-depth)" --> CLIPBOARD
+
+    HT --> KD
+    KD --> TD
+    INPUT_API --> TD
+    PASTE_API --> TD
+    TD --> OD
+    OD --> PTY
+
+    HTI -- "patches focus()" --> HT
+    HTI -. "FocusEvent('focus'/'blur')" .-> FOCUS_LIS
+
+    OV -- "reads" --> BUF
