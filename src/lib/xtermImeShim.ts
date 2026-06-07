@@ -849,7 +849,21 @@ export function attachKoreanImeShim(
   function attachCursorTracker(): void {
     if (cursorMoveDisposable) return;
     cursorMoveDisposable = terminal.onCursorMove(() => {
-      overlay.reposition();
+      // Round-3 fold:
+      //   - @codex2: also reposition the shadow textarea. It's the IME
+      //     composition target, so if its cell coordinates drift,
+      //     candidate-window placement could drift on the same race.
+      //   - @claude2 C1: defensive try/catch. xterm's EventEmitter2
+      //     does not catch listener exceptions; a throw here would
+      //     bubble to whoever fed the PTY data into xterm (the
+      //     `pty-data-*` event listener), breaking the data pipeline.
+      try {
+        overlay.reposition();
+        shadow.repositionToCursor();
+      } catch {
+        // Swallow — overlay/shadow positioning is a visual-state
+        // concern, never load-bearing for PTY correctness.
+      }
     });
   }
   function detachCursorTracker(): void {

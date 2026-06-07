@@ -1082,15 +1082,25 @@ describe("attachKoreanImeShim — overlay live cursor tracking", () => {
     expect(fx.cursorMoveListenerCount()).toBe(0);
   });
 
-  it("unsubscribes on mid-composition terminator (Enter)", () => {
-    const fx = makeMockTerminal();
-    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
-    fireCompositionStart(shadowEl(fx));
-    fireCompositionUpdate(shadowEl(fx), "안");
-    expect(fx.cursorMoveListenerCount()).toBe(1);
-    fireKeydown(shadowEl(fx), { key: "Enter", code: "Enter", keyCode: 13 });
-    expect(fx.cursorMoveListenerCount()).toBe(0);
-  });
+  // Parametrized over all 3 terminator keys (round-3 fold per @claude3:
+  // the unified-branch detach should keep firing if a future refactor
+  // splits Enter/Esc/Tab into separate branches).
+  it.each([
+    ["Enter", "Enter", 13] as const,
+    ["Escape", "Escape", 27] as const,
+    ["Tab", "Tab", 9] as const,
+  ])(
+    "unsubscribes on mid-composition terminator (%s)",
+    (key, code, keyCode) => {
+      const fx = makeMockTerminal();
+      attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+      fireCompositionStart(shadowEl(fx));
+      fireCompositionUpdate(shadowEl(fx), "안");
+      expect(fx.cursorMoveListenerCount()).toBe(1);
+      fireKeydown(shadowEl(fx), { key, code, keyCode });
+      expect(fx.cursorMoveListenerCount()).toBe(0);
+    },
+  );
 
   it("unsubscribes on blur during composition", () => {
     const fx = makeMockTerminal();
@@ -1140,6 +1150,41 @@ describe("attachKoreanImeShim — overlay live cursor tracking", () => {
     // ever be registered.
     fireKeydown(shadowEl(fx), { key: "a", code: "KeyA", keyCode: 65 });
     expect(fx.cursorMoveListenerCount()).toBe(0);
+  });
+
+  // Round-3 fold (@codex2): tracker also repositions the shadow
+  // textarea so the IME composition target stays cell-aligned. Verify
+  // shadow.style.left snaps alongside the overlay.
+  it("PTY echo race: shadow textarea ALSO snaps to new cursor position", () => {
+    const fx = makeMockTerminal();
+    attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fx.cursorRef.x = 0;
+    fireCompositionStart(shadowEl(fx));
+    fireCompositionUpdate(shadowEl(fx), "녕");
+    const ta = shadowEl(fx);
+    expect(ta.style.left).toBe("0px");
+    fx.cursorRef.x = 2;
+    fx.fireCursorMove();
+    // Shadow snapped to cell 2 (cellW=8 in the mock).
+    expect(ta.style.left).toBe(`${2 * 8}px`);
+  });
+
+  // Round-3 fold (@claude2 C1): exceptions inside the tracker closure
+  // must not propagate. xterm's EventEmitter2 does not catch
+  // listener throws — propagation would reach the PTY data pipeline
+  // and could break terminal rendering.
+  it("tracker swallows exceptions from overlay/shadow positioning", () => {
+    const fx = makeMockTerminal();
+    const h = attachKoreanImeShim(fx.terminal, fx.container, { sessionId: "s" });
+    fireCompositionStart(shadowEl(fx));
+    // Forcibly break overlay positioning by removing its host parent
+    // mid-flight. The tracker should swallow whatever DOM exception
+    // results.
+    const overlay = h.overlayEl!;
+    // Remove overlay's parent so any DOM operation on detached nodes
+    // could surface — covers the defensive-catch contract.
+    overlay.remove();
+    expect(() => fx.fireCursorMove()).not.toThrow();
   });
 });
 

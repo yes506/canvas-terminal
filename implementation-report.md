@@ -403,3 +403,133 @@ deferrals (sibling-vs-child, dispose position leak, no-selection copy,
 real-xterm test, R3 probe, DMG smoke, LOC target) are documented
 trade-offs or release-gate prerequisites — none reopen the rewrite's
 correctness contract.
+
+---
+
+## Post-merge fix — round 3 (dev-mode overlay race)
+
+**Commits**: `dc64ab2` (initial cursor-tracker) + follow-up round-3
+fold (@codex2 shadow reposition, @claude2 C1 defensive try/catch,
+@claude3 parametric Esc/Tab tests).
+
+### Symptom
+
+User-observed in `npm run tauri dev` (agent CLI terminal in the
+collaborator pane):
+
+```
+안 → 안녕 → 안ㅎ → 안녕하 → 안녕핫 → 안녕세 → 안녕하셍 → 안녕하요 → (wait) → 안녕하세요
+```
+
+Multi-syllable Korean composition drifts visually. The final
+committed PTY text is correct (`안녕하세요`), but intermediate
+composition frames show the overlay glyph covering just-arrived
+characters instead of trailing them.
+
+### Root cause
+
+In dev mode the Vite + Tauri IPC round-trip is slower than
+production. When a Korean syllable commits:
+
+1. `compositionend("안")` → `invoke("write_to_pty", "안")` (async).
+2. User immediately types "녕" → `compositionstart("녕")` fires
+   BEFORE the PTY echo of "안" lands and xterm advances its cursor.
+3. `overlay.reposition()` (called during the new compositionstart's
+   `overlay.show("")`) reads `terminal.buffer.active.cursorX` —
+   still STALE (cursor hasn't moved because xterm hasn't seen the
+   echo yet).
+4. Overlay paints at the position where "안" will land, NOT where
+   "녕" should land.
+5. PTY echo arrives → xterm writes "안" at the previous cursor
+   cell, advances cursor by 2 (Korean full-width).
+6. Overlay is still at the original cell, COVERING the just-rendered
+   "안". User sees the overlay glyph instead of "안".
+7. The drift compounds across multi-syllable sequences.
+
+happy-dom can't reproduce this (no PTY round-trip), which is why
+the prior 334-test suite missed it.
+
+### Fix
+
+Subscribe to `terminal.onCursorMove` (public xterm event,
+`@xterm/xterm` `typings/xterm.d.ts:902`) during composition. On
+every cursor move:
+- `overlay.reposition()` — overlay snaps to the live cursor cell.
+- `shadow.repositionToCursor()` — shadow textarea (IME composition
+  target / candidate-window anchor) snaps in lockstep so any
+  candidate-window placement stays cell-aligned.
+
+Both calls wrapped in `try/catch` (defensive — xterm's
+`EventEmitter2` does not catch listener exceptions, so a throw
+would bubble to the `pty-data-*` event listener and break the
+data pipeline; overlay/shadow positioning is a visual-state
+concern, never load-bearing for PTY correctness).
+
+Listener lifecycle wired into every composition exit path:
+- `attachCursorTracker()` — `onShadowCompositionStart`
+- `detachCursorTracker()` — `onShadowCompositionEnd`,
+  `onShadowBlur`, mid-composition terminator branch
+  (Enter / Esc / Tab), `handle.dispose()`.
+
+### Round-3 reviewer convergence on `dc64ab2`
+
+| Reviewer | Verdict | Asks | Resolved? |
+|---|---|---|---|
+| @claude2 | APPROVE | F1 (report update), C1 (try/catch), C2 (acceptable, no action) | F1 + C1 ✓ |
+| @claude3 | APPROVE | Parametric Esc/Tab tests | ✓ via `it.each` |
+| @codex1 | Approve | None (notes Cargo.lock dirty, unrelated) | n/a |
+| @codex2 | Approve with one note | Tracker also repositions shadow textarea | ✓ |
+| @codex3 | APPROVE with notes | None blocking | n/a |
+
+### Test coverage (round 0 + round-3 fold)
+
+| Test | Round | Coverage |
+|---|---|---|
+| subscribe on compositionstart, unsubscribe on compositionend | 0 | lifecycle baseline |
+| unsubscribe on mid-composition terminator (parametric over Enter/Esc/Tab via `it.each`) | 0 + 3 | three explicit cases |
+| unsubscribe on blur during composition | 0 | blur path |
+| unsubscribe on dispose | 0 | teardown path |
+| PTY echo race: overlay snaps from stale to live cursor | 0 | load-bearing test |
+| PTY echo race: shadow textarea ALSO snaps | 3 | IME candidate-window cell-alignment |
+| tracker swallows exceptions from overlay/shadow positioning | 3 | EventEmitter2 isolation |
+| does NOT subscribe outside composition (no listener leak) | 0 | anti-leak |
+
+The mock `Terminal` now ships `onCursorMove(cb): { dispose() }`,
+`fireCursorMove()`, and `cursorMoveListenerCount()` — the
+listener-count surface is the right primitive for dispose-leak
+assertions without relying on side-effect counting.
+
+### Validation post round-3 fold
+
+- `npx tsc --noEmit`: exit 0
+- `npm test`: 344/344 (was 340 on `dc64ab2`; +4 net from the
+  `it.each` parametrization × 3 terminator keys + shadow-snap +
+  exception-swallow tests)
+- `npm run build:app`: exit 0
+
+### Concerns explicitly NOT acted on this round
+
+- **@claude2 C2** (initial paint still uses stale cursor at
+  compositionstart, before the first `onCursorMove` fires):
+  @claude2 self-marked "Acceptable — the brief flash of
+  misalignment before the snap is far less bad than the persistent
+  mispaint the bug originally produced. Hypothetical perfection
+  would require IPC-level orchestration that the shim deliberately
+  stays out of." Concur. Closing IPC-level await of PTY echo
+  would re-introduce the timing-window discipline the v3.4 rewrite
+  was specifically designed to delete.
+- **@claude3** (full multi-syllable cascade test): structural
+  invariant test ("if cursor moves during composition, overlay
+  snaps") is the right minimum for happy-dom; a multi-syllable
+  cascade requires real PTY round-trip and belongs to the DMG
+  smoke. Concur.
+
+### Limitations (unchanged from rounds 0-2)
+
+DMG manual smoke acceptance remains the release-gate
+prerequisite — and **especially relevant for this round** because
+the cursor-tracker fix targets a bug class only reproducible
+against real Tauri IPC timing. A DMG cycle should now include the
+multi-syllable Korean composition sequence the user observed
+(`안녕하세요` typed continuously) to confirm the visual drift is
+gone.
