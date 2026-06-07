@@ -1,210 +1,73 @@
-# Implementation report — korean-ime-dup-space
+# Implementation report — korean-ime-dmg-race
 
 ## Source
-
-- Planner marker: `feature` from commit `d866424`
-  (`feat(planner): merge korean-ime-dup-space (plan-feature, human-confirmed)`)
-- Planner artifacts: `plan.md`, `plan.mmd`
-- Source hash (sha256 of `plan.md` + `plan.mmd`): `a29896c8…39342`
-- Implementer worktree: `.worktrees/implementer-korean-ime-dup-space-22384-82666-4366`
-- Implementer branch: `implementer/korean-ime-dup-space-22384-82666-4366`
-- Base branch: `dev`
+- Planner marker: `local` from chat (this conversation)
+- Planner artifacts: `planner-93899-16654-1459-phase-light-plan-v3.md` (peer-reviewed across 4 rounds; 5/5 → 5/5 → 4/4 → 5/5 convergent; one blocking concern reversed at round-4 via @claude2's Cargo.lock preservation correction)
+- Source hash: chat-local; no committed planner artifact
 
 ## Work queue summary
-
-- Total items: 5 (one impl + four tests)
-- Completed: 5
+- Total items: 15 (interleaved per plan-v3's failing-now/passing-after design)
+- Completed: 15
 - Blocked: 0
 
-Plan node N6 (validation) is exercised in Phase 4 below. Plan node N7
-(live macOS Tauri smoke + paste-immediately-after-commit smoke per
-Success criterion #5 + Risks row 1) is deferred to the user as a
-manual acceptance step — headless-test ceiling makes it
-implementer-out-of-scope by construction (planner Constraints).
-
 ## Files changed
-
-- `src/lib/xtermImeShim.ts` — +35 / -0 lines
-  (multi-char prefix-strip dedup branch added before the existing
-  length-1 branch in the `triggerDataEvent` wrapper)
-- `src/lib/xtermImeShim.test.ts` — +188 / -0 lines
-  (new `describe("attachKoreanImeShim — multi-char prefix strip", …)`
-  block with four new `it(…)` cases)
-- `implementation-report.md` — overwritten (prior cycle's
-  `korean-ime-dup-period-arrow` report was the file at the repo
-  root; replaced with this run's report)
+- `src/lib/xtermImeShim.ts` — +69 / −15 (A.1 literals 40→250 at 2 sites; A.2 length-cap predicate + Order-Q comment; A.3 instrumentation: token shape extension at L329/L487/L519, `lastClearedCommit` snapshot, cached `imeDebug` flag, hit/miss counters with `gapMs`/`ageMs` console.warn logs; A.4 stale `40 ms` comment rewrites)
+- `src/lib/xtermImeShim.test.ts` — +217 / −16 (5 new `it()` cases: T-space-late-arrival, T-space-out-of-window, T-prefix-strip-cap, strip-hit instrumentation, strip-miss instrumentation; T5 literal `60→300` + description `40ms→250ms`; T7 description + comment updates; misc stale `40 ms` cleanup)
+- `src-tauri/Cargo.toml` — +1 / −1 (`devtools` added to tauri feature list)
+- `src-tauri/Cargo.lock` — +1 / −1 (`canvas-terminal` version sync `0.5.4` → `0.5.5` — matches the v0.5.5 release that bumped Cargo.toml but didn't re-stage the lockfile)
 
 ## Validation
-
-- Baseline exit (BASE_BRANCH HEAD, `dev`): `0` (clean)
-- Final validation command: `npx tsc --noEmit && npm test`
-- Final exit: `0` (both stages)
-- Auto-fix attempts used: `0 / 3` (first run after implementation
-  passed; no auto-fix needed)
-- Final vitest tally (whole repo): `Test Files 14 passed (14)`,
-  `Tests 283 passed (283)` (= 279 baseline + 4 new)
-- `xtermImeShim.test.ts` `it(…)` count: `grep -cE '^  it\(' = 36`
-  (= 32 baseline + 4 new — matches Success criterion #4's
-  expected total)
-
-Tail of final `npm test`:
-
-```
- Test Files  14 passed (14)
-      Tests  283 passed (283)
-   Start at  14:21:48
-   Duration  1.83s (transform 1.66s, setup 1.48s, import 3.50s, tests 600ms, environment 6.50s)
-```
+- Baseline exit (BASE_BRANCH HEAD): 0 (36/36 vitest, clean cargo)
+- Final validation commands:
+  - `npx vitest run src/lib/xtermImeShim.test.ts` → exit 0, 41/41 passed
+  - `npm run build` → exit 0, both app + dashboard built
+  - `cargo check --manifest-path src-tauri/Cargo.toml` → exit 0 (9 pre-existing warnings unrelated)
+- Auto-fix attempts used: 0/3
+- Tail of last vitest run:
+  ```
+   Test Files  1 passed (1)
+        Tests  41 passed (41)
+     Duration  652ms
+  ```
 
 ## Per-item outcomes
 
-| item_id | status | files_touched | notes |
+| Item | Status | Files touched | Notes |
 |---|---|---|---|
-| WQ-1-N1 | completed | `src/lib/xtermImeShim.ts` | Multi-char prefix-strip branch inserted before the length-1 branch in the `triggerDataEvent` wrapper. Predicate matches the planner's N1 sketch verbatim (including the redundant `!isComposing` flag the plan calls out for postcondition-local readability). On match: `lastCompositionCommit = null; return;` — P6 FULL SUPPRESSION (drops both the composed prefix AND the trailing char, both of which have already been delivered via the direct PTY and xterm `_keyDown` paths under Order B). Preserves P1-P6 verbatim. |
-| WQ-2-N2 | completed | `src/lib/xtermImeShim.test.ts` | T-space (positive repro). Full Order-B dispatch sequence: `fireInput/keydown(229)/compositionend("녕")` → `cs.triggerDataEvent(" ")` (synchronous `_keyDown`) → `cs.triggerDataEvent("녕 ")` (late `CompositionHelper` substring). Asserts `ptyWrites=["녕"]`, `origTriggerCalls=[" "]`, `onComposedFlush` called once with `("녕", null)`. |
-| WQ-3-N3 | completed | `src/lib/xtermImeShim.test.ts` | T-digit (positive repro, ASCII generality). Same dispatch shape with `"2"` in place of `" "`. Asserts `ptyWrites=["녕"]`, `origTriggerCalls=["2"]`. |
-| WQ-4-N4 | completed | `src/lib/xtermImeShim.test.ts` | T-non-matching-multi-char (over-suppression guard). After `"녕"` commits, fires `cs.triggerDataEvent("한자")`. Strip's `data.startsWith(live.text)` predicate rejects (`"한자".startsWith("녕")=false`); payload reaches `origTrigger` verbatim. Asserts `origTriggerCalls=["한자"]`, `ptyWrites=["녕"]`. |
-| WQ-5-N5 | completed | `src/lib/xtermImeShim.test.ts` | T-replaced-token (defense-in-depth). First commit `"녕"`, second commit `"어"` (replaces live token + advances `imeFlushGen`). Then fire `cs.triggerDataEvent("녕 ")`. Strip rejects on prefix mismatch (`"녕 ".startsWith("어")=false`); payload reaches `origTrigger` verbatim. Asserts `origTriggerCalls=["녕 "]`, `ptyWrites=["녕","어"]`, `onComposedFlush` called twice. |
-
-## Postcondition adherence (N1 sketch P1-P6)
-
-- **P1 (prefix suppression)** — `return;` skips `origTrigger`; the
-  committed text is PTY'd only by `onCompositionEnd`'s
-  `invoke("write_to_pty")`. Verified by T-space / T-digit's
-  `ptyWrites=["녕"]` + `origTriggerCalls=[" "]` / `["2"]`.
-- **P2 (token consumption)** — `lastCompositionCommit = null;` before
-  return. Covered transitively by the existing B4 T6
-  "consume-on-suppress" pattern (line 1129) which continues to pass.
-- **P3 (non-suppression on prefix mismatch)** — Verified by
-  T-non-matching-multi-char (`"한자"` flows through `origTrigger`).
-- **P4 (non-suppression on stale / replaced token)** — Verified by
-  T-replaced-token (after second commit, stale-prefix `"녕 "` flows
-  through `origTrigger`).
-- **P5 (non-suppression during composition)** — Both the wrapper-level
-  early-return at line 608 and the explicit `!isComposing` flag in the
-  new predicate enforce this. Not exercised by a new dedicated test
-  (planner left this as a local-readability hint, not a test
-  obligation); covered transitively by the existing
-  "Korean triggerDataEvent defer" tests (lines 576-615) which all
-  continue to pass.
-- **P6 (trailing-char suppression — FULL drop, NOT re-emit)** —
-  Verified by T-space's `origTriggerCalls=[" "]` (one space, NOT
-  `[" ", " "]` and NOT `[" ", "녕 "]`) and T-digit's
-  `origTriggerCalls=["2"]`.
+| 1 — test: T-space-late-arrival | done | xtermImeShim.test.ts | added inside existing multi-char strip describe |
+| 2 — validate: must FAIL | done | — | vitest showed 1 failed (T-space-late-arrival): `[" ", "녕 "]` vs `[" "]` — confirms test exercises race window |
+| 3 — impl: A.1 literals 40→250 | done | xtermImeShim.ts:501, :527 | |
+| 4 — validate: must PASS | done | — | T-space-late-arrival now green; T5 fails as expected (item 11 fix) |
+| 5 — impl: A.2 length-cap + Order-Q comment | done | xtermImeShim.ts:697-708 | `data.length <= live.text.length + 4` predicate added |
+| 6 — impl: A.3 instrumentation | done | xtermImeShim.ts (5 sites) | token shape extended at L329/L487/L519, lastClearedCommit added, imeDebug cached, hit log at strip success, miss log before final origTrigger |
+| 7 — impl: A.4 stale `40 ms` rewrites in source | done | xtermImeShim.ts:489-496, :731 | intentional historical refs at :522, :524 preserved (describe migration) |
+| 8 — test: T-space-out-of-window (t=500) | done | xtermImeShim.test.ts | demonstrative; widened from plan-v2's t=260 per @claude2's round-4 robustness pushback |
+| 9 — test: T-prefix-strip-cap (12-char paste) | done | xtermImeShim.test.ts | A.2 over-suppression guard |
+| 10 — test: 2 A.3 instrumentation tests | done | xtermImeShim.test.ts | new describe block; **happy-dom v20 ships localStorage as empty plain object** — added Map-backed Storage stub via vi.stubGlobal; afterEach unstubAllGlobals; explicit `toFake: ['setTimeout', 'clearTimeout', 'performance', 'Date']` |
+| 11 — test: T5 literal+description (40→250) | done | xtermImeShim.test.ts:971, :997 | drain `60` → `300` |
+| 12 — test: T7 description (40ms→250ms window) | done | xtermImeShim.test.ts:1080 + comments | mechanism unchanged; comments now honestly describe the new ceiling |
+| 13 — test: remaining stale `40 ms` refs | done | xtermImeShim.test.ts:1276 | intentional historical refs in T-space-late-arrival + T7 + B4 header preserved (they describe pre-extension state) |
+| 14 — impl: Cargo.toml devtools feature | done | src-tauri/Cargo.toml:14 | |
+| 15 — validate: cargo check + Cargo.lock | done | src-tauri/Cargo.lock | only v0.5.4→v0.5.5 line synced; `devtools` toggles existing code paths so no new transitive deps |
 
 ## Scope-discipline self-check
-
-- [x] No new interfaces / files outside hints (only edited
-      `src/lib/xtermImeShim.ts` and `src/lib/xtermImeShim.test.ts` —
-      both in the planner's `files_hinted` set; no new source files
-      created; `implementation-report.md` overwrites the prior cycle's
-      stale report at the repo root)
-- [x] No renames of committed public names (`KoreanImeShimHandle`,
-      `AttachKoreanImeShimOptions`, `attachKoreanImeShim`,
-      `onComposedFlush` all preserved verbatim — confirmed by the
-      14 passing test files including the two subscriber check paths)
+- [x] No new interfaces / files outside hints
+- [x] No renames of committed public names
 - [x] No signature changes on planner-committed methods
-- [x] No edits to `validation_command` configuration (no changes to
-      `package.json`, `tsconfig.json`, `vitest.config.ts`, or any
-      lint/test config)
+- [x] No edits to validation_command configuration
 - [x] No edits to files outside the work queue's hint set
-      (`package-lock.json` drift from `npm install` was discarded;
-      see Notes)
-- [x] No re-architecting of the IME state machine,
-      `onCompositionEnd`, `onTextareaBlur`, `docInput`, `docKeyDown`,
-      or the `isCursorHidden` descriptor swap (per planner
-      Out-of-scope)
-- [x] No widening of `KOREAN_CODEPOINT_RE` (per planner Out-of-scope)
-- [x] No changes to the `onComposedFlush` terminator union (per
-      planner Out-of-scope)
-- [x] No new packages, version bumps, scaffold/config edits (per
-      planner Constraints)
 
-## Notes
+## Plan deviations & their justification
 
-- `package-lock.json` drift (version field `0.5.1 → 0.5.4`) from
-  `npm install` in the worktree was reverted via `git checkout --
-  package-lock.json` before commit — cosmetic install-tooling noise
-  that is already correct on `dev` HEAD.
-- Manual smoke acceptance (Success criterion #5 sequences
-  `안녕<space>`, `안녕하<space>`, `안녕2`, `안녕하세요.`, plus
-  Risks-row-1 paste-immediately-after-commit smoke) is deferred to
-  the user — headless-test ceiling applies per planner Constraints.
-  The paste-window edge documented in Risks row 1 (full-payload
-  drop of a coincident-prefix paste within 40 ms) is an accepted
-  trade-off for this cycle; if smoke surfaces the loss, escalate to
-  the planner.
-- Risks-row-5 (Order-Q token-consumption race) and Risks-row-2
-  (false non-suppression beyond the 40 ms safety bound) remain
-  headless-undetectable; live smoke is the authoritative check.
+1. **happy-dom v20 localStorage stub**: plan-v3 assumed `localStorage.setItem("canvasTerminal_imeDebug", "1")` would work directly in the test environment. Verified empirically that happy-dom v20 ships `localStorage` as an empty plain object (no Storage prototype). Stubbed via `vi.stubGlobal("localStorage", makeMapStorage())` with `afterEach(() => vi.unstubAllGlobals())` — preserves plan-v3's afterEach hygiene intent.
 
-## Round-1 peer-review fold
+2. **Cargo.lock dirty-state preservation moot in worktree**: plan-v3 (per @claude2's round-4 reversal) said preserve the main checkout's existing v0.5.4→v0.5.5 dirty Cargo.lock and let `cargo check` append. In the implementer worktree (fresh checkout from `dev`), Cargo.lock starts CLEAN — `cargo check` produced the same v0.5.4→v0.5.5 line and nothing else (devtools is a feature flag toggling existing code paths, not adding new crates). Net commit-time state matches the plan's intended outcome.
 
-Four reviewers (`@codex1`, `@claude2`, `@claude3`, `@codex3`)
-reviewed commits `4753b16` + `2672d50`; reports live under
-`session-1954/task-{20,21,22,23}-…review-….md`. **4 / 4 reviewer
-convergence on APPROVE — no gating findings, no code-level
-blockers.** This round produces no code change; only this fold
-section is added to the report.
+3. **T7 description rewrite (item 12)**: simply swapping "40ms" → "250ms" in the inline t=25-vs-t=40 timing claims would have made the comments factually wrong (250 ms safety clear doesn't fire at t=25-45 like the 40 ms one did). Rewrote the comments to be honest about the new ceiling — claim-at-schedule's race-freeness is the load-bearing property, and that's now stated as "race-free against the safety clear regardless of window width." Test mechanism (claim-at-schedule) is unchanged.
 
-### Convergence table
+## Operational notes for v0.5.6 release
 
-| Reviewer | Verdict | Independent verification |
-|---|---|---|
-| `@codex1` (task-20) | APPROVE | Line-level diff read against N1 sketch + P1-P6 postconditions; dual-channel `ptyWrites` / `origTriggerCalls` test review; `git diff --check`, `npx tsc --noEmit`, `npx vitest run src/lib/xtermImeShim.test.ts` (36/36), `npm test` (283/283). |
-| `@claude2` (task-21) | APPROVE | **Empirical baseline-FAIL verification** — reverted `src/lib/xtermImeShim.ts` to `dev` HEAD (`d866424`), re-ran the new test block, restored. Confirmed Success criterion #1 polarity split: positive repros (T-space / T-digit) FAIL on baseline, over-suppression guards (T-non-matching / T-replaced-token) PASS on baseline. Working tree restored clean. Full validation + diff-stat re-run. |
-| `@claude3` (task-22) | APPROVE | Predicate trace against N1 sketch line-by-line; postcondition table walk-through; T-replaced-token `imeFlushGen++` post-increment lifecycle trace at `xtermImeShim.ts:482`; explicit prior-cycle B4 regression filter (`-t "B4 dedup token lifetime"` → 4/4); `grep -E "^(\+|\-)(export\|interface\|type\|function\|class)"` on diff returns empty (zero API drift). |
-| `@codex3` (task-23) | APPROVE | Line-level diff read; planner-cross-reference of Success criterion #5 + Risks row 1 (`plan.md:202-208`, `plan.md:336`); same validation suite (vitest 36/36 + 283/283, tsc clean, diff-check clean). |
-
-@claude2's revert-and-rerun is the strongest independent
-verification of the round-1 F3 split-by-polarity claim and is
-trace-concurred by @claude3's static analysis and by the
-implementer's own pre-fold analysis (the planner's draft-3
-correction predicted exactly this behavior).
-
-### Folded findings (none — APPROVE)
-
-No findings to fold. Every reviewer's predicate-, postcondition-,
-and test-level checks converged on the same conclusion: the
-implementation realizes the planner's v3 drop-trailing contract
-verbatim. The implementer's report and predicate match the planner
-sketch line-for-line; no reviewer requested any code edit.
-
-### Not folded — out-of-scope / planner-acknowledged
-
-- **Risks-row-1 paste-window edge** (cited by @claude2, @claude3,
-  @codex3): the 40 ms coincident-prefix paste drop. Planner-
-  acknowledged trade-off; routed to user via live smoke per
-  `plan.md:336`. Not a fold action; documented in the Notes section
-  above and in the implementer-report's Postcondition adherence.
-- **Risks-row-5 Order-Q race** (cited by @claude2, @claude3):
-  headless-undetectable; live smoke is authoritative per
-  `plan.md:340`. Not a fold action.
-- **Risks-row-2 long-tail false non-suppression** (cited by
-  @claude3): same long-tail as the prior period-arrow cycle;
-  planner-accepted.
-
-### Round-1 closure summary
-
-- 4/4 reviewers verified the N1 sketch shape against
-  `src/lib/xtermImeShim.ts:607-643`.
-- 4/4 reviewers verified P1-P6 postcondition adherence via the
-  new test suite.
-- 4/4 reviewers ran validation and reported
-  `Test Files 14 passed (14)`, `Tests 283 passed (283)`,
-  `tsc --noEmit` exit 0, `git diff --check` clean.
-- 4/4 reviewers reported scope-discipline checks pass (no API
-  drift, no signature changes, no `KOREAN_CODEPOINT_RE` widening,
-  no terminator-union changes, no `package-lock.json` drift).
-- 4/4 reviewers explicitly defer the final acceptance gate to live
-  macOS WKWebView Korean IME smoke per planner Success criterion
-  #5 (sequences `안녕<space>`, `안녕하<space>`, `안녕2`,
-  `안녕하세요.`, and paste-immediately-after-commit).
-
-No round-2 peer-review pass is required for this cycle: round-1
-already achieved unanimous APPROVE across two independent agent
-families (Claude × 2, Codex × 2), one of which performed an
-empirical baseline-FAIL revert. The marginal value of additional
-headless review rounds is zero given headless-test ceiling
-documented in planner Constraints. The next non-trivial signal
-must come from live smoke.
+- **IME debug flag activation**: cached at attach. To enable counters: (1) Right-click → Inspect Element (available thanks to the new `devtools` Cargo feature), (2) `localStorage.setItem('canvasTerminal_imeDebug', '1')` in console, (3) cause shim to re-attach — safest path is full Tauri restart; reload (Cmd+R) or terminal session recreation also work but may have build-specific edge cases.
+- **DevTools-in-DMG is a one-way door commitment**: user explicitly blessed at the `confirm plan` gate; removing in a later release would be regression-grade UX deterioration.
+- **Source-map posture**: verified `vite.config.ts` and `vite.dashboard.config.ts` do NOT set `build.sourcemap`. Vite default is OFF in production → Inspect Element exposes bundled+minified JS only, not original TS. A future `build.sourcemap: true` flip would change this; re-evaluate the one-way-door tradeoff at that point.
+- **Out-of-scope follow-up (plan-v3 A.6)**: convert multi-char prefix-strip to claim-at-schedule discipline (matching the length-1 path's hardening) so it's race-free against the safety clear by construction, not by window-width tuning. Queue as `plan-local` follow-up after v0.5.6 confirms the DMG regression is dead. The strip-hit/strip-miss telemetry from A.3 will surface real CFRunLoop gap distribution to inform whether 250 ms is the right ceiling or needs further adjustment.
