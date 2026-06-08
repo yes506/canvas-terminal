@@ -183,6 +183,15 @@ export function AgentMiniTerminal({
     disposed.current = false;
     const isCurrentRun = () => !disposed.current && initRunRef.current === runId;
 
+    // Effect-local state for the redraw-artifact refresh interval (see the
+    // setInterval block deeper in initTerminal for rationale). These MUST
+    // be plain let-bindings — calling React hooks (useRef/useState) inside
+    // this effect would be an invalid hooks-in-effect pattern. Both the
+    // initTerminal closure and the cleanup return at the bottom of this
+    // effect capture them by reference.
+    let lastPtyDataAt = 0;
+    let refreshInterval: ReturnType<typeof setInterval> | null = null;
+
     const initTerminal = async () => {
       if (!termRef.current || terminalRef.current) return;
 
@@ -615,11 +624,42 @@ export function AgentMiniTerminal({
             writeWithFollowBottom(event.payload);
             capture.feed(event.payload);
             checkReady(event.payload);
+            // Feed the redraw-artifact refresh interval; the timestamp
+            // gates the interval to only refresh while the tile has
+            // had recent PTY output.
+            lastPtyDataAt = Date.now();
           }
         },
       );
       // Unlisten the original listener that was set up before
       origDataUnlisten?.();
+
+      // Workaround for the redraw artifact at the bottom of mini-agent
+      // terminals when spawns.length > 4 across 2+ collaborator panes.
+      // Manual tile resize empirically clears the stale paint; this
+      // interval mimics that by forcing a full-viewport dirty mark
+      // every 500ms whenever there's been recent PTY output. The
+      // refresh is a no-op when xterm's RenderService is paused via
+      // its built-in IntersectionObserver (RenderService.ts:106-144),
+      // so this naturally targets only currently-visible tiles. If
+      // this workaround doesn't fix the symptom, the next planner
+      // cycle escalates to compositor-level CSS containment or the
+      // WebGL renderer with idle-context handling.
+      //
+      // Post-await stale-run guard: initTerminal is async with multiple
+      // awaits above. Without this check between the final listen() and
+      // setInterval(), a StrictMode dispose-mid-flight could leave
+      // Mount #1's interval running after Mount #2 starts.
+      if (!isCurrentRun()) return;
+      refreshInterval = setInterval(() => {
+        if (!isCurrentRun()) return;
+        const el = termRef.current;
+        if (!el?.isConnected || el.offsetWidth <= 0 || el.offsetHeight <= 0)
+          return;
+        if (Date.now() - lastPtyDataAt > 1000) return;
+        if (terminal.rows <= 0) return;
+        terminal.refresh(0, terminal.rows - 1);
+      }, 500);
 
       // Handle resize
       let resizeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -640,6 +680,10 @@ export function AgentMiniTerminal({
       if (readyTimeoutRef.current) {
         clearTimeout(readyTimeoutRef.current);
         readyTimeoutRef.current = null;
+      }
+      if (refreshInterval) {
+        clearInterval(refreshInterval);
+        refreshInterval = null;
       }
       disposed.current = true;
       // Flush remaining output and clean up capture
