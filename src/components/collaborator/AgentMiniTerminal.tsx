@@ -191,6 +191,11 @@ export function AgentMiniTerminal({
     // effect capture them by reference.
     let lastPtyDataAt = 0;
     let refreshInterval: ReturnType<typeof setInterval> | null = null;
+    // Visibility-restore observer state (see the IntersectionObserver
+    // block deeper in initTerminal). Same idiom as the bindings above —
+    // captured by the IO callback closure and the cleanup return.
+    let wasIntersecting = true;
+    let visibilityObserver: IntersectionObserver | null = null;
 
     const initTerminal = async () => {
       if (!termRef.current || terminalRef.current) return;
@@ -288,6 +293,57 @@ export function AgentMiniTerminal({
       });
       if (termRef.current) observer.observe(termRef.current);
       observerRef.current = observer;
+
+      // Visibility-restore IntersectionObserver. Complements the 500 ms
+      // refresh interval below for the cross-tab-switch case: when a
+      // CollaboratorPane lives inside an inactive terminal tab, the host
+      // hides it with `display: none` (TerminalTabs.tsx). That propagates
+      // through to this tile, xterm's internal RenderService pauses via
+      // its own IntersectionObserver (RenderService.ts:106-144) and only
+      // remembers `_needsFullRefresh`; the 500 ms interval here is also
+      // a no-op while hidden (offsetWidth/Height guards). On restore,
+      // RenderService schedules a refresh, but a per-tile ResizeObserver
+      // tick can race ahead and call safeFit() — `terminal.resize()`
+      // changes row count and a stale frame from the prior size shows
+      // for a beat, producing the "text line collision" symptom users
+      // reported with ≥5 agents across ≥2 panes.
+      //
+      // The mitigation here is a one-shot on the hidden→visible
+      // transition: bump `lastPtyDataAt` so the 500 ms interval pulses
+      // through the post-restore settle window, then on the next
+      // animation frame re-fit and force-refresh the full viewport
+      // AFTER the resize has settled. The rAF gate is load-bearing —
+      // running safeFit + refresh synchronously inside the IO callback
+      // misses the layout tick that the IO entry itself just announced.
+      visibilityObserver = new IntersectionObserver(
+        (entries) => {
+          if (!isCurrentRun()) return;
+          const entry = entries[entries.length - 1];
+          if (!entry) return;
+          const nowVisible = entry.isIntersecting;
+          if (!wasIntersecting && nowVisible) {
+            // Feed the recency gate on the 500 ms interval so it pulses
+            // through the settle window even if the agent is idle.
+            lastPtyDataAt = Date.now();
+            requestAnimationFrame(() => {
+              if (!isCurrentRun()) return;
+              const el = termRef.current;
+              if (!el?.isConnected) return;
+              if (el.offsetWidth <= 0 || el.offsetHeight <= 0) return;
+              // safeFit() picks up any size delta accumulated while
+              // hidden; the refresh discards the stale canvas frame
+              // that the renderer painted at the prior row count.
+              safeFit();
+              if (terminal.rows > 0) {
+                terminal.refresh(0, terminal.rows - 1);
+              }
+            });
+          }
+          wasIntersecting = nowVisible;
+        },
+        { threshold: 0 },
+      );
+      if (termRef.current) visibilityObserver.observe(termRef.current);
 
       const capture = createOutputCapture({
         agentLabel: tool.label,
@@ -684,6 +740,10 @@ export function AgentMiniTerminal({
       if (refreshInterval) {
         clearInterval(refreshInterval);
         refreshInterval = null;
+      }
+      if (visibilityObserver) {
+        visibilityObserver.disconnect();
+        visibilityObserver = null;
       }
       disposed.current = true;
       // Flush remaining output and clean up capture
