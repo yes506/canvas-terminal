@@ -337,6 +337,59 @@ export function AgentMiniTerminal({
               if (terminal.rows > 0) {
                 terminal.refresh(0, terminal.rows - 1);
               }
+              // Two-step PTY size toggle to force a SIGWINCH at the
+              // child TUI (Claude/Codex). Background — both prior
+              // fixes (mini-terminal-redraw-interval 740c327 and
+              // visibility-restore 6a2dc2a) only repaint the xterm
+              // canvas; neither informs the child PTY process that
+              // anything changed. The user-reported symptom ("text
+              // line collision on every pane switch — slight manual
+              // resize clears it") is a buffer/cursor mismatch that
+              // only the child TUI's own redraw can reconcile. The
+              // manual resize works precisely because it changes
+              // cols/rows → terminal.onResize fires → resize_pty IPC
+              // → ioctl(TIOCSWINSZ) on the PTY master → kernel emits
+              // SIGWINCH → TUI redraws from scratch.
+              //
+              // safeFit() above is a no-op on terminal.onResize when
+              // proposed dims equal current dims, which is the
+              // common case on a pure tab switch (no layout change).
+              // And the Linux/macOS kernel SUPPRESSES SIGWINCH when
+              // TIOCSWINSZ is called with the same winsize as the
+              // current one (Linux: tty_do_resize gates on memcmp;
+              // BSD: same delta check). So a single same-dim
+              // invoke("resize_pty", ...) is a no-op end-to-end.
+              //
+              // The two-step (rows+1) then (rows) toggle forces two
+              // real winsize deltas back-to-back; the kernel emits
+              // SIGWINCH on each, the TUI sees them and redraws.
+              // Promise-chained so the Rust handler executes them in
+              // order; void+catch swallows the IPC errors that occur
+              // if the session was removed mid-toggle. The captured
+              // const dims defend against a race with the existing
+              // 80 ms terminal.onResize debounced resize_pty (which
+              // would run AFTER our toggle and re-issue resize_pty
+              // with the same dims — a kernel-level no-op, harmless).
+              //
+              // See task-14-investigation-claude1.md in the collab
+              // memory for the full root-cause derivation.
+              const currentCols = terminal.cols;
+              const currentRows = terminal.rows;
+              if (currentCols > 0 && currentRows > 0) {
+                void invoke("resize_pty", {
+                  sessionId,
+                  cols: currentCols,
+                  rows: currentRows + 1,
+                })
+                  .then(() =>
+                    invoke("resize_pty", {
+                      sessionId,
+                      cols: currentCols,
+                      rows: currentRows,
+                    }),
+                  )
+                  .catch(() => {});
+              }
             });
           }
           wasIntersecting = nowVisible;
