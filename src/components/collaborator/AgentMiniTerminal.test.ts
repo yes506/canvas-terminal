@@ -435,4 +435,26 @@ describe("visibility-restore IntersectionObserver", () => {
       /if \(visibilityObserver\)[\s\S]*?visibilityObserver\.disconnect\(\)[\s\S]*?visibilityObserver\s*=\s*null/,
     );
   });
+
+  it("forces a SIGWINCH via two-step resize_pty toggle after safeFit + refresh", () => {
+    // The two prior fixes only repaint the xterm canvas; they don't
+    // inform the child PTY. A two-step (rows+1) then (rows) toggle
+    // forces two real winsize deltas through ioctl(TIOCSWINSZ) so the
+    // kernel emits SIGWINCH and the child TUI self-redraws.
+    //
+    // Anchored: the toggle must live inside the rAF body, AFTER the
+    // refresh call. The Promise chain ordering matters (rows+1 first,
+    // rows second), and currentCols/currentRows must be captured into
+    // local consts to defend against the existing 80 ms onResize
+    // debounce racing the toggle.
+    expect(source).toMatch(
+      /requestAnimationFrame\(\(\)\s*=>\s*\{[\s\S]*?terminal\.refresh\(0,\s*terminal\.rows\s*-\s*1\)[\s\S]*?invoke\("resize_pty"[\s\S]*?invoke\("resize_pty"/,
+    );
+    expect(source).toMatch(
+      /const\s+currentCols\s*=\s*terminal\.cols[\s\S]*?const\s+currentRows\s*=\s*terminal\.rows/,
+    );
+    expect(source).toMatch(
+      /invoke\("resize_pty",\s*\{[\s\S]*?rows:\s*currentRows\s*\+\s*1[\s\S]*?\}\)[\s\S]*?\.then\([\s\S]*?invoke\("resize_pty",\s*\{[\s\S]*?rows:\s*currentRows[\s\S]*?\}\)/,
+    );
+  });
 });
