@@ -1,35 +1,32 @@
-# Implementation report — agent-mini-terminal-visibility-restore
+# Implementation report — agent-mini-terminal-pty-sigwinch-restore
 
 ## Source
 
-- Planner marker: **local** (chat-gate, same-session)
+- Planner marker: **local** (chat-gate, same-session) — planner run id `63601-18473-15960`
 - Planner artifacts: none on disk — local lane is chat-only by contract
-- Source hash: N/A — local-lane chat-gate; planner content lives in the
-  same conversation transcript that invoked the implementer (the LWQ-1
-  through LWQ-5 spec in the Phase 0.5 + plan-reflection blocks
-  immediately preceding `confirm plan`; investigation report at
-  `~/.cache/canvas-terminal/collab-memory/session-6801/task-1-investigation-claude1.md`
-  used as the upstream root-cause document)
-- Phase 0 note: inspector reported a stale `on-base-with-marker`
-  (`feature` @ `8a46ddb`, `korean-ime-textarea-rewrite`) whose
-  implementer marker already landed at `422a410`. The user typed
-  `proceed` to acknowledge that the stale commit-based marker is for a
-  different, already-implemented plan and to honor the chat-gate
-  `(plan-local, human-confirmed)` for this run instead.
+- Source hash: N/A — local-lane chat-gate; planner content lives in this
+  conversation's transcript (Phase 0.5 triage + plan-reflection blocks
+  preceding `confirm plan`; root-cause document at
+  `~/.cache/canvas-terminal/collab-memory/session-6801/task-14-investigation-claude1.md`)
+- Phase 0 note: inspector reported the same stale `on-base-with-marker`
+  (`feature` @ `8a46ddb`, `korean-ime-textarea-rewrite`) as the prior
+  two cycles; user typed `proceed` to acknowledge it is not the active
+  marker and to honor the chat-gate `(plan-local, human-confirmed)`
+  for this run.
 
 ## Work queue summary
 
-- Total items: 5
-- Completed: 5
+- Total items: 2
+- Completed: 2
 - Blocked: 0
 
 ## Files changed
 
-- `src/components/collaborator/AgentMiniTerminal.tsx` — +60 / -0
-- `src/components/collaborator/AgentMiniTerminal.test.ts` — +73 / -0
+- `src/components/collaborator/AgentMiniTerminal.tsx` — +53 / -0
+- `src/components/collaborator/AgentMiniTerminal.test.ts` — +22 / -0
 - `implementation-report.md` — overwritten (the worktree inherited the
-  prior `mini-terminal-redraw-interval` run's report from `dev` HEAD at
-  `a145699`; the prior content is preserved in `git log` on `dev` and
+  prior `agent-mini-terminal-visibility-restore` report from `dev` HEAD;
+  the prior content is preserved in `git log` on `dev` at `bfea201` and
   is no longer the live document for this branch)
 
 ## Validation
@@ -41,30 +38,27 @@
 - Tail of last run:
 
 ```
- RUN  v4.1.5 .../implementer-agent-mini-terminal-visibility-restore-08264-82512-27746
+ RUN  v4.1.5 .../implementer-agent-mini-terminal-pty-sigwinch-restore-64068-22513-3685
 
  Test Files  1 passed (1)
-      Tests  26 passed (26)
-   Start at  17:48:46
-   Duration  1.25s (transform 137ms, setup 91ms, import 685ms, tests 20ms, environment 334ms)
+      Tests  27 passed (27)
+   Start at  09:18:55
+   Duration  1.09s (transform 124ms, setup 87ms, import 548ms, tests 17ms, environment 334ms)
 ```
 
-(tsc step produced no diagnostics; only the vitest summary is shown above. Baseline was 19 tests; new visibility-restore suite contributes 7 = 26 total.)
+(tsc step produced no diagnostics; only the vitest summary is shown above. Baseline was 26 tests; new SIGWINCH-toggle assertion contributes 1 = 27 total.)
 
 ## Per-item outcomes
 
 | item_id | status | files_touched | notes |
 |---|---|---|---|
-| LWQ-1 | completed | src/components/collaborator/AgentMiniTerminal.tsx | Added `wasIntersecting = true` and `visibilityObserver: IntersectionObserver \| null = null` as effect-local `let` bindings immediately after the existing `lastPtyDataAt` / `refreshInterval` lets. Same idiom (plain lets, captured by closure into the IO callback and the cleanup return). Initial `wasIntersecting=true` prevents a spurious rAF on the mount-time IO entry (`!true && true = false`). |
-| LWQ-2 | completed | src/components/collaborator/AgentMiniTerminal.tsx | Instantiated `visibilityObserver = new IntersectionObserver(...)` with `threshold: 0` immediately after the existing `observerRef.current = observer;` line (before the capture / pty-data listener wiring). Callback reads the last entry, gates on `isCurrentRun()`, computes `nowVisible`, branches on `!wasIntersecting && nowVisible` (hidden→visible only), bumps `lastPtyDataAt = Date.now()` to pulse the 500 ms refresh interval through the settle window, schedules one `requestAnimationFrame(...)` for the actual fit+refresh work, and unconditionally updates `wasIntersecting = nowVisible` at end. Observes `termRef.current` under the same truthy guard as the existing ResizeObserver site. |
-| LWQ-3 | completed | src/components/collaborator/AgentMiniTerminal.tsx | rAF body re-checks `isCurrentRun()` (StrictMode dispose-mid-frame guard, same as LWQ-3 from the prior redraw-interval run), `el?.isConnected`, `el.offsetWidth <= 0 \|\| el.offsetHeight <= 0` (mirrors the 500 ms interval guards at lines 657-658 pre-edit), then calls `safeFit()` and `terminal.refresh(0, terminal.rows - 1)` under a `terminal.rows > 0` guard. Implemented as part of the same Edit as LWQ-2 since the rAF lives inside the IO callback closure. |
-| LWQ-4 | completed | src/components/collaborator/AgentMiniTerminal.tsx | Added `if (visibilityObserver) { visibilityObserver.disconnect(); visibilityObserver = null; }` to the lifecycle cleanup return, immediately after the existing `refreshInterval` clear block. Same idiom — null-out the binding so a same-effect-instance re-entry sees a clean state. |
-| LWQ-5 | completed | src/components/collaborator/AgentMiniTerminal.test.ts | Added a new `describe("visibility-restore IntersectionObserver", ...)` block at the end of the file (after the `shouldFitMiniTerminal` describe). Seven source-text assertions (mirroring the existing "default renderer" check at line ~286): (1) the two effect-local lets are declared, (2) `new IntersectionObserver(` is instantiated with `threshold: 0`, (3) the IO callback gates on `isCurrentRun`, (4) `!wasIntersecting && nowVisible` bumps `lastPtyDataAt = Date.now()`, (5) `requestAnimationFrame` wraps `safeFit()` + `terminal.refresh(0, terminal.rows - 1)`, (6) the rAF body guards on isCurrentRun + isConnected + offsetWidth/Height + terminal.rows, (7) cleanup disconnects + nulls `visibilityObserver`. Each assertion uses an anchored regex with `[\s\S]*?` between landmarks so harmless whitespace/comment edits don't false-fail. |
+| LWQ-1 | completed | src/components/collaborator/AgentMiniTerminal.tsx | Added the two-step `resize_pty` toggle inside the visibility-restore rAF body (the same body that was added in `6a2dc2a`), immediately after the `if (terminal.rows > 0) { terminal.refresh(0, terminal.rows - 1); }` block. Captured `const currentCols = terminal.cols` and `const currentRows = terminal.rows` to defend against the existing 80 ms `terminal.onResize` debounce racing the toggle. Guarded the toggle on `currentCols > 0 && currentRows > 0`. Issued as a Promise chain — `void invoke("resize_pty", {sessionId, cols: currentCols, rows: currentRows + 1}).then(() => invoke("resize_pty", {sessionId, cols: currentCols, rows: currentRows})).catch(() => {})` — so the Rust handler executes the two ioctls in order. Inline comment block explains the kernel SIGWINCH-suppression-on-same-dim behavior (Linux `tty_do_resize` memcmp gate; BSD/macOS equivalent), why the two-step works (each ioctl is a real winsize delta → SIGWINCH → child TUI self-redraws), and references the task-14 investigation. |
+| LWQ-2 | completed | src/components/collaborator/AgentMiniTerminal.test.ts | Added a new `it()` block inside the existing `describe("visibility-restore IntersectionObserver", ...)` titled "forces a SIGWINCH via two-step resize_pty toggle after safeFit + refresh". Three anchored regex assertions: (1) within the rAF body, after the `terminal.refresh(0, terminal.rows - 1)` call, there are two `invoke("resize_pty"` calls (the toggle pair); (2) the `currentCols = terminal.cols` and `currentRows = terminal.rows` const captures are present; (3) the toggle pattern — first call uses `rows: currentRows + 1`, then `.then(...)` chains to a second `invoke("resize_pty"` with `rows: currentRows` (no increment). Permissive `[\s\S]*?` between landmarks, same style as the existing 7 tests in this describe block. |
 
 ## Scope-discipline self-check
 
-- [x] No new interfaces / files outside hints (only the two work-queue files touched plus this report; the prior `mini-terminal-redraw-interval` report is overwritten at the worktree root by virtue of the same file path — preserved in `dev`'s history)
+- [x] No new interfaces / files outside hints (only the two work-queue files touched plus this report; the prior `agent-mini-terminal-visibility-restore` report is overwritten at the worktree root by virtue of the same file path — preserved in `dev`'s history)
 - [x] No renames of committed public names
-- [x] No signature changes on planner-committed methods (the lifecycle `useEffect` callback signature is unchanged; the new IO callback is local)
+- [x] No signature changes on planner-committed methods (the lifecycle `useEffect` and the IntersectionObserver callback signatures are unchanged; the toggle lives inside the existing rAF body)
 - [x] No edits to validation_command configuration (no `tsconfig.json` / `vitest.config.*` / `package.json` edits)
 - [x] No edits to files outside the work queue's hint set
