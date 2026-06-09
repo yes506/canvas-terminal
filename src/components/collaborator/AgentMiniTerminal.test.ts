@@ -363,3 +363,98 @@ describe("shouldFitMiniTerminal (column-floor guard)", () => {
     ).toBe(true);
   });
 });
+
+describe("visibility-restore IntersectionObserver", () => {
+  // Source-text-only checks: jsdom does not implement the visual layout
+  // signals (offsetWidth/Height, IntersectionObserver intersection math)
+  // that this lifecycle hook depends on, and the surrounding effect is
+  // not pulled apart for unit testing. Mirroring the existing
+  // "keeps mini terminals on the default renderer" pattern (line ~286)
+  // keeps this resilient to harmless rewording elsewhere in the file
+  // while still asserting the load-bearing wiring.
+  const source = readFileSync(
+    resolve(process.cwd(), "src/components/collaborator/AgentMiniTerminal.tsx"),
+    "utf8",
+  );
+
+  it("declares the wasIntersecting + visibilityObserver effect-local lets", () => {
+    expect(source).toMatch(/let\s+wasIntersecting\s*=\s*true\s*;/);
+    expect(source).toMatch(
+      /let\s+visibilityObserver\s*:\s*IntersectionObserver\s*\|\s*null\s*=\s*null\s*;/,
+    );
+  });
+
+  it("instantiates an IntersectionObserver with threshold 0", () => {
+    expect(source).toContain("new IntersectionObserver(");
+    expect(source).toMatch(/threshold\s*:\s*0/);
+  });
+
+  it("gates the IO callback on the runId guard", () => {
+    // The callback must early-return when the per-mount run no longer
+    // owns this effect — same pattern as the rest of the lifecycle.
+    expect(source).toMatch(
+      /new IntersectionObserver\([\s\S]*?if \(!isCurrentRun\(\)\) return/,
+    );
+  });
+
+  it("bumps lastPtyDataAt on the hidden→visible transition", () => {
+    // Feeds the recency gate on the 500 ms refresh interval so it
+    // pulses through the post-restore settle window.
+    expect(source).toMatch(
+      /!wasIntersecting\s*&&\s*nowVisible[\s\S]*?lastPtyDataAt\s*=\s*Date\.now\(\)/,
+    );
+  });
+
+  it("schedules safeFit + terminal.refresh inside requestAnimationFrame", () => {
+    // safeFit picks up any size delta from the hidden window; refresh
+    // discards the stale canvas frame painted at the prior row count.
+    expect(source).toMatch(
+      /requestAnimationFrame\(\(\)\s*=>\s*\{[\s\S]*?safeFit\(\)[\s\S]*?terminal\.refresh\(0,\s*terminal\.rows\s*-\s*1\)/,
+    );
+  });
+
+  it("guards the rAF body against unmounted / zero-size tiles", () => {
+    // Mirror the 500 ms interval's guards: isCurrentRun, isConnected,
+    // and offsetWidth/Height floors.
+    expect(source).toMatch(
+      /requestAnimationFrame\(\(\)\s*=>\s*\{[\s\S]*?if \(!isCurrentRun\(\)\) return/,
+    );
+    expect(source).toMatch(
+      /requestAnimationFrame\(\(\)\s*=>\s*\{[\s\S]*?el\?\.isConnected/,
+    );
+    expect(source).toMatch(
+      /requestAnimationFrame\(\(\)\s*=>\s*\{[\s\S]*?el\.offsetWidth\s*<=\s*0[\s\S]*?el\.offsetHeight\s*<=\s*0/,
+    );
+    expect(source).toMatch(
+      /requestAnimationFrame\(\(\)\s*=>\s*\{[\s\S]*?terminal\.rows\s*>\s*0/,
+    );
+  });
+
+  it("disconnects the visibilityObserver in the cleanup return", () => {
+    expect(source).toMatch(
+      /if \(visibilityObserver\)[\s\S]*?visibilityObserver\.disconnect\(\)[\s\S]*?visibilityObserver\s*=\s*null/,
+    );
+  });
+
+  it("forces a SIGWINCH via two-step resize_pty toggle after safeFit + refresh", () => {
+    // The two prior fixes only repaint the xterm canvas; they don't
+    // inform the child PTY. A two-step (rows+1) then (rows) toggle
+    // forces two real winsize deltas through ioctl(TIOCSWINSZ) so the
+    // kernel emits SIGWINCH and the child TUI self-redraws.
+    //
+    // Anchored: the toggle must live inside the rAF body, AFTER the
+    // refresh call. The Promise chain ordering matters (rows+1 first,
+    // rows second), and currentCols/currentRows must be captured into
+    // local consts to defend against the existing 80 ms onResize
+    // debounce racing the toggle.
+    expect(source).toMatch(
+      /requestAnimationFrame\(\(\)\s*=>\s*\{[\s\S]*?terminal\.refresh\(0,\s*terminal\.rows\s*-\s*1\)[\s\S]*?invoke\("resize_pty"[\s\S]*?invoke\("resize_pty"/,
+    );
+    expect(source).toMatch(
+      /const\s+currentCols\s*=\s*terminal\.cols[\s\S]*?const\s+currentRows\s*=\s*terminal\.rows/,
+    );
+    expect(source).toMatch(
+      /invoke\("resize_pty",\s*\{[\s\S]*?rows:\s*currentRows\s*\+\s*1[\s\S]*?\}\)[\s\S]*?\.then\([\s\S]*?invoke\("resize_pty",\s*\{[\s\S]*?rows:\s*currentRows[\s\S]*?\}\)/,
+    );
+  });
+});
