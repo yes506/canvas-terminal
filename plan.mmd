@@ -1,0 +1,34 @@
+graph LR
+  AgentMiniTerminal_invoke["AgentMiniTerminal_invoke"]
+  WatchTranscript_IPC["WatchTranscript_IPC"]
+  TranscriptWatcher_watch["TranscriptWatcher_watch"]
+  DiscoveryLoop["DiscoveryLoop"]
+  DiscoverSession["DiscoverSession"]
+  DiscoverByMtime["DiscoverByMtime"]
+  TranscriptHandle["TranscriptHandle"]
+  AppendNormalizedTurn["AppendNormalizedTurn"]
+  RotateIfNeeded["RotateIfNeeded"]
+  ScanArchiveIndices["ScanArchiveIndices"]
+  LoadActive["LoadActive"]
+  LoadLastArchive["LoadLastArchive"]
+  ListArchives["ListArchives"]
+  HasContextsBreadcrumb["HasContextsBreadcrumb"]
+  StoreBreadcrumb["StoreBreadcrumb"]
+  PeerContextPanel["PeerContextPanel"]
+  AgentMiniTerminal_invoke --> WatchTranscript_IPC
+  WatchTranscript_IPC --> TranscriptWatcher_watch
+  TranscriptWatcher_watch --> DiscoveryLoop
+  DiscoveryLoop --> DiscoverSession
+  DiscoverSession --> DiscoverByMtime
+  DiscoverByMtime --> TranscriptHandle
+  TranscriptHandle --> AppendNormalizedTurn
+  TranscriptHandle --> RotateIfNeeded
+  TranscriptHandle --> ScanArchiveIndices
+  AppendNormalizedTurn --> LoadActive
+  AppendNormalizedTurn --> HasContextsBreadcrumb
+  AppendNormalizedTurn --> StoreBreadcrumb
+  RotateIfNeeded --> LoadLastArchive
+  ScanArchiveIndices --> ListArchives
+  LoadActive --> PeerContextPanel
+  LoadLastArchive --> PeerContextPanel
+  ListArchives --> PeerContextPanel
