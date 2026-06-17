@@ -2,8 +2,8 @@
 
 > Planner lane: **feature** (downgraded from rubric system; risk=3 concurrency,
 > scope=2, ambiguity=1). Rust subsystem only. Canonical input: the `task-8`
-> diagnosis, confirmed across three unanimous peer-review rounds
-> (@codex1/@codex2/@codex3, @claude2/@claude3).
+> diagnosis (3 unanimous peer-review rounds) + the **plan-review round** that
+> reworked N7/N8 (task-36..44; @codex1/@codex2/@codex3/@claude2/@claude3).
 
 ## Goal
 
@@ -17,52 +17,80 @@ rollout in that collab session**. Today 11 of 16 mirror files are cross-wired
 The source->agent binding key is **handle-only and not collab-session-scoped**:
 
 - `transcript_has_identity_marker` (`adapters/mod.rs:34`) matches only
-  `You are @<handle>` and scans only the **leading 256 KiB** from the top of the
-  source file.
+  `You are @<handle>` and scans only the **leading 256 KiB** from the top.
 - `discover_by_mtime` (`adapters/mod.rs:704`) tiebreaks by **newest mtime** among
-  handle-marked candidates -> a newer same-handle **wrong-session** rollout
-  actively wins (`newest_marked`, `adapters/mod.rs:773-777`).
+  handle-marked candidates -> a newer same-handle **wrong-session** rollout wins
+  (`newest_marked`, `adapters/mod.rs:773-777`).
 - `allow_unmarked_fallback` (`adapters/mod.rs:782`) binds the newest unclaimed
   candidate **regardless of marker** -> **wrong-agent** binds.
 - App-global `claimed_paths` (`mod.rs:912-925`, no `collab_session_id` filter)
   turns one mis-bind into a cascade.
-- On **resumed Claude rollouts** the current launch's preamble sits **past** the
-  256 KiB top window — verified on disk at `source_offset ~= 1,049,781`
-  (`turn_index 318`) vs `MARKER_SCAN_CAP_BYTES = 262,144` — so even a scoped
-  top-anchored scan would miss it -> forced fallback.
+- On **resumed Claude rollouts** the current launch's preamble sits **deep** in
+  the file (Claude `--resume` appends to the same JSONL), past a top-anchored
+  256 KiB scan -> forced fallback.
+
+## Governing design principle (from the plan-review round)
+
+> **The LATEST identity-preamble turn in the rollout is authoritative.**
+
+A rollout is one JSONL stream; on resume the current launch's CT preamble is the
+**most recent** `You are @<handle>` turn, with any number of earlier (possibly
+stale, foreign) headers behind it. Both discovery selection (N7) and
+populate-time revalidation (N8) must key on the *latest* preamble turn — not a
+fixed byte window, and not "any marker anywhere." This single rule resolves both
+the N7 middle-gap and the N8 stale-header defects.
 
 ## In scope
 
 1. **[load-bearing]** Thread `collab_session_id` into `discover_session` (trait +
    3 adapters) and `discover_by_mtime` as a **borrowed, read-only discovery-time
-   discriminator**. Ownership is unchanged: still watcher-owned, still *filled*
-   only at `populate_entry`. Adapters receive it, never store/fill it.
-2. **[load-bearing]** Scoped + **resume-aware** marker: require BOTH
-   `You are @<handle>` AND the `collab_session_id` token in the scan window; scan
-   **HEAD and TAIL** windows (head = fresh codex rollouts with preamble at top;
-   tail = resumed Claude rollouts whose latest re-injected header is near EOF).
-   Both windows bounded by `MARKER_SCAN_CAP_BYTES` (no full-file reads).
+   discriminator**. Ownership unchanged: watcher-owned, *filled* only at
+   `populate_entry`. Adapters receive it, never store/fill it.
+2. **[load-bearing] N7 — latest-preamble, scoped matching.** Replace the fixed
+   top-256 KiB (and the earlier head+tail proposal — see "Rejected approach")
+   with a **backward-from-EOF JSONL turn-walk**: read lines backward from EOF and
+   stop at the first line carrying a `You are @<handle>` identity preamble; that
+   is the current launch's. Require it to match BOTH the expected `<handle>` AND
+   the `collab_session_id` token. This is a **bounded one-time read at discovery
+   time** (`discover_session` is called once per bind, never in the tailer poll
+   loop — M8 invariant), so reading from EOF back to the latest preamble is
+   acceptable IO. If an implementer imposes a hard backward-scan byte cap, the
+   plan MUST state the residual gap and add a boundary test (see N10b).
 3. **[load-bearing]** **Disable `allow_unmarked_fallback` for CT-launched collab
-   watches** (i.e. when `collab_session_id` is non-empty). A missed marker then
-   degrades to a safe `NoMatchingFd` spin/retry instead of a wrong bind. The
-   fallback code path is retained, gated on an **empty** session id (future
-   non-CT / manual watch).
-4. **[hardening]** Populate-time re-validation in `populate_entry`: before
-   committing the handle, scan the bound source's window and **reject** (return
-   `false`, keep polling) if it embeds a different `collab_session_id` or a
-   different `You are @<handle>` than expected. Reuses item-2's scan helper.
-5. Correct the stale comments at `adapters/mod.rs:784-786` and
-   `transcripts/mod.rs:898-899` that claim codex rollouts lack the CT-injected
-   identity line (they do carry it — it's the injected first `user_message`).
+   watches** (`collab_session_id` non-empty). A missed marker then degrades to a
+   safe `NoMatchingFd` spin/retry instead of a wrong bind. The fallback code path
+   is retained, gated on an **empty** session id (future non-CT/manual watch).
+   Because the latest-preamble walk (N7) is gap-free, the safe-spin should not
+   fire for a correctly-launched agent.
+4. **[hardening] N8 — latest-marker authority.** In `populate_entry`, before
+   committing the handle, resolve the bound source's **latest** identity-preamble
+   turn (reuse N7's helper) and **reject** (return `false`, keep polling) only
+   when that latest marker's `(handle, session)` differs from the watcher's, or
+   no preamble is found. Stale historical headers earlier in the file are
+   **ignored**, so valid resumed transcripts are not rejected.
+5. Correct stale comments: `adapters/mod.rs:784-786` and
+   `transcripts/mod.rs:898-899` (claim codex rollouts lack the CT identity line —
+   they carry it) **and** the `MARKER_WAIT_ATTEMPTS` strict->fallback comment at
+   `transcripts/mod.rs:893-901` (misleading once collab fallback is permanently
+   off).
+
+## Rejected approach (recorded so it is not re-proposed)
+
+A fixed **HEAD + TAIL** raw-byte window (256 KiB each) was proposed in the prior
+plan revision. The plan-review round **empirically refuted** it: on live large
+Claude rollouts the latest marker frequently lands in the unscanned middle.
+Independent measurement (12 rollouts >400 KiB): **4 had their latest marker in
+the middle gap** (e.g. `069a3d81` 8.98 MB / last marker @8.40 MB; `c94df1f1`
+1.28 MB / @993 KB), and several "tail" hits were within 8-64 KB of the boundary
+(one more turn evicts them). With fallback disabled this converts wrong-data into
+**no-data**. Hence the backward-from-EOF turn-walk in N7.
 
 ## Out of scope (reviewed decisions, not omissions)
 
 - **Naively session-scoping `claimed_paths`** — it enforces the
   one-source != two-handles invariant together with the N17 dup-source guard
-  (`mod.rs:1075`). Per @codex2/@codex3, revisit its semantics only **after**
-  scoped discovery lands (once #1+#3 prevent the initial mis-bind, the cascade
-  cannot start, so the global claim set is harmless for correctness). Documented
-  as a follow-up, not done here.
+  (`mod.rs:1075`). Revisit only **after** scoped discovery lands (once #1+#2+#3
+  prevent the initial mis-bind, the cascade cannot start). Follow-up, not here.
 - No signature changes beyond `discover_session`; no re-architecture of the
   tailer / normalize / fs_gate pipeline.
 - Frontend untouched — `watch_transcript` already passes `collabSessionId`.
@@ -71,31 +99,42 @@ The source->agent binding key is **handle-only and not collab-session-scoped**:
 
 - Rust subsystem only: `src-tauri/src/commands/transcripts/**`.
 - Concurrency-sensitive: must not deadlock or spin beyond the **intended** safe
-  spin; must not reintroduce double-binding (preserve N17). Keep the
-  lock-ordering invariant in `populate_entry` (no `notify::unwatch` under the
-  `Inner` lock).
-- Bounded IO on every marker scan (head + tail caps; never read whole files).
-- `collab_session_id` passed to adapters is the raw IPC value; sanitize/compare
-  consistently with `sanitize_collab_session_id` where it is compared to the
-  watcher-owned value.
+  spin; preserve N17 (no double-binding); keep the lock-ordering invariant in
+  `populate_entry` (no `notify::unwatch` under the `Inner` lock); the N7 helper's
+  IO must stay outside the `Inner` lock when called from `populate_entry`'s
+  Phase B.
+- Bounded IO: N7 reads at discovery time only (not the hot loop). Prefer a
+  gap-free backward walk to BOF; any hard cap must document its residual gap.
+- **Session-token match format**: search for the **sanitized** `collab_session_id`
+  as it appears embedded in the preamble's path text
+  (`conversation-session-<id>.md`, `contexts/session-<id>/`), comparing via
+  `sanitize_collab_session_id` so raw vs sanitized IDs match consistently.
+- **Helper visibility**: `transcript_has_identity_marker` is currently a private
+  `fn` in `transcripts::adapters`; `populate_entry` lives in the parent
+  `transcripts` module. The implementer MUST either expose the (reworked) helper
+  as `pub(super)` or relocate it to a shared parent module so N8 can reuse it.
 
 ## Success criteria
 
 - `cargo check` and `cargo test` green in `src-tauri`.
-- New **deterministic** regression tests:
+- New **deterministic** regression tests (N10):
   - (a) two same-handle / different-session candidates -> each binds its own.
-  - (b) a different-handle candidate is **not** fallback-bound under a CT collab
+  - (b) **stale wrong header in HEAD + correct current header later -> binds**
+    (latest-preamble authority).
+  - (c) **correct header followed by >256 KiB trailing output -> still found**
+    (backward walk, no middle/tail gap).
+  - (d) a different-handle candidate is **not** fallback-bound under a CT collab
     watch (non-empty session id).
-  - (c) a preamble placed **past 256 KiB** (resumed rollout) is still matched via
-    the tail scan.
-  - (d) populate-time re-validation **rejects** a source whose embedded
-    session/handle mismatches the watcher.
+  - (e) populate-time revalidation **rejects** a source whose **latest** marker's
+    session/handle mismatches the watcher (and does NOT reject when only an
+    earlier stale header mismatches).
 - Re-running the collab flow yields **0** cross-wired mirror files.
 
 ## Open questions (none blocking)
 
-- Tail-window size — proposed: reuse `MARKER_SCAN_CAP_BYTES` for both head and
-  tail.
+- Hard upper bound (if any) on the N7 backward scan — proposed: none (gap-free
+  walk to BOF; discovery is one-shot, not the hot loop). If a cap is added,
+  document the residual gap + boundary test.
 - Keep any fallback for a future non-CT/manual watch path — proposed: retain the
   code, gate it on an empty `collab_session_id`.
 
@@ -106,9 +145,9 @@ subsystem.
 
 ```
 src-tauri/src/commands/transcripts/
-- mod.rs              [MODIFY] trait discover_session sig; discovery_loop; populate_entry; comment
+- mod.rs              [MODIFY] trait discover_session sig; discovery_loop; populate_entry (N8); comments (N9)
 - adapters/
-  - mod.rs            [MODIFY] transcript_has_identity_marker; discover_by_mtime; comment
+  - mod.rs            [MODIFY] transcript_has_identity_marker (N7, backward-walk + scoped + visibility); discover_by_mtime; comment
   - codex.rs          [MODIFY] discover_session forwards collab_session_id
   - claude_code.rs    [MODIFY] discover_session forwards collab_session_id
   - gemini.rs         [MODIFY] discover_session forwards collab_session_id
@@ -119,35 +158,43 @@ src-tauri/tests/transcript_adapter_contract.rs   [REVIEW] trait-contract fixture
 Dependency direction (unchanged): `discovery_loop` (owns `collab_session_id`) ->
 `TranscriptAdapter::discover_session` -> concrete adapters -> `discover_by_mtime`
 -> `transcript_has_identity_marker` (leaf). `collab_session_id` flows **down** as
-a borrowed discriminator. `populate_entry` (sibling of `discovery_loop`) gains a
-re-validation read that reuses the leaf scan helper.
+a borrowed discriminator. `populate_entry` (sibling) reuses the leaf helper for
+N8 revalidation.
 
 ## Decomposition
 
 | Node # | Stage | Belongs to package | Notes |
 |---|---|---|---|
-| N1 | `discovery_loop` — own session id; session-aware fallback gate | `transcripts/mod.rs` | Pass `collab_session_id` into `discover_session`; set `allow_unmarked_fallback = (collab_session_id empty) && attempt>=3`. In-scope #1,#3 |
-| N2 | `TranscriptAdapter::discover_session` trait sig + docstring | `transcripts/mod.rs` | Add `collab_session_id: &str`; clarify "received as discriminator, not owned/filled". In-scope #1 |
-| N3 | `CodexAdapter::discover_session` | `adapters/codex.rs` | Forward `collab_session_id` to `discover_by_mtime`. In-scope #1 |
+| N1 | `discovery_loop` — own session id; session-aware fallback gate | `transcripts/mod.rs` | Pass `collab_session_id` into `discover_session`; `allow_unmarked_fallback = collab_session_id.is_empty() && attempt>=3`. In-scope #1,#3 |
+| N2 | `TranscriptAdapter::discover_session` trait sig + docstring | `transcripts/mod.rs` | Add `collab_session_id: &str`; doc: "received as discriminator, not owned/filled". In-scope #1 |
+| N3 | `CodexAdapter::discover_session` | `adapters/codex.rs` | Forward `collab_session_id`. In-scope #1 |
 | N4 | `ClaudeCodeAdapter::discover_session` | `adapters/claude_code.rs` | Forward `collab_session_id`. In-scope #1 |
 | N5 | `GeminiAdapter::discover_session` | `adapters/gemini.rs` | Forward `collab_session_id`. In-scope #1 |
-| N6 | `discover_by_mtime` — scoped select; honor disabled fallback | `adapters/mod.rs` | New `collab_session_id` param; pass to scoped marker; respect caller's fallback flag. In-scope #1,#2,#3 |
-| N7 | `transcript_has_identity_marker` — scoped + resume-aware | `adapters/mod.rs` | Needle = handle AND session token; scan HEAD+TAIL windows. Extract a reusable scan helper. In-scope #2 |
-| N8 | `populate_entry` — re-validate bound source | `transcripts/mod.rs` | Reject mismatched embedded session/handle before commit; reuse N7 helper; keep lock-ordering invariant. In-scope #4 |
-| N9 | Stale-comment corrections | `adapters/mod.rs`, `transcripts/mod.rs` | Fix the "codex has no identity line" claims. In-scope #5 |
-| N10 | Deterministic regression tests (a-d) | `adapters/mod.rs` tests + `tests/` | Cover same-handle/diff-session, fallback rejection, past-256KiB tail match, populate re-validation. Success criteria |
+| N6 | `discover_by_mtime` — scoped select; honor disabled fallback | `adapters/mod.rs` | New `collab_session_id` param; pass to N7; respect caller's fallback flag. In-scope #1,#2,#3 |
+| N7 | `transcript_has_identity_marker` — backward-from-EOF turn-walk; scoped (handle AND session); reusable + visible | `adapters/mod.rs` | Returns/validates the LATEST preamble turn. `pub(super)` or relocate. In-scope #2 |
+| N8 | `populate_entry` — latest-marker-authority revalidation | `transcripts/mod.rs` | Reject only if LATEST marker's (handle,session) mismatches or absent; tolerate stale headers; reuse N7; keep lock-ordering. In-scope #4 |
+| N9 | Stale-comment corrections (codex-identity ×2 + MARKER_WAIT strict->fallback) | `adapters/mod.rs`, `transcripts/mod.rs` | In-scope #5 |
+| N10 | Deterministic regression tests (a-e) | `adapters/mod.rs` tests + `tests/` | Same-handle/diff-session; stale-head/correct-later; >256KiB trailing; fallback rejection; latest-marker reject. Success criteria |
 
-Load-bearing trio: **N1 + N6 + N7**. N8 is defense-in-depth reusing N7. N2-N5
-are the mechanical signature ripple. N9/N10 are docs/tests.
+Load-bearing trio: **N1 + N6 + N7**. N8 reuses N7's latest-preamble helper (so
+the authority semantics live in one place). N2-N5 are the mechanical signature
+ripple. N9/N10 are docs/tests.
 
 ## Interfaces emitted
 
-N/A — Phase 5 skipped (plan-only feature lane; the change modifies existing
-functions and one trait signature rather than introducing new interfaces).
+N/A — Phase 5 skipped (plan-only feature lane; modifies existing functions and
+one trait signature rather than introducing new interfaces).
 
 ## Validation
 
 Phase 7 plan-artifact smoke-check (skeletons skipped): `plan.md` contains the
 required headers (`## Goal`, `## Package layout`, `## Decomposition`); `plan.mmd`
 parses as Mermaid (`graph`). Compile/test validation (`cargo check` / `cargo
-test` in `src-tauri`) is the implementer's phase to run against real bodies.
+test` in `src-tauri`) is the implementer's phase against real bodies.
+
+## Feature-lane gate note
+
+The `(plan-feature, human-confirmed)` marker is **expected to be absent
+pre-approval**; it lands on the Phase 8 `--no-ff` merge commit into `dev` after
+the human types `confirm plan` + `confirm merge`. Reviewers correctly flagged its
+current absence as a not-yet-confirmed state, not a planner error.

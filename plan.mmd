@@ -6,10 +6,10 @@ graph TD
     N3 -->|forward| N6[N6 discover_by_mtime<br/>scoped select + disabled fallback]
     N4 -->|forward| N6
     N5 -->|forward| N6
-    N6 --> N7[N7 transcript_has_identity_marker<br/>handle AND session; head+tail scan]
-    N1 -.sibling.-> N8[N8 populate_entry<br/>re-validate bound source]
-    N8 -.reuses scan helper.-> N7
-    N9[N9 stale-comment fixes] -.docs.-> N6
-    N10[N10 regression tests] -.verify.-> N6
+    N6 --> N7[N7 transcript_has_identity_marker<br/>backward-from-EOF turn-walk<br/>latest preamble; handle AND session<br/>pub super / relocated]
+    N1 -.sibling.-> N8[N8 populate_entry<br/>latest-marker authority<br/>tolerate stale headers]
+    N8 -.reuses helper.-> N7
+    N9[N9 comment fixes: codex-identity x2 + MARKER_WAIT] -.docs.-> N6
+    N10[N10 regression tests a-e] -.verify.-> N6
     N10 -.verify.-> N7
     N10 -.verify.-> N8
