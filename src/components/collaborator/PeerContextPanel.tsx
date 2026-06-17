@@ -19,6 +19,12 @@ export interface PeerContextPanelProps {
   agentHandle: string;
   /** Whether the peer is currently publishing (drives the indicator). */
   isPublishing: boolean;
+  /**
+   * Collab session id — scopes the mirror read to
+   * `contexts/<collabSessionId>/<agent>.jsonl` so peers from other sessions
+   * are not mixed in (plan N15).
+   */
+  collabSessionId: string;
 }
 
 /**
@@ -51,7 +57,7 @@ export interface PeerContextPanelProps {
  * once per debounced fs-event.
  */
 export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
-  const { agentHandle, isPublishing } = props;
+  const { agentHandle, isPublishing, collabSessionId } = props;
   const [snapshot, setSnapshot] = useState<PeerContextSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -67,7 +73,7 @@ export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
 
     let cancelled = false;
     setError(null);
-    loadSnapshot(agentHandle)
+    loadSnapshot(agentHandle, collabSessionId)
       .then((snap) => {
         if (!cancelled) setSnapshot(snap);
       })
@@ -82,7 +88,7 @@ export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [agentHandle, isPublishing]);
+  }, [agentHandle, isPublishing, collabSessionId]);
 
   // Empty state — peer hasn't opted in.
   if (!isPublishing) {

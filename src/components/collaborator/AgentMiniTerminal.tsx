@@ -918,6 +918,10 @@ export function AgentMiniTerminal({
       agentHandle,
       tool: toolId,
       spawnedAtUnixMs: Date.now(),
+      // Namespaces the mirror path to contexts/<collabSessionId>/<agent>.jsonl
+      // (plan N10) so two collab sessions' identically-named agents (claude1)
+      // never write to the same file.
+      collabSessionId,
     })
       .then((token) => {
         if (unmounted) {
@@ -944,7 +948,7 @@ export function AgentMiniTerminal({
         invoke("unwatch_transcript", { token }).catch(() => {});
       }
     };
-  }, [sessionId, agentHandle, isRunning, isPublishing, toolId]);
+  }, [sessionId, agentHandle, isRunning, isPublishing, toolId, collabSessionId]);
 
   const displayName = agent ? agentDisplayName(agent) : tool.label;
   const isExited = agent?.status === "exited";
