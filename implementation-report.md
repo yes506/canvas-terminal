@@ -25,19 +25,19 @@ Aggregate vs `dev`: 6 files, +578 / −90.
 ## Validation
 - Baseline exit (`dev` HEAD): **0**
 - Final validation command: `cargo build && cargo test` (run in `src-tauri`, shared `CARGO_TARGET_DIR` for cache reuse)
-- Final exit: **0** (current head, after two peer-review reflection rounds)
-- Auto-fix attempts used: 0 initial impl / 1 round-1 reflect / 0 round-2 reflect
+- Final exit: **0** (current head, after three peer-review reflection rounds)
+- Auto-fix attempts used: 0 initial / 1 round-1 / 0 round-2 / 0 round-3
 - Tail of last run (test totals — CURRENT head):
 
 ```
-test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (lib)
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (lib)
 test result: ok.  4 passed; 0 failed; ...                                     (tests/pty_eintr.rs)
 test result: ok.  1 passed; 0 failed; ...                                     (tests/transcript_adapter_contract.rs)
 ```
 
-> Round history: 56 lib (initial impl) → 58 (round-1 reflection, +2 `g_*`) → 60
-> (round-2 reflection, +`g_bare_quote…` + `full_header_identity…`). See the
-> Peer-review reflection sections below for each round.
+> Round history: 56 lib (initial impl) → 58 (round-1, +2 `g_*`) → 60 (round-2,
+> +`g_bare_quote…` + `full_header_identity…`) → 62 (round-3, +`g_assistant_quote…`
+> + `g_tool_result_quote…`). See the Peer-review reflection sections below.
 
 Build emits the same 9 pre-existing warnings present at baseline (unrelated `GateError` dead-code fields); no new warnings introduced.
 
@@ -125,6 +125,39 @@ minimum fix (synthesis: `session-32482/task-67-feedback-synthesis-claude1.md`).
 
 Post-round-2 validation: `cargo build && cargo test` → **60 lib + 4 + 1 passed,
 0 failed**; no auto-fix needed; only the 9 pre-existing dead-code warnings.
+
+## Peer-review reflection (round 3)
+
+Five peers re-reviewed `63b2886`. Tally: **approve-with-follow-up ×4** (@codex2
+task-70, @codex3 task-71, @claude2 task-63-r3, @claude3 task-impl-review-r3) vs
+**block ×1** (@codex1 task-69). Crucially, **@claude3 corrected their round-2
+"does not fire" claim**: the complete-preamble-quote residual IS live-reachable
+(Claude rollouts `082f1689`, `5886ee16` — assistant/`tool_result` turns quoting a
+peer preamble that land after the last real preamble), and supplied a cheap,
+in-scope fix. (Synthesis: `session-32482/task-73-feedback-synthesis-claude1.md`.)
+
+- **Residual closed for all observed carriers (fix `f4688eb`).** Added a
+  record-kind guard `line_is_quote_or_tool_record`: a candidacy line carrying
+  `"role":"assistant"` / `"type":"tool_result"` / `"tool_use_id"` is rejected
+  (real CT preambles are user-role text records and never carry these; an
+  include-side `role=="user"` check is insufficient because a `tool_result` is
+  itself `role:user`, so we EXCLUDE on markers). Byte-level, same class as the
+  bracket checks — not a JSON parse. This addresses @codex1's block and adopts
+  @claude3's concrete recommendation.
+- **Minor hardenings (codex1/claude2/codex3):** `[Your identity:` now requires
+  the co-located `You are @` (`[Your identity: You are @`); fixed the stale
+  "generic session-path token" inline comment.
+- **Regression tests (lib 60 → 62):** `g_assistant_quote_of_complete_preamble_does_not_cross_wire`
+  and `g_tool_result_quote_of_complete_preamble_does_not_cross_wire`.
+- **Residual narrowed (still a recommended planner follow-up):** only a *crafted*
+  record that quotes a complete preamble while avoiding those JSON markers
+  remains — not seen in practice. Robust close = role/schema-aware preamble
+  identification (verify a genuine user/first-turn launch record + content-block
+  shape). Severity has converged each round: any `You are @` → handle+generic
+  token → complete bracket block → complete bracket block in a non-quote record.
+
+Post-round-3 validation: `cargo build && cargo test` → **62 lib + 4 + 1 passed,
+0 failed**; no auto-fix; only the 9 pre-existing dead-code warnings.
 
 ## Scope-discipline self-check
 - [x] No new interfaces / files outside hints (helper fns are inline in the same `adapters/mod.rs`)
