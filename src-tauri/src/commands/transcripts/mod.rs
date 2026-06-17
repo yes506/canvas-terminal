@@ -13,7 +13,7 @@ pub mod fs_gate;
 pub mod tailer;
 pub mod watcher;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -65,6 +65,35 @@ pub struct TranscriptHandle {
     /// codex2 B2 / codex3 P0 — the prior implementer cycle reverted three
     /// Tailer items because the trait offered no in-bounds writable path.
     pub memory_dir: PathBuf,
+    /// Collaborator-session id, sanitized to a single path segment. Namespaces
+    /// the mirror path so two collab sessions that each spawn a `claude1`
+    /// write to distinct files:
+    /// `contexts/<collab_session_id>/<agent_handle>.jsonl`.
+    ///
+    /// WATCHER-OWNED, NOT adapter-derived: `discover_session` constructs the
+    /// handle with an empty placeholder; `populate_entry` overwrites it (after
+    /// sanitizing) with the value threaded down from the `watch_transcript`
+    /// IPC. Adapters never see it — discovery only locates the source
+    /// transcript; namespacing is a CT-side identity concern (plan N4/N6,
+    /// codex2/claude3 convergence). NEVER persisted to `.state.json` (resume
+    /// rebuilds the mirror path from this handle field — see
+    /// `tailer::resume_from_state`).
+    pub collab_session_id: String,
+}
+
+/// Sanitize a collaborator-session id into a single safe path segment.
+///
+/// SINGLE SHARED RULE with the TS reader
+/// (`src/lib/peerContext.ts::sanitizeCollabSessionId`): retain only
+/// `[A-Za-z0-9_-]`, drop every other character. Writer (this side) and reader
+/// (TS) MUST apply the identical filter or the agent's grep path diverges from
+/// the on-disk write path and collaboration deadlocks (plan "sanitize contract").
+/// In practice collab ids are `session-<n>-<ts>` so the filter is a no-op; it
+/// exists as defense-in-depth.
+pub fn sanitize_collab_session_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
 }
 
 /// Opaque registration token returned by `TranscriptWatcher::watch`. Passed
@@ -72,7 +101,7 @@ pub struct TranscriptHandle {
 pub struct WatchToken(pub u64);
 
 /// Canonical mirrored record format. One per accepted turn in
-/// `session-<pid>/contexts/<agent>.jsonl`.
+/// `session-<pid>/contexts/<collab_session_id>/<agent>.jsonl`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct NormalizedTurn {
     pub normalized_schema_version: u32,
@@ -274,11 +303,28 @@ pub trait TranscriptAdapter: Send + Sync {
     /// Given a PID with no open fds matching the pattern, returns
     /// `NoMatchingFd` rather than guessing by mtime. Returned `source_inode`
     /// matches `lstat(source_path)` at call time.
+    ///
+    /// # Defense-2 parameters (plan N4/N5/N19)
+    /// - `claimed_paths`: canonical `source_path`s already bound to other live
+    ///   handles. The adapter forwards these to `discover_by_mtime` so an
+    ///   already-mirrored transcript is excluded from this binding's candidate
+    ///   set (Defense-2B — prevents two handles binding the same source).
+    ///   Adapters do NOT own `collab_session_id` (that is watcher-owned and
+    ///   attached at populate time); they own only source discovery.
+    /// - `allow_unmarked_fallback`: when `false`, the adapter MUST return
+    ///   `NoMatchingFd` if no candidate carries the `You are @<agent_handle>`
+    ///   identity marker (Defense-2A strict mode — the discovery loop retries,
+    ///   waiting for the agent's first marked turn to flush). When `true`
+    ///   (after the loop's finite marker-wait budget is exhausted), the adapter
+    ///   MAY fall back to the newest unclaimed candidate with a warning so a
+    ///   tool that never writes the marker (e.g. codex) still binds (N19).
     fn discover_session(
         &self,
         agent_handle: &str,
         pid: i32,
         spawned_at_unix_ms: i64,
+        claimed_paths: &HashSet<PathBuf>,
+        allow_unmarked_fallback: bool,
     ) -> Result<TranscriptHandle, DiscoveryError>;
 
     /// Static table describing which native content blocks propagate.
@@ -726,6 +772,7 @@ impl TranscriptWatcher {
         agent_handle: String,
         pid: i32,
         spawned_at_unix_ms: i64,
+        collab_session_id: String,
     ) -> Result<WatchToken, WatcherError> {
         // Lazily start FSEvents on first watch().
         self.start_if_needed()?;
@@ -771,6 +818,7 @@ impl TranscriptWatcher {
         // `tauri::async_runtime::spawn` for the same reason.
         let inner_for_task = self.inner.clone();
         let agent_handle_for_task = agent_handle.clone();
+        let collab_session_id_for_task = collab_session_id.clone();
         let join = tauri::async_runtime::spawn(async move {
             Self::discovery_loop(
                 inner_for_task,
@@ -779,6 +827,7 @@ impl TranscriptWatcher {
                 agent_handle_for_task,
                 pid,
                 spawned_at_unix_ms,
+                collab_session_id_for_task,
             )
             .await;
         });
@@ -838,11 +887,29 @@ impl TranscriptWatcher {
         agent_handle: String,
         pid: i32,
         spawned_at_unix_ms: i64,
+        collab_session_id: String,
     ) {
         const POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+        // Defense-2A termination policy (N19): for the first
+        // MARKER_WAIT_ATTEMPTS polls, require the `You are @<handle>` identity
+        // marker (strict mode) so a freshly-spawned agent binds to ITS OWN
+        // transcript even if a same-cwd sibling's file is momentarily newer.
+        // After the budget is exhausted, allow the newest-unclaimed fallback
+        // (with a warning) so a tool that never writes the marker (codex's
+        // rollout has no CT-injected identity line) still binds rather than
+        // spinning forever. ~5s per poll → ~15s of marker-wait before fallback.
+        const MARKER_WAIT_ATTEMPTS: u32 = 3;
+        let mut attempt: u32 = 0;
         loop {
-            // Exit-condition check before each discover_session attempt.
-            {
+            // Exit-condition check + claimed-path snapshot (N9, 2B select
+            // stage) under ONE Inner lock acquisition. The snapshot is the
+            // set of canonical source_paths already bound to OTHER live
+            // populated handles; discover_session excludes them so two handles
+            // never bind the same transcript. NB: this snapshot is necessary
+            // but NOT sufficient — concurrent pending discoveries can both
+            // pass it, so populate_entry re-checks atomically under the lock
+            // (N17).
+            let claimed_paths: HashSet<PathBuf> = {
                 let g = match inner.lock() {
                     Ok(g) => g,
                     Err(_) => return,
@@ -850,22 +917,42 @@ impl TranscriptWatcher {
                 if g.shutdown || !g.entries.contains_key(&token_id) {
                     return;
                 }
-            }
+                g.entries
+                    .iter()
+                    .filter(|(id, _)| **id != token_id)
+                    .filter_map(|(_, e)| e.handle.as_ref())
+                    .map(|h| h.source_path.clone())
+                    .collect()
+            };
 
-            let result = adapter.discover_session(&agent_handle, pid, spawned_at_unix_ms);
+            let allow_unmarked_fallback = attempt >= MARKER_WAIT_ATTEMPTS;
+            attempt = attempt.saturating_add(1);
+
+            let result = adapter.discover_session(
+                &agent_handle,
+                pid,
+                spawned_at_unix_ms,
+                &claimed_paths,
+                allow_unmarked_fallback,
+            );
             match result {
                 Ok(handle) => {
-                    // Populate is a sync helper that re-checks entry
-                    // presence under the lock and releases before the
-                    // initial-drain on_fs_event call. Errors inside
-                    // populate are logged-and-dropped (the task exits
-                    // either way once we have a successful discovery).
-                    Self::populate_entry(&inner, token_id, handle);
-                    return;
+                    // Populate re-checks entry presence under the lock and
+                    // atomically re-checks for a dup source_path (N17). It
+                    // returns `true` when it bound the handle (we're done) and
+                    // `false` when it rolled back (entry vanished via unwatch,
+                    // or another handle raced to the same source_path). On
+                    // `false` we keep polling: the next discover_session sees
+                    // the now-claimed path in the snapshot and either picks a
+                    // different transcript or returns NoMatchingFd.
+                    if Self::populate_entry(&inner, token_id, handle, collab_session_id.clone()) {
+                        return;
+                    }
                 }
                 Err(DiscoveryError::NoMatchingFd) => {
-                    // Common path: tool hasn't created its JSONL yet.
-                    // Silent retry.
+                    // Common path: tool hasn't created its JSONL yet, OR (under
+                    // strict marker mode) no candidate carries the identity
+                    // marker yet. Silent retry.
                 }
                 Err(e) => {
                     // Less-common path: an Io / Gated / Unsupported.
@@ -895,21 +982,36 @@ impl TranscriptWatcher {
     ///   undo the FSEvents subscription (decrement ref-count). If
     ///   present, populate the trio.
     /// - Initial drain (outside the lock): synthesize an on_fs_event so
-    ///   any content already on disk replays into `contexts/<agent>.jsonl`
-    ///   without waiting for the next FSEvents notification.
+    ///   any content already on disk replays into
+    ///   `contexts/<collab_session_id>/<agent>.jsonl` without waiting for the
+    ///   next FSEvents notification.
+    ///
+    /// Returns `true` when the handle was bound (discovery is done); `false`
+    /// when it rolled back — either the entry vanished (unwatch raced) or
+    /// another live handle already owns this `source_path` (N17 dup-source
+    /// race). On `false` the caller (`discovery_loop`) keeps polling; its
+    /// next exit-condition check tears the watch down if the entry is gone,
+    /// otherwise the next `discover_session` excludes the now-claimed path.
     fn populate_entry(
         inner: &std::sync::Arc<std::sync::Mutex<Inner>>,
         token_id: u64,
-        handle: TranscriptHandle,
-    ) {
+        mut handle: TranscriptHandle,
+        collab_session_id: String,
+    ) -> bool {
+        // Attach the watcher-owned, sanitized collab_session_id BEFORE any
+        // claim comparison or storage. This is the ONLY site that fills the
+        // field — adapters construct handles with an empty placeholder (plan
+        // N6: collab_session_id is watcher-owned, not adapter-derived).
+        handle.collab_session_id = sanitize_collab_session_id(&collab_session_id);
+
         // Phase A: cheap presence check.
         {
             let g = match inner.lock() {
                 Ok(g) => g,
-                Err(_) => return,
+                Err(_) => return false,
             };
             if g.shutdown || !g.entries.contains_key(&token_id) {
-                return;
+                return false;
             }
         }
 
@@ -921,7 +1023,7 @@ impl TranscriptWatcher {
                 "transcripts: fs_gate rejected populated handle for token {}: {:?}",
                 token_id, e
             );
-            return;
+            return false;
         }
 
         let tail_state = match tailer::resume_from_state(&handle) {
@@ -931,7 +1033,7 @@ impl TranscriptWatcher {
                     "transcripts: tail_state resume failed for token {}: {:?}",
                     token_id, e
                 );
-                return;
+                return false;
             }
         };
 
@@ -942,7 +1044,7 @@ impl TranscriptWatcher {
                     "transcripts: FSEvents subscribe failed for token {}: {:?}",
                     token_id, e
                 );
-                return;
+                return false;
             }
         };
 
@@ -960,7 +1062,41 @@ impl TranscriptWatcher {
         }
         let outcome = match inner.lock() {
             Ok(mut g) => {
-                if let Some(entry) = g.entries.get_mut(&token_id) {
+                // N17: atomic dup-source recheck. The N9 snapshot the loop
+                // took before discovery is necessary-but-NOT-sufficient — two
+                // pending discoveries for the same source can both pass it,
+                // then both arrive here. Under this single lock, refuse to
+                // bind a `source_path` already owned by another live populated
+                // handle. Both `source_path`s are fs_gate-canonical, so `==`
+                // is a canonical comparison (plan N17 canonical-compare
+                // constraint). On a dup we take the SAME rollback path as the
+                // unwatch race, but the entry stays PENDING so the loop retries
+                // and the next discovery excludes this (now-claimed) path.
+                let dup_source = g.entries.iter().any(|(id, e)| {
+                    *id != token_id
+                        && e.handle
+                            .as_ref()
+                            .map_or(false, |h| h.source_path == handle.source_path)
+                });
+                if dup_source {
+                    let mut release_parent: Option<PathBuf> = None;
+                    if let Some(parent) = &parent_for_rollback {
+                        let cur = g.parent_dir_refs.get(parent).copied().unwrap_or(0);
+                        let next = cur.saturating_sub(1);
+                        if next == 0 {
+                            g.parent_dir_refs.remove(parent);
+                            release_parent = Some(parent.clone());
+                        } else {
+                            g.parent_dir_refs.insert(parent.clone(), next);
+                        }
+                    }
+                    eprintln!(
+                        "transcripts: token {} discovered an already-claimed source_path \
+                         ({:?}); rolling back and retrying discovery (N17 dup-source guard)",
+                        token_id, handle.source_path
+                    );
+                    PopulateOutcome::RaceRollback(release_parent)
+                } else if let Some(entry) = g.entries.get_mut(&token_id) {
                     entry.handle = Some(handle);
                     entry.subscription_id = Some(subscription.0);
                     entry.tail_state = Some(tail_state);
@@ -1011,15 +1147,19 @@ impl TranscriptWatcher {
         }
 
         if !matches!(outcome, PopulateOutcome::Populated) {
-            return;
+            // RaceRollback (entry-gone OR N17 dup-source) and LockPoisoned
+            // both report "not bound" so the loop keeps polling / exits on its
+            // next presence check.
+            return false;
         }
 
         // Initial drain: synthesize one on_fs_event so any content
         // already present in the source JSONL replays into
-        // contexts/<agent>.jsonl without waiting for the next FSEvents
-        // notification. Outside-lock: on_fs_event re-acquires the lock
-        // internally.
+        // contexts/<collab_session_id>/<agent>.jsonl without waiting for the
+        // next FSEvents notification. Outside-lock: on_fs_event re-acquires
+        // the lock internally.
         watcher::on_fs_event(&watcher::Subscription(0), &source_path_for_drain);
+        true
     }
 
     /// Unregister a previously-issued token. Decrements ref-count.
@@ -1099,7 +1239,7 @@ impl TranscriptWatcher {
                         g.parent_dir_refs.remove(&parent_path);
                         // Capture parent path for the post-lock-release
                         // notify::unwatch call. The mirror file in
-                        // `contexts/<agent>.jsonl` (if any) stays on disk;
+                        // `contexts/<collab_session_id>/<agent>.jsonl` (if any) stays on disk;
                         // clean-up is the user's call, matching the
                         // session-lifetime retention default.
                         Some(parent_path)
@@ -1131,7 +1271,7 @@ impl TranscriptWatcher {
         }
     }
 
-    /// Persist one normalized turn to `contexts/<agent>.jsonl`.
+    /// Persist one normalized turn to `contexts/<collab_session_id>/<agent>.jsonl`.
     ///
     /// # Inputs
     /// - `token`: identifies which agent stream this turn belongs to.
@@ -1169,9 +1309,11 @@ impl TranscriptWatcher {
         token: &WatchToken,
         turn: NormalizedTurn,
     ) -> Result<(), WatcherError> {
-        // Resolve agent_handle under the lock; release before the file
-        // IO so a slow disk doesn't block concurrent watch/unwatch.
-        let agent_handle = {
+        // Resolve agent_handle + collab_session_id under the lock; release
+        // before the file IO so a slow disk doesn't block concurrent
+        // watch/unwatch. `collab_session_id` is already sanitized (filled at
+        // populate time) — it namespaces the mirror path per the collision fix.
+        let (agent_handle, collab_session_id) = {
             let g = self
                 .inner
                 .lock()
@@ -1194,7 +1336,7 @@ impl TranscriptWatcher {
                     "append_normalized_turn called on pending entry",
                 ))
             })?;
-            handle.agent_handle.clone()
+            (handle.agent_handle.clone(), handle.collab_session_id.clone())
         };
 
         // Serialize to one line, terminated by \n. Readers split on '\n';
@@ -1207,7 +1349,12 @@ impl TranscriptWatcher {
         let dir = super::memory::get_memory_dir().map_err(|e| {
             WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
         })?;
-        let full_path = dir.join("contexts").join(format!("{}.jsonl", agent_handle));
+        let full_path = dir
+            .join("contexts")
+            .join(&collab_session_id)
+            .join(format!("{}.jsonl", agent_handle));
+        // mkdir -p the session-scoped contexts dir (one extra level deeper
+        // than the legacy flat layout).
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent).map_err(WatcherError::Io)?;
         }
@@ -1234,7 +1381,7 @@ impl TranscriptWatcher {
         Ok(())
     }
 
-    /// Rotate `contexts/<agent>.jsonl` if it exceeds the active-file cap.
+    /// Rotate `contexts/<collab_session_id>/<agent>.jsonl` if it exceeds the active-file cap.
     ///
     /// # Inputs
     /// `token`: stream to check.
@@ -1273,7 +1420,7 @@ impl TranscriptWatcher {
     /// "no auto-promote" rule MUST then create a fresh active on the
     /// next write.
     pub fn rotate_if_needed(&self, token: &WatchToken) -> Result<(), WatcherError> {
-        let agent_handle = {
+        let (agent_handle, collab_session_id) = {
             let g = self
                 .inner
                 .lock()
@@ -1289,13 +1436,16 @@ impl TranscriptWatcher {
                 Some(h) => h,
                 None => return Ok(()),
             };
-            handle.agent_handle.clone()
+            (handle.agent_handle.clone(), handle.collab_session_id.clone())
         };
 
         let dir = super::memory::get_memory_dir().map_err(|e| {
             WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
         })?;
-        let active_path = dir.join("contexts").join(format!("{}.jsonl", agent_handle));
+        // Session-scoped active path — same rule as append (N6) so rotation
+        // operates on the file the appends actually wrote.
+        let contexts_dir = dir.join("contexts").join(&collab_session_id);
+        let active_path = contexts_dir.join(format!("{}.jsonl", agent_handle));
 
         let size = match std::fs::metadata(&active_path) {
             Ok(m) => m.len(),
@@ -1307,11 +1457,9 @@ impl TranscriptWatcher {
         }
 
         // Scan archive indices (T1: directory listing is authoritative).
-        let indices = self.scan_archive_indices(&agent_handle);
+        let indices = self.scan_archive_indices(&agent_handle, &collab_session_id);
         let next_n = indices.iter().max().copied().unwrap_or(0) + 1;
-        let archive_path = dir
-            .join("contexts")
-            .join(format!("{}.{}.jsonl", agent_handle, next_n));
+        let archive_path = contexts_dir.join(format!("{}.{}.jsonl", agent_handle, next_n));
 
         // 1. fsync current active before renaming.
         {
@@ -1326,9 +1474,7 @@ impl TranscriptWatcher {
         //    between steps 2 and 3 leaves archive present and active
         //    missing — the docstring's "no auto-promote" recovery rule
         //    relies on the next append's O_CREAT to materialize active.
-        let tmp_active = dir
-            .join("contexts")
-            .join(format!("{}.jsonl.tmp", agent_handle));
+        let tmp_active = contexts_dir.join(format!("{}.jsonl.tmp", agent_handle));
         let f = std::fs::File::create(&tmp_active).map_err(WatcherError::Io)?;
         f.sync_all().map_err(WatcherError::Io)?;
         drop(f);
@@ -1343,7 +1489,8 @@ impl TranscriptWatcher {
     ///
     /// # Returns
     /// Sorted ascending vector of integer N values from existing
-    /// `contexts/<agent>.<N>.jsonl` files. Empty if no archives yet.
+    /// `contexts/<collab_session_id>/<agent>.<N>.jsonl` files. Empty if no
+    /// archives yet.
     ///
     /// # Errors
     /// Cannot fail (returns empty vec on directory missing or read errors).
@@ -1365,12 +1512,16 @@ impl TranscriptWatcher {
     /// # Test contract
     /// Returns `[]` when no archives exist. Returns `[1, 2, 5]` when
     /// `<agent>.{1,2,5}.jsonl` exist — gaps are preserved, not filled.
-    pub fn scan_archive_indices(&self, agent_handle: &str) -> Vec<u32> {
+    pub fn scan_archive_indices(&self, agent_handle: &str, collab_session_id: &str) -> Vec<u32> {
         // T1: dir-listing is authoritative for "next archive N" — never
         // substitute a state-file cache. The state cache can lag a
         // successful rename and produce a colliding N on the next rotate.
+        // Scan the session-scoped contexts dir so two collab sessions' archive
+        // numbering never collides. Sanitize defensively (the handle already
+        // stores a sanitized id, but this method is pub).
+        let scope = sanitize_collab_session_id(collab_session_id);
         let dir = match super::memory::get_memory_dir() {
-            Ok(d) => d.join("contexts"),
+            Ok(d) => d.join("contexts").join(&scope),
             Err(_) => return Vec::new(),
         };
         let prefix = format!("{}.", agent_handle);
@@ -1504,6 +1655,7 @@ pub fn watch_transcript(
     agent_handle: String,
     tool: String,
     spawned_at_unix_ms: i64,
+    collab_session_id: String,
 ) -> Result<u64, String> {
     // Extract PID under a minimal lock scope so downstream lsof /
     // fs_gate / etc. don't gate behind the sessions mutex. Mirrors
@@ -1527,7 +1679,7 @@ pub fn watch_transcript(
     // populated states. spawned_at_unix_ms is passed through so the
     // trait signature stays stable (adapters ignore it under cycle F).
     let token = transcript
-        .watch(adapter, agent_handle, pid, spawned_at_unix_ms)
+        .watch(adapter, agent_handle, pid, spawned_at_unix_ms, collab_session_id)
         .map_err(|e| format!("watch: {:?}", e))?;
     Ok(token.0)
 }
@@ -1538,4 +1690,140 @@ pub fn watch_transcript(
 #[tauri::command]
 pub fn unwatch_transcript(state: tauri::State<'_, TranscriptWatcher>, token: u64) {
     state.unwatch(WatchToken(token));
+}
+
+#[cfg(test)]
+mod writer_tests {
+    //! Plan N20 (Defense-1): prove the mirror writer is session-namespaced —
+    //! appends land in `contexts/<collab_session_id>/<agent>.jsonl` (NOT the
+    //! legacy flat path), and `scan_archive_indices` only sees THIS session's
+    //! archives. These exercise the load-bearing N6/N7/N8 path-construction
+    //! that the sanitize/marker unit tests do not.
+    use super::*;
+
+    fn handle_with(agent: &str, sid: &str) -> TranscriptHandle {
+        TranscriptHandle {
+            agent_handle: agent.to_string(),
+            adapter_id: "claude_code",
+            source_path: PathBuf::from("/tmp/ct-test-source.jsonl"),
+            source_inode: 0,
+            pid: 0,
+            memory_dir: PathBuf::from("/tmp"),
+            collab_session_id: sanitize_collab_session_id(sid),
+        }
+    }
+
+    fn insert_populated(watcher: &TranscriptWatcher, token: u64, handle: TranscriptHandle) {
+        let mut g = watcher.inner.lock().unwrap();
+        g.entries.insert(
+            token,
+            Entry {
+                handle: Some(handle),
+                subscription_id: None,
+                tail_state: None,
+                adapter: &adapters::CLAUDE_CODE_ADAPTER,
+                discovery_task: None,
+                last_event_at: None,
+            },
+        );
+    }
+
+    fn sample_turn(agent: &str) -> NormalizedTurn {
+        NormalizedTurn {
+            normalized_schema_version: NORMALIZED_SCHEMA_VERSION,
+            source_tool: "claude_code".to_string(),
+            source_tool_version: None,
+            adapter_version: "0.1.0".to_string(),
+            agent_handle: agent.to_string(),
+            ts_iso8601: "2026-06-17T00:00:00Z".to_string(),
+            ts_source: TsSource::Ct,
+            role: TurnRole::User,
+            text_visible: "hello".to_string(),
+            turn_index: 0,
+            source_offset: 0,
+        }
+    }
+
+    #[test]
+    fn append_writes_to_session_scoped_path_not_flat() {
+        // Unique sid per test so concurrent test threads don't interfere
+        // (get_memory_dir is shared per process).
+        let sid = "session-writer-N6-1";
+        let watcher = TranscriptWatcher::new();
+        insert_populated(&watcher, 1, handle_with("claude1", sid));
+
+        watcher
+            .append_normalized_turn(&WatchToken(1), sample_turn("claude1"))
+            .expect("append should succeed");
+
+        let dir = super::super::memory::get_memory_dir().unwrap();
+        let scoped = dir.join("contexts").join(sid).join("claude1.jsonl");
+        let flat = dir.join("contexts").join("claude1.jsonl");
+        assert!(scoped.exists(), "expected session-scoped file at {:?}", scoped);
+        assert!(
+            !flat.exists(),
+            "must NOT write the legacy flat path {:?} (collision bug)",
+            flat
+        );
+
+        // Two sessions' claude1 land in distinct files.
+        let sid_b = "session-writer-N6-2";
+        insert_populated(&watcher, 2, handle_with("claude1", sid_b));
+        watcher
+            .append_normalized_turn(&WatchToken(2), sample_turn("claude1"))
+            .expect("append B should succeed");
+        let scoped_b = dir.join("contexts").join(sid_b).join("claude1.jsonl");
+        assert!(scoped_b.exists());
+        assert_ne!(scoped, scoped_b);
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(dir.join("contexts").join(sid));
+        let _ = std::fs::remove_dir_all(dir.join("contexts").join(sid_b));
+    }
+
+    #[test]
+    fn scan_archive_indices_is_session_scoped() {
+        let sid = "session-scan-N8-1";
+        let other = "session-scan-N8-2";
+        let dir = super::super::memory::get_memory_dir().unwrap();
+        let mine = dir.join("contexts").join(sid);
+        let theirs = dir.join("contexts").join(other);
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(mine.join("claude1.1.jsonl"), b"").unwrap();
+        std::fs::write(mine.join("claude1.3.jsonl"), b"").unwrap();
+        std::fs::write(mine.join("claude1.jsonl"), b"").unwrap(); // active, not archive
+        std::fs::write(theirs.join("claude1.2.jsonl"), b"").unwrap(); // cross-session
+
+        let watcher = TranscriptWatcher::new();
+        let indices = watcher.scan_archive_indices("claude1", sid);
+        assert_eq!(indices, vec![1, 3], "scan must be scoped to this session only");
+
+        let _ = std::fs::remove_dir_all(&mine);
+        let _ = std::fs::remove_dir_all(&theirs);
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    //! Plan N20: the sanitize contract is a SINGLE shared rule across the Rust
+    //! writer and the TS reader (`peerContext.ts::sanitizeCollabSessionId`).
+    //! These assertions mirror `src/lib/peerContext.test.ts` so the two never
+    //! drift (a drift would make the agent's grep path diverge from the write
+    //! path → collaboration deadlock).
+    use super::sanitize_collab_session_id;
+
+    #[test]
+    fn keeps_allowed_drops_others() {
+        assert_eq!(sanitize_collab_session_id("session-1-123"), "session-1-123");
+        assert_eq!(sanitize_collab_session_id("a/b\\c..d e"), "abcde");
+        assert_eq!(sanitize_collab_session_id("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_collab_session_id("foo_bar-9"), "foo_bar-9");
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let once = sanitize_collab_session_id("we!rd/id");
+        assert_eq!(sanitize_collab_session_id(&once), once);
+    }
 }

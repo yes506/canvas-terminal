@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 
-import { loadSnapshot } from "../../lib/peerContext";
+import { loadSnapshot, sanitizeCollabSessionId } from "../../lib/peerContext";
 import type {
   NormalizedTurn,
   PeerContextSnapshot,
@@ -19,6 +19,12 @@ export interface PeerContextPanelProps {
   agentHandle: string;
   /** Whether the peer is currently publishing (drives the indicator). */
   isPublishing: boolean;
+  /**
+   * Collab session id — scopes the mirror read to
+   * `contexts/<collabSessionId>/<agent>.jsonl` so peers from other sessions
+   * are not mixed in (plan N15).
+   */
+  collabSessionId: string;
 }
 
 /**
@@ -51,7 +57,7 @@ export interface PeerContextPanelProps {
  * once per debounced fs-event.
  */
 export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
-  const { agentHandle, isPublishing } = props;
+  const { agentHandle, isPublishing, collabSessionId } = props;
   const [snapshot, setSnapshot] = useState<PeerContextSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -67,7 +73,7 @@ export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
 
     let cancelled = false;
     setError(null);
-    loadSnapshot(agentHandle)
+    loadSnapshot(agentHandle, collabSessionId)
       .then((snap) => {
         if (!cancelled) setSnapshot(snap);
       })
@@ -82,7 +88,7 @@ export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [agentHandle, isPublishing]);
+  }, [agentHandle, isPublishing, collabSessionId]);
 
   // Empty state — peer hasn't opted in.
   if (!isPublishing) {
@@ -135,7 +141,11 @@ export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
         <span className="peer-context-panel__status">publishing</span>
       </div>
       {renderFenced(ordered)}
-      {renderTruncationFooter(agentHandle, snapshot.archivesBeyondWindow)}
+      {renderTruncationFooter(
+        agentHandle,
+        snapshot.archivesBeyondWindow,
+        collabSessionId,
+      )}
     </div>
   );
 }
@@ -201,8 +211,12 @@ export function renderFenced(turns: NormalizedTurn[]): JSX.Element {
  * Inputs: `archivesBeyondWindow` from `PeerContextSnapshot`.
  *
  * Returns: a React node containing a single-line text breadcrumb
- * "History truncated — older turns at <session-dir>/contexts/<agent>.0..N-2.jsonl"
- * when `archivesBeyondWindow >= 1`; returns `null` otherwise.
+ * "History truncated — older turns at
+ * <session-dir>/contexts/<collabSessionId>/<agent>.0..N-2.jsonl" when
+ * `archivesBeyondWindow >= 1`; returns `null` otherwise. The path is
+ * session-scoped to match the actual mirror layout (the writer + readers all
+ * use `contexts/<collabSessionId>/`), so the debug hint points where the
+ * archives really live.
  *
  * Errors: never.
  *
@@ -222,10 +236,12 @@ export function renderFenced(turns: NormalizedTurn[]): JSX.Element {
 export function renderTruncationFooter(
   agentHandle: string,
   archivesBeyondWindow: number,
+  collabSessionId: string,
 ): JSX.Element | null {
   if (archivesBeyondWindow < 1) {
     return null;
   }
+  const scope = sanitizeCollabSessionId(collabSessionId);
   // Per the docstring test-contract: archivesBeyondWindow=5 → "0..3"
   // (5 hidden archives, indices 0..4 inclusive — but the rendered
   // breadcrumb shows the range as 0..N-2 where N is the total archive
@@ -246,8 +262,8 @@ export function renderTruncationFooter(
     <div className="peer-context-panel__truncation-footer">
       History truncated — older turns at{" "}
       <code>
-        &lt;session-dir&gt;/contexts/{agentHandle}.{oldest}..{newestHidden}
-        .jsonl
+        &lt;session-dir&gt;/contexts/{scope}/{agentHandle}.{oldest}..
+        {newestHidden}.jsonl
       </code>
     </div>
   );
