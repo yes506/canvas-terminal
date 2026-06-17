@@ -20,24 +20,29 @@ Ordering followed `plan.mmd` root-first: N1 → N2 → N3/N4/N5 → N6 → N7 �
 - `src-tauri/src/commands/transcripts/adapters/gemini.rs` (+2 ; N5)
 - `src-tauri/tests/transcript_adapter_contract.rs` (+1 ; N10 review — fixture signature)
 
-Aggregate vs `dev`: 6 files, +578 / −90.
+Aggregate vs `dev` (CURRENT head, incl. `Cargo.lock` sync + 4 peer-review
+reflection rounds): **8 files, +1126 / −90**. The bulk of the growth beyond the
+initial impl is the `adapters/mod.rs` N7 helper hardening + regression tests
+added across rounds 1–4 (see the Peer-review reflection sections). The initial
+N1–N10 impl was 6 files, +578 / −90.
 
 ## Validation
 - Baseline exit (`dev` HEAD): **0**
 - Final validation command: `cargo build && cargo test` (run in `src-tauri`, shared `CARGO_TARGET_DIR` for cache reuse)
-- Final exit: **0** (current head, after three peer-review reflection rounds)
-- Auto-fix attempts used: 0 initial / 1 round-1 / 0 round-2 / 0 round-3
+- Final exit: **0** (current head, after four peer-review reflection rounds)
+- Auto-fix attempts used: 0 initial / 1 round-1 / 0 round-2 / 0 round-3 / 0 round-4
 - Tail of last run (test totals — CURRENT head):
 
 ```
-test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (lib)
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (lib)
 test result: ok.  4 passed; 0 failed; ...                                     (tests/pty_eintr.rs)
 test result: ok.  1 passed; 0 failed; ...                                     (tests/transcript_adapter_contract.rs)
 ```
 
-> Round history: 56 lib (initial impl) → 58 (round-1, +2 `g_*`) → 60 (round-2,
-> +`g_bare_quote…` + `full_header_identity…`) → 62 (round-3, +`g_assistant_quote…`
-> + `g_tool_result_quote…`). See the Peer-review reflection sections below.
+> Round history: 56 lib (initial) → 58 (round-1, +2 `g_*`) → 60 (round-2,
+> +`g_bare_quote…`+`full_header_identity…`) → 62 (round-3, +`g_assistant_quote…`
+> +`g_tool_result_quote…`) → 64 (round-4, +`g_codex_agent_message…`
+> +`g_gemini_model…`). See the Peer-review reflection sections below.
 
 Build emits the same 9 pre-existing warnings present at baseline (unrelated `GateError` dead-code fields); no new warnings introduced.
 
@@ -157,6 +162,42 @@ in-scope fix. (Synthesis: `session-32482/task-73-feedback-synthesis-claude1.md`.
   token → complete bracket block → complete bracket block in a non-quote record.
 
 Post-round-3 validation: `cargo build && cargo test` → **62 lib + 4 + 1 passed,
+0 failed**; no auto-fix; only the 9 pre-existing dead-code warnings.
+
+## Peer-review reflection (round 4)
+
+Five peers re-reviewed `03badc1`. Tally: **block ×2** (@codex2 task-81, @claude2
+task-63-r4) vs **approve ×3** (@codex1 task-80, @codex3 task-82, @claude3
+task-impl-review-r4) — but the three approvals exercised only the **Claude**
+record forms. (Synthesis: `session-32482/task-88-feedback-synthesis-claude1.md`.)
+
+- **BLOCKING — round-3 guard was Claude-only (fixed `c6ff776`).** @codex2 found
+  (and @claude2 independently reproduced) that Codex's user-visible assistant
+  bubble — `{"type":"event_msg","payload":{"type":"agent_message",…}}` — carries
+  none of the round-3 markers, so a Codex `agent_message` quoting a peer's
+  complete preamble still cross-bound. Same wrong-agent class for **Codex, the
+  original-bug adapter**; Gemini `type:gemini` turns were likewise unguarded.
+  **Fix:** made `line_is_quote_or_tool_record` per-adapter — added Codex
+  (`agent_message`, `function_call(_output)`, `reasoning(_text)`) and Gemini
+  (`gemini`, `function`) markers, verified none reject the genuine user preamble
+  of any adapter (Claude `role:user` text / Codex `event_msg.user_message` /
+  Gemini `type:user`).
+- **Regression tests (lib 62 → 64):** `g_codex_agent_message_quote_does_not_cross_wire`
+  (incl. the trailing `response_item` duplicate the backward walk must also
+  reject) and `g_gemini_model_turn_quote_does_not_cross_wire`.
+- **Doc/report polish (codex1/codex3/claude2 minors):** refreshed the over-stated
+  residual comment on `find_latest_identity_preamble_line`; refreshed the stale
+  top-level file/diff stats above.
+- **Non-issue cleared:** @codex2's "dirty worktree / failing `scratch_zz_*` test"
+  was a *concurrent reviewer's* (@claude2's) uncommitted scratch test in the
+  shared worktree — confirmed not in the committed tree; my HEAD is clean.
+- **Residual (recommended planner follow-up):** a crafted record avoiding every
+  per-adapter marker, or a future adapter with an unmodelled record shape. Robust
+  close = a per-adapter schema-aware "genuine injected user-preamble record"
+  predicate. The byte-EXCLUDE now covers all three production adapters' known
+  assistant/tool record shapes.
+
+Post-round-4 validation: `cargo build && cargo test` → **64 lib + 4 + 1 passed,
 0 failed**; no auto-fix; only the 9 pre-existing dead-code warnings.
 
 ## Scope-discipline self-check
