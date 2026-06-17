@@ -94,32 +94,83 @@ pub(super) fn transcript_has_identity_marker(
         return false;
     }
 
-    let line = match find_latest_identity_preamble_line(path, MARKER_BACKWARD_SCAN_CAP_BYTES) {
+    // Candidacy gate (peer-review fix): for a CT collab watch (non-empty
+    // expected session) a line counts as the latest preamble only if it is a
+    // WELL-FORMED CT preamble — a parseable handle AND a generic session-path
+    // token. For a non-CT/manual watch (empty expected session) we keep the
+    // legacy handle-only candidacy. See `find_latest_identity_preamble_line`.
+    let require_session_token = !expected_collab_session_id.is_empty();
+
+    let line = match find_latest_identity_preamble_line(
+        path,
+        MARKER_BACKWARD_SCAN_CAP_BYTES,
+        require_session_token,
+    ) {
         Some(l) => l,
         None => return false,
     };
 
-    // Parse-then-compare the handle (never search for the expected handle).
+    // Parse-then-compare the handle (never search for the expected handle). The
+    // candidacy gate guarantees a parseable handle, but re-parse defensively.
     match parse_identity_preamble_handle(&line) {
         Some(parsed) if parsed.as_slice() == expected_handle.as_bytes() => {}
         _ => return false,
     }
 
-    // Session match only when an expected session is supplied.
+    // Session match only when an expected session is supplied. A well-formed
+    // FOREIGN preamble (different session) therefore returns false here —
+    // latest-authority correctly rejects rather than walking to an older
+    // matching preamble.
     if expected_collab_session_id.is_empty() {
         return true;
     }
     line_references_collab_session(&line, expected_collab_session_id)
 }
 
-/// Locate the latest (closest-to-EOF) complete JSONL line in `path` that
-/// contains the identity-preamble needle, reading at most `cap_bytes` backward
-/// from EOF. Returns the matching line's bytes (newline excluded), or `None`.
+/// Locate the latest (closest-to-EOF) complete JSONL line in `path` that is a
+/// WELL-FORMED CT identity preamble, reading at most `cap_bytes` backward from
+/// EOF. Returns the line's bytes (newline excluded), or `None`.
+///
+/// **Well-formed gate (peer-review fix).** It is NOT enough that a line contains
+/// the raw substring `You are @`: ordinary later transcript output (an assistant
+/// turn discussing the harness, a code/diff attachment, a doc placeholder like
+/// `You are @claudeN`, or a bare `You are @`) also contains it. If such a line
+/// were treated as authoritative it would shadow the real current-launch
+/// preamble — and because the unmarked fallback is permanently disabled for CT
+/// collab watches (plan N1), discovery would safe-spin forever and the mirror
+/// would never populate (this is the COMMON case in a session where every agent
+/// reasons about the harness). So the walk accepts a line as the latest preamble
+/// only if it is well-formed — a parseable handle AND (when `require_session_token`)
+/// a generic session-path token (`conversation-<…>.md` / `contexts/<…>/` for ANY
+/// session) — and **keeps walking backward** past lines that merely contain the
+/// substring. Latest-authority is then applied over that filtered set: the first
+/// (latest) well-formed preamble wins; the caller compares it to the EXPECTED
+/// `(handle, session)` and rejects a foreign one rather than walking to an older
+/// matching one. The generic-vs-expected split is deliberate — it lets a stale
+/// foreign preamble (well-formed, different sid) be recognized as the latest real
+/// identity (→ reject) while incidental text (no session token) is skipped.
+///
+/// `require_session_token == false` (empty expected session — future non-CT/manual
+/// watch) relaxes candidacy to handle-only, preserving legacy behavior.
 ///
 /// Reads EOF→BOF in `MARKER_BACKWARD_CHUNK_BYTES` chunks, reassembling lines
 /// across chunk boundaries so a turn larger than one chunk — or a needle split
-/// across a boundary — is still found. Stops early at the first match.
-fn find_latest_identity_preamble_line(path: &Path, cap_bytes: u64) -> Option<Vec<u8>> {
+/// across a boundary — is still found. Stops early at the first well-formed
+/// preamble.
+///
+/// **Residual (documented):** a single physical line that embeds a parseable
+/// foreign handle AND a session-path token but is not a real preamble (e.g. an
+/// agent quoting `… contexts/<sid>/claudeN.jsonl … You are @claudeN …`, or a
+/// diff of this subsystem's own source) can still be mis-classified as the
+/// latest preamble. This is low-probability (needs both tokens on one
+/// newline-free line) and the fully-robust fix is role-aware parsing (the CT
+/// preamble is a user/first-turn record), which the plan intentionally kept out
+/// of this byte-oriented helper.
+fn find_latest_identity_preamble_line(
+    path: &Path,
+    cap_bytes: u64,
+    require_session_token: bool,
+) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path).ok()?;
@@ -163,7 +214,9 @@ fn find_latest_identity_preamble_line(path: &Path, cap_bytes: u64) -> Option<Vec
         // The leading segment (before the first '\n' in `tail`) is a complete
         // line only once we've reached BOF or the cap; otherwise it continues
         // into not-yet-read bytes.
-        if let Some(found) = scan_tail_for_latest_needle(&tail, at_bof || cap_hit) {
+        if let Some(found) =
+            scan_tail_for_latest_preamble(&tail, at_bof || cap_hit, require_session_token)
+        {
             return Some(found);
         }
         if at_bof || cap_hit {
@@ -179,13 +232,19 @@ fn find_latest_identity_preamble_line(path: &Path, cap_bytes: u64) -> Option<Vec
     }
 }
 
-/// Scan `tail` for the rightmost (latest) COMPLETE line containing the
-/// identity-preamble needle. `front_complete` says whether the leading segment
-/// (before the first `\n`) is a complete line — true only at BOF / cap. The
-/// trailing segment (after the last `\n`) is always complete: on the first
-/// read it is the file's final line; on later reads its terminating newline
-/// was truncated off a previous iteration.
-fn scan_tail_for_latest_needle(tail: &[u8], front_complete: bool) -> Option<Vec<u8>> {
+/// Scan `tail` for the rightmost (latest) COMPLETE line that is a well-formed
+/// CT preamble. `front_complete` says whether the leading segment (before the
+/// first `\n`) is a complete line — true only at BOF / cap. The trailing segment
+/// (after the last `\n`) is always complete: on the first read it is the file's
+/// final line; on later reads its terminating newline was truncated off a
+/// previous iteration. Lines that merely contain the needle but are not
+/// well-formed preambles are skipped, so the caller's backward walk continues
+/// past them (peer-review fix — see `find_latest_identity_preamble_line`).
+fn scan_tail_for_latest_preamble(
+    tail: &[u8],
+    front_complete: bool,
+    require_session_token: bool,
+) -> Option<Vec<u8>> {
     let nls: Vec<usize> = tail
         .iter()
         .enumerate()
@@ -209,11 +268,44 @@ fn scan_tail_for_latest_needle(tail: &[u8], front_complete: bool) -> Option<Vec<
             continue;
         }
         let seg = &tail[start..end];
-        if contains_subslice(seg, IDENTITY_PREAMBLE_NEEDLE) {
+        if line_is_wellformed_preamble(seg, require_session_token) {
             return Some(seg.to_vec());
         }
     }
     None
+}
+
+/// Whether `line` is a well-formed CT identity preamble: it carries the needle,
+/// a parseable handle follows it, and — when `require_session_token` — it also
+/// carries a generic session-path token. This is the candidacy gate that
+/// distinguishes a real preamble turn from incidental text that happens to
+/// contain `You are @` (peer-review fix).
+fn line_is_wellformed_preamble(line: &[u8], require_session_token: bool) -> bool {
+    if parse_identity_preamble_handle(line).is_none() {
+        return false;
+    }
+    if require_session_token && !line_has_any_session_token(line) {
+        return false;
+    }
+    true
+}
+
+/// Whether `line` carries ANY collab-session path token, independent of which
+/// session — a conversation-log path (`conversation-<…>.md`) or a peer-contexts
+/// path (`contexts/<…>/`). Used for preamble candidacy (generic), kept separate
+/// from `line_references_collab_session` (which matches a SPECIFIC expected id).
+fn line_has_any_session_token(line: &[u8]) -> bool {
+    if let Some(i) = find_subslice(line, b"conversation-") {
+        if find_subslice(&line[i + b"conversation-".len()..], b".md").is_some() {
+            return true;
+        }
+    }
+    if let Some(i) = find_subslice(line, b"contexts/") {
+        if find_subslice(&line[i + b"contexts/".len()..], b"/").is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse the handle out of the first `You are @<handle>` occurrence in `line`.
@@ -1304,12 +1396,63 @@ mod marker_tests {
         let p = write_temp("f-split", content.as_bytes());
 
         // Sanity: the reader returns the whole single line (needle reassembled).
-        let line = find_latest_identity_preamble_line(&p, MARKER_BACKWARD_SCAN_CAP_BYTES)
+        let line = find_latest_identity_preamble_line(&p, MARKER_BACKWARD_SCAN_CAP_BYTES, true)
             .expect("preamble line must be located across the chunk boundary");
         assert!(super::contains_subslice(&line, b"You are @claude1"));
 
         assert!(transcript_has_identity_marker(&p, "claude1", "session-split"));
         assert!(!transcript_has_identity_marker(&p, "claude2", "session-split"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- (g) peer-review regression: incidental `You are @` AFTER a valid -
+    //        preamble must not shadow it (liveness) nor cross-bind (wrong agent)
+
+    #[test]
+    fn g_incidental_needle_after_preamble_does_not_shadow() {
+        // Valid current-launch preamble, THEN ordinary later output lines that
+        // merely contain `You are @<handle>` with NO session-path token — the
+        // common case in a session where agents reason about the harness.
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-g"));
+        c.push('\n');
+        // assistant turn discussing the protocol (parseable handle, no session token)
+        c.push_str(
+            "{\"role\":\"assistant\",\"text\":\"the marker string You are @claude2 should be parsed\"}\n",
+        );
+        // a bare needle with no handle
+        c.push_str("{\"role\":\"assistant\",\"text\":\"prefix You are @ suffix\"}\n");
+        let p = write_temp("g-incidental", c.as_bytes());
+
+        // Liveness: the valid claude1/session-g preamble is still found despite
+        // the later incidental needle lines (old code returned false → spin).
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-g"),
+            "valid preamble must not be shadowed by later incidental `You are @` text"
+        );
+        // No cross-wire: the incidental `You are @claude2` line (no session
+        // token) is skipped, so the latest well-formed preamble is claude1's →
+        // claude2's watch does not bind this transcript.
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-g"),
+            "incidental foreign-handle mention must not cross-bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn g_foreign_wellformed_preamble_after_expected_rejects() {
+        // A well-formed FOREIGN preamble appearing AFTER the expected one is the
+        // rollout's latest real identity → latest-authority must reject the
+        // expected watch (not walk back to the older matching preamble).
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-h"));
+        c.push('\n');
+        c.push_str(&preamble_line("claude2", "session-h"));
+        c.push('\n');
+        let p = write_temp("g-foreign-latest", c.as_bytes());
+        assert!(!transcript_has_identity_marker(&p, "claude1", "session-h"));
+        assert!(transcript_has_identity_marker(&p, "claude2", "session-h"));
         let _ = std::fs::remove_file(&p);
     }
 }
