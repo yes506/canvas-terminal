@@ -34,12 +34,26 @@ Total: 13 files, +686/-92.
 - Final validation command: `(cd src-tauri && cargo check && cargo test) && tsc --noEmit && npm test`
 - Final exit: 0
 - Auto-fix attempts used: 1/3 (corrected a wrong assertion in my own new tests — the impl was correct; `"a/b\c..d e"` sanitizes to `"abcde"`, not `"abcd"`)
-- Result tail:
+- Result tail (after peer-review round):
 ```
-cargo test: 45 passed; 0 failed (lib) | 4 passed (integration) | 1 passed (contract)
+cargo test: 47 passed; 0 failed (lib) | 4 passed (integration) | 1 passed (contract)
 tsc --noEmit: clean
 vitest: Test Files 16 passed (16) | Tests 364 passed (364)
 ```
+
+### Rust test coverage — precise scope (corrected after peer review)
+N20's Rust tests cover: `sanitize_collab_session_id` contract (2),
+`transcript_has_identity_marker` incl. word-boundary (5), AND — added in the
+review round — `append_normalized_turn` session-scoped write vs. flat-path
+absence + two-session isolation (1) and `scan_archive_indices` session scoping
++ cross-session exclusion (1). The **N17 dup-source rollback branch** in
+`populate_entry` is NOT unit-tested: it sits behind `subscribe_fsevents` /
+`tailer::resume_from_state`, which require a live FSEvents watcher and a real
+source file under an fs_gate-allowed root — out of reach for an in-process unit
+test without heavy fixtures. Its correctness is established by review (peer
+@claude2 independently verified the rollback symmetry against the proven
+entry-gone `RaceRollback` path) and by inspection; this report does not claim
+it is covered by an automated test.
 
 ## Per-item outcomes
 | item | status | notes |
@@ -62,7 +76,7 @@ vitest: Test Files 16 passed (16) | Tests 364 passed (364)
 | N17 populate dup-source recheck | completed | atomic under Inner lock; rollback → loop retries |
 | N18 TASK_PROTOCOL + docs | completed | `buildTaskProtocol(glob)`; doc x2 |
 | N19 2A fallback termination | completed | finite marker-wait (3 polls ≈ 15s) → newest-unclaimed + warn |
-| N20 tests | completed | Rust sanitize+marker, TS readers |
+| N20 tests | completed | Rust sanitize+marker+writer(append/scan), TS readers; N17 dup-rollback review-verified (not unit-tested — FSEvents dependency) |
 | N21 stale comments/docs | completed | mod.rs docstrings + discover_by_mtime algo doc |
 
 ## Reconciliation notes (faithful to plan intent)
@@ -75,3 +89,24 @@ vitest: Test Files 16 passed (16) | Tests 364 passed (364)
 - [x] No signature changes on planner-committed methods beyond the planned threading
 - [x] No edits to validation_command configuration
 - [x] No edits to files outside the work queue's hint set (watcher.rs touched only as a direct consequence of the N3 field addition)
+
+## Peer-review round (task-6)
+
+Five independent peer reviews were collected from the collaborator session
+(`session-2403`): @codex1, @codex2, @codex3, @claude2, @claude3. Verdicts: one
+explicit APPROVE (@claude2), four "no functional blocker." Each finding was
+empirically re-verified against the tree before acting.
+
+| Finding (reviewers) | Verdict after verification | Action |
+|---|---|---|
+| Rust N20 coverage incomplete; report overstated it (codex1, codex3, claude3 — Med) | TRUE — only sanitize/marker tests existed | Added `writer_tests` (append session-scoped vs flat + 2-session isolation; scan session-scoped + cross-session exclusion). Corrected report to scope N17 as review-verified, not unit-tested. |
+| Stale truncation footer omits session segment (codex2, codex3, claude3 — Low) | TRUE — `renderTruncationFooter` showed flat path | Threaded `collabSessionId` into the footer; path now `contexts/<scope>/…`. |
+| TS doc-comment drift (claude2, claude3 — Low) | TRUE — `types/peerContext.ts` ×2 still flat | Updated comments to session-scoped path. |
+| `watch_transcript` effect lacks `!collabSessionId` guard (claude2 — Low) | Latent (hook returns non-empty `string`); cheap defense-in-depth | Added `|| !collabSessionId` to the effect guard with rationale. |
+| Dirty worktree: `Cargo.lock` 0.5.6→0.5.9 + untracked `target/` (all — non-blocking) | Pre-existing dev lock drift, not feature logic; `target` is the build-cache symlink | Reverted `Cargo.lock`; `target` symlink is gitignored-adjacent and never staged. |
+| Defense-2A marker assumption for Claude (claude2, claude3 — value-add) | Confirmed VALID: real claude transcripts contain `You are @claudeN`; codex/gemini remain the plan's stated open question, covered by N19 fallback + 2B/N17 | No change needed (matches plan). |
+| N19 markerless residual / marker-forgery (codex1, claude3 — awareness) | Within plan's stated out-of-scope; 2B+N17 prevent double-binding regardless | No change (documented residual risk). |
+
+All fixes stay within implementer scope: test additions, one UI path-display
+fix, comment sync, and a defensive guard — no re-architecting, no signature
+changes to planner-committed methods.

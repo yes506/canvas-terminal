@@ -1693,6 +1693,118 @@ pub fn unwatch_transcript(state: tauri::State<'_, TranscriptWatcher>, token: u64
 }
 
 #[cfg(test)]
+mod writer_tests {
+    //! Plan N20 (Defense-1): prove the mirror writer is session-namespaced —
+    //! appends land in `contexts/<collab_session_id>/<agent>.jsonl` (NOT the
+    //! legacy flat path), and `scan_archive_indices` only sees THIS session's
+    //! archives. These exercise the load-bearing N6/N7/N8 path-construction
+    //! that the sanitize/marker unit tests do not.
+    use super::*;
+
+    fn handle_with(agent: &str, sid: &str) -> TranscriptHandle {
+        TranscriptHandle {
+            agent_handle: agent.to_string(),
+            adapter_id: "claude_code",
+            source_path: PathBuf::from("/tmp/ct-test-source.jsonl"),
+            source_inode: 0,
+            pid: 0,
+            memory_dir: PathBuf::from("/tmp"),
+            collab_session_id: sanitize_collab_session_id(sid),
+        }
+    }
+
+    fn insert_populated(watcher: &TranscriptWatcher, token: u64, handle: TranscriptHandle) {
+        let mut g = watcher.inner.lock().unwrap();
+        g.entries.insert(
+            token,
+            Entry {
+                handle: Some(handle),
+                subscription_id: None,
+                tail_state: None,
+                adapter: &adapters::CLAUDE_CODE_ADAPTER,
+                discovery_task: None,
+                last_event_at: None,
+            },
+        );
+    }
+
+    fn sample_turn(agent: &str) -> NormalizedTurn {
+        NormalizedTurn {
+            normalized_schema_version: NORMALIZED_SCHEMA_VERSION,
+            source_tool: "claude_code".to_string(),
+            source_tool_version: None,
+            adapter_version: "0.1.0".to_string(),
+            agent_handle: agent.to_string(),
+            ts_iso8601: "2026-06-17T00:00:00Z".to_string(),
+            ts_source: TsSource::Ct,
+            role: TurnRole::User,
+            text_visible: "hello".to_string(),
+            turn_index: 0,
+            source_offset: 0,
+        }
+    }
+
+    #[test]
+    fn append_writes_to_session_scoped_path_not_flat() {
+        // Unique sid per test so concurrent test threads don't interfere
+        // (get_memory_dir is shared per process).
+        let sid = "session-writer-N6-1";
+        let watcher = TranscriptWatcher::new();
+        insert_populated(&watcher, 1, handle_with("claude1", sid));
+
+        watcher
+            .append_normalized_turn(&WatchToken(1), sample_turn("claude1"))
+            .expect("append should succeed");
+
+        let dir = super::super::memory::get_memory_dir().unwrap();
+        let scoped = dir.join("contexts").join(sid).join("claude1.jsonl");
+        let flat = dir.join("contexts").join("claude1.jsonl");
+        assert!(scoped.exists(), "expected session-scoped file at {:?}", scoped);
+        assert!(
+            !flat.exists(),
+            "must NOT write the legacy flat path {:?} (collision bug)",
+            flat
+        );
+
+        // Two sessions' claude1 land in distinct files.
+        let sid_b = "session-writer-N6-2";
+        insert_populated(&watcher, 2, handle_with("claude1", sid_b));
+        watcher
+            .append_normalized_turn(&WatchToken(2), sample_turn("claude1"))
+            .expect("append B should succeed");
+        let scoped_b = dir.join("contexts").join(sid_b).join("claude1.jsonl");
+        assert!(scoped_b.exists());
+        assert_ne!(scoped, scoped_b);
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(dir.join("contexts").join(sid));
+        let _ = std::fs::remove_dir_all(dir.join("contexts").join(sid_b));
+    }
+
+    #[test]
+    fn scan_archive_indices_is_session_scoped() {
+        let sid = "session-scan-N8-1";
+        let other = "session-scan-N8-2";
+        let dir = super::super::memory::get_memory_dir().unwrap();
+        let mine = dir.join("contexts").join(sid);
+        let theirs = dir.join("contexts").join(other);
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(mine.join("claude1.1.jsonl"), b"").unwrap();
+        std::fs::write(mine.join("claude1.3.jsonl"), b"").unwrap();
+        std::fs::write(mine.join("claude1.jsonl"), b"").unwrap(); // active, not archive
+        std::fs::write(theirs.join("claude1.2.jsonl"), b"").unwrap(); // cross-session
+
+        let watcher = TranscriptWatcher::new();
+        let indices = watcher.scan_archive_indices("claude1", sid);
+        assert_eq!(indices, vec![1, 3], "scan must be scoped to this session only");
+
+        let _ = std::fs::remove_dir_all(&mine);
+        let _ = std::fs::remove_dir_all(&theirs);
+    }
+}
+
+#[cfg(test)]
 mod sanitize_tests {
     //! Plan N20: the sanitize contract is a SINGLE shared rule across the Rust
     //! writer and the TS reader (`peerContext.ts::sanitizeCollabSessionId`).

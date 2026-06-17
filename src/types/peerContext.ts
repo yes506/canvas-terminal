@@ -1,4 +1,5 @@
-// Canonical record format mirrored into session-<pid>/contexts/<agent>.jsonl
+// Canonical record format mirrored into
+// session-<pid>/contexts/<collab-session-id>/<agent>.jsonl
 //
 // Source-of-truth Rust definition lives in
 // `src-tauri/src/commands/transcripts/mod.rs::NormalizedTurn`.
@@ -67,7 +68,8 @@ export const ENV_COLLAB_SESSION_ID = "CT_COLLAB_SESSION_ID" as const;
 /**
  * Result of a PeerContextPanel data load. `archivesBeyondWindow` is the
  * truncation-footer count (Q4): when ≥ 1, the panel renders a
- * "history truncated — older turns at <session-dir>/contexts/<agent>.0..N-2.jsonl"
+ * "history truncated — older turns at
+ * <session-dir>/contexts/<collab-session-id>/<agent>.0..N-2.jsonl"
  * breadcrumb.
  */
 export interface PeerContextSnapshot {
