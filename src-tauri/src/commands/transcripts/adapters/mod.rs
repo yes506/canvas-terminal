@@ -214,10 +214,21 @@ fn find_latest_identity_preamble_line(
         let at_bof = pos == 0;
         let cap_hit = read_total >= cap_bytes;
         // The leading segment (before the first '\n' in `tail`) is a complete
-        // line only once we've reached BOF or the cap; otherwise it continues
-        // into not-yet-read bytes.
+        // line ONLY at BOF. On a cap hit before BOF that segment is the suffix
+        // of a single physical record whose start lies beyond the cap window —
+        // a TRUNCATED fragment, not a complete line. Marking it complete would
+        // let the record-kind guard (`line_is_quote_or_tool_record`) see only
+        // the in-window suffix and miss a `"role":"assistant"` / tool marker
+        // sitting before the boundary, so a quoted complete peer preamble in
+        // the suffix could be accepted as latest identity → wrong bind
+        // (peer-review fix: codex1/codex3/claude3 round-5). We therefore pass
+        // `at_bof` alone: at the cap the leading fragment stays incomplete and
+        // is skipped, so a preamble beyond the cap degrades to a safe spin —
+        // never a fabricated match — honoring `MARKER_BACKWARD_SCAN_CAP_BYTES`'s
+        // documented guarantee. Complete lines fully inside the window are
+        // still scanned.
         if let Some(found) =
-            scan_tail_for_latest_preamble(&tail, at_bof || cap_hit, require_session_token)
+            scan_tail_for_latest_preamble(&tail, at_bof, require_session_token)
         {
             return Some(found);
         }
@@ -236,7 +247,8 @@ fn find_latest_identity_preamble_line(
 
 /// Scan `tail` for the rightmost (latest) COMPLETE line that is a well-formed
 /// CT preamble. `front_complete` says whether the leading segment (before the
-/// first `\n`) is a complete line — true only at BOF / cap. The trailing segment
+/// first `\n`) is a complete line — true only at BOF (NOT on a cap hit: there
+/// the leading segment is a truncated over-cap fragment). The trailing segment
 /// (after the last `\n`) is always complete: on the first read it is the file's
 /// final line; on later reads its terminating newline was truncated off a
 /// previous iteration. Lines that merely contain the needle but are not
@@ -341,6 +353,21 @@ fn line_is_wellformed_preamble(line: &[u8], require_session_token: bool) -> bool
 /// bracket checks (NOT a JSON parse). A false reject only ever degrades to a safe
 /// spin (liveness), never a wrong bind.
 ///
+/// **False-reject direction is bounded by JSON escaping** (peer-review note —
+/// codex1/claude3 raised a genuine-preamble self-reject concern). The genuine
+/// preamble shares its physical line with the agent's first user message, so a
+/// launch prompt could *paste* a compact transcript snippet containing one of
+/// these markers. But that pasted text is a JSON string VALUE, so its quotes are
+/// escaped on disk (`\"type\":\"agent_message\"`), while these needles use
+/// UNescaped quotes — the exact asymmetry that makes the EXCLUDE sound (real
+/// structural markers are unescaped; quoted ones are escaped). So a pasted marker
+/// does NOT match the needle and does NOT self-reject the genuine preamble. The
+/// only way to self-reject is an UNescaped marker, which on a genuine
+/// user-preamble record can only be its own structural record-kind — and the
+/// genuine record kinds (Claude `role:user`, Codex `user_message`, Gemini
+/// `type:user`) are none of these. Regression:
+/// `g_genuine_preamble_with_escaped_marker_text_still_binds`.
+///
 /// The marker set is **per-adapter** because the helper is adapter-agnostic but
 /// each tool's assistant/tool record shape differs (round-4 peer-review fix —
 /// the round-3 Claude-only markers let Codex `event_msg.agent_message` quotes
@@ -420,6 +447,14 @@ fn parse_identity_preamble_handle(line: &[u8]) -> Option<Vec<u8>> {
 /// preamble's embedded path tokens (`conversation-<sid>.md` /
 /// `contexts/<sid>/`). The expected id is sanitized first so raw vs sanitized
 /// ids match consistently (plan "session-token match format").
+///
+/// **Format coupling (peer-review note — claude3, latent):** the on-disk bracket
+/// is built by the frontend from the RAW `collabSessionId`
+/// (`conversation-${collabSessionId}.md`), while this needle is built from the
+/// SANITIZED id. They agree only when the id is sanitization-stable
+/// (`[A-Za-z0-9_-]` only) — true for real ids like `session-2-1781684658960`. A
+/// future id carrying a stripped char (space/slash/dot) would silently fail to
+/// match here → a safe spin (never a wrong bind). Not active today.
 fn line_references_collab_session(line: &[u8], expected_collab_session_id: &str) -> bool {
     let sid = super::sanitize_collab_session_id(expected_collab_session_id);
     if sid.is_empty() {
@@ -1690,6 +1725,74 @@ mod marker_tests {
         assert!(
             transcript_has_identity_marker(&p, "gemini1", "session-gem"),
             "owner's real Gemini user preamble must still bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-5 peer-review regression (codex1/codex3/claude3 BLOCK): cap-hit
+    //    must NOT accept a truncated over-cap fragment as a complete preamble.
+
+    #[test]
+    fn cap_hit_does_not_accept_truncated_fragment_as_preamble() {
+        // One physical assistant line whose record-kind marker (`"role":
+        // "assistant"`) sits at the FRONT, then a long pad, then a quoted complete
+        // peer preamble (both bracket labels + foreign handle + expected session)
+        // near EOF. With a SMALL injected cap, the backward window holds only the
+        // trailing suffix (brackets) — the `"role":"assistant"` marker is beyond
+        // the cap. Before the fix, cap-hit marked that suffix complete, the guard
+        // saw no marker, and it was accepted → wrong bind. After the fix the
+        // truncated leading fragment stays incomplete → None (safe spin).
+        let mut c = String::from(
+            "{\"role\":\"assistant\",\"content\":\"",
+        );
+        c.push_str(&"x".repeat(4096)); // pad so the marker is far from EOF
+        c.push_str(
+            "[You are @claude2] [Conversation log: /m/conversation-session-cap.md] [contexts/session-cap/x]\"}",
+        );
+        c.push('\n');
+        let p = write_temp("cap-truncated", c.as_bytes());
+
+        // Small cap (512 B) → window holds the trailing brackets but not the
+        // leading `"role":"assistant"` marker. Must NOT fabricate a match.
+        let small_cap: u64 = 512;
+        assert!(
+            find_latest_identity_preamble_line(&p, small_cap, true).is_none(),
+            "a truncated over-cap fragment must never be accepted as a complete preamble"
+        );
+
+        // With a cap large enough to cover the whole line, the `"role":
+        // \"assistant\"` marker is now in-window → the record-kind guard rejects
+        // it as a quote carrier. Either way: never a wrong bind.
+        assert!(
+            find_latest_identity_preamble_line(&p, MARKER_BACKWARD_SCAN_CAP_BYTES, true).is_none(),
+            "with the marker in-window the assistant quote carrier must be rejected"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-5 peer-review regression (codex1/claude3 SHOULD-FIX): a genuine
+    //    preamble whose user text embeds an excluded marker must STILL bind,
+    //    because the pasted marker is JSON-escaped on disk and the guard's
+    //    needles use unescaped quotes (the same asymmetry that makes the EXCLUDE
+    //    sound also bounds the false-reject direction). Empirically settles the
+    //    codex1/claude3-vs-claude2/codex2 disagreement: escaping holds → no
+    //    self-reject, so this is NOT a wrong/no-bind defect.
+
+    #[test]
+    fn g_genuine_preamble_with_escaped_marker_text_still_binds() {
+        // A real Claude user-preamble record whose `text` value pastes a compact
+        // Codex snippet `{"type":"agent_message",...}` — on disk its quotes are
+        // escaped (`\"type\":\"agent_message\"`), so `line_is_quote_or_tool_record`
+        // (unescaped needles) does NOT fire. The preamble is the agent's own.
+        let c = b"{\"role\":\"user\",\"text\":\"[You are @claude1] [Conversation log: /m/conversation-session-esc.md] [contexts/session-esc/x] user pasted snippet: {\\\"type\\\":\\\"agent_message\\\",\\\"message\\\":\\\"hi\\\"}\"}\n";
+        let p = write_temp("g-escaped-marker", c);
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-esc"),
+            "a genuine preamble embedding an ESCAPED excluded marker must still bind"
+        );
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-esc"),
+            "and it must not cross-bind a foreign handle"
         );
         let _ = std::fs::remove_file(&p);
     }

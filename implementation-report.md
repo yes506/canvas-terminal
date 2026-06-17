@@ -200,6 +200,47 @@ record forms. (Synthesis: `session-32482/task-88-feedback-synthesis-claude1.md`.
 Post-round-4 validation: `cargo build && cargo test` → **64 lib + 4 + 1 passed,
 0 failed**; no auto-fix; only the 9 pre-existing dead-code warnings.
 
+## Peer-review reflection (round 5)
+
+Five independent peer reviews (codex1/2/3, claude2/3): claude2 + codex2
+**APPROVE**; codex1, codex3, claude3 **BLOCK**. Collected, verified each claim by
+code trace, and reflected the verified ones.
+
+- **BLOCKING — cap-hit accepted a truncated over-cap fragment as a complete
+  preamble (codex1 #2, codex3, claude3 #1; 3-way convergence, confirmed by
+  trace).** `find_latest_identity_preamble_line` passed `front_complete =
+  at_bof || cap_hit` to `scan_tail_for_latest_preamble`. On `cap_hit && !at_bof`
+  the leading segment is the suffix of an over-cap record, but was scanned as a
+  complete line — so a quoted complete peer preamble whose `"role":"assistant"` /
+  tool record-kind marker sits *before* the 8 MiB window bypassed the guard and
+  could cross-bind, contradicting the cap's documented safe-spin guarantee.
+  **Fix:** pass `at_bof` alone (one token); the truncated leading fragment now
+  stays incomplete and is skipped → a preamble beyond the cap degrades to a safe
+  spin, never a fabricated match. Refreshed the two now-stale comments.
+- **Regression test (lib 64 → 65):** `cap_hit_does_not_accept_truncated_fragment_as_preamble`
+  exercises the previously-untested cap path by injecting a small `cap_bytes`
+  directly into the helper (no 8 MiB allocation). Verified it FAILS on the
+  pre-fix code (returns `Some` → wrong bind) and PASSES post-fix.
+- **Cleared, NOT a defect — genuine-preamble self-reject (codex1 #1, claude3 #2;
+  disagreed with by claude2 #7 / codex2).** The concern: a launch prompt pasting
+  a compact transcript snippet containing an excluded marker (e.g.
+  `"type":"agent_message"`) would self-reject the genuine preamble. Verified the
+  opposite: the pasted text is a JSON string *value*, so its quotes are escaped
+  on disk (`\"type\":\"agent_message\"`) while the guard's needles use UNescaped
+  quotes — the exact asymmetry that makes the EXCLUDE sound also bounds the
+  false-reject direction. codex1/claude3 overlooked the escaping. **Reflected as
+  defense-in-depth, not a code change:** regression test (lib 65 → 66)
+  `g_genuine_preamble_with_escaped_marker_text_still_binds` pins the invariant,
+  plus a doc note on `line_is_quote_or_tool_record`.
+- **Minor/latent doc note — raw-vs-sanitized session-id coupling (claude3 #3).**
+  The on-disk session bracket is built from the raw id, this needle from the
+  sanitized id; they agree only for sanitization-stable ids (true for real
+  `session-N-<ts>` ids). Documented the coupling on `line_references_collab_session`;
+  not active, no code change.
+
+Post-round-5 validation: `cargo test` → **66 lib + 4 + 1 passed, 0 failed**; only
+the 9 pre-existing dead-code warnings.
+
 ## Scope-discipline self-check
 - [x] No new interfaces / files outside hints (helper fns are inline in the same `adapters/mod.rs`)
 - [x] No renames of committed public names
