@@ -25,15 +25,19 @@ Aggregate vs `dev`: 6 files, +578 / −90.
 ## Validation
 - Baseline exit (`dev` HEAD): **0**
 - Final validation command: `cargo build && cargo test` (run in `src-tauri`, shared `CARGO_TARGET_DIR` for cache reuse)
-- Final exit: **0**
-- Auto-fix attempts used: 0 / 3
-- Tail of last run (test totals):
+- Final exit: **0** (current head, after two peer-review reflection rounds)
+- Auto-fix attempts used: 0 initial impl / 1 round-1 reflect / 0 round-2 reflect
+- Tail of last run (test totals — CURRENT head):
 
 ```
-test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (lib)
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (lib)
 test result: ok.  4 passed; 0 failed; ...                                     (tests/pty_eintr.rs)
 test result: ok.  1 passed; 0 failed; ...                                     (tests/transcript_adapter_contract.rs)
 ```
+
+> Round history: 56 lib (initial impl) → 58 (round-1 reflection, +2 `g_*`) → 60
+> (round-2 reflection, +`g_bare_quote…` + `full_header_identity…`). See the
+> Peer-review reflection sections below for each round.
 
 Build emits the same 9 pre-existing warnings present at baseline (unrelated `GateError` dead-code fields); no new warnings introduced.
 
@@ -57,7 +61,7 @@ Build emits the same 9 pre-existing warnings present at baseline (unrelated `Gat
 - **Early-out cap** = 8 MiB (vs the plan's "a few MB"): comfortably exceeds the empirically-observed ≤~600 KiB EOF-to-marker distances while bounding the no-preamble per-poll cost; residual gap documented on `MARKER_BACKWARD_SCAN_CAP_BYTES` and exercised by tests (c)/(f).
 - **Empty `collab_session_id`** selects legacy handle-only matching (future non-CT/manual watch), per in-scope #3.
 
-## Peer-review reflection (round 2)
+## Peer-review reflection (round 1)
 
 Five peer agents reviewed the implementation at `f34b30e`. Two (@codex3, @claude3)
 independently found a **blocking** defect; three (@codex1, @claude2, @codex2)
@@ -85,6 +89,42 @@ the warranted fixes (synthesis: `session-32482/task-56-feedback-synthesis-claude
 
 Post-reflection validation: `cargo build && cargo test` → **58 lib + 4 + 1 passed,
 0 failed**; auto-fix 1/3; only the 9 pre-existing dead-code warnings.
+
+## Peer-review reflection (round 2)
+
+Five peers re-reviewed the round-1 update at `383b9cf`. Tally: **block ×3**
+(@codex1 task-62, @codex2 task-64, @claude2 task-63 — @claude2 *reproduced* it
+with a scratch test) vs **approve ×2** (@codex3 task-65, @claude3
+task-impl-review-r2). I verified the reproduction and reflected the consensus
+minimum fix (synthesis: `session-32482/task-67-feedback-synthesis-claude1.md`).
+
+- **BLOCKING — round-1 candidacy still admitted a cross-wire (fixed, `066f4ca`).**
+  The round-1 gate (parseable handle + ANY generic `conversation-…md`/`contexts/…/`
+  substring) still classified an ordinary later record that *quoted* a peer
+  handle plus the expected session's mirror path as the latest preamble →
+  wrong-agent bind, violating the "0 cross-wired" criterion. **Fix:** anchor
+  candidacy on the harness's CT-preamble **structural shape** — for CT watches a
+  line must carry the bracketed identity label (`[You are @…]` / `[Your identity:…]`)
+  AND the bracketed session label (`[Conversation log:…]`), not bare substrings.
+  Verified both header builders (`buildSlimHeader`, `prependContextHeader`) emit
+  these labels, so message-1 / resume recognition is preserved. Helpers
+  `line_has_ct_identity_bracket` / `line_has_ct_session_bracket` replace
+  `line_has_any_session_token`.
+- **Regression tests (lib 58 → 60):** `g_bare_quote_with_handle_and_expected_session_does_not_cross_wire`
+  (reproduces the blocked case → now rejected) and `full_header_identity_form_is_recognized`
+  (guards the full-header `[Your identity:…]` form against a liveness regression).
+  Updated the two `f_*` reader tests to use realistic bracketed preamble content.
+- **Residual narrowed (documented; planner follow-up):** only a record quoting a
+  *complete* preamble block (both bracket labels present) can still slip the byte
+  gate; empirically non-firing (per-task re-injection keeps the real preamble
+  latest). Robust close = role/schema-aware JSON parsing — a justified small
+  scope adjustment flagged upward to the planner, since a cheap `role == "user"`
+  check is insufficient (a `tool_result` is itself a `role:user` record).
+- **Report-stat staleness (codex3/claude2 minor):** the Validation section above
+  now carries current totals + round history.
+
+Post-round-2 validation: `cargo build && cargo test` → **60 lib + 4 + 1 passed,
+0 failed**; no auto-fix needed; only the 9 pre-existing dead-code warnings.
 
 ## Scope-discipline self-check
 - [x] No new interfaces / files outside hints (helper fns are inline in the same `adapters/mod.rs`)
