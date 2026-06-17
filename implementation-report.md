@@ -57,6 +57,35 @@ Build emits the same 9 pre-existing warnings present at baseline (unrelated `Gat
 - **Early-out cap** = 8 MiB (vs the plan's "a few MB"): comfortably exceeds the empirically-observed ≤~600 KiB EOF-to-marker distances while bounding the no-preamble per-poll cost; residual gap documented on `MARKER_BACKWARD_SCAN_CAP_BYTES` and exercised by tests (c)/(f).
 - **Empty `collab_session_id`** selects legacy handle-only matching (future non-CT/manual watch), per in-scope #3.
 
+## Peer-review reflection (round 2)
+
+Five peer agents reviewed the implementation at `f34b30e`. Two (@codex3, @claude3)
+independently found a **blocking** defect; three (@codex1, @claude2, @codex2)
+approved behaviorally. I verified every finding against the code and reflected
+the warranted fixes (synthesis: `session-32482/task-56-feedback-synthesis-claude1.md`).
+
+- **BLOCKING — needle-presence ≠ preamble-turn (fixed, `20221f8`).** The
+  latest-preamble walk treated any line *containing* `You are @` as authoritative
+  and validated only that line. Later incidental occurrences (assistant text about
+  the harness, code/diff attachments, doc placeholders, a bare `You are @`)
+  shadowed the real current-launch preamble → with CT fallback permanently off,
+  the mirror safe-spun forever. Fix: accept a line only if **well-formed**
+  (parseable handle AND, for CT watches, a generic session-path token) and **keep
+  walking** past mere-substring lines; apply latest-authority over the filtered
+  set. New helpers `line_is_wellformed_preamble` / `line_has_any_session_token`.
+- **Test blind spot (fixed).** Added `g_incidental_needle_after_preamble_does_not_shadow`
+  and `g_foreign_wellformed_preamble_after_expected_rejects` (lib tests now 58).
+- **Cargo.lock drift (fixed, `28cb99e`).** Pre-existing base drift (dev Cargo.toml
+  0.5.10 vs committed lock 0.5.6); committed the regenerated lock so the worktree
+  is clean. Behavior-neutral, outside the planner item set.
+- **Residual (documented in code, not fixed):** a crafted single physical line
+  carrying both a foreign handle and a session-path token can still mis-classify;
+  the fully-robust fix is role-aware parsing, which the plan kept out of this
+  byte-oriented helper. Candidate follow-up planner item.
+
+Post-reflection validation: `cargo build && cargo test` → **58 lib + 4 + 1 passed,
+0 failed**; auto-fix 1/3; only the 9 pre-existing dead-code warnings.
+
 ## Scope-discipline self-check
 - [x] No new interfaces / files outside hints (helper fns are inline in the same `adapters/mod.rs`)
 - [x] No renames of committed public names
