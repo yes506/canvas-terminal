@@ -71,6 +71,7 @@ impl TranscriptAdapter for CodexAdapter {
         _spawned_at_unix_ms: i64,
         claimed_paths: &std::collections::HashSet<std::path::PathBuf>,
         allow_unmarked_fallback: bool,
+        collab_session_id: &str,
     ) -> Result<TranscriptHandle, DiscoveryError> {
         // Cycle E: lsof-based discovery never sees Codex's rollout JSONL
         // (open-append-close per turn — same behavior as Claude Code 2.1.x).
@@ -121,6 +122,7 @@ impl TranscriptAdapter for CodexAdapter {
             },
             claimed_paths,
             allow_unmarked_fallback,
+            collab_session_id,
         )
     }
 
