@@ -837,3 +837,61 @@ where
 
     Err(DiscoveryError::NoMatchingFd)
 }
+
+#[cfg(test)]
+mod marker_tests {
+    //! Plan N20 (Defense-2A): identity-marker detection is what binds an agent
+    //! to ITS OWN transcript among same-cwd siblings. The word-boundary check
+    //! is load-bearing — without it `claude1` would falsely match `claude11`.
+    use super::transcript_has_identity_marker;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn write_temp(tag: &str, content: &str) -> PathBuf {
+        // Unique per (process, tag) so parallel test threads don't collide.
+        let p = std::env::temp_dir().join(format!("ct-{}-{}.jsonl", std::process::id(), tag));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        p
+    }
+
+    #[test]
+    fn detects_identity_marker() {
+        let p = write_temp("detect", "{\"text\":\"[You are @claude1]\"}\n");
+        assert!(transcript_has_identity_marker(&p, "claude1"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn word_boundary_prevents_prefix_match() {
+        // claude1 must NOT match a transcript that belongs to claude11.
+        let p = write_temp("boundary", "{\"text\":\"[You are @claude11]\"}\n");
+        assert!(!transcript_has_identity_marker(&p, "claude1"));
+        assert!(transcript_has_identity_marker(&p, "claude11"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn absent_marker_returns_false() {
+        let p = write_temp("absent", "{\"text\":\"hello world, no marker here\"}\n");
+        assert!(!transcript_has_identity_marker(&p, "claude1"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn missing_file_returns_false() {
+        let p = std::env::temp_dir().join(format!(
+            "ct-{}-does-not-exist-xyz.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        assert!(!transcript_has_identity_marker(&p, "claude1"));
+    }
+
+    #[test]
+    fn empty_handle_returns_false() {
+        let p = write_temp("emptyhandle", "{\"text\":\"You are @\"}\n");
+        assert!(!transcript_has_identity_marker(&p, ""));
+        let _ = std::fs::remove_file(&p);
+    }
+}

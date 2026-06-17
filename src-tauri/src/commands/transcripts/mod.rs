@@ -1691,3 +1691,27 @@ pub fn watch_transcript(
 pub fn unwatch_transcript(state: tauri::State<'_, TranscriptWatcher>, token: u64) {
     state.unwatch(WatchToken(token));
 }
+
+#[cfg(test)]
+mod sanitize_tests {
+    //! Plan N20: the sanitize contract is a SINGLE shared rule across the Rust
+    //! writer and the TS reader (`peerContext.ts::sanitizeCollabSessionId`).
+    //! These assertions mirror `src/lib/peerContext.test.ts` so the two never
+    //! drift (a drift would make the agent's grep path diverge from the write
+    //! path → collaboration deadlock).
+    use super::sanitize_collab_session_id;
+
+    #[test]
+    fn keeps_allowed_drops_others() {
+        assert_eq!(sanitize_collab_session_id("session-1-123"), "session-1-123");
+        assert_eq!(sanitize_collab_session_id("a/b\\c..d e"), "abcde");
+        assert_eq!(sanitize_collab_session_id("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_collab_session_id("foo_bar-9"), "foo_bar-9");
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let once = sanitize_collab_session_id("we!rd/id");
+        assert_eq!(sanitize_collab_session_id(&once), once);
+    }
+}
