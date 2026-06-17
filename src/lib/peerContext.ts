@@ -21,6 +21,28 @@ import {
 } from "../stores/collaboratorStore";
 
 // ---------------------------------------------------------------------------
+// Session-scope path helper
+// ---------------------------------------------------------------------------
+//
+// Peer-context mirror files live under `contexts/<collabSessionId>/<agent>.jsonl`
+// so two collab sessions that each spawn a `claude1` never collide on one
+// file. The collabSessionId must be sanitized to a single safe path segment
+// using the SAME rule the Rust writer applies
+// (`transcripts/mod.rs::sanitize_collab_session_id`): retain only
+// `[A-Za-z0-9_-]`, drop everything else. Reader (here) and writer (Rust) MUST
+// agree, or the agent's grep path diverges from the on-disk write path and the
+// collaboration deadlocks (plan "sanitize contract").
+
+/**
+ * Sanitize a collab session id into a single path segment. Mirror of the Rust
+ * `sanitize_collab_session_id`. In practice ids are `session-<n>-<ts>` so this
+ * is a no-op; it exists as defense-in-depth so reader/writer never drift.
+ */
+export function sanitizeCollabSessionId(raw: string): string {
+  return raw.replace(/[^A-Za-z0-9_-]/g, "");
+}
+
+// ---------------------------------------------------------------------------
 // Cluster F — reservation API
 // ---------------------------------------------------------------------------
 //
@@ -239,9 +261,10 @@ function parseJsonlNormalizedTurns(text: string): NormalizedTurn[] {
  * no prefix arg; the conditional check is implemented client-side by
  * filtering the full file list. No new IPC needed.
  *
- * Returns: `Promise<boolean>` — true iff any file under `contexts/`
- * (i.e. `contexts/<agent>.jsonl` or any archive) exists in the current
- * session's memory dir. PeerContextPanel binds this to its visibility
+ * Returns: `Promise<boolean>` — true iff any file under
+ * `contexts/<collabSessionId>/` (i.e. `contexts/<collabSessionId>/<agent>.jsonl`
+ * or any archive) exists in the current session's memory dir. PeerContextPanel
+ * binds this to its visibility
  * indicator; `prependContextHeader` uses it to conditionally inject the
  * breadcrumb (matching the existing `context.md` conditional pattern).
  *
@@ -259,14 +282,28 @@ function parseJsonlNormalizedTurns(text: string): NormalizedTurn[] {
  * Lifecycle: called from `prependContextHeader` before each header
  * assembly; from `PeerContextPanel` to decide whether to render at all.
  *
+ * Inputs: `collabSessionId` — scopes the check to THIS session's subdir.
+ * `null` returns `false` (no session → nothing to surface). Without the
+ * session segment a bare `startsWith("contexts/")` would cross-session
+ * over-report any other session's mirror files, since `list_memory_files`
+ * walks the memory dir recursively (plan N13/N14, claude3 finding).
+ *
  * Test contract: empty session returns `false`; presence of
- * `contexts/<agent>.jsonl` returns `true`; presence of only
- * `contexts/<agent>.1.jsonl` (archive without active) still returns `true`.
+ * `contexts/<session>/<agent>.jsonl` returns `true`; presence of only
+ * `contexts/<session>/<agent>.1.jsonl` (archive without active) still returns
+ * `true`; a DIFFERENT session's `contexts/<other>/<agent>.jsonl` returns
+ * `false`.
  */
-export async function hasContextsBreadcrumb(): Promise<boolean> {
+export async function hasContextsBreadcrumb(
+  collabSessionId: string | null,
+): Promise<boolean> {
+  if (!collabSessionId) return false;
+  const scope = sanitizeCollabSessionId(collabSessionId);
+  if (scope.length === 0) return false;
+  const prefix = `contexts/${scope}/`;
   try {
     const files = await invoke<string[]>("list_memory_files");
-    return files.some((f) => f.startsWith("contexts/"));
+    return files.some((f) => f.startsWith(prefix));
   } catch {
     return false;
   }
@@ -275,8 +312,9 @@ export async function hasContextsBreadcrumb(): Promise<boolean> {
 /**
  * Load the active mirror file for a peer agent.
  *
- * Per Q3: this is a single `read_memory_file('contexts/<agent>.jsonl')`
- * call; the file is ≤ 8 MB by rotation cap (well under 10 MB read cap).
+ * Per Q3: this is a single
+ * `read_memory_file('contexts/<collabSessionId>/<agent>.jsonl')` call; the file
+ * is ≤ 8 MB by rotation cap (well under 10 MB read cap).
  *
  * Inputs: `agentHandle` — bare handle, e.g. "claude3".
  *
@@ -304,8 +342,10 @@ export async function hasContextsBreadcrumb(): Promise<boolean> {
  */
 export async function loadActive(
   agentHandle: string,
+  collabSessionId: string,
 ): Promise<NormalizedTurn[]> {
-  const relative = `contexts/${agentHandle}.jsonl`;
+  const scope = sanitizeCollabSessionId(collabSessionId);
+  const relative = `contexts/${scope}/${agentHandle}.jsonl`;
   const text = await invoke<string | null>("read_memory_file", {
     relativePath: relative,
   });
@@ -316,7 +356,8 @@ export async function loadActive(
 }
 
 /**
- * Load the most-recent rolled archive (`contexts/<agent>.<N>.jsonl`).
+ * Load the most-recent rolled archive
+ * (`contexts/<collabSessionId>/<agent>.<N>.jsonl`).
  *
  * Inputs: `agentHandle`, `archiveN` — the integer N selected by
  * `listArchives()`.
@@ -341,8 +382,10 @@ export async function loadActive(
 export async function loadLastArchive(
   agentHandle: string,
   archiveN: number,
+  collabSessionId: string,
 ): Promise<NormalizedTurn[]> {
-  const relative = `contexts/${agentHandle}.${archiveN}.jsonl`;
+  const scope = sanitizeCollabSessionId(collabSessionId);
+  const relative = `contexts/${scope}/${agentHandle}.${archiveN}.jsonl`;
   const text = await invoke<string | null>("read_memory_file", {
     relativePath: relative,
   });
@@ -367,7 +410,8 @@ export async function loadLastArchive(
  * Side effects: one `list_memory_files` IPC call.
  *
  * Invariants: parsed N values match the file-name regex
- * `^contexts/<agentHandle>\.(\d+)\.jsonl$`; ignores malformed names.
+ * `^contexts/<collabSessionId>/<agentHandle>\.(\d+)\.jsonl$`; ignores malformed
+ * names.
  *
  * Concurrency: idempotent.
  *
@@ -378,7 +422,10 @@ export async function loadLastArchive(
  * Test contract: `[1, 2, 5]` is returned for archives 1, 2, 5 present —
  * gaps preserved. Sibling agents' archives are NOT returned.
  */
-export async function listArchives(agentHandle: string): Promise<number[]> {
+export async function listArchives(
+  agentHandle: string,
+  collabSessionId: string,
+): Promise<number[]> {
   let files: string[];
   try {
     files = await invoke<string[]>("list_memory_files");
@@ -389,7 +436,14 @@ export async function listArchives(agentHandle: string): Promise<number[]> {
   // backslash-and-dot characters that could appear in an agent handle
   // (in practice handles are `[a-z]+\d+` so this is defensive).
   const escapedHandle = agentHandle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`^contexts/${escapedHandle}\\.(\\d+)\\.jsonl$`);
+  // Include the session segment so this only matches THIS session's archives —
+  // `list_memory_files` walks recursively, so an un-scoped pattern would both
+  // miss the now-nested files AND risk cross-session matches (plan N13).
+  const scope = sanitizeCollabSessionId(collabSessionId);
+  const escapedScope = scope.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `^contexts/${escapedScope}/${escapedHandle}\\.(\\d+)\\.jsonl$`,
+  );
   const indices: number[] = [];
   for (const f of files) {
     const m = f.match(pattern);
@@ -433,12 +487,13 @@ export async function listArchives(agentHandle: string): Promise<number[]> {
  */
 export async function loadSnapshot(
   agentHandle: string,
+  collabSessionId: string,
 ): Promise<PeerContextSnapshot> {
-  const indices = await listArchives(agentHandle);
-  const activePromise = loadActive(agentHandle);
+  const indices = await listArchives(agentHandle, collabSessionId);
+  const activePromise = loadActive(agentHandle, collabSessionId);
   const lastArchivePromise =
     indices.length > 0
-      ? loadLastArchive(agentHandle, indices[indices.length - 1])
+      ? loadLastArchive(agentHandle, indices[indices.length - 1], collabSessionId)
       : Promise.resolve<NormalizedTurn[]>([]);
 
   // Errors from either read (schema-version, IPC) propagate. Q3 contract:

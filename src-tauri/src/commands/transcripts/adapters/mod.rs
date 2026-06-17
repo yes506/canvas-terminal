@@ -9,9 +9,63 @@
 // Per the X3 narrowing, transcript adapters here ship only for tools
 // already registered in `ToolId` / `TOOL_CONFIGS`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::{DiscoveryError, TranscriptAdapter, TranscriptHandle};
+
+/// Cap on bytes read from a candidate transcript when checking for the
+/// `You are @<handle>` identity marker (Defense-2A). The marker is injected
+/// into the agent's FIRST turn (the context preamble), so it sits at the very
+/// top of the file — 256 KiB is far more than enough while bounding IO.
+const MARKER_SCAN_CAP_BYTES: u64 = 256 * 1024;
+
+/// Whether `path`'s leading bytes contain the CT-injected identity marker
+/// `You are @<agent_handle>` (Defense-2A, plan N5). The marker comes from the
+/// collaborator harness's per-agent context preamble (`[You are @claude1]` /
+/// `[Your identity: You are @claude1. ...]`), so a transcript that carries it
+/// definitively belongs to THIS agent — disambiguating same-cwd, same-tool
+/// siblings whose mtimes would otherwise be indistinguishable.
+///
+/// A trailing word-boundary check prevents `@claude1` from matching
+/// `@claude11`. Reads at most `MARKER_SCAN_CAP_BYTES`. Any IO error → `false`
+/// (treat as "no marker": the strict-mode caller retries, the fallback-mode
+/// caller still has the newest-unclaimed path).
+fn transcript_has_identity_marker(path: &Path, agent_handle: &str) -> bool {
+    use std::io::Read;
+
+    if agent_handle.is_empty() {
+        return false;
+    }
+    let needle = format!("You are @{}", agent_handle);
+    let needle_b = needle.as_bytes();
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = Vec::new();
+    if file
+        .take(MARKER_SCAN_CAP_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return false;
+    }
+
+    buf.windows(needle_b.len()).enumerate().any(|(i, w)| {
+        if w != needle_b {
+            return false;
+        }
+        // Word-boundary: the char after the handle must not extend it
+        // (so `@claude1` does not match `@claude10`). End-of-buffer counts
+        // as a boundary.
+        match buf.get(i + needle_b.len()) {
+            None => true,
+            Some(c) => !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-'),
+        }
+    })
+}
 
 pub mod claude_code;
 pub mod codex;
@@ -314,6 +368,10 @@ where
         source_inode,
         pid,
         memory_dir,
+        // Watcher-owned: adapters never set this. `populate_entry` overwrites
+        // the empty placeholder with the sanitized collab_session_id from the
+        // IPC (plan N4/N6).
+        collab_session_id: String::new(),
     })
 }
 
@@ -616,11 +674,18 @@ fn parse_ps_etime(s: &str) -> Option<u64> {
 ///
 /// Algorithm: resolve `pid`'s start time via `discover_pid_start_time` to
 /// produce an authoritative threshold (no slack — process start time is
-/// definitive). Then `read_dir` every root in turn, filter entries by
-/// `predicate(path) && mtime >= threshold`, and keep the entry with the
-/// maximum mtime across all roots. If a candidate exists, build the
-/// `TranscriptHandle` (via `fs_gate` + `lstat` + `memory_dir`) and return.
-/// Otherwise `DiscoveryError::NoMatchingFd`.
+/// definitive). Then `read_dir` every root, collecting entries that satisfy
+/// `predicate(path) && mtime >= threshold` AND are not in `claimed_paths`
+/// (Defense-2B — excludes transcripts already bound to other live handles,
+/// canonical compare). Among the unclaimed candidates, prefer the newest one
+/// carrying the `You are @<agent_handle>` identity marker (Defense-2A); if
+/// none is marked, return `NoMatchingFd` in strict mode
+/// (`allow_unmarked_fallback == false`) so the loop retries, or fall back to
+/// the newest unclaimed candidate with a warning when the marker-wait budget
+/// is exhausted (`allow_unmarked_fallback == true`, N19). On a chosen
+/// candidate, build the `TranscriptHandle` (via `fs_gate` + `lstat` +
+/// `memory_dir`, `collab_session_id` left empty for the watcher to fill) and
+/// return. Otherwise `DiscoveryError::NoMatchingFd`.
 ///
 /// Single-shot scan — the retry-until-unwatch loop has moved up one layer
 /// into `TranscriptWatcher::watch`'s async task (cycle F F6). Cycle E's
@@ -642,6 +707,8 @@ pub(super) fn discover_by_mtime<F>(
     scan_roots: &[PathBuf],
     pid: i32,
     predicate: F,
+    claimed_paths: &HashSet<PathBuf>,
+    allow_unmarked_fallback: bool,
 ) -> Result<TranscriptHandle, DiscoveryError>
 where
     F: Fn(&Path) -> bool,
@@ -662,8 +729,13 @@ where
     let threshold_ms = start_unix_secs.saturating_mul(1000).max(0);
     let threshold = UNIX_EPOCH + Duration::from_millis(threshold_ms as u64);
 
-    let mut best: Option<(PathBuf, SystemTime)> = None;
-
+    // Collect every candidate at-or-after the threshold, EXCLUDING any whose
+    // path is already bound to another live handle (Defense-2B). The claimed
+    // set holds fs_gate-canonical paths, so we compare against both the raw
+    // entry path and its canonical form (a candidate and a claimed handle can
+    // reach the same file via different aliases — plan N17 canonical-compare
+    // constraint applied at the discovery boundary too).
+    let mut candidates: Vec<(PathBuf, SystemTime)> = Vec::new();
     for root in scan_roots {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
@@ -685,17 +757,56 @@ where
             if mtime < threshold {
                 continue;
             }
-            match &best {
-                None => best = Some((path, mtime)),
-                Some((_, current_mtime)) if mtime > *current_mtime => {
-                    best = Some((path, mtime));
-                }
-                _ => {}
+            // Defense-2B: skip paths already claimed by another live handle.
+            let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if claimed_paths.contains(&canon) || claimed_paths.contains(&path) {
+                continue;
             }
+            candidates.push((path, mtime));
         }
     }
 
-    if let Some((candidate, _)) = best {
+    // Defense-2A: prefer the candidate carrying the `You are @<handle>`
+    // identity marker; among marker-matched candidates pick the newest mtime.
+    // This binds an agent to ITS OWN transcript even if a same-cwd sibling's
+    // file is momentarily newer.
+    let newest_marked = candidates
+        .iter()
+        .filter(|(p, _)| transcript_has_identity_marker(p, agent_handle))
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(p, _)| p.clone());
+
+    let chosen: Option<PathBuf> = match newest_marked {
+        Some(p) => Some(p),
+        None => {
+            if allow_unmarked_fallback {
+                // N19 termination: marker-wait budget exhausted. Fall back to
+                // the newest unclaimed candidate so a tool that never writes
+                // the marker (e.g. codex's rollout has no CT-injected identity
+                // line) still binds. Double-binding is still prevented by 2B
+                // (claimed exclusion above) + N17 (populate-time recheck).
+                let fallback = candidates
+                    .iter()
+                    .max_by_key(|(_, mtime)| *mtime)
+                    .map(|(p, _)| p.clone());
+                if let Some(p) = &fallback {
+                    eprintln!(
+                        "transcripts: no identity marker found for {} after marker-wait \
+                         budget; falling back to newest unclaimed candidate {:?} (N19)",
+                        agent_handle, p
+                    );
+                }
+                fallback
+            } else {
+                // Strict mode: no marked candidate yet. Return NoMatchingFd so
+                // the discovery loop retries — the agent's first marked turn
+                // may not have flushed to disk yet.
+                None
+            }
+        }
+    };
+
+    if let Some(candidate) = chosen {
         // Run the same fs_gate + lstat + memory_dir wiring as
         // discover_handle. Inlined here so this primitive stays
         // independent of the legacy helper (now dead code since cycle E).
@@ -719,8 +830,68 @@ where
             // existing Tailer / fs_gate diagnostic logging).
             pid,
             memory_dir,
+            // Watcher-owned: filled by `populate_entry`, never here (plan N6).
+            collab_session_id: String::new(),
         });
     }
 
     Err(DiscoveryError::NoMatchingFd)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    //! Plan N20 (Defense-2A): identity-marker detection is what binds an agent
+    //! to ITS OWN transcript among same-cwd siblings. The word-boundary check
+    //! is load-bearing — without it `claude1` would falsely match `claude11`.
+    use super::transcript_has_identity_marker;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn write_temp(tag: &str, content: &str) -> PathBuf {
+        // Unique per (process, tag) so parallel test threads don't collide.
+        let p = std::env::temp_dir().join(format!("ct-{}-{}.jsonl", std::process::id(), tag));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        p
+    }
+
+    #[test]
+    fn detects_identity_marker() {
+        let p = write_temp("detect", "{\"text\":\"[You are @claude1]\"}\n");
+        assert!(transcript_has_identity_marker(&p, "claude1"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn word_boundary_prevents_prefix_match() {
+        // claude1 must NOT match a transcript that belongs to claude11.
+        let p = write_temp("boundary", "{\"text\":\"[You are @claude11]\"}\n");
+        assert!(!transcript_has_identity_marker(&p, "claude1"));
+        assert!(transcript_has_identity_marker(&p, "claude11"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn absent_marker_returns_false() {
+        let p = write_temp("absent", "{\"text\":\"hello world, no marker here\"}\n");
+        assert!(!transcript_has_identity_marker(&p, "claude1"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn missing_file_returns_false() {
+        let p = std::env::temp_dir().join(format!(
+            "ct-{}-does-not-exist-xyz.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        assert!(!transcript_has_identity_marker(&p, "claude1"));
+    }
+
+    #[test]
+    fn empty_handle_returns_false() {
+        let p = write_temp("emptyhandle", "{\"text\":\"You are @\"}\n");
+        assert!(!transcript_has_identity_marker(&p, ""));
+        let _ = std::fs::remove_file(&p);
+    }
 }

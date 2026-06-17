@@ -22,8 +22,10 @@ Per collaborator session, the harness creates a directory under
 - `tasks-*.md` — current task definitions. Read-only for agents.
 - `context.md` — optional shared context written by the user via
   `/context <text>` from the collaborator command line.
-- `contexts/<agent>.jsonl` — per-agent transcript mirror, written
-  continuously by the peer-context-mirror watcher (cycle-F always-on).
+- `contexts/<collab-session-id>/<agent>.jsonl` — per-agent transcript
+  mirror, written continuously by the peer-context-mirror watcher
+  (cycle-F always-on). Namespaced by collab session so two sessions'
+  identically-named agents (e.g. `claude1`) never collide on one file.
 - `task-<id>-*.md` — per-agent peer reports / handoffs.
 - `<task-id>.done.json` — completion signal written by the assigned
   agent. The harness picks these up, updates the task list, and
@@ -37,7 +39,8 @@ Per collaborator session, the harness creates a directory under
 2. **Discover peer context on demand** — when information needed to
    advance a task is not in the current message, conversation log, or
    `context.md`, search the per-session peer-context store
-   (`contexts/*.jsonl` and other agents' `task-*-*.md` files) using
+   (`contexts/<collab-session-id>/*.jsonl` and other agents'
+   `task-*-*.md` files) using
    **targeted grep — not exhaustive reads**. If targeted search
    doesn't surface the missing info, surface the gap to the user
    rather than crawl wider.

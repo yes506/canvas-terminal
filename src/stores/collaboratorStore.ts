@@ -10,7 +10,7 @@ import type {
 } from "../types/collaborator";
 import { TOOL_CONFIGS } from "../types/collaborator";
 import { muteCapture } from "../lib/agentOutputCapture";
-import { hasContextsBreadcrumb } from "../lib/peerContext";
+import { hasContextsBreadcrumb, sanitizeCollabSessionId } from "../lib/peerContext";
 import { useTerminalStore } from "./terminalStore";
 
 // ---------------------------------------------------------------------------
@@ -415,14 +415,25 @@ export function _isRenamePendingForTests(sessionId: string): boolean {
 // Task protocol — injected into every agent prompt
 // ---------------------------------------------------------------------------
 
-const TASK_PROTOCOL = `
+/**
+ * Build the task-protocol block injected into every agent's FIRST message.
+ *
+ * `peerContextGlob` is the session-scoped grep target for Rule 2 — it MUST
+ * match the path the Rust writer mirrors into
+ * (`contexts/<collabSessionId>/*.jsonl`) and the `[Peer contexts: …]`
+ * breadcrumb, or the agent greps an empty/foreign directory and the
+ * collaboration deadlocks on a missing-info gap that is actually present
+ * (plan N18, load-bearing — this text is injected on every first send).
+ */
+function buildTaskProtocol(peerContextGlob: string): string {
+  return `
 ## Agent Task Protocol
 
 You are a participant in a multi-agent collaboration.
 
 ### Rules
 1. **Read before acting**: Read the conversation log and \`context.md\` (if present) in the shared memory directory to understand prior context and other agents' work.
-2. **Discover peer context on demand**: When information needed to advance a task is not in the current message, conversation log, or \`context.md\`, search the per-session peer-context store (\`contexts/*.jsonl\` and other agents' \`task-*-*.md\` files) using **targeted grep — not exhaustive reads**. If targeted search doesn't surface the missing info, surface the gap to the user rather than crawl wider.
+2. **Discover peer context on demand**: When information needed to advance a task is not in the current message, conversation log, or \`context.md\`, search the per-session peer-context store (\`${peerContextGlob}\` and other agents' \`task-*-*.md\` files) using **targeted grep — not exhaustive reads**. If targeted search doesn't surface the missing info, surface the gap to the user rather than crawl wider.
 3. **Be self-contained**: Include enough detail that any other agent can understand what you did.
 4. **Reference by task ID** (e.g. "task-1-...").
 5. **Signal blockers**: State the blocking task ID and what you need. Try Rule 2 first before declaring blocked on a missing-info gap.
@@ -449,6 +460,7 @@ Replace \`SHARED_MEMORY_DIR\` with the path shown above, \`TASK_ID\` with your a
 - \`context.md\` — Shared context (if present).
 - Shared memory directory — Write files here to share artifacts with other agents.
 `.trim();
+}
 
 /**
  * Format tasks array into a markdown document for shared memory.
@@ -1082,14 +1094,28 @@ async function prependContextHeader(
     // No context file
   }
 
+  // Session-scoped peer-context paths (N16/N18). The breadcrumb and the
+  // TASK_PROTOCOL Rule-2 grep target must BOTH point at the same session
+  // subdir the Rust writer mirrors into — `contexts/<collabSessionId>/` — or
+  // the agent greps an empty/foreign path and collaboration deadlocks.
+  const contextsScope = collabSessionId
+    ? sanitizeCollabSessionId(collabSessionId)
+    : null;
+  const peerContextsDir = contextsScope
+    ? `${dir}/contexts/${contextsScope}/`
+    : `${dir}/contexts/`;
+  const peerContextsGlob = contextsScope
+    ? `contexts/${contextsScope}/*.jsonl`
+    : `contexts/*.jsonl`;
+
   // Peer-context-mirror breadcrumb (Q3-A wording): mirrors the
-  // context.md conditional above. Surfaces the contexts/ directory
-  // only when at least one peer agent is actively publishing — the
-  // agent can enumerate via list_memory_files. hasContextsBreadcrumb
+  // context.md conditional above. Surfaces the session-scoped contexts/
+  // directory only when this session has at least one peer mirror file —
+  // the agent can enumerate via list_memory_files. hasContextsBreadcrumb
   // already silent-falses on IPC failure (see peerContext.ts).
   try {
-    if (await hasContextsBreadcrumb()) {
-      parts.push(`[Peer contexts: ${dir}/contexts/]`);
+    if (await hasContextsBreadcrumb(collabSessionId)) {
+      parts.push(`[Peer contexts: ${peerContextsDir}]`);
     }
   } catch {
     // No peer contexts available
@@ -1114,7 +1140,7 @@ async function prependContextHeader(
   }
 
   // Inject task protocol and active task summary
-  parts.push(TASK_PROTOCOL);
+  parts.push(buildTaskProtocol(peerContextsGlob));
   const taskSummary = formatTaskSummaryForAgent(tasks, agentIdentity ?? null);
   if (taskSummary) parts.push(taskSummary);
 

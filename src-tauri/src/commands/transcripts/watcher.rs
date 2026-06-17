@@ -285,6 +285,7 @@ pub fn on_fs_event(subscription: &Subscription, event_path: &PathBuf) {
                 source_inode: handle_ref.source_inode,
                 pid: handle_ref.pid,
                 memory_dir: handle_ref.memory_dir.clone(),
+                collab_session_id: handle_ref.collab_session_id.clone(),
             },
             tail_state_ref.byte_offset,
             tail_state_ref.last_normalized_turn_index,
