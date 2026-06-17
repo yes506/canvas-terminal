@@ -45,6 +45,7 @@ impl TranscriptAdapter for FixtureAdapter {
         _spawned_at_unix_ms: i64,
         _claimed_paths: &std::collections::HashSet<std::path::PathBuf>,
         _allow_unmarked_fallback: bool,
+        _collab_session_id: &str,
     ) -> Result<TranscriptHandle, DiscoveryError> {
         Err(DiscoveryError::NoMatchingFd)
     }

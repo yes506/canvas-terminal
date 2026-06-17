@@ -91,6 +91,7 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
         _spawned_at_unix_ms: i64,
         claimed_paths: &std::collections::HashSet<std::path::PathBuf>,
         allow_unmarked_fallback: bool,
+        collab_session_id: &str,
     ) -> Result<TranscriptHandle, DiscoveryError> {
         // Cycle E: Claude Code 2.1.x uses open-append-close per turn —
         // verified by lsof showing zero JSONL FDs across the agent PID and
@@ -127,6 +128,7 @@ impl TranscriptAdapter for ClaudeCodeAdapter {
             |p| p.extension().map_or(false, |e| e == "jsonl"),
             claimed_paths,
             allow_unmarked_fallback,
+            collab_session_id,
         )
     }
 
