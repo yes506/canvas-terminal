@@ -261,9 +261,10 @@ function parseJsonlNormalizedTurns(text: string): NormalizedTurn[] {
  * no prefix arg; the conditional check is implemented client-side by
  * filtering the full file list. No new IPC needed.
  *
- * Returns: `Promise<boolean>` — true iff any file under `contexts/`
- * (i.e. `contexts/<agent>.jsonl` or any archive) exists in the current
- * session's memory dir. PeerContextPanel binds this to its visibility
+ * Returns: `Promise<boolean>` — true iff any file under
+ * `contexts/<collabSessionId>/` (i.e. `contexts/<collabSessionId>/<agent>.jsonl`
+ * or any archive) exists in the current session's memory dir. PeerContextPanel
+ * binds this to its visibility
  * indicator; `prependContextHeader` uses it to conditionally inject the
  * breadcrumb (matching the existing `context.md` conditional pattern).
  *
@@ -311,8 +312,9 @@ export async function hasContextsBreadcrumb(
 /**
  * Load the active mirror file for a peer agent.
  *
- * Per Q3: this is a single `read_memory_file('contexts/<agent>.jsonl')`
- * call; the file is ≤ 8 MB by rotation cap (well under 10 MB read cap).
+ * Per Q3: this is a single
+ * `read_memory_file('contexts/<collabSessionId>/<agent>.jsonl')` call; the file
+ * is ≤ 8 MB by rotation cap (well under 10 MB read cap).
  *
  * Inputs: `agentHandle` — bare handle, e.g. "claude3".
  *
@@ -354,7 +356,8 @@ export async function loadActive(
 }
 
 /**
- * Load the most-recent rolled archive (`contexts/<agent>.<N>.jsonl`).
+ * Load the most-recent rolled archive
+ * (`contexts/<collabSessionId>/<agent>.<N>.jsonl`).
  *
  * Inputs: `agentHandle`, `archiveN` — the integer N selected by
  * `listArchives()`.
@@ -407,7 +410,8 @@ export async function loadLastArchive(
  * Side effects: one `list_memory_files` IPC call.
  *
  * Invariants: parsed N values match the file-name regex
- * `^contexts/<agentHandle>\.(\d+)\.jsonl$`; ignores malformed names.
+ * `^contexts/<collabSessionId>/<agentHandle>\.(\d+)\.jsonl$`; ignores malformed
+ * names.
  *
  * Concurrency: idempotent.
  *

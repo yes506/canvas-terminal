@@ -103,10 +103,25 @@ empirically re-verified against the tree before acting.
 | Stale truncation footer omits session segment (codex2, codex3, claude3 — Low) | TRUE — `renderTruncationFooter` showed flat path | Threaded `collabSessionId` into the footer; path now `contexts/<scope>/…`. |
 | TS doc-comment drift (claude2, claude3 — Low) | TRUE — `types/peerContext.ts` ×2 still flat | Updated comments to session-scoped path. |
 | `watch_transcript` effect lacks `!collabSessionId` guard (claude2 — Low) | Latent (hook returns non-empty `string`); cheap defense-in-depth | Added `|| !collabSessionId` to the effect guard with rationale. |
-| Dirty worktree: `Cargo.lock` 0.5.6→0.5.9 + untracked `target/` (all — non-blocking) | Pre-existing dev lock drift, not feature logic; `target` is the build-cache symlink | Reverted `Cargo.lock`; `target` symlink is gitignored-adjacent and never staged. |
+| Dirty worktree: `Cargo.lock` 0.5.6→0.5.9 + untracked `target/` (all — non-blocking) | Pre-existing **dev-branch** drift: committed `Cargo.lock` is 0.5.6 but `Cargo.toml` is 0.5.9 on dev, so **every** cargo invocation re-normalizes the lock — reverting does not stick. `target` is the build-cache symlink. | Left **uncommitted** (correct scope discipline — release/lockfile concern, not this feature; to be fixed on `dev` separately). The branch's 5 commits do NOT touch `Cargo.lock`, so the merge change-set is clean. The working tree re-dirties only because validation runs cargo. **Not claiming the working tree stays clean** — claiming the *merge* is clean. |
 | Defense-2A marker assumption for Claude (claude2, claude3 — value-add) | Confirmed VALID: real claude transcripts contain `You are @claudeN`; codex/gemini remain the plan's stated open question, covered by N19 fallback + 2B/N17 | No change needed (matches plan). |
 | N19 markerless residual / marker-forgery (codex1, claude3 — awareness) | Within plan's stated out-of-scope; 2B+N17 prevent double-binding regardless | No change (documented residual risk). |
 
 All fixes stay within implementer scope: test additions, one UI path-display
 fix, comment sync, and a defensive guard — no re-architecting, no signature
 changes to planner-committed methods.
+
+### Round 2 (task-12)
+
+Re-reviewed the updated draft (`72aec16..0b2eddf`). Verdicts: **2 APPROVE**
+(@claude2 "ship it", @claude3 "recommend merge") + 3 "no functional blocker".
+No new functional findings. Two Low doc/hygiene items, both addressed:
+
+| Finding (reviewers) | Verdict | Action |
+|---|---|---|
+| `src/lib/peerContext.ts` function docstrings still show flat `contexts/<agent>.jsonl` (codex2, codex3 — Low) | TRUE — N21 synced types + Rust but missed these 4 docstrings | Updated `hasContextsBreadcrumb`/`loadActive`/`loadLastArchive`/`listArchives` docstrings to `contexts/<collabSessionId>/…` |
+| `Cargo.lock` re-dirties despite report saying "reverted/clean" (codex1, codex2, codex3 — Low) | TRUE — cargo re-normalizes 0.5.6→0.5.9 every run; my revert can't stick | Corrected report language (above row) to claim a clean *merge change-set*, not a clean working tree; lock left uncommitted as a dev-branch concern. Reverted again immediately before the merge gate. |
+
+Multiple reviewers explicitly endorsed the decision to scope N17's dup-source
+rollback as review-verified-not-unit-tested (FSEvents dependency) rather than
+author a brittle fake test.
