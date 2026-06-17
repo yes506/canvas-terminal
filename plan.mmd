@@ -1,40 +1,15 @@
-graph LR
-  AgentMiniTerminal_invoke["AgentMiniTerminal_invoke"]
-  WatchTranscript_IPC["WatchTranscript_IPC"]
-  TranscriptWatcher_watch["TranscriptWatcher_watch"]
-  DiscoveryLoop["DiscoveryLoop"]
-  DiscoverSession["DiscoverSession"]
-  DiscoverByMtime["DiscoverByMtime"]
-  PopulateEntryRecheck["PopulateEntryRecheck"]
-  TranscriptHandle["TranscriptHandle"]
-  AppendNormalizedTurn["AppendNormalizedTurn"]
-  RotateIfNeeded["RotateIfNeeded"]
-  ScanArchiveIndices["ScanArchiveIndices"]
-  LoadActive["LoadActive"]
-  LoadLastArchive["LoadLastArchive"]
-  ListArchives["ListArchives"]
-  LoadSnapshot["LoadSnapshot"]
-  HasContextsBreadcrumb["HasContextsBreadcrumb"]
-  StoreBreadcrumb["StoreBreadcrumb"]
-  ProtocolText["ProtocolText"]
-  PeerContextPanel["PeerContextPanel"]
-  AgentMiniTerminal_invoke --> WatchTranscript_IPC
-  WatchTranscript_IPC --> TranscriptWatcher_watch
-  TranscriptWatcher_watch --> DiscoveryLoop
-  DiscoveryLoop --> DiscoverSession
-  DiscoverSession --> DiscoverByMtime
-  DiscoverByMtime --> PopulateEntryRecheck
-  PopulateEntryRecheck --> TranscriptHandle
-  TranscriptHandle --> AppendNormalizedTurn
-  TranscriptHandle --> RotateIfNeeded
-  TranscriptHandle --> ScanArchiveIndices
-  AppendNormalizedTurn --> LoadActive
-  AppendNormalizedTurn --> HasContextsBreadcrumb
-  AppendNormalizedTurn --> StoreBreadcrumb
-  AppendNormalizedTurn --> ProtocolText
-  RotateIfNeeded --> LoadLastArchive
-  ScanArchiveIndices --> ListArchives
-  LoadActive --> LoadSnapshot
-  LoadLastArchive --> LoadSnapshot
-  ListArchives --> LoadSnapshot
-  LoadSnapshot --> PeerContextPanel
+graph TD
+    N1[N1 discovery_loop<br/>owns collab_session_id<br/>session-aware fallback gate] -->|collab_session_id: &str| N2[N2 trait discover_session<br/>+ borrowed session param]
+    N2 --> N3[N3 CodexAdapter::discover_session]
+    N2 --> N4[N4 ClaudeCodeAdapter::discover_session]
+    N2 --> N5[N5 GeminiAdapter::discover_session]
+    N3 -->|forward| N6[N6 discover_by_mtime<br/>scoped select + disabled fallback]
+    N4 -->|forward| N6
+    N5 -->|forward| N6
+    N6 --> N7[N7 transcript_has_identity_marker<br/>handle AND session; head+tail scan]
+    N1 -.sibling.-> N8[N8 populate_entry<br/>re-validate bound source]
+    N8 -.reuses scan helper.-> N7
+    N9[N9 stale-comment fixes] -.docs.-> N6
+    N10[N10 regression tests] -.verify.-> N6
+    N10 -.verify.-> N7
+    N10 -.verify.-> N8
