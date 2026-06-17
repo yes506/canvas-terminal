@@ -95,9 +95,10 @@ pub(super) fn transcript_has_identity_marker(
     }
 
     // Candidacy gate (peer-review fix): for a CT collab watch (non-empty
-    // expected session) a line counts as the latest preamble only if it is a
-    // WELL-FORMED CT preamble — a parseable handle AND a generic session-path
-    // token. For a non-CT/manual watch (empty expected session) we keep the
+    // expected session) a line counts as the latest preamble only if it has the
+    // harness's bracketed CT preamble shape (identity + conversation-log labels)
+    // AND is not an assistant/tool-result record that merely quotes preamble
+    // bytes. For a non-CT/manual watch (empty expected session) we keep the
     // legacy handle-only candidacy. See `find_latest_identity_preamble_line`.
     let require_session_token = !expected_collab_session_id.is_empty();
 
@@ -291,25 +292,35 @@ fn scan_tail_for_latest_preamble(
 ///   (emitted by both header builders whenever a collab session is set).
 ///
 /// A line like `… see contexts/session-18/claude2.jsonl which contains
-/// You are @claude2 …` (ordinary prose / a peer-grep `tool_result`) carries
-/// neither bracket label and is rejected, so it no longer shadows or cross-wires
-/// the real preamble. A non-CT/manual watch (`require_session_token == false`)
-/// keeps the looser handle-only candidacy.
+/// You are @claude2 …` (ordinary prose) carries neither bracket label and is
+/// rejected. A line that *does* quote both bracket labels but is an assistant
+/// turn or a `tool_result` record (e.g. a peer-mirror grep) is rejected by the
+/// record-kind guard (`line_is_quote_or_tool_record`). A non-CT/manual watch
+/// (`require_session_token == false`) keeps the looser handle-only candidacy but
+/// still applies the record-kind guard.
 ///
-/// **Residual (documented, follow-up planner item):** a single JSONL record that
-/// quotes a *complete* real preamble block — both bracket labels present, e.g. a
-/// `tool_result` from grepping a peer's transcript — still passes this byte-level
-/// shape gate. Empirically it does not fire (the harness re-injects the preamble
-/// on every task prompt, so the agent's own real preamble is the latest
-/// well-formed line; initial discovery runs at spawn/resume before any peer-grep
-/// activity). Fully closing it requires role/schema-aware JSON parsing (confirm a
-/// user record with no `tool_result` block and the preamble at text start) — a
-/// cheap `role == "user"` check is insufficient because a `tool_result` is itself
-/// a `role:user` record. The plan deliberately kept role-aware parsing out of
-/// this byte-oriented helper; closing the residual is a justified small scope
-/// adjustment to flag upward to the planner.
+/// **Residual (documented, follow-up planner item):** the record-kind guard
+/// closes every OBSERVED live carrier (round-3 evidence: Claude rollouts
+/// `082f1689`, `5886ee16` — assistant/`tool_result` quotes landing after the
+/// last real preamble). What remains is a CRAFTED record that quotes a complete
+/// preamble block while avoiding the `"role":"assistant"` / `"type":"tool_result"`
+/// / `"tool_use_id"` markers — not seen in practice. Fully closing that requires
+/// role/schema-aware JSON parsing (confirm a genuine user/first-turn launch
+/// record and match the preamble content-block shape, not bytes); a bare
+/// `role == "user"` include-check is insufficient because a `tool_result` is
+/// itself a `role:user` record (hence the EXCLUDE-on-markers approach here). The
+/// plan kept role-aware parsing out of this byte-oriented helper; the robust
+/// close is a justified small scope adjustment flagged upward to the planner.
 fn line_is_wellformed_preamble(line: &[u8], require_session_token: bool) -> bool {
     if parse_identity_preamble_handle(line).is_none() {
+        return false;
+    }
+    // Record-kind guard (round-3 peer-review fix): an assistant turn or a
+    // tool-result record that merely QUOTES preamble bytes (e.g. an agent
+    // grepping a peer's mirror) is never a real preamble. This closes the
+    // observed live complete-preamble-quote cross-wire that the bracket shape
+    // alone cannot (assistant/tool text can contain the exact bracket bytes).
+    if line_is_quote_or_tool_record(line) {
         return false;
     }
     if require_session_token
@@ -320,12 +331,34 @@ fn line_is_wellformed_preamble(line: &[u8], require_session_token: bool) -> bool
     true
 }
 
+/// Whether `line` is plainly NOT a real CT preamble record but an assistant turn
+/// or a tool-result record that merely quotes preamble bytes. Real CT preambles
+/// are user-role TEXT records injected by the harness and never carry these JSON
+/// record markers; the live residual carriers do (observed in Claude rollouts
+/// `082f1689`, `5886ee16` — assistant/`tool_result` turns quoting a peer's
+/// preamble that land after the agent's last real preamble). Byte-level, same
+/// class as the bracket checks (NOT a JSON parse). A false reject only ever
+/// degrades to a safe spin (liveness), never a wrong bind.
+///
+/// NOTE: this closes every OBSERVED live carrier; a crafted record that quotes a
+/// complete preamble while avoiding these exact JSON markers remains the
+/// documented residual whose robust close is role/schema-aware parsing (planner
+/// follow-up). A bare `role == "user"` include-check cannot substitute for this:
+/// a `tool_result` is itself a `role:user` record, so we EXCLUDE on the
+/// tool-result/assistant markers instead.
+fn line_is_quote_or_tool_record(line: &[u8]) -> bool {
+    contains_subslice(line, b"\"role\":\"assistant\"")
+        || contains_subslice(line, b"\"type\":\"tool_result\"")
+        || contains_subslice(line, b"\"tool_use_id\"")
+}
+
 /// Whether `line` carries the harness's bracketed CT identity label —
-/// `[You are @…]` (slim header) or `[Your identity: …]` (full header). Anchoring
-/// on the bracket (not the bare `You are @` substring) rejects ordinary prose
-/// that merely mentions a handle.
+/// `[You are @…]` (slim header) or `[Your identity: You are @…]` (full header).
+/// Requiring the `You are @` needle to sit INSIDE the bracket (co-located with
+/// `[Your identity: `, not merely somewhere on the line) rejects ordinary prose
+/// that mentions a handle separately from a stray `[Your identity:` token.
 fn line_has_ct_identity_bracket(line: &[u8]) -> bool {
-    contains_subslice(line, b"[You are @") || contains_subslice(line, b"[Your identity:")
+    contains_subslice(line, b"[You are @") || contains_subslice(line, b"[Your identity: You are @")
 }
 
 /// Whether `line` carries the harness's bracketed CT session label
@@ -1526,6 +1559,58 @@ mod marker_tests {
         let p = write_temp("full-header", c.as_bytes());
         assert!(transcript_has_identity_marker(&p, "claude1", "session-full"));
         assert!(!transcript_has_identity_marker(&p, "claude2", "session-full"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-3 peer-review regression (codex1 block; claude3 live evidence +
+    //    cheap fix): a record that quotes a COMPLETE foreign preamble block
+    //    (both bracket labels) but is an assistant turn or a tool_result must
+    //    NOT cross-bind. These are the observed live carriers (082f1689,
+    //    5886ee16) the record-kind guard now rejects.
+
+    #[test]
+    fn g_assistant_quote_of_complete_preamble_does_not_cross_wire() {
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-y"));
+        c.push('\n');
+        // Later ASSISTANT turn quoting a complete foreign preamble (both bracket
+        // labels + foreign handle + the EXPECTED session) — `"role":"assistant"`
+        // marks it a non-preamble record.
+        c.push_str(
+            "{\"role\":\"assistant\",\"content\":\"quoting peer: [You are @claude2] [Conversation log: /m/conversation-session-y.md]\"}\n",
+        );
+        let p = write_temp("g-assistant-quote", c.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-y"),
+            "an assistant turn quoting a complete preamble must not cross-bind"
+        );
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-y"),
+            "owner's real preamble must still bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn g_tool_result_quote_of_complete_preamble_does_not_cross_wire() {
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-z"));
+        c.push('\n');
+        // Later tool_result record (user-role!) carrying a grepped peer preamble —
+        // `"type":"tool_result"` / `"tool_use_id"` mark it a non-preamble even
+        // though its role is `user`.
+        c.push_str(
+            "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"[You are @claude2] [Conversation log: /m/conversation-session-z.md]\"}]}\n",
+        );
+        let p = write_temp("g-toolresult-quote", c.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-z"),
+            "a tool_result quoting a complete preamble must not cross-bind"
+        );
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-z"),
+            "owner's real preamble must still bind"
+        );
         let _ = std::fs::remove_file(&p);
     }
 }
