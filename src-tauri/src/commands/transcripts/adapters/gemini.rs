@@ -72,6 +72,7 @@ impl TranscriptAdapter for GeminiAdapter {
         _spawned_at_unix_ms: i64,
         claimed_paths: &std::collections::HashSet<std::path::PathBuf>,
         allow_unmarked_fallback: bool,
+        collab_session_id: &str,
     ) -> Result<TranscriptHandle, DiscoveryError> {
         // Cycle E: switch to mtime-based discovery (consistent with the
         // Claude / Codex rewrites). Gemini's project-slug encoding from cwd
@@ -126,6 +127,7 @@ impl TranscriptAdapter for GeminiAdapter {
             },
             claimed_paths,
             allow_unmarked_fallback,
+            collab_session_id,
         )
     }
 

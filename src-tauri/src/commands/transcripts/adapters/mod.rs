@@ -14,57 +14,470 @@ use std::path::{Path, PathBuf};
 
 use super::{DiscoveryError, TranscriptAdapter, TranscriptHandle};
 
-/// Cap on bytes read from a candidate transcript when checking for the
-/// `You are @<handle>` identity marker (Defense-2A). The marker is injected
-/// into the agent's FIRST turn (the context preamble), so it sits at the very
-/// top of the file — 256 KiB is far more than enough while bounding IO.
-const MARKER_SCAN_CAP_BYTES: u64 = 256 * 1024;
+/// ASCII needle that anchors a CT-injected identity preamble turn. The
+/// collaborator harness prepends a context header to the agent's launch
+/// message (`[You are @claude1]` / `[You are @claude1 (Claude Code #1)]` /
+/// `[Your identity: You are @claude1. ...]`), so any JSONL turn containing
+/// this substring is an identity preamble. ASCII-only ⇒ UTF-8-safe to search
+/// over raw bytes (it can never split a multi-byte codepoint).
+const IDENTITY_PREAMBLE_NEEDLE: &[u8] = b"You are @";
 
-/// Whether `path`'s leading bytes contain the CT-injected identity marker
-/// `You are @<agent_handle>` (Defense-2A, plan N5). The marker comes from the
-/// collaborator harness's per-agent context preamble (`[You are @claude1]` /
-/// `[Your identity: You are @claude1. ...]`), so a transcript that carries it
-/// definitively belongs to THIS agent — disambiguating same-cwd, same-tool
-/// siblings whose mtimes would otherwise be indistinguishable.
+/// Early-out byte cap for the N7 backward-from-EOF preamble walk.
 ///
-/// A trailing word-boundary check prevents `@claude1` from matching
-/// `@claude11`. Reads at most `MARKER_SCAN_CAP_BYTES`. Any IO error → `false`
-/// (treat as "no marker": the strict-mode caller retries, the fallback-mode
-/// caller still has the newest-unclaimed path).
-fn transcript_has_identity_marker(path: &Path, agent_handle: &str) -> bool {
-    use std::io::Read;
+/// `discover_session` is out of the tailer hot loop, but the discovery-retry
+/// loop re-invokes it every 5 s until a *successful* bind. For a
+/// correctly-launched agent the latest preamble sits near EOF and the walk
+/// stops after the first chunk (cheap). The cap bounds the PATHOLOGICAL case:
+/// a candidate that carries NO CT preamble at all (e.g. a stray non-collab
+/// rollout in codex's date dir) would otherwise read all the way to BOF on
+/// every poll. With the cap, "no preamble found within the last
+/// `MARKER_BACKWARD_SCAN_CAP_BYTES`" is treated as a non-match for that poll.
+///
+/// **Residual gap**: if a candidate's only matching preamble lies *farther*
+/// than this cap from EOF (e.g. a resumed rollout with > cap of trailing
+/// output appended after the current-launch preamble), the walk will not see
+/// it and returns "no match". With fallback disabled for CT collab watches
+/// (plan N1/N3) this converts a would-be wrong/no bind into a safe spin —
+/// never a wrong bind. Empirically (plan-review round, 12 rollouts > 400 KiB)
+/// latest markers landed within ~600 KiB of EOF, so 8 MiB is generous
+/// headroom; the cap exists to bound cost, not to be hit in normal operation.
+const MARKER_BACKWARD_SCAN_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
-    if agent_handle.is_empty() {
+/// Read-chunk size for the backward walk. The walk reads the file in
+/// EOF→BOF chunks so a correctly-launched agent (preamble near EOF) costs one
+/// chunk; only the no-preamble case pays up to the cap.
+const MARKER_BACKWARD_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Whether `path`'s **latest** (closest-to-EOF) CT identity preamble names the
+/// expected `(expected_handle, expected_collab_session_id)` (plan N7).
+///
+/// # Governing principle — latest-preamble authority
+///
+/// A rollout is a single JSONL stream; on `--resume` the current launch's CT
+/// preamble is the **most recent** `You are @<handle>` turn, with any number of
+/// earlier (possibly stale / foreign) headers behind it. We therefore walk
+/// **backward from EOF**, stop at the FIRST turn carrying ANY identity
+/// preamble (that is the current launch's), **parse its `(handle, session)`**,
+/// and compare to the expected pair. This **parse-latest-then-compare** order
+/// is mandatory: we never scan backward for the expected handle alone, because
+/// that could skip a newer *foreign* preamble and wrongly accept an older
+/// *expected* one. Both the discovery filter (`discover_by_mtime`) and the
+/// populate-time revalidation (`populate_entry`, N8) key on this one helper so
+/// the authority semantics live in a single place.
+///
+/// # Session matching
+///
+/// The session token appears embedded in the preamble's path text
+/// (`conversation-<sid>.md`, `contexts/<sid>/`). We build those needles from
+/// the **sanitized** expected id (via `super::sanitize_collab_session_id`) so
+/// raw vs sanitized ids match consistently (plan "session-token match
+/// format"). The `.md` / `/` delimiters act as right word-boundaries, so
+/// `session-3` does NOT match `conversation-session-32.md`. When
+/// `expected_collab_session_id` is EMPTY (future non-CT/manual watch) the
+/// session check is skipped — handle-only matching, preserving legacy
+/// behavior.
+///
+/// # Errors / robustness
+///
+/// Any IO error, an empty file, an empty `expected_handle`, or "no preamble
+/// found within the byte cap" all return `false` (treated as "no match": the
+/// strict-mode caller spins/retries). The backward line reassembly handles a
+/// missing trailing newline, a preamble turn larger than one read chunk, and a
+/// needle split across a chunk boundary (it searches reassembled lines, never
+/// raw chunks).
+pub(super) fn transcript_has_identity_marker(
+    path: &Path,
+    expected_handle: &str,
+    expected_collab_session_id: &str,
+) -> bool {
+    if expected_handle.is_empty() {
         return false;
     }
-    let needle = format!("You are @{}", agent_handle);
-    let needle_b = needle.as_bytes();
 
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
+    // Candidacy gate (peer-review fix): for a CT collab watch (non-empty
+    // expected session) a line counts as the latest preamble only if it has the
+    // harness's bracketed CT preamble shape (identity + conversation-log labels)
+    // AND is not an assistant/tool-result record that merely quotes preamble
+    // bytes. For a non-CT/manual watch (empty expected session) we keep the
+    // legacy handle-only candidacy. See `find_latest_identity_preamble_line`.
+    let require_session_token = !expected_collab_session_id.is_empty();
+
+    let line = match find_latest_identity_preamble_line(
+        path,
+        MARKER_BACKWARD_SCAN_CAP_BYTES,
+        require_session_token,
+    ) {
+        Some(l) => l,
+        None => return false,
     };
-    let mut buf = Vec::new();
-    if file
-        .take(MARKER_SCAN_CAP_BYTES)
-        .read_to_end(&mut buf)
-        .is_err()
+
+    // Parse-then-compare the handle (never search for the expected handle). The
+    // candidacy gate guarantees a parseable handle, but re-parse defensively.
+    match parse_identity_preamble_handle(&line) {
+        Some(parsed) if parsed.as_slice() == expected_handle.as_bytes() => {}
+        _ => return false,
+    }
+
+    // Session match only when an expected session is supplied. A well-formed
+    // FOREIGN preamble (different session) therefore returns false here —
+    // latest-authority correctly rejects rather than walking to an older
+    // matching preamble.
+    if expected_collab_session_id.is_empty() {
+        return true;
+    }
+    line_references_collab_session(&line, expected_collab_session_id)
+}
+
+/// Locate the latest (closest-to-EOF) complete JSONL line in `path` that is a
+/// WELL-FORMED CT identity preamble, reading at most `cap_bytes` backward from
+/// EOF. Returns the line's bytes (newline excluded), or `None`.
+///
+/// **Well-formed gate (peer-review fix).** It is NOT enough that a line contains
+/// the raw substring `You are @`: ordinary later transcript output (an assistant
+/// turn discussing the harness, a code/diff attachment, a doc placeholder like
+/// `You are @claudeN`, or a bare `You are @`) also contains it. If such a line
+/// were treated as authoritative it would shadow the real current-launch
+/// preamble — and because the unmarked fallback is permanently disabled for CT
+/// collab watches (plan N1), discovery would safe-spin forever and the mirror
+/// would never populate (this is the COMMON case in a session where every agent
+/// reasons about the harness). So the walk accepts a line as the latest preamble
+/// only if it has the harness's CT-preamble **structural shape**
+/// (`line_is_wellformed_preamble`: a parseable handle AND, for CT watches, the
+/// bracketed `[You are @…]`/`[Your identity:…]` + `[Conversation log:…]` labels)
+/// — and **keeps walking backward** past lines that merely contain the substring.
+/// Latest-authority is then applied over that filtered set: the first (latest)
+/// well-formed preamble wins; the caller compares it to the EXPECTED
+/// `(handle, session)` and rejects a foreign one rather than walking to an older
+/// matching one. The candidacy/expected split is deliberate — it lets a stale
+/// foreign preamble (well-formed, different sid) be recognized as the latest real
+/// identity (→ reject) while ordinary content (no CT bracket shape) is skipped.
+///
+/// `require_session_token == false` (empty expected session — future non-CT/manual
+/// watch) relaxes candidacy to handle-only, preserving legacy behavior.
+///
+/// Reads EOF→BOF in `MARKER_BACKWARD_CHUNK_BYTES` chunks, reassembling lines
+/// across chunk boundaries so a turn larger than one chunk — or a needle split
+/// across a boundary — is still found. Stops early at the first well-formed
+/// preamble.
+///
+/// **Residual (documented; see `line_is_wellformed_preamble` /
+/// `line_is_quote_or_tool_record`):** assistant/tool-result quote carriers are
+/// rejected per-adapter (Claude/Codex/Gemini), so the observed complete-preamble
+/// quotes no longer mis-classify. What remains is a CRAFTED record that quotes a
+/// complete preamble while avoiding every per-adapter marker, or a future adapter
+/// with an unmodelled record shape. The fully-robust fix is a per-adapter
+/// schema-aware "genuine injected user-preamble record" predicate, which the plan
+/// intentionally kept out of this byte-oriented helper.
+fn find_latest_identity_preamble_line(
+    path: &Path,
+    cap_bytes: u64,
+    require_session_token: bool,
+) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.seek(SeekFrom::End(0)).ok()?;
+    if file_len == 0 {
+        return None;
+    }
+
+    let mut pos = file_len; // start of the region currently held in `tail`
+    let mut read_total: u64 = 0;
+    // `tail` holds a contiguous file region ending at the start of the lines
+    // we've already fully scanned. Each iteration prepends a freshly-read
+    // chunk, then scans the newly-complete lines and drops them, keeping only
+    // the still-incomplete leading fragment for the next iteration.
+    let mut tail: Vec<u8> = Vec::new();
+
+    loop {
+        let remaining_cap = cap_bytes.saturating_sub(read_total);
+        if remaining_cap == 0 {
+            return None; // hit the byte cap without a match
+        }
+        let want = (MARKER_BACKWARD_CHUNK_BYTES as u64)
+            .min(pos)
+            .min(remaining_cap) as usize;
+        if want == 0 {
+            return None; // reached BOF
+        }
+        let new_pos = pos - want as u64;
+        file.seek(SeekFrom::Start(new_pos)).ok()?;
+        let mut chunk = vec![0u8; want];
+        file.read_exact(&mut chunk).ok()?;
+        read_total += want as u64;
+
+        // Prepend the chunk: chunk = file[new_pos, pos), tail = file[pos, ...).
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        pos = new_pos;
+
+        let at_bof = pos == 0;
+        let cap_hit = read_total >= cap_bytes;
+        // The leading segment (before the first '\n' in `tail`) is a complete
+        // line ONLY at BOF. On a cap hit before BOF that segment is the suffix
+        // of a single physical record whose start lies beyond the cap window —
+        // a TRUNCATED fragment, not a complete line. Marking it complete would
+        // let the record-kind guard (`line_is_quote_or_tool_record`) see only
+        // the in-window suffix and miss a `"role":"assistant"` / tool marker
+        // sitting before the boundary, so a quoted complete peer preamble in
+        // the suffix could be accepted as latest identity → wrong bind
+        // (peer-review fix: codex1/codex3/claude3 round-5). We therefore pass
+        // `at_bof` alone: at the cap the leading fragment stays incomplete and
+        // is skipped, so a preamble beyond the cap degrades to a safe spin —
+        // never a fabricated match — honoring `MARKER_BACKWARD_SCAN_CAP_BYTES`'s
+        // documented guarantee. Complete lines fully inside the window are
+        // still scanned.
+        if let Some(found) =
+            scan_tail_for_latest_preamble(&tail, at_bof, require_session_token)
+        {
+            return Some(found);
+        }
+        if at_bof || cap_hit {
+            return None;
+        }
+        // Not found yet: discard the already-scanned complete lines, keep only
+        // the still-incomplete leading fragment (everything before the first
+        // '\n') so the next chunk reassembles the line that spans `pos`.
+        match tail.iter().position(|&b| b == b'\n') {
+            Some(first_nl) => tail.truncate(first_nl),
+            None => { /* one line longer than the chunk — keep all of `tail` */ }
+        }
+    }
+}
+
+/// Scan `tail` for the rightmost (latest) COMPLETE line that is a well-formed
+/// CT preamble. `front_complete` says whether the leading segment (before the
+/// first `\n`) is a complete line — true only at BOF (NOT on a cap hit: there
+/// the leading segment is a truncated over-cap fragment). The trailing segment
+/// (after the last `\n`) is always complete: on the first read it is the file's
+/// final line; on later reads its terminating newline was truncated off a
+/// previous iteration. Lines that merely contain the needle but are not
+/// well-formed preambles are skipped, so the caller's backward walk continues
+/// past them (peer-review fix — see `find_latest_identity_preamble_line`).
+fn scan_tail_for_latest_preamble(
+    tail: &[u8],
+    front_complete: bool,
+    require_session_token: bool,
+) -> Option<Vec<u8>> {
+    let nls: Vec<usize> = tail
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| if b == b'\n' { Some(i) } else { None })
+        .collect();
+
+    // Build (start, end_exclusive, complete) ranges right-to-left.
+    let mut ranges: Vec<(usize, usize, bool)> = Vec::new();
+    if nls.is_empty() {
+        ranges.push((0, tail.len(), front_complete));
+    } else {
+        ranges.push((nls[nls.len() - 1] + 1, tail.len(), true)); // trailing
+        for k in (1..nls.len()).rev() {
+            ranges.push((nls[k - 1] + 1, nls[k], true)); // middle segments
+        }
+        ranges.push((0, nls[0], front_complete)); // leading
+    }
+
+    for (start, end, complete) in ranges {
+        if !complete || start >= end {
+            continue;
+        }
+        let seg = &tail[start..end];
+        if line_is_wellformed_preamble(seg, require_session_token) {
+            return Some(seg.to_vec());
+        }
+    }
+    None
+}
+
+/// Whether `line` is a well-formed CT identity preamble — i.e. it has the
+/// **structural shape** the collaborator harness emits, not merely the
+/// `You are @` substring. This is the candidacy gate that distinguishes a real
+/// preamble turn from ordinary transcript content that happens to mention a
+/// handle and a session path (round-2 peer-review fix; reproduced cross-wire).
+///
+/// For a CT collab watch (`require_session_token`) a line qualifies only if it
+/// carries BOTH of the harness's bracketed labels co-located on the one
+/// physical JSONL record:
+/// - a CT **identity** bracket — `[You are @…]` (slim header, collaboratorStore
+///   `buildSlimHeader`) or `[Your identity: You are @…]` (full message-1 header,
+///   `prependContextHeader`); AND
+/// - a CT **session** bracket — `[Conversation log: …/conversation-<sid>.md]`
+///   (emitted by both header builders whenever a collab session is set).
+///
+/// A line like `… see contexts/session-18/claude2.jsonl which contains
+/// You are @claude2 …` (ordinary prose) carries neither bracket label and is
+/// rejected. A line that *does* quote both bracket labels but is an assistant
+/// turn or a `tool_result` record (e.g. a peer-mirror grep) is rejected by the
+/// record-kind guard (`line_is_quote_or_tool_record`). A non-CT/manual watch
+/// (`require_session_token == false`) keeps the looser handle-only candidacy but
+/// still applies the record-kind guard.
+///
+/// **Residual (documented, follow-up planner item):** the record-kind guard
+/// closes every OBSERVED live carrier (round-3 evidence: Claude rollouts
+/// `082f1689`, `5886ee16` — assistant/`tool_result` quotes landing after the
+/// last real preamble). What remains is a CRAFTED record that quotes a complete
+/// preamble block while avoiding the `"role":"assistant"` / `"type":"tool_result"`
+/// / `"tool_use_id"` markers — not seen in practice. Fully closing that requires
+/// role/schema-aware JSON parsing (confirm a genuine user/first-turn launch
+/// record and match the preamble content-block shape, not bytes); a bare
+/// `role == "user"` include-check is insufficient because a `tool_result` is
+/// itself a `role:user` record (hence the EXCLUDE-on-markers approach here). The
+/// plan kept role-aware parsing out of this byte-oriented helper; the robust
+/// close is a justified small scope adjustment flagged upward to the planner.
+fn line_is_wellformed_preamble(line: &[u8], require_session_token: bool) -> bool {
+    if parse_identity_preamble_handle(line).is_none() {
+        return false;
+    }
+    // Record-kind guard (round-3 peer-review fix): an assistant turn or a
+    // tool-result record that merely QUOTES preamble bytes (e.g. an agent
+    // grepping a peer's mirror) is never a real preamble. This closes the
+    // observed live complete-preamble-quote cross-wire that the bracket shape
+    // alone cannot (assistant/tool text can contain the exact bracket bytes).
+    if line_is_quote_or_tool_record(line) {
+        return false;
+    }
+    if require_session_token
+        && !(line_has_ct_identity_bracket(line) && line_has_ct_session_bracket(line))
     {
         return false;
     }
+    true
+}
 
-    buf.windows(needle_b.len()).enumerate().any(|(i, w)| {
-        if w != needle_b {
-            return false;
+/// Whether `line` is plainly NOT a genuine injected user-preamble record but an
+/// assistant turn, tool-result, or other non-user record that merely quotes
+/// preamble bytes. The real CT preamble is always the agent's first **user**
+/// message (Claude `role:user` text record / Codex `event_msg.user_message` /
+/// Gemini `type:user`), and the harness boilerplate never emits these JSON
+/// record markers — whereas the quote carriers do. Byte-level, same class as the
+/// bracket checks (NOT a JSON parse). A false reject only ever degrades to a safe
+/// spin (liveness), never a wrong bind.
+///
+/// **False-reject direction is bounded by JSON escaping** (peer-review note —
+/// codex1/claude3 raised a genuine-preamble self-reject concern). The genuine
+/// preamble shares its physical line with the agent's first user message, so a
+/// launch prompt could *paste* a compact transcript snippet containing one of
+/// these markers. But that pasted text is a JSON string VALUE, so its quotes are
+/// escaped on disk (`\"type\":\"agent_message\"`), while these needles use
+/// UNescaped quotes — the exact asymmetry that makes the EXCLUDE sound (real
+/// structural markers are unescaped; quoted ones are escaped). So a pasted marker
+/// does NOT match the needle and does NOT self-reject the genuine preamble. The
+/// only way to self-reject is an UNescaped marker, which on a genuine
+/// user-preamble record can only be its own structural record-kind — and the
+/// genuine record kinds (Claude `role:user`, Codex `user_message`, Gemini
+/// `type:user`) are none of these. Regression:
+/// `g_genuine_preamble_with_escaped_marker_text_still_binds`.
+///
+/// The marker set is **per-adapter** because the helper is adapter-agnostic but
+/// each tool's assistant/tool record shape differs (round-4 peer-review fix —
+/// the round-3 Claude-only markers let Codex `event_msg.agent_message` quotes
+/// through):
+/// - **Claude**: `"role":"assistant"` (assistant turn), `"type":"tool_result"` /
+///   `"tool_use_id"` (tool-result record).
+/// - **Codex**: `"type":"agent_message"` (the user-visible assistant bubble; the
+///   paired `response_item` duplicate already carries `"role":"assistant"`),
+///   `"type":"function_call` (covers `function_call` + `function_call_output`),
+///   `"type":"reasoning` (covers `reasoning_text`). The genuine preamble is
+///   `"type":"user_message"`, which matches none of these.
+/// - **Gemini**: `"type":"gemini"` (the model/assistant turn), `"type":"function"`
+///   (function call/response). The genuine preamble is `"type":"user"`.
+///
+/// NOTE: this closes every OBSERVED carrier across all three production adapters.
+/// What remains is a CRAFTED record that quotes a complete preamble while
+/// avoiding all these markers, or a future adapter with a new record shape —
+/// both → the documented planner follow-up: a per-adapter schema-aware "is this a
+/// genuine injected user-preamble record" predicate. A bare `role == "user"`
+/// include-check cannot substitute (a Claude `tool_result` is itself a
+/// `role:user` record), so we EXCLUDE on the non-user-record markers instead.
+fn line_is_quote_or_tool_record(line: &[u8]) -> bool {
+    // Claude
+    contains_subslice(line, b"\"role\":\"assistant\"")
+        || contains_subslice(line, b"\"type\":\"tool_result\"")
+        || contains_subslice(line, b"\"tool_use_id\"")
+        // Codex (event_msg.agent_message bubble + tool/reasoning payloads)
+        || contains_subslice(line, b"\"type\":\"agent_message\"")
+        || contains_subslice(line, b"\"type\":\"function_call")
+        || contains_subslice(line, b"\"type\":\"reasoning")
+        // Gemini (model turn + function call/response)
+        || contains_subslice(line, b"\"type\":\"gemini\"")
+        || contains_subslice(line, b"\"type\":\"function\"")
+}
+
+/// Whether `line` carries the harness's bracketed CT identity label —
+/// `[You are @…]` (slim header) or `[Your identity: You are @…]` (full header).
+/// Requiring the `You are @` needle to sit INSIDE the bracket (co-located with
+/// `[Your identity: `, not merely somewhere on the line) rejects ordinary prose
+/// that mentions a handle separately from a stray `[Your identity:` token.
+fn line_has_ct_identity_bracket(line: &[u8]) -> bool {
+    contains_subslice(line, b"[You are @") || contains_subslice(line, b"[Your identity: You are @")
+}
+
+/// Whether `line` carries the harness's bracketed CT session label
+/// `[Conversation log:` — emitted (co-located with the session id) by both the
+/// slim and full header builders whenever a collab session is set. Anchoring on
+/// the bracket label (not a bare `conversation-`/`contexts/` substring) rejects
+/// ordinary text that merely quotes a peer mirror path.
+fn line_has_ct_session_bracket(line: &[u8]) -> bool {
+    contains_subslice(line, b"[Conversation log:")
+}
+
+/// Parse the handle out of the first `You are @<handle>` occurrence in `line`.
+/// Returns the handle bytes (the maximal `[A-Za-z0-9_-]+` run after the
+/// needle), or `None` if the needle is absent or immediately followed by a
+/// non-handle character. The run terminates at the first non-handle byte
+/// (e.g. `]`, space) so `@claude1]` parses to `claude1` (not `claude11`).
+fn parse_identity_preamble_handle(line: &[u8]) -> Option<Vec<u8>> {
+    let at = find_subslice(line, IDENTITY_PREAMBLE_NEEDLE)? + IDENTITY_PREAMBLE_NEEDLE.len();
+    let mut end = at;
+    while end < line.len() {
+        let c = line[end];
+        if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' {
+            end += 1;
+        } else {
+            break;
         }
-        // Word-boundary: the char after the handle must not extend it
-        // (so `@claude1` does not match `@claude10`). End-of-buffer counts
-        // as a boundary.
-        match buf.get(i + needle_b.len()) {
-            None => true,
-            Some(c) => !(c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-'),
-        }
-    })
+    }
+    if end == at {
+        return None;
+    }
+    Some(line[at..end].to_vec())
+}
+
+/// Whether `line` references the expected collab session via one of the
+/// preamble's embedded path tokens (`conversation-<sid>.md` /
+/// `contexts/<sid>/`). The expected id is sanitized first so raw vs sanitized
+/// ids match consistently (plan "session-token match format").
+///
+/// **Format coupling (peer-review note — claude3, latent):** the on-disk bracket
+/// is built by the frontend from the RAW `collabSessionId`
+/// (`conversation-${collabSessionId}.md`), while this needle is built from the
+/// SANITIZED id. They agree only when the id is sanitization-stable
+/// (`[A-Za-z0-9_-]` only) — true for real ids like `session-2-1781684658960`. A
+/// future id carrying a stripped char (space/slash/dot) would silently fail to
+/// match here → a safe spin (never a wrong bind). Not active today.
+fn line_references_collab_session(line: &[u8], expected_collab_session_id: &str) -> bool {
+    let sid = super::sanitize_collab_session_id(expected_collab_session_id);
+    if sid.is_empty() {
+        return false;
+    }
+    let conversation = format!("conversation-{}.md", sid);
+    let contexts = format!("contexts/{}/", sid);
+    contains_subslice(line, conversation.as_bytes())
+        || contains_subslice(line, contexts.as_bytes())
+}
+
+/// Index of the first occurrence of `needle` in `haystack`, or `None`.
+/// Empty needle never matches (no meaningful position for our callers).
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether `haystack` contains `needle` as a contiguous subslice.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    find_subslice(haystack, needle).is_some()
 }
 
 pub mod claude_code;
@@ -678,11 +1091,14 @@ fn parse_ps_etime(s: &str) -> Option<u64> {
 /// `predicate(path) && mtime >= threshold` AND are not in `claimed_paths`
 /// (Defense-2B — excludes transcripts already bound to other live handles,
 /// canonical compare). Among the unclaimed candidates, prefer the newest one
-/// carrying the `You are @<agent_handle>` identity marker (Defense-2A); if
-/// none is marked, return `NoMatchingFd` in strict mode
+/// whose LATEST identity preamble names BOTH `agent_handle` AND
+/// `collab_session_id` (Defense-2A, plan N7 — `transcript_has_identity_marker`
+/// walks backward from EOF and parses-then-compares the current launch's
+/// preamble); if none matches, return `NoMatchingFd` in strict mode
 /// (`allow_unmarked_fallback == false`) so the loop retries, or fall back to
 /// the newest unclaimed candidate with a warning when the marker-wait budget
-/// is exhausted (`allow_unmarked_fallback == true`, N19). On a chosen
+/// is exhausted (`allow_unmarked_fallback == true`, N19 — reachable only for a
+/// non-CT/manual watch with an empty `collab_session_id`). On a chosen
 /// candidate, build the `TranscriptHandle` (via `fs_gate` + `lstat` +
 /// `memory_dir`, `collab_session_id` left empty for the watcher to fill) and
 /// return. Otherwise `DiscoveryError::NoMatchingFd`.
@@ -709,6 +1125,7 @@ pub(super) fn discover_by_mtime<F>(
     predicate: F,
     claimed_paths: &HashSet<PathBuf>,
     allow_unmarked_fallback: bool,
+    collab_session_id: &str,
 ) -> Result<TranscriptHandle, DiscoveryError>
 where
     F: Fn(&Path) -> bool,
@@ -766,13 +1183,16 @@ where
         }
     }
 
-    // Defense-2A: prefer the candidate carrying the `You are @<handle>`
-    // identity marker; among marker-matched candidates pick the newest mtime.
-    // This binds an agent to ITS OWN transcript even if a same-cwd sibling's
-    // file is momentarily newer.
+    // Defense-2A (plan N7): prefer the candidate whose LATEST identity preamble
+    // names BOTH the expected handle AND this collab session; among matches
+    // pick the newest mtime. Keying on the *latest* preamble (backward walk)
+    // and on (handle, session) — not handle alone — binds an agent to ITS OWN
+    // transcript in THIS session even when a same-handle, different-session
+    // rollout is momentarily newer, and tolerates resumed rollouts whose stale
+    // head headers belong to an earlier launch.
     let newest_marked = candidates
         .iter()
-        .filter(|(p, _)| transcript_has_identity_marker(p, agent_handle))
+        .filter(|(p, _)| transcript_has_identity_marker(p, agent_handle, collab_session_id))
         .max_by_key(|(_, mtime)| *mtime)
         .map(|(p, _)| p.clone());
 
@@ -781,10 +1201,17 @@ where
         None => {
             if allow_unmarked_fallback {
                 // N19 termination: marker-wait budget exhausted. Fall back to
-                // the newest unclaimed candidate so a tool that never writes
-                // the marker (e.g. codex's rollout has no CT-injected identity
-                // line) still binds. Double-binding is still prevented by 2B
-                // (claimed exclusion above) + N17 (populate-time recheck).
+                // the newest unclaimed candidate. NOTE (plan N1/N3): for a
+                // CT-launched collab watch the caller holds
+                // `allow_unmarked_fallback == false` PERMANENTLY, so this
+                // branch is reachable only for a non-CT/manual watch (empty
+                // collab_session_id). All three production CLIs — Claude Code,
+                // Codex, AND Gemini — DO carry the CT-injected `You are @`
+                // preamble (the earlier "codex has no identity line" claim was
+                // wrong), so within a CT watch the strict latest-preamble path
+                // (N7) handles them and this fallback never fires. Double-
+                // binding is still prevented by 2B (claimed exclusion above) +
+                // N17 (populate-time recheck).
                 let fallback = candidates
                     .iter()
                     .max_by_key(|(_, mtime)| *mtime)
@@ -798,9 +1225,10 @@ where
                 }
                 fallback
             } else {
-                // Strict mode: no marked candidate yet. Return NoMatchingFd so
-                // the discovery loop retries — the agent's first marked turn
-                // may not have flushed to disk yet.
+                // Strict mode: no candidate's latest preamble matches this
+                // (handle, session) yet. Return NoMatchingFd so the discovery
+                // loop retries — the agent's current-launch preamble turn may
+                // not have flushed to disk yet.
                 None
             }
         }
@@ -840,41 +1268,71 @@ where
 
 #[cfg(test)]
 mod marker_tests {
-    //! Plan N20 (Defense-2A): identity-marker detection is what binds an agent
-    //! to ITS OWN transcript among same-cwd siblings. The word-boundary check
-    //! is load-bearing — without it `claude1` would falsely match `claude11`.
-    use super::transcript_has_identity_marker;
+    //! Plan N7/N10: the latest-preamble, session-scoped identity match is what
+    //! binds an agent to ITS OWN transcript in THIS collab session. These
+    //! deterministic tests cover the success-criteria matrix (a)-(f):
+    //!   (a) two same-handle / different-session candidates bind their own
+    //!   (b) stale wrong header in HEAD + correct header later → latest wins
+    //!   (c) correct header followed by >256 KiB trailing output → still found
+    //!   (d) a different-handle candidate is rejected (not bound) under a CT
+    //!       collab watch (non-empty session id)
+    //!   (e) populate-time revalidation rejects a latest-marker mismatch but
+    //!       NOT a merely-stale earlier header
+    //!   (f) backward-reader robustness: no trailing newline; a turn larger
+    //!       than the read chunk; a needle split across a chunk boundary
+    use super::{
+        find_latest_identity_preamble_line, transcript_has_identity_marker,
+        MARKER_BACKWARD_CHUNK_BYTES, MARKER_BACKWARD_SCAN_CAP_BYTES,
+    };
     use std::io::Write;
     use std::path::PathBuf;
 
-    fn write_temp(tag: &str, content: &str) -> PathBuf {
+    fn write_temp(tag: &str, content: &[u8]) -> PathBuf {
         // Unique per (process, tag) so parallel test threads don't collide.
         let p = std::env::temp_dir().join(format!("ct-{}-{}.jsonl", std::process::id(), tag));
         let mut f = std::fs::File::create(&p).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
+        f.write_all(content).unwrap();
         p
     }
 
+    /// Build one physical JSONL preamble line (no embedded real newline — the
+    /// CT preamble is one JSON record whose `text` field carries the handle
+    /// and the session path tokens together).
+    fn preamble_line(handle: &str, sid: &str) -> String {
+        format!(
+            "{{\"role\":\"user\",\"text\":\"[You are @{h}] [Conversation log: \
+             /m/conversation-{s}.md] [contexts/{s}/x.jsonl]\"}}",
+            h = handle,
+            s = sid
+        )
+    }
+
+    // -- basic detection --------------------------------------------------
+
     #[test]
-    fn detects_identity_marker() {
-        let p = write_temp("detect", "{\"text\":\"[You are @claude1]\"}\n");
-        assert!(transcript_has_identity_marker(&p, "claude1"));
+    fn detects_identity_marker_handle_and_session() {
+        let mut c = preamble_line("claude1", "session-A");
+        c.push('\n');
+        let p = write_temp("detect", c.as_bytes());
+        assert!(transcript_has_identity_marker(&p, "claude1", "session-A"));
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn word_boundary_prevents_prefix_match() {
         // claude1 must NOT match a transcript that belongs to claude11.
-        let p = write_temp("boundary", "{\"text\":\"[You are @claude11]\"}\n");
-        assert!(!transcript_has_identity_marker(&p, "claude1"));
-        assert!(transcript_has_identity_marker(&p, "claude11"));
+        let mut c = preamble_line("claude11", "session-A");
+        c.push('\n');
+        let p = write_temp("boundary", c.as_bytes());
+        assert!(!transcript_has_identity_marker(&p, "claude1", "session-A"));
+        assert!(transcript_has_identity_marker(&p, "claude11", "session-A"));
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn absent_marker_returns_false() {
-        let p = write_temp("absent", "{\"text\":\"hello world, no marker here\"}\n");
-        assert!(!transcript_has_identity_marker(&p, "claude1"));
+        let p = write_temp("absent", b"{\"text\":\"hello world, no marker here\"}\n");
+        assert!(!transcript_has_identity_marker(&p, "claude1", "session-A"));
         let _ = std::fs::remove_file(&p);
     }
 
@@ -885,13 +1343,457 @@ mod marker_tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&p);
-        assert!(!transcript_has_identity_marker(&p, "claude1"));
+        assert!(!transcript_has_identity_marker(&p, "claude1", "session-A"));
     }
 
     #[test]
     fn empty_handle_returns_false() {
-        let p = write_temp("emptyhandle", "{\"text\":\"You are @\"}\n");
-        assert!(!transcript_has_identity_marker(&p, ""));
+        let p = write_temp("emptyhandle", b"{\"text\":\"You are @\"}\n");
+        assert!(!transcript_has_identity_marker(&p, "", "session-A"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn empty_session_is_handle_only_match() {
+        // Non-CT/manual watch (empty session id) keeps legacy handle-only
+        // matching: the session token is not required.
+        let c = b"{\"text\":\"[You are @claude1] no session path here\"}\n";
+        let p = write_temp("emptysess", c);
+        assert!(transcript_has_identity_marker(&p, "claude1", ""));
+        assert!(!transcript_has_identity_marker(&p, "claude2", ""));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- (a) same-handle / different-session each binds its own -----------
+
+    #[test]
+    fn a_same_handle_different_session_each_binds_own() {
+        let mut a = preamble_line("claude1", "session-A");
+        a.push('\n');
+        let mut b = preamble_line("claude1", "session-B");
+        b.push('\n');
+        let pa = write_temp("a-sessA", a.as_bytes());
+        let pb = write_temp("a-sessB", b.as_bytes());
+
+        assert!(transcript_has_identity_marker(&pa, "claude1", "session-A"));
+        assert!(!transcript_has_identity_marker(&pa, "claude1", "session-B"));
+        assert!(transcript_has_identity_marker(&pb, "claude1", "session-B"));
+        assert!(!transcript_has_identity_marker(&pb, "claude1", "session-A"));
+
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    // -- (b) latest-preamble authority (stale head, correct later) --------
+
+    #[test]
+    fn b_latest_preamble_wins_over_stale_head() {
+        // A stale FOREIGN preamble in the head (claude2/session-X), then the
+        // current-launch correct preamble (claude1/session-A) later, then
+        // ordinary trailing output.
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude2", "session-X"));
+        c.push('\n');
+        c.push_str(&preamble_line("claude1", "session-A"));
+        c.push('\n');
+        c.push_str("{\"text\":\"some later assistant output\"}\n");
+        let p = write_temp("b-latest", c.as_bytes());
+
+        // Latest preamble is claude1/session-A → matches it, NOT the stale head.
+        assert!(transcript_has_identity_marker(&p, "claude1", "session-A"));
+        // Parse-latest-then-compare: the stale head's (claude2, session-X) must
+        // NOT be accepted just because it appears somewhere in the file.
+        assert!(!transcript_has_identity_marker(&p, "claude2", "session-X"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- (c) correct header + >256 KiB trailing output → still found ------
+
+    #[test]
+    fn c_found_behind_large_trailing_output() {
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-c"));
+        c.push('\n');
+        // > 256 KiB of separate trailing output lines (also spans several
+        // 64 KiB backward chunks), so the preamble is far from EOF.
+        let line = "{\"text\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}\n";
+        let target = 300 * 1024;
+        while c.len() < target {
+            c.push_str(line);
+        }
+        let p = write_temp("c-trailing", c.as_bytes());
+        assert!(transcript_has_identity_marker(&p, "claude1", "session-c"));
+        assert!(!transcript_has_identity_marker(&p, "claude1", "session-other"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- (d) different-handle candidate not bound under a CT collab watch -
+
+    #[test]
+    fn d_different_handle_not_matched_under_ct_watch() {
+        // A claude2 rollout must not satisfy a claude1/session-A CT watch.
+        // discover_by_mtime's strict filter (fallback disabled for non-empty
+        // session, plan N1) then yields NoMatchingFd rather than binding it.
+        let mut c = preamble_line("claude2", "session-A");
+        c.push('\n');
+        let p = write_temp("d-otherhandle", c.as_bytes());
+        assert!(!transcript_has_identity_marker(&p, "claude1", "session-A"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- (e) populate revalidation: reject latest mismatch, tolerate stale -
+
+    #[test]
+    fn e_revalidation_rejects_latest_mismatch_tolerates_stale() {
+        // Reject: latest preamble names a DIFFERENT session than the watcher.
+        let mut reject = preamble_line("claude1", "session-B");
+        reject.push('\n');
+        let p_reject = write_temp("e-reject", reject.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p_reject, "claude1", "session-A"),
+            "latest marker session mismatch must reject (N8)"
+        );
+
+        // Tolerate: an earlier STALE header mismatches, but the LATEST one
+        // matches the watcher → must NOT reject.
+        let mut tolerate = String::new();
+        tolerate.push_str(&preamble_line("claude1", "session-OLD"));
+        tolerate.push('\n');
+        tolerate.push_str(&preamble_line("claude1", "session-A"));
+        tolerate.push('\n');
+        let p_tolerate = write_temp("e-tolerate", tolerate.as_bytes());
+        assert!(
+            transcript_has_identity_marker(&p_tolerate, "claude1", "session-A"),
+            "a merely-stale earlier header must NOT cause rejection (N8)"
+        );
+
+        let _ = std::fs::remove_file(&p_reject);
+        let _ = std::fs::remove_file(&p_tolerate);
+    }
+
+    // -- (f) backward-reader robustness -----------------------------------
+
+    #[test]
+    fn f_last_line_without_trailing_newline() {
+        // Preamble IS the final line and the file has no trailing '\n'.
+        let c = preamble_line("claude1", "session-f1");
+        let p = write_temp("f-nonl", c.as_bytes());
+        assert!(transcript_has_identity_marker(&p, "claude1", "session-f1"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn f_preamble_turn_larger_than_read_chunk() {
+        // One physical line (a realistic CT preamble: both bracket labels)
+        // longer than the backward read chunk — forces multi-chunk reassembly
+        // of a single line before it can be recognized as a preamble.
+        let chunk = MARKER_BACKWARD_CHUNK_BYTES;
+        let mut c = String::from(
+            "{\"text\":\"[You are @claude1] [Conversation log: /m/conversation-session-big.md] [contexts/session-big/] ",
+        );
+        c.push_str(&"x".repeat(chunk * 3));
+        c.push_str("\"}\n");
+        let p = write_temp("f-biglinetail", c.as_bytes());
+        assert!(transcript_has_identity_marker(&p, "claude1", "session-big"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn f_needle_split_across_chunk_boundary() {
+        // Craft a single realistic-preamble line so the `[You are @` identity
+        // bracket straddles the boundary between the first and second backward
+        // read chunks (at file_len - C). With the identity bracket starting at
+        // offset `head.len() + 8` and a trailing pad of `C - 14`, the boundary
+        // lands mid-bracket, so only reassembly (not a per-chunk search) can
+        // find it. The `[Conversation log: …]` head supplies the session anchor.
+        let c = MARKER_BACKWARD_CHUNK_BYTES;
+        let head = "[Conversation log: /m/conversation-session-split.md] ";
+        let identity = "[You are @claude1]"; // 18 bytes
+        assert_eq!(identity.len(), 18);
+        let pad = "pppppppp"; // 8 bytes, places identity `[` at head.len()+8
+        let trailing = "x".repeat(c - 14); // boundary lands inside `[You are @`
+        let content = format!("{}{}{}{}", head, pad, identity, trailing);
+        let p = write_temp("f-split", content.as_bytes());
+
+        // Sanity: the reader returns the whole single line (bracket reassembled
+        // across the chunk boundary).
+        let line = find_latest_identity_preamble_line(&p, MARKER_BACKWARD_SCAN_CAP_BYTES, true)
+            .expect("preamble line must be located across the chunk boundary");
+        assert!(super::contains_subslice(&line, b"[You are @claude1]"));
+
+        assert!(transcript_has_identity_marker(&p, "claude1", "session-split"));
+        assert!(!transcript_has_identity_marker(&p, "claude2", "session-split"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- (g) peer-review regression: incidental `You are @` AFTER a valid -
+    //        preamble must not shadow it (liveness) nor cross-bind (wrong agent)
+
+    #[test]
+    fn g_incidental_needle_after_preamble_does_not_shadow() {
+        // Valid current-launch preamble, THEN ordinary later output lines that
+        // merely contain `You are @<handle>` with NO session-path token — the
+        // common case in a session where agents reason about the harness.
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-g"));
+        c.push('\n');
+        // assistant turn discussing the protocol (parseable handle, no session token)
+        c.push_str(
+            "{\"role\":\"assistant\",\"text\":\"the marker string You are @claude2 should be parsed\"}\n",
+        );
+        // a bare needle with no handle
+        c.push_str("{\"role\":\"assistant\",\"text\":\"prefix You are @ suffix\"}\n");
+        let p = write_temp("g-incidental", c.as_bytes());
+
+        // Liveness: the valid claude1/session-g preamble is still found despite
+        // the later incidental needle lines (old code returned false → spin).
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-g"),
+            "valid preamble must not be shadowed by later incidental `You are @` text"
+        );
+        // No cross-wire: the incidental `You are @claude2` line (no session
+        // token) is skipped, so the latest well-formed preamble is claude1's →
+        // claude2's watch does not bind this transcript.
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-g"),
+            "incidental foreign-handle mention must not cross-bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn g_foreign_wellformed_preamble_after_expected_rejects() {
+        // A well-formed FOREIGN preamble appearing AFTER the expected one is the
+        // rollout's latest real identity → latest-authority must reject the
+        // expected watch (not walk back to the older matching preamble).
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-h"));
+        c.push('\n');
+        c.push_str(&preamble_line("claude2", "session-h"));
+        c.push('\n');
+        let p = write_temp("g-foreign-latest", c.as_bytes());
+        assert!(!transcript_has_identity_marker(&p, "claude1", "session-h"));
+        assert!(transcript_has_identity_marker(&p, "claude2", "session-h"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-2 peer-review regression (codex1/codex2/claude2): a non-preamble
+    //    line carrying BOTH a foreign handle AND the EXPECTED session path (but
+    //    no CT bracket shape) must NOT cross-bind. This reproduces the wrong-agent
+    //    bind @claude2 demonstrated; with the structural-shape candidacy it is now
+    //    skipped as non-preamble.
+
+    #[test]
+    fn g_bare_quote_with_handle_and_expected_session_does_not_cross_wire() {
+        let mut c = String::new();
+        // The owner's real, well-formed preamble (claude1 / session-x).
+        c.push_str(&preamble_line("claude1", "session-x"));
+        c.push('\n');
+        // A later ORDINARY assistant turn quoting a peer handle AND the expected
+        // session's mirror path — bare `You are @claude2`, NO CT bracket labels.
+        c.push_str(
+            "{\"role\":\"assistant\",\"text\":\"see contexts/session-x/claude2.jsonl which contains You are @claude2 as its preamble\"}\n",
+        );
+        let p = write_temp("g-crosswire-quote", c.as_bytes());
+
+        // No cross-wire: claude2's watcher must NOT bind claude1's rollout.
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-x"),
+            "a bare quote of a foreign handle + expected session path must not cross-bind"
+        );
+        // Owner still binds: the quote is skipped, the real preamble is latest.
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-x"),
+            "owner's real preamble must still bind despite the later quote"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn full_header_identity_form_is_recognized() {
+        // The message-1 full header uses `[Your identity: You are @<h> ...]`
+        // (collaboratorStore `prependContextHeader`) rather than the slim
+        // `[You are @<h>]`. The candidacy must accept it.
+        let c = "{\"text\":\"[Collaborator shared memory: /m] [Conversation log: /m/conversation-session-full.md] [Your identity: You are @claude1. Use the @claude1 handle when authoring files.]\"}\n";
+        let p = write_temp("full-header", c.as_bytes());
+        assert!(transcript_has_identity_marker(&p, "claude1", "session-full"));
+        assert!(!transcript_has_identity_marker(&p, "claude2", "session-full"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-3 peer-review regression (codex1 block; claude3 live evidence +
+    //    cheap fix): a record that quotes a COMPLETE foreign preamble block
+    //    (both bracket labels) but is an assistant turn or a tool_result must
+    //    NOT cross-bind. These are the observed live carriers (082f1689,
+    //    5886ee16) the record-kind guard now rejects.
+
+    #[test]
+    fn g_assistant_quote_of_complete_preamble_does_not_cross_wire() {
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-y"));
+        c.push('\n');
+        // Later ASSISTANT turn quoting a complete foreign preamble (both bracket
+        // labels + foreign handle + the EXPECTED session) — `"role":"assistant"`
+        // marks it a non-preamble record.
+        c.push_str(
+            "{\"role\":\"assistant\",\"content\":\"quoting peer: [You are @claude2] [Conversation log: /m/conversation-session-y.md]\"}\n",
+        );
+        let p = write_temp("g-assistant-quote", c.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-y"),
+            "an assistant turn quoting a complete preamble must not cross-bind"
+        );
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-y"),
+            "owner's real preamble must still bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn g_tool_result_quote_of_complete_preamble_does_not_cross_wire() {
+        let mut c = String::new();
+        c.push_str(&preamble_line("claude1", "session-z"));
+        c.push('\n');
+        // Later tool_result record (user-role!) carrying a grepped peer preamble —
+        // `"type":"tool_result"` / `"tool_use_id"` mark it a non-preamble even
+        // though its role is `user`.
+        c.push_str(
+            "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"[You are @claude2] [Conversation log: /m/conversation-session-z.md]\"}]}\n",
+        );
+        let p = write_temp("g-toolresult-quote", c.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-z"),
+            "a tool_result quoting a complete preamble must not cross-bind"
+        );
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-z"),
+            "owner's real preamble must still bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-4 peer-review regression (codex2/claude2 block): the reject guard
+    //    must be adapter-aware. Codex's user-visible assistant bubble is
+    //    `event_msg.agent_message` (no Claude markers); Gemini's is `type:gemini`.
+
+    #[test]
+    fn g_codex_agent_message_quote_does_not_cross_wire() {
+        let mut c = String::new();
+        // Real Codex preamble: event_msg + user_message payload.
+        c.push_str(
+            "{\"timestamp\":\"t\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"[You are @codex1] [Conversation log: /m/conversation-session-cdx.md]\"}}\n",
+        );
+        // Later Codex ASSISTANT bubble quoting a peer's complete preamble — carries
+        // none of the Claude markers, only `agent_message`.
+        c.push_str(
+            "{\"timestamp\":\"t\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"quoting [You are @codex2] [Conversation log: /m/conversation-session-cdx.md]\"}}\n",
+        );
+        // The paired response_item duplicate (carries role:assistant) lands last —
+        // the backward walk skips it and must then ALSO reject the agent_message.
+        c.push_str(
+            "{\"timestamp\":\"t\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"[You are @codex2] [Conversation log: /m/conversation-session-cdx.md]\"}]}}}\n",
+        );
+        let p = write_temp("g-codex-agentmsg", c.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p, "codex2", "session-cdx"),
+            "a Codex agent_message quoting a peer preamble must not cross-bind"
+        );
+        assert!(
+            transcript_has_identity_marker(&p, "codex1", "session-cdx"),
+            "owner's real Codex user_message preamble must still bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn g_gemini_model_turn_quote_does_not_cross_wire() {
+        let mut c = String::new();
+        // Real Gemini preamble: type:user.
+        c.push_str(
+            "{\"type\":\"user\",\"content\":[{\"text\":\"[You are @gemini1] [Conversation log: /m/conversation-session-gem.md]\"}]}\n",
+        );
+        // Later Gemini model turn quoting a peer preamble — type:gemini.
+        c.push_str(
+            "{\"type\":\"gemini\",\"content\":[{\"text\":\"quoting [You are @gemini2] [Conversation log: /m/conversation-session-gem.md]\"}]}\n",
+        );
+        let p = write_temp("g-gemini-model", c.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p, "gemini2", "session-gem"),
+            "a Gemini model turn quoting a peer preamble must not cross-bind"
+        );
+        assert!(
+            transcript_has_identity_marker(&p, "gemini1", "session-gem"),
+            "owner's real Gemini user preamble must still bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-5 peer-review regression (codex1/codex3/claude3 BLOCK): cap-hit
+    //    must NOT accept a truncated over-cap fragment as a complete preamble.
+
+    #[test]
+    fn cap_hit_does_not_accept_truncated_fragment_as_preamble() {
+        // One physical assistant line whose record-kind marker (`"role":
+        // "assistant"`) sits at the FRONT, then a long pad, then a quoted complete
+        // peer preamble (both bracket labels + foreign handle + expected session)
+        // near EOF. With a SMALL injected cap, the backward window holds only the
+        // trailing suffix (brackets) — the `"role":"assistant"` marker is beyond
+        // the cap. Before the fix, cap-hit marked that suffix complete, the guard
+        // saw no marker, and it was accepted → wrong bind. After the fix the
+        // truncated leading fragment stays incomplete → None (safe spin).
+        let mut c = String::from(
+            "{\"role\":\"assistant\",\"content\":\"",
+        );
+        c.push_str(&"x".repeat(4096)); // pad so the marker is far from EOF
+        c.push_str(
+            "[You are @claude2] [Conversation log: /m/conversation-session-cap.md] [contexts/session-cap/x]\"}",
+        );
+        c.push('\n');
+        let p = write_temp("cap-truncated", c.as_bytes());
+
+        // Small cap (512 B) → window holds the trailing brackets but not the
+        // leading `"role":"assistant"` marker. Must NOT fabricate a match.
+        let small_cap: u64 = 512;
+        assert!(
+            find_latest_identity_preamble_line(&p, small_cap, true).is_none(),
+            "a truncated over-cap fragment must never be accepted as a complete preamble"
+        );
+
+        // With a cap large enough to cover the whole line, the `"role":
+        // \"assistant\"` marker is now in-window → the record-kind guard rejects
+        // it as a quote carrier. Either way: never a wrong bind.
+        assert!(
+            find_latest_identity_preamble_line(&p, MARKER_BACKWARD_SCAN_CAP_BYTES, true).is_none(),
+            "with the marker in-window the assistant quote carrier must be rejected"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-5 peer-review regression (codex1/claude3 SHOULD-FIX): a genuine
+    //    preamble whose user text embeds an excluded marker must STILL bind,
+    //    because the pasted marker is JSON-escaped on disk and the guard's
+    //    needles use unescaped quotes (the same asymmetry that makes the EXCLUDE
+    //    sound also bounds the false-reject direction). Empirically settles the
+    //    codex1/claude3-vs-claude2/codex2 disagreement: escaping holds → no
+    //    self-reject, so this is NOT a wrong/no-bind defect.
+
+    #[test]
+    fn g_genuine_preamble_with_escaped_marker_text_still_binds() {
+        // A real Claude user-preamble record whose `text` value pastes a compact
+        // Codex snippet `{"type":"agent_message",...}` — on disk its quotes are
+        // escaped (`\"type\":\"agent_message\"`), so `line_is_quote_or_tool_record`
+        // (unescaped needles) does NOT fire. The preamble is the agent's own.
+        let c = b"{\"role\":\"user\",\"text\":\"[You are @claude1] [Conversation log: /m/conversation-session-esc.md] [contexts/session-esc/x] user pasted snippet: {\\\"type\\\":\\\"agent_message\\\",\\\"message\\\":\\\"hi\\\"}\"}\n";
+        let p = write_temp("g-escaped-marker", c);
+        assert!(
+            transcript_has_identity_marker(&p, "claude1", "session-esc"),
+            "a genuine preamble embedding an ESCAPED excluded marker must still bind"
+        );
+        assert!(
+            !transcript_has_identity_marker(&p, "claude2", "session-esc"),
+            "and it must not cross-bind a foreign handle"
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

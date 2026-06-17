@@ -312,12 +312,25 @@ pub trait TranscriptAdapter: Send + Sync {
     ///   Adapters do NOT own `collab_session_id` (that is watcher-owned and
     ///   attached at populate time); they own only source discovery.
     /// - `allow_unmarked_fallback`: when `false`, the adapter MUST return
-    ///   `NoMatchingFd` if no candidate carries the `You are @<agent_handle>`
-    ///   identity marker (Defense-2A strict mode — the discovery loop retries,
-    ///   waiting for the agent's first marked turn to flush). When `true`
-    ///   (after the loop's finite marker-wait budget is exhausted), the adapter
-    ///   MAY fall back to the newest unclaimed candidate with a warning so a
-    ///   tool that never writes the marker (e.g. codex) still binds (N19).
+    ///   `NoMatchingFd` if no candidate's LATEST identity preamble matches the
+    ///   expected `(agent_handle, collab_session_id)` (strict mode — the
+    ///   discovery loop retries, waiting for the agent's current-launch marked
+    ///   turn to flush). When `true` (only for non-CT/manual watches, i.e. an
+    ///   EMPTY `collab_session_id`, after the loop's finite marker-wait budget
+    ///   is exhausted), the adapter MAY fall back to the newest unclaimed
+    ///   candidate with a warning (N19). For CT-launched collab watches the
+    ///   loop holds this `false` permanently (see `discovery_loop`), so a
+    ///   missed marker degrades to a safe spin/retry rather than a wrong bind.
+    /// - `collab_session_id`: the sanitized collaborator-session id, passed as
+    ///   a **borrowed, read-only discovery-time discriminator** (plan N1/N7).
+    ///   The adapter forwards it to `discover_by_mtime` so a candidate's latest
+    ///   identity preamble is matched against BOTH the expected handle AND this
+    ///   session — preventing a same-handle rollout from a *different* collab
+    ///   session from binding. Ownership is unchanged: the field on
+    ///   `TranscriptHandle` stays watcher-owned and is FILLED only at
+    ///   `populate_entry`; adapters receive this value, never store or fill it.
+    ///   An EMPTY string selects the legacy handle-only (non-session-scoped)
+    ///   behavior for future non-CT/manual watches.
     fn discover_session(
         &self,
         agent_handle: &str,
@@ -325,6 +338,7 @@ pub trait TranscriptAdapter: Send + Sync {
         spawned_at_unix_ms: i64,
         claimed_paths: &HashSet<PathBuf>,
         allow_unmarked_fallback: bool,
+        collab_session_id: &str,
     ) -> Result<TranscriptHandle, DiscoveryError>;
 
     /// Static table describing which native content blocks propagate.
@@ -890,14 +904,24 @@ impl TranscriptWatcher {
         collab_session_id: String,
     ) {
         const POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
-        // Defense-2A termination policy (N19): for the first
-        // MARKER_WAIT_ATTEMPTS polls, require the `You are @<handle>` identity
-        // marker (strict mode) so a freshly-spawned agent binds to ITS OWN
-        // transcript even if a same-cwd sibling's file is momentarily newer.
-        // After the budget is exhausted, allow the newest-unclaimed fallback
-        // (with a warning) so a tool that never writes the marker (codex's
-        // rollout has no CT-injected identity line) still binds rather than
-        // spinning forever. ~5s per poll → ~15s of marker-wait before fallback.
+        // Defense-2A termination policy (plan N1/N7/N19).
+        //
+        // For a CT-launched collab watch (`collab_session_id` non-empty — the
+        // case this subsystem exists for) the strict latest-preamble match is
+        // required FOREVER: `allow_unmarked_fallback` below stays `false` on
+        // every poll, so a candidate must carry a current-launch
+        // `You are @<handle>` preamble naming THIS (handle, session) or the
+        // poll degrades to a safe `NoMatchingFd` spin/retry. All three
+        // production CLIs — Claude Code, Codex, AND Gemini — DO write that
+        // preamble (the earlier "codex has no CT identity line" claim was
+        // wrong), so a correctly-launched agent binds within a poll or two and
+        // never needs a fallback.
+        //
+        // MARKER_WAIT_ATTEMPTS therefore matters only for a future
+        // non-CT/manual watch (empty `collab_session_id`): for the first
+        // MARKER_WAIT_ATTEMPTS polls it requires the marker (strict mode), then
+        // allows the newest-unclaimed fallback so such a watch still binds
+        // rather than spinning forever. ~5s per poll → ~15s of marker-wait.
         const MARKER_WAIT_ATTEMPTS: u32 = 3;
         let mut attempt: u32 = 0;
         loop {
@@ -925,7 +949,18 @@ impl TranscriptWatcher {
                     .collect()
             };
 
-            let allow_unmarked_fallback = attempt >= MARKER_WAIT_ATTEMPTS;
+            // Defense-2A fallback gate (plan N1): the newest-unclaimed
+            // fallback is permitted ONLY for non-CT/manual watches (empty
+            // collab_session_id) AND only after the marker-wait budget is
+            // spent. For a CT-launched collab watch (`collab_session_id`
+            // non-empty — the case this binding subsystem exists for) the
+            // gate stays `false` forever: a missed/foreign marker degrades to
+            // a safe `NoMatchingFd` spin/retry instead of a wrong-agent or
+            // wrong-session bind. Because the latest-preamble walk (N7) is
+            // gap-free to its byte cap, the safe-spin should not fire for a
+            // correctly-launched agent.
+            let allow_unmarked_fallback =
+                collab_session_id.is_empty() && attempt >= MARKER_WAIT_ATTEMPTS;
             attempt = attempt.saturating_add(1);
 
             let result = adapter.discover_session(
@@ -934,6 +969,7 @@ impl TranscriptWatcher {
                 spawned_at_unix_ms,
                 &claimed_paths,
                 allow_unmarked_fallback,
+                &collab_session_id,
             );
             match result {
                 Ok(handle) => {
@@ -1022,6 +1058,33 @@ impl TranscriptWatcher {
             eprintln!(
                 "transcripts: fs_gate rejected populated handle for token {}: {:?}",
                 token_id, e
+            );
+            return false;
+        }
+
+        // N8 — latest-marker-authority revalidation. Before committing the
+        // binding, re-confirm the bound source's LATEST identity preamble names
+        // THIS (handle, session). Reuses N7's backward-walk helper so the
+        // authority semantics (parse-latest-then-compare; stale head headers
+        // ignored) live in exactly one place. This is a TOCTOU guard over the
+        // discovery-time check: the source could have been appended to (a newer
+        // foreign preamble) between selection and now. Only enforced for CT
+        // collab watches (non-empty `collab_session_id`); a manual/non-CT watch
+        // (empty id) keeps the pre-existing permissive behavior. The helper's
+        // IO runs HERE, OUTSIDE the Inner lock (lock-ordering constraint), so
+        // Phase C's lock section stays IO-free. A mismatch returns `false`
+        // (keep polling) rather than binding wrong data.
+        if !handle.collab_session_id.is_empty()
+            && !adapters::transcript_has_identity_marker(
+                &handle.source_path,
+                &handle.agent_handle,
+                &handle.collab_session_id,
+            )
+        {
+            eprintln!(
+                "transcripts: populate revalidation rejected token {} — source {:?} latest \
+                 identity preamble does not name (handle @{}, session {}); keep polling (N8)",
+                token_id, handle.source_path, handle.agent_handle, handle.collab_session_id
             );
             return false;
         }
