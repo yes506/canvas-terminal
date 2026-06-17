@@ -160,13 +160,14 @@ pub(super) fn transcript_has_identity_marker(
 /// across a boundary — is still found. Stops early at the first well-formed
 /// preamble.
 ///
-/// **Residual (documented; see `line_is_wellformed_preamble`):** a single
-/// physical line that quotes a COMPLETE real preamble (both CT bracket labels
-/// present — e.g. a `tool_result` from grepping a peer transcript) can still be
-/// mis-classified. It does not fire in practice (per-task preamble re-injection
-/// keeps the real preamble latest) and the fully-robust fix is role-aware parsing (the CT
-/// preamble is a user/first-turn record), which the plan intentionally kept out
-/// of this byte-oriented helper.
+/// **Residual (documented; see `line_is_wellformed_preamble` /
+/// `line_is_quote_or_tool_record`):** assistant/tool-result quote carriers are
+/// rejected per-adapter (Claude/Codex/Gemini), so the observed complete-preamble
+/// quotes no longer mis-classify. What remains is a CRAFTED record that quotes a
+/// complete preamble while avoiding every per-adapter marker, or a future adapter
+/// with an unmodelled record shape. The fully-robust fix is a per-adapter
+/// schema-aware "genuine injected user-preamble record" predicate, which the plan
+/// intentionally kept out of this byte-oriented helper.
 fn find_latest_identity_preamble_line(
     path: &Path,
     cap_bytes: u64,
@@ -331,25 +332,48 @@ fn line_is_wellformed_preamble(line: &[u8], require_session_token: bool) -> bool
     true
 }
 
-/// Whether `line` is plainly NOT a real CT preamble record but an assistant turn
-/// or a tool-result record that merely quotes preamble bytes. Real CT preambles
-/// are user-role TEXT records injected by the harness and never carry these JSON
-/// record markers; the live residual carriers do (observed in Claude rollouts
-/// `082f1689`, `5886ee16` — assistant/`tool_result` turns quoting a peer's
-/// preamble that land after the agent's last real preamble). Byte-level, same
-/// class as the bracket checks (NOT a JSON parse). A false reject only ever
-/// degrades to a safe spin (liveness), never a wrong bind.
+/// Whether `line` is plainly NOT a genuine injected user-preamble record but an
+/// assistant turn, tool-result, or other non-user record that merely quotes
+/// preamble bytes. The real CT preamble is always the agent's first **user**
+/// message (Claude `role:user` text record / Codex `event_msg.user_message` /
+/// Gemini `type:user`), and the harness boilerplate never emits these JSON
+/// record markers — whereas the quote carriers do. Byte-level, same class as the
+/// bracket checks (NOT a JSON parse). A false reject only ever degrades to a safe
+/// spin (liveness), never a wrong bind.
 ///
-/// NOTE: this closes every OBSERVED live carrier; a crafted record that quotes a
-/// complete preamble while avoiding these exact JSON markers remains the
-/// documented residual whose robust close is role/schema-aware parsing (planner
-/// follow-up). A bare `role == "user"` include-check cannot substitute for this:
-/// a `tool_result` is itself a `role:user` record, so we EXCLUDE on the
-/// tool-result/assistant markers instead.
+/// The marker set is **per-adapter** because the helper is adapter-agnostic but
+/// each tool's assistant/tool record shape differs (round-4 peer-review fix —
+/// the round-3 Claude-only markers let Codex `event_msg.agent_message` quotes
+/// through):
+/// - **Claude**: `"role":"assistant"` (assistant turn), `"type":"tool_result"` /
+///   `"tool_use_id"` (tool-result record).
+/// - **Codex**: `"type":"agent_message"` (the user-visible assistant bubble; the
+///   paired `response_item` duplicate already carries `"role":"assistant"`),
+///   `"type":"function_call` (covers `function_call` + `function_call_output`),
+///   `"type":"reasoning` (covers `reasoning_text`). The genuine preamble is
+///   `"type":"user_message"`, which matches none of these.
+/// - **Gemini**: `"type":"gemini"` (the model/assistant turn), `"type":"function"`
+///   (function call/response). The genuine preamble is `"type":"user"`.
+///
+/// NOTE: this closes every OBSERVED carrier across all three production adapters.
+/// What remains is a CRAFTED record that quotes a complete preamble while
+/// avoiding all these markers, or a future adapter with a new record shape —
+/// both → the documented planner follow-up: a per-adapter schema-aware "is this a
+/// genuine injected user-preamble record" predicate. A bare `role == "user"`
+/// include-check cannot substitute (a Claude `tool_result` is itself a
+/// `role:user` record), so we EXCLUDE on the non-user-record markers instead.
 fn line_is_quote_or_tool_record(line: &[u8]) -> bool {
+    // Claude
     contains_subslice(line, b"\"role\":\"assistant\"")
         || contains_subslice(line, b"\"type\":\"tool_result\"")
         || contains_subslice(line, b"\"tool_use_id\"")
+        // Codex (event_msg.agent_message bubble + tool/reasoning payloads)
+        || contains_subslice(line, b"\"type\":\"agent_message\"")
+        || contains_subslice(line, b"\"type\":\"function_call")
+        || contains_subslice(line, b"\"type\":\"reasoning")
+        // Gemini (model turn + function call/response)
+        || contains_subslice(line, b"\"type\":\"gemini\"")
+        || contains_subslice(line, b"\"type\":\"function\"")
 }
 
 /// Whether `line` carries the harness's bracketed CT identity label —
@@ -1610,6 +1634,62 @@ mod marker_tests {
         assert!(
             transcript_has_identity_marker(&p, "claude1", "session-z"),
             "owner's real preamble must still bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // -- round-4 peer-review regression (codex2/claude2 block): the reject guard
+    //    must be adapter-aware. Codex's user-visible assistant bubble is
+    //    `event_msg.agent_message` (no Claude markers); Gemini's is `type:gemini`.
+
+    #[test]
+    fn g_codex_agent_message_quote_does_not_cross_wire() {
+        let mut c = String::new();
+        // Real Codex preamble: event_msg + user_message payload.
+        c.push_str(
+            "{\"timestamp\":\"t\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"[You are @codex1] [Conversation log: /m/conversation-session-cdx.md]\"}}\n",
+        );
+        // Later Codex ASSISTANT bubble quoting a peer's complete preamble — carries
+        // none of the Claude markers, only `agent_message`.
+        c.push_str(
+            "{\"timestamp\":\"t\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"quoting [You are @codex2] [Conversation log: /m/conversation-session-cdx.md]\"}}\n",
+        );
+        // The paired response_item duplicate (carries role:assistant) lands last —
+        // the backward walk skips it and must then ALSO reject the agent_message.
+        c.push_str(
+            "{\"timestamp\":\"t\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"[You are @codex2] [Conversation log: /m/conversation-session-cdx.md]\"}]}}}\n",
+        );
+        let p = write_temp("g-codex-agentmsg", c.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p, "codex2", "session-cdx"),
+            "a Codex agent_message quoting a peer preamble must not cross-bind"
+        );
+        assert!(
+            transcript_has_identity_marker(&p, "codex1", "session-cdx"),
+            "owner's real Codex user_message preamble must still bind"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn g_gemini_model_turn_quote_does_not_cross_wire() {
+        let mut c = String::new();
+        // Real Gemini preamble: type:user.
+        c.push_str(
+            "{\"type\":\"user\",\"content\":[{\"text\":\"[You are @gemini1] [Conversation log: /m/conversation-session-gem.md]\"}]}\n",
+        );
+        // Later Gemini model turn quoting a peer preamble — type:gemini.
+        c.push_str(
+            "{\"type\":\"gemini\",\"content\":[{\"text\":\"quoting [You are @gemini2] [Conversation log: /m/conversation-session-gem.md]\"}]}\n",
+        );
+        let p = write_temp("g-gemini-model", c.as_bytes());
+        assert!(
+            !transcript_has_identity_marker(&p, "gemini2", "session-gem"),
+            "a Gemini model turn quoting a peer preamble must not cross-bind"
+        );
+        assert!(
+            transcript_has_identity_marker(&p, "gemini1", "session-gem"),
+            "owner's real Gemini user preamble must still bind"
         );
         let _ = std::fs::remove_file(&p);
     }
