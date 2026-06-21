@@ -20,13 +20,21 @@
 - Final validation command: `cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml commands::localfile`
 - Final exit: 0
 - Auto-fix attempts used: 0/3
-- Tail of last run:
+- Tail of last run (after round-5 review test additions):
   ```
   test commands::localfile::tests::maybe_transcode_text_paths ... ok
   test commands::localfile::tests::decode_text_to_utf8_decodes_cp949 ... ok
   test commands::localfile::tests::build_localfile_response_charset_and_headers ... ok
-  test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out
+  test commands::localfile::tests::maybe_transcode_text_non_korean_legacy_is_force_decoded_v1_limitation ... ok
+  test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out
   ```
+
+### Round-5 peer-review test additions (test-only, no production change)
+- `build_localfile_response_charset_and_headers`: added CSP + `Referrer-Policy`
+  non-regression assertions (codex3 coverage gap).
+- `maybe_transcode_text_non_korean_legacy_is_force_decoded_v1_limitation`: pins
+  the accepted v1 limitation (Windows-1252 `text/*` is force-decoded, not
+  preserved) as an executable assertion (claude2).
 
 ## Per-item outcomes
 | item_id | status | files_touched | notes |

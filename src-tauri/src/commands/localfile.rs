@@ -905,6 +905,26 @@ mod tests {
         assert_eq!(maybe_transcode_text(png.clone(), "image/png"), png);
     }
 
+    /// Pins the ACCEPTED v1 limitation (plan §7): a non-Korean, non-UTF-8
+    /// `text/*` body (here a Windows-1252 string with a curly apostrophe
+    /// `0x92`) is force-decoded as CP949 rather than passed through. We
+    /// assert the documented *shape* of that behavior — the body is
+    /// transformed (not byte-identical) and the result is valid UTF-8 —
+    /// without coupling to the exact replacement glyphs, so a future
+    /// maintainer who "fixes" this into passthrough trips this test and
+    /// has to make the change a conscious one.
+    #[test]
+    fn maybe_transcode_text_non_korean_legacy_is_force_decoded_v1_limitation() {
+        let cp1252 = vec![0x53, 0x6d, 0x61, 0x72, 0x74, 0x92, 0x73]; // "Smart’s"
+        assert!(std::str::from_utf8(&cp1252).is_err()); // genuinely non-UTF-8
+        let out = maybe_transcode_text(cp1252.clone(), "text/plain");
+        assert_ne!(out, cp1252, "non-UTF-8 text/* is transcoded, not preserved");
+        assert!(
+            std::str::from_utf8(&out).is_ok(),
+            "transcoded output is always valid UTF-8"
+        );
+    }
+
     /// text/* responses advertise `; charset=utf-8`; other classes keep the
     /// bare MIME. Content-Length tracks the body buffer; security headers and
     /// disposition (keyed on the original MIME) are unchanged.
@@ -927,6 +947,19 @@ mod tests {
             "nosniff"
         );
         assert_eq!(resp.headers().get("Content-Disposition").unwrap(), "inline");
+        // Security headers must stay byte-identical — transcoding only
+        // touches the body + Content-Type, never the v1 header set.
+        assert!(resp
+            .headers()
+            .get("Content-Security-Policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("sandbox"));
+        assert_eq!(
+            resp.headers().get("Referrer-Policy").unwrap(),
+            "no-referrer"
+        );
 
         // Non-text: no charset appended.
         let png = std::path::PathBuf::from("/tmp/foo.png");
