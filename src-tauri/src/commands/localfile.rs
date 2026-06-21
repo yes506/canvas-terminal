@@ -215,6 +215,68 @@ pub(crate) fn classify_mime(canonical: &Path) -> String {
         .to_string()
 }
 
+/// Decode legacy (non-UTF-8) Korean text bytes to a UTF-8 `String`.
+///
+/// **Responsibility:** Transcode CP949/EUC-KR bytes to UTF-8. This is
+/// the legacy-only fallback path — `maybe_transcode_text` calls it
+/// ONLY after `std::str::from_utf8` has already failed, so the input
+/// is known to not be valid UTF-8.
+/// **Pipeline-position:** `maybe_transcode_text` (on the non-UTF-8
+/// branch) -> THIS -> UTF-8 bytes fed to `build_localfile_response`.
+/// **Inputs:** `bytes`: `&[u8]` — file body already confirmed non-UTF-8.
+/// **Outputs:** `String` — UTF-8 text decoded under the WHATWG
+/// `euc-kr` index (`encoding_rs::EUC_KR`), which is the windows-949 /
+/// UHC superset and therefore covers both EUC-KR and CP949.
+/// **Side-effects:** None.
+/// **Preconditions:** none enforced; callers pass non-UTF-8 bytes.
+/// **Postconditions:** returns valid UTF-8 (lossy: undecodable bytes
+/// become U+FFFD).
+/// **Failure-modes:** none (decode is infallible; malformed bytes map
+/// to the replacement character). NOTE: do NOT use the decoder's
+/// `had_errors` flag (`decode_without_bom_handling` returns it as the
+/// 2nd tuple element `.1`) as a success discriminator — non-Korean
+/// legacy bytes (e.g. Windows-1252) can form valid-but-wrong UHC
+/// sequences with `had_errors == false`. Non-Korean legacy text is an
+/// accepted v1 limitation, not something this fn guards against.
+/// **Collaborators:** `encoding_rs::EUC_KR`.
+fn decode_text_to_utf8(bytes: &[u8]) -> String {
+    encoding_rs::EUC_KR
+        .decode_without_bom_handling(bytes)
+        .0
+        .into_owned()
+}
+
+/// Gate text/* bodies through encoding normalization to UTF-8, leaving
+/// every other MIME class byte-identical.
+///
+/// **Responsibility:** Decide whether a localfile body needs legacy
+/// transcoding and, if so, produce UTF-8 bytes. Non-text bodies
+/// (images, PDF, octet-stream) and already-valid-UTF-8 text are
+/// returned untouched (zero-copy — the `Vec<u8>` is moved straight
+/// through), so only genuinely legacy-encoded text allocates.
+/// **Pipeline-position:** localfile serve handler (`tokio::fs::read`)
+/// -> THIS -> `build_localfile_response`.
+/// **Inputs:**
+/// - `bytes`: `Vec<u8>` — raw file body read from disk.
+/// - `mime`: `&str` — extension-derived MIME from `classify_mime`.
+/// **Outputs:** `Vec<u8>` — UTF-8 bytes for legacy `text/*`, otherwise
+/// the original bytes unchanged.
+/// **Side-effects:** None.
+/// **Preconditions:** none.
+/// **Postconditions:** for `text/*` the result is valid UTF-8; for any
+/// other class the result is byte-identical to the input.
+/// **Failure-modes:** none.
+/// **Collaborators:** `decode_text_to_utf8` (legacy branch only).
+fn maybe_transcode_text(bytes: Vec<u8>, mime: &str) -> Vec<u8> {
+    if !mime.starts_with("text/") {
+        return bytes; // non-text: preserve bytes exactly
+    }
+    if std::str::from_utf8(&bytes).is_ok() {
+        return bytes; // already UTF-8 (incl. ASCII / UTF-8 BOM): zero-copy
+    }
+    decode_text_to_utf8(&bytes).into_bytes() // legacy CP949/EUC-KR
+}
+
 // Token generation (16 bytes getrandom -> URL-safe-base64) is an
 // internal concern of `LocalFileTokenStore::mint` and lives inside
 // the impl in `state.rs`. Keeping it inside the trait impl closes
@@ -233,21 +295,29 @@ pub(crate) fn classify_mime(canonical: &Path) -> String {
 /// **Pipeline-position:** `tokio::fs::read` (inside protocol
 /// handler) -> THIS -> `UriSchemeResponder::respond`.
 /// **Inputs:**
-/// - `bytes`: `Vec<u8>` — file body read from disk; length is
-///   <= `LOCALFILE_MAX_BYTES` (caller enforces).
-/// - `mime`: `&str` — Content-Type value; trusted because it was
-///   built by `classify_mime` which guarantees no CR/LF/control
-///   bytes.
+/// - `bytes`: `Vec<u8>` — the response body. May have been transcoded
+///   from a legacy encoding to UTF-8 by `maybe_transcode_text`, so its
+///   length can exceed the original on-disk file size; `Content-Length`
+///   is always derived from THIS buffer.
+/// - `mime`: `&str` — the ORIGINAL extension-derived MIME class;
+///   trusted because it was built by `classify_mime` which guarantees
+///   no CR/LF/control bytes. The Content-Type header value derived from
+///   it gains `; charset=utf-8` for `text/*`; disposition still keys on
+///   this original value.
 /// - `path`: `&Path` — used for the `attachment; filename=...`
 ///   fallback when MIME class is unknown.
 /// **Outputs:** `tauri::http::Response<Vec<u8>>` — fully
 /// populated; body length matches `Content-Length` header.
 /// **Side-effects:** None. (pure construction.)
 /// **Preconditions:** `mime` contains no CR / LF / control bytes
-/// (guaranteed by `classify_mime` postcondition); `bytes.len()
-/// <= LOCALFILE_MAX_BYTES` (caller enforces).
+/// (guaranteed by `classify_mime` postcondition). NOTE:
+/// `LOCALFILE_MAX_BYTES` is an *original on-disk read cap* enforced by
+/// the serve handler before reading — it is NOT a bound on `bytes.len()`
+/// here, because `text/*` bodies may grow (~1.5x for CP949->UTF-8) after
+/// transcoding. `Content-Length` tracks the final buffer regardless.
 /// **Postconditions:** response carries every v1 header:
-///   - `Content-Type: <mime>`
+///   - `Content-Type: <mime>` (with `; charset=utf-8` appended for
+///     `text/*`, since those bodies are served as UTF-8)
 ///   - `Content-Length: <bytes.len()>`
 ///   - `Content-Security-Policy: default-src 'none';
 ///      img-src 'self' data:; style-src 'self' 'unsafe-inline';
@@ -268,13 +338,24 @@ pub(crate) fn build_localfile_response(
     path: &Path,
 ) -> tauri::http::Response<Vec<u8>> {
     let len_str = bytes.len().to_string();
+    // Disposition keys on the ORIGINAL mime class — never the
+    // charset-appended header value — so prefix checks and the
+    // `mime == "application/pdf"` equality stay correct.
     let disposition = disposition_for_mime(mime, path);
+    // text/* bodies are served as UTF-8 (already-UTF-8 passthrough or
+    // CP949->UTF-8 transcode upstream in `maybe_transcode_text`), so
+    // advertise the charset; every other class keeps the bare MIME.
+    let content_type = if mime.starts_with("text/") {
+        format!("{mime}; charset=utf-8")
+    } else {
+        mime.to_string()
+    };
     let csp = "default-src 'none'; img-src 'self' data:; \
                style-src 'self' 'unsafe-inline'; script-src 'self'; sandbox";
 
     tauri::http::Response::builder()
         .status(200)
-        .header("Content-Type", mime)
+        .header("Content-Type", content_type)
         .header("Content-Length", len_str)
         .header("Content-Security-Policy", csp)
         .header("X-Content-Type-Options", "nosniff")
@@ -576,6 +657,13 @@ pub fn localfile_protocol_handler<R: Runtime>(
             }
         };
 
+        // Normalize text/* bodies to UTF-8 (legacy CP949/EUC-KR -> UTF-8;
+        // already-UTF-8 and non-text bodies pass through unchanged) so the
+        // built-in browser renders Korean text files correctly. Must run
+        // BEFORE build_localfile_response so Content-Length tracks the final
+        // (possibly transcoded) buffer.
+        let bytes = maybe_transcode_text(bytes, &mime);
+
         let response = build_localfile_response(bytes, &mime, &canonical_path);
         responder.respond(response);
     });
@@ -776,6 +864,74 @@ mod tests {
         let d = disposition_for_mime("application/octet-stream", &p);
         assert!(d.starts_with("attachment;"));
         assert!(d.contains("foo.png"));
+    }
+
+    // ── Korean text encoding (browser-korean-text feature) ──────────────
+
+    /// CP949/EUC-KR bytes decode to Korean. `[bf a9 bc b8]` are the first
+    /// four bytes of the real sample `어린왕자-dmsah10.txt` and decode to
+    /// "여섯". This is the legacy-only path — N1 calls it after UTF-8 has
+    /// already failed.
+    #[test]
+    fn decode_text_to_utf8_decodes_cp949() {
+        assert_eq!(decode_text_to_utf8(&[0xbf, 0xa9, 0xbc, 0xb8]), "여섯");
+        // ASCII is a CP949 subset, so it round-trips unchanged.
+        assert_eq!(decode_text_to_utf8(b"hello"), "hello");
+    }
+
+    /// maybe_transcode_text is where the zero-copy short-circuits live.
+    /// Valid UTF-8 and ASCII text/* bodies pass through byte-identical;
+    /// legacy CP949 text/* is transcoded to UTF-8; non-text bodies are
+    /// preserved exactly regardless of their byte content.
+    #[test]
+    fn maybe_transcode_text_paths() {
+        // Already valid UTF-8 Korean → unchanged (zero-copy passthrough).
+        let utf8 = "안녕".as_bytes().to_vec();
+        assert_eq!(maybe_transcode_text(utf8.clone(), "text/plain"), utf8);
+
+        // ASCII text → unchanged.
+        let ascii = b"hello world".to_vec();
+        assert_eq!(maybe_transcode_text(ascii.clone(), "text/markdown"), ascii);
+
+        // Legacy CP949 text → transcoded to UTF-8 "여섯".
+        assert_eq!(
+            maybe_transcode_text(vec![0xbf, 0xa9, 0xbc, 0xb8], "text/plain"),
+            "여섯".as_bytes()
+        );
+
+        // Non-text body whose bytes are NOT valid UTF-8 → preserved exactly
+        // (must not be force-decoded as Korean).
+        let png = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        assert_eq!(maybe_transcode_text(png.clone(), "image/png"), png);
+    }
+
+    /// text/* responses advertise `; charset=utf-8`; other classes keep the
+    /// bare MIME. Content-Length tracks the body buffer; security headers and
+    /// disposition (keyed on the original MIME) are unchanged.
+    #[test]
+    fn build_localfile_response_charset_and_headers() {
+        let p = std::path::PathBuf::from("/tmp/foo.txt");
+        let body = "여섯".as_bytes().to_vec();
+        let resp = build_localfile_response(body.clone(), "text/plain", &p);
+
+        assert_eq!(
+            resp.headers().get("Content-Type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers().get("Content-Length").unwrap(),
+            body.len().to_string().as_str()
+        );
+        assert_eq!(
+            resp.headers().get("X-Content-Type-Options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(resp.headers().get("Content-Disposition").unwrap(), "inline");
+
+        // Non-text: no charset appended.
+        let png = std::path::PathBuf::from("/tmp/foo.png");
+        let img = build_localfile_response(vec![0u8; 4], "image/png", &png);
+        assert_eq!(img.headers().get("Content-Type").unwrap(), "image/png");
     }
 
     /// Token shape check at the URL-string level (validate_localfile_url_shape)
