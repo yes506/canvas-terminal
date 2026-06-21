@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>의도 확인서 — browser-korean-text</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --fg:          #1a1a1a;
+      --fg-muted:    #5a5a5a;
+      --fg-soft:     #888;
+      --bg:          #f7f7f5;
+      --bg-card:     #fff;
+      --accent:      #2b5fb5;
+      --accent-soft: #e8f0fb;
+      --good:        #2f7c4f;
+      --good-soft:   #e6f4ec;
+      --good-line:   #b6dcc4;
+      --bad:         #b53737;
+      --bad-soft:    #fbeaea;
+      --bad-line:    #e6b8b8;
+      --warn:        #b87900;
+      --warn-soft:   #fff4d6;
+      --warn-line:   #e8c870;
+      --border:      #e0e0dc;
+      --shadow:      0 1px 2px rgba(0,0,0,0.04);
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
+            "Noto Sans KR", "Malgun Gothic", Roboto, "Helvetica Neue", Arial, sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+    }
+    .page {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 36px 32px 60px;
+    }
+    /* ── HEADER ─────────────────────────────────────────────── */
+    header.doc-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
+      margin-bottom: 24px;
+    }
+    header.doc-head h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    header.doc-head h1 .slug {
+      color: var(--accent);
+    }
+    /* ── PIPELINE BREADCRUMB (chain ubiquitous vocabulary) ──── */
+    .pipeline-wrap {
+      margin: 0 0 18px;
+    }
+    .pipeline-svg {
+      width: 100%;
+      height: auto;
+      max-height: 76px;
+      display: block;
+    }
+    /* ── MODE BADGE (replaces text pill) ────────────────────── */
+    .mode-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      padding: 6px 12px 6px 10px;
+      border: 1px solid;
+      border-radius: 8px;
+      background: var(--accent-soft);
+      font-size: 12px;
+    }
+    .mode-badge svg { flex: 0 0 20px; }
+    .mode-badge .mode-text {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.15;
+    }
+    .mode-badge .mode-text strong {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .mode-badge .mode-tagline {
+      font-size: 11px;
+      opacity: 0.78;
+      font-weight: 500;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    /* ── STAT TAPE (at-a-glance counts) ─────────────────────── */
+    .stat-tape-wrap {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 6px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .stat-tape {
+      width: 100%;
+      height: auto;
+      max-height: 64px;
+      display: block;
+    }
+    /* ── FISHBONE ───────────────────────────────────────────── */
+    .fishbone-svg {
+      width: 100%;
+      height: auto;
+      max-height: 230px;
+      display: block;
+    }
+    /* ── HERO BLOCK ─────────────────────────────────────────── */
+    .hero {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 22px 26px;
+      margin-bottom: 28px;
+      box-shadow: var(--shadow);
+    }
+    .hero .label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+      margin-bottom: 8px;
+    }
+    .hero .goal {
+      font-size: 19px;
+      font-weight: 500;
+      line-height: 1.45;
+      color: var(--fg);
+      margin: 0 0 14px;
+    }
+    .hero .persona {
+      font-size: 14px;
+      color: var(--fg-muted);
+      margin: 0;
+    }
+    .hero .persona strong {
+      color: var(--fg);
+      font-weight: 600;
+    }
+    /* ── SCOPE GRID (✓ in / ✗ out) ──────────────────────────── */
+    .scope-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+    .scope-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+    }
+    .scope-col.in  { border-top: 3px solid var(--good); }
+    .scope-col.out { border-top: 3px solid var(--bad); }
+    .scope-col h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .scope-col.in  h2 { color: var(--good); }
+    .scope-col.out h2 { color: var(--bad); }
+    .scope-col ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .scope-col li {
+      position: relative;
+      padding: 6px 0 6px 22px;
+      font-size: 14px;
+      line-height: 1.5;
+      border-bottom: 1px dashed var(--border);
+    }
+    .scope-col li:last-child { border-bottom: none; }
+    .scope-col.in  li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      top: 6px;
+      color: var(--good);
+      font-weight: 700;
+    }
+    .scope-col.out li::before {
+      content: "✗";
+      position: absolute;
+      left: 0;
+      top: 6px;
+      color: var(--bad);
+      font-weight: 700;
+    }
+    /* ── PANEL (generic card) ───────────────────────────────── */
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 22px;
+      box-shadow: var(--shadow);
+    }
+    .panel > h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--fg-soft);
+    }
+    /* ── SUCCESS CRITERIA AS CHECKLIST ──────────────────────── */
+    .checklist {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .checklist li {
+      position: relative;
+      padding: 8px 0 8px 28px;
+      font-size: 14.5px;
+      border-bottom: 1px dashed var(--border);
+    }
+    .checklist li:last-child { border-bottom: none; }
+    .checklist li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 11px;
+      width: 14px;
+      height: 14px;
+      border: 1.5px solid var(--accent);
+      border-radius: 3px;
+      background: var(--bg-card);
+    }
+    /* ── CONSTRAINTS AS BARE LIST ───────────────────────────── */
+    .constraint-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .constraint-list li {
+      position: relative;
+      padding: 5px 0 5px 18px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .constraint-list li::before {
+      content: "▸";
+      position: absolute;
+      left: 0;
+      top: 5px;
+      color: var(--accent);
+    }
+    /* ── EXAMPLES (paired ✓ / ✗) ────────────────────────────── */
+    .ex-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .ex-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      box-shadow: var(--shadow);
+    }
+    .ex-col h2 {
+      margin: 0 0 10px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .ex-col.good h2 { color: var(--good); }
+    .ex-col.bad  h2 { color: var(--bad);  }
+    .ex-item {
+      padding: 10px 12px;
+      border-radius: 5px;
+      margin-bottom: 8px;
+      font-size: 13.5px;
+      line-height: 1.5;
+    }
+    .ex-item:last-child { margin-bottom: 0; }
+    .ex-col.good .ex-item { background: var(--good-soft); border-left: 3px solid var(--good); }
+    .ex-col.bad  .ex-item { background: var(--bad-soft);  border-left: 3px solid var(--bad);  }
+    /* ── OPEN QUESTIONS (loud call-to-action) ───────────────── */
+    .open-questions {
+      background: var(--warn-soft);
+      border: 1px solid var(--warn-line);
+      border-left: 5px solid var(--warn);
+      border-radius: 8px;
+      padding: 18px 22px;
+      margin-bottom: 28px;
+    }
+    .open-questions > h2 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--warn);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .open-questions > h2::before {
+      content: "⚠";
+      font-size: 18px;
+    }
+    .open-questions ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .open-questions li {
+      padding: 6px 0;
+      font-size: 14.5px;
+      line-height: 1.5;
+      border-bottom: 1px dashed var(--warn-line);
+    }
+    .open-questions li:last-child { border-bottom: none; }
+    /* ── PLACEHOLDERS (when state is sparse) ────────────────── */
+    .placeholder {
+      color: var(--fg-soft);
+      font-style: italic;
+      font-size: 13.5px;
+    }
+    /* ── FOOTER ─────────────────────────────────────────────── */
+    footer.doc-foot {
+      margin-top: 32px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--fg-soft);
+      text-align: center;
+    }
+    /* ── PRINT ──────────────────────────────────────────────── */
+    @media print {
+      body { background: #fff; }
+      .page { padding: 0; max-width: none; }
+      .hero, .panel, .scope-col, .ex-col, .open-questions {
+        box-shadow: none;
+        page-break-inside: avoid;
+      }
+    }
+    /* ── NARROW ─────────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      .scope-grid, .ex-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+<div class="pipeline-wrap"><svg class="pipeline-svg" viewBox="0 0 880 76" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Pipeline position: intent"><line x1="88" y1="32" x2="792" y2="32" stroke="#d4d4cf" stroke-width="2" stroke-dasharray="4 3"/><polygon points="88,18 102,32 88,46 74,32" fill="#2b5fb5" stroke="#2b5fb5" stroke-width="2"/><text x="88" y="62" text-anchor="middle" font-size="12" font-weight="600" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">의도</text><circle cx="264" cy="32" r="14" fill="#fff" stroke="#2f7c4f" stroke-width="1.5"/><text x="264" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">씨앗</text><polygon points="440,18 454,44 426,44" fill="#fff" stroke="#7a3fb5" stroke-width="1.5"/><text x="440" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">계획</text><rect x="602" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#b87900" stroke-width="1.5"/><line x1="606" y1="29" x2="626" y2="29" stroke="#b87900" stroke-width="1.4"/><line x1="606" y1="35" x2="626" y2="35" stroke="#b87900" stroke-width="1.4"/><text x="616" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">문서 골격</text><rect x="778" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#0f7a83" stroke-width="1.5"/><line x1="792" y1="21" x2="792" y2="43" stroke="#0f7a83" stroke-width="1.4"/><text x="792" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">인터페이스</text></svg></div>
+
+<header class="doc-head">
+  <h1>의도 확인서 — <span class="slug">browser-korean-text</span></h1>
+  <span class="mode-badge" style="background:#fbeaea;border-color:#b53737;color:#b53737"><svg viewBox="0 0 28 28" width="20" height="20" aria-hidden="true"><polygon points="14,4 26,24 2,24" fill="none" stroke="#b53737" stroke-width="2.2" stroke-linejoin="round"/><line x1="14" y1="11" x2="14" y2="18" stroke="#b53737" stroke-width="2.2" stroke-linecap="round"/><circle cx="14" cy="21.5" r="1.2" fill="#b53737"/></svg><span class="mode-text"><strong>문제 정의</strong><span class="mode-tagline">근본 원인 분석</span></span></span>
+</header>
+
+<div class="stat-tape-wrap"><svg class="stat-tape" viewBox="0 0 880 64" preserveAspectRatio="xMidYMid meet" role="img" aria-label="At a glance"><text x="88" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2f7c4f" font-family="-apple-system, system-ui, sans-serif">4</text><text x="88" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">범위 안</text><line x1="176" y1="12" x2="176" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="264" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b53737" font-family="-apple-system, system-ui, sans-serif">5</text><text x="264" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">범위 밖</text><line x1="352" y1="12" x2="352" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="440" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">5</text><text x="440" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">성공 기준</text><line x1="528" y1="12" x2="528" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="616" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">6</text><text x="616" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">제약</text><line x1="704" y1="12" x2="704" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="792" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b87900" font-family="-apple-system, system-ui, sans-serif">3</text><text x="792" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">미해결</text></svg></div>
+
+<section class="hero"><div class="label">우리가 합의한 결과물</div><p class="goal">로컬 텍스트 파일을 내장 브라우저로 여는 사용자를 위해, 한글이 포함된 텍스트 파일이 UTF-8 및 한국어 레거시 인코딩(EUC-KR/CP949) 범위에서 깨짐 없이 표시되도록 한다.</p><p class="persona"><strong>대상:</strong> 내장 브라우저로 로컬 텍스트 파일(.txt, .md 등)을 열어보는 Canvas Terminal 사용자. 한국어 콘텐츠(레거시 인코딩 포함)를 다룬다. [사용 빈도는 사용자가 명시하지 않음 — inferred]</p></section>
+<section class="scope-grid"><div class="scope-col in"><h2>범위 안</h2><ul><li>내장 브라우저가 localfile://로 텍스트 파일을 인라인 렌더링할 때 한글이 올바르게 표시된다</li><li>UTF-8(BOM 유무 무관) 한글 텍스트 파일 지원</li><li>EUC-KR/CP949(레거시) 한글 텍스트 파일 지원 (실제 깨진 파일 어린왕자-dmsah10.txt가 CP949로 검증됨)</li><li>인라인 렌더 대상 포맷 audit: 현재 disposition은 text/*만 인라인(.md=text/markdown, .csv=text/csv는 인라인이라 깨질 수 있음; .json=application/json은 attachment/다운로드라 in-browser mojibake 없음; .log은 경계 사례). 인라인 렌더되어 한글이 깨지는 포맷을 식별 후 커버 범위를 확정한다</li></ul></div><div class="scope-col out"><h2>범위 밖</h2><ul><li>터미널 패널 / 캔버스 텍스트 / 협업 패널에서의 한글 — 이번 버그는 내장 브라우저 localfile 렌더링 한정</li><li>원격(http/https) 웹사이트의 한글 인코딩 — 서버가 보내는 charset은 우리 통제 밖</li><li>한국어 외 보편 인코딩 감지: UTF-16/UTF-32, Shift_JIS, GBK, Big5 등 — 이번 버그 범위 밖(필요 시 부수적으로만)</li><li>파일을 다른 인코딩으로 변환·저장하는 에디터 기능 — 읽기/표시만이 목적이며 파일 수정이 아님</li><li>다운로드(attachment) 대상 포맷을 인라인 렌더로 바꾸는 동작 변경</li></ul></div></section>
+<section class="panel"><h2>성공의 기준</h2><ul class="checklist"><li>한글이 포함된 UTF-8 .txt/.md를 내장 브라우저로 열면 깨짐 없이 그대로 보인다 (.md는 마크다운 &#x27;서식 렌더&#x27;가 아니라 원문 한글 텍스트가 안 깨지는 것을 의미)</li><li>한글이 포함된 CP949/EUC-KR .txt(예: 어린왕자-dmsah10.txt)를 열면 &quot;여섯 살 적에 나는 …&quot;처럼 한글로 올바로 보인다(mojibake 아님)</li><li>헤더/바디 시맨틱: UTF-8 텍스트는 명시적 UTF-8 charset(또는 UTF-8 바디)로, 레거시 텍스트는 올바른 charset 또는 UTF-8 트랜스코딩 + 일치 헤더로 제공된다</li><li>회귀 금지: 기존 ASCII/영문 표시, 이미지/PDF 인라인, 비텍스트 attachment(다운로드) 동작, 보안 헤더(CSP/nosniff)가 변하지 않는다</li><li>검증 경로 존재: UTF-8 한글 fixture + CP949 한글 fixture(&quot;여섯 살 적에 나는&quot;) + ASCII 불변 케이스에 대한 단위/통합(또는 수동) 확인 경로가 있다</li></ul></section>
+<section class="panel"><h2>제약 사항</h2><ul class="constraint-list"><li>현재 증거(근본원인 가설): localfile 응답은 classify_mime가 mime_guess로 만든 charset 없는 MIME(text/plain)을 그대로 Content-Type에 싣고 raw 바이트를 X-Content-Type-Options: nosniff와 함께 전달한다. 깨진 샘플은 CP949이므로 charset=utf-8만으로는 고칠 수 없다. (정확한 WebKit fallback 동작은 미검증 — 추정)</li><li>인코딩 감지/트랜스코딩이 필요: file -I조차 iso-8859-1로 오판하므로 신뢰할 외부 charset 신호가 없고 바이트 기반으로 인코딩을 정해야 한다</li><li>CP949는 EUC-KR의 상위집합이며 샘플이 양쪽에서 동일하게 디코드됨(검증) → 단일 CP949 디코더로 충분하고 EUC-KR 별도 처리는 불필요하다 [resolved]</li><li>결함은 응답 구성 경로(classify_mime / build_localfile_response + 선택적 트랜스코딩 단계)에 국소화된다 → URL-scheme 3-way invariant(browser.rs/urlScheme.ts/localfile.rs)나 CSP sandbox는 건드릴 필요가 없으며, 보안 헤더(CSP/nosniff)·localfile 토큰 범위·deny-prefix 경로 검사는 그대로 유지할 것</li><li>기존 ASCII/영문 텍스트 및 비텍스트(이미지/PDF/octet-stream attachment) 동작을 회귀시키지 않을 것</li><li>선례: dashboard/server.rs는 이미 text/plain·json·html 응답에 charset=utf-8을 부여한다 — localfile 경로만 예외다</li></ul></section>
+<section class="panel"><h2>원인 분석</h2><svg class="fishbone-svg" viewBox="0 0 880 230" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Root cause chain"><line x1="20" y1="130" x2="860" y2="130" stroke="#888" stroke-width="2.5"/><polygon points="860,130 850,124 850,136" fill="#888"/><circle cx="20" cy="130" r="6" fill="#b53737" stroke="#fff" stroke-width="2"/><line x1="20" y1="130" x2="50" y2="80" stroke="#b53737" stroke-width="2" stroke-dasharray="3 3"/><rect x="50" y="58" width="210" height="56" rx="5" fill="#fff" stroke="#b53737" stroke-width="1.5"/><text x="58" y="74" font-size="10" font-weight="700" fill="#b53737" letter-spacing="0.06em" font-family="-apple-system, system-ui, sans-serif">증상</text><text x="58" y="94" font-size="12" fill="#1a1a1a" font-family="-apple-system, system-ui, sans-serif">사용자가 CP949로 인코딩된 한글 .txt를 내장 브라우저로 연다 (증상: 한글이 ¿©¼¸ 형태로 깨…</text><circle cx="230" cy="130" r="6" fill="#b87900" stroke="#fff" stroke-width="2"/><line x1="230" y1="130" x2="260" y2="180" stroke="#b87900" stroke-width="2" stroke-dasharray="3 3"/><rect x="260" y="178" width="210" height="56" rx="5" fill="#fff" stroke="#b87900" stroke-width="1.5"/><text x="268" y="194" font-size="10" font-weight="700" fill="#b87900" letter-spacing="0.06em" font-family="-apple-system, system-ui, sans-serif">이유 1</text><text x="268" y="214" font-size="12" fill="#1a1a1a" font-family="-apple-system, system-ui, sans-serif">localfile 핸들러가 classify_mime로 확장자만 보고 text/plain을 결정한다 (c…</text><circle cx="440" cy="130" r="6" fill="#b87900" stroke="#fff" stroke-width="2"/><line x1="440" y1="130" x2="470" y2="80" stroke="#b87900" stroke-width="2" stroke-dasharray="3 3"/><rect x="470" y="58" width="210" height="56" rx="5" fill="#fff" stroke="#b87900" stroke-width="1.5"/><text x="478" y="74" font-size="10" font-weight="700" fill="#b87900" letter-spacing="0.06em" font-family="-apple-system, system-ui, sans-serif">이유 2</text><text x="478" y="94" font-size="12" fill="#1a1a1a" font-family="-apple-system, system-ui, sans-serif">build_localfile_response가 Content-Type: text/plain(charse…</text><circle cx="650" cy="130" r="6" fill="#b87900" stroke="#fff" stroke-width="2"/><line x1="650" y1="130" x2="666" y2="180" stroke="#b87900" stroke-width="2" stroke-dasharray="3 3"/><rect x="666" y="178" width="210" height="56" rx="5" fill="#fff" stroke="#b87900" stroke-width="1.5"/><text x="674" y="194" font-size="10" font-weight="700" fill="#b87900" letter-spacing="0.06em" font-family="-apple-system, system-ui, sans-serif">이유 3</text><text x="674" y="214" font-size="12" fill="#1a1a1a" font-family="-apple-system, system-ui, sans-serif">charset 신호도 트랜스코딩도 없어 디코딩 인코딩이 미확정 상태가 된다</text><circle cx="860" cy="130" r="6" fill="#2f7c4f" stroke="#fff" stroke-width="2"/><line x1="860" y1="130" x2="666" y2="80" stroke="#2f7c4f" stroke-width="2" stroke-dasharray="3 3"/><rect x="666" y="58" width="210" height="56" rx="5" fill="#fff" stroke="#2f7c4f" stroke-width="1.5"/><text x="674" y="74" font-size="10" font-weight="700" fill="#2f7c4f" letter-spacing="0.06em" font-family="-apple-system, system-ui, sans-serif">근본 원인</text><text x="674" y="94" font-size="12" fill="#1a1a1a" font-family="-apple-system, system-ui, sans-serif">[추정] WebKit가 파일과 불일치하는 기본/추정 인코딩으로 바이트를 해석한다 → 한글 mojibak…</text></svg></section>
+<section class="ex-grid"><div class="ex-col good"><h2>과거에 발생한 사건 (해결하려는 통증)</h2><div class="ex-item">어린왕자-dmsah10.txt(CP949, 첫 바이트 bf a9 bc b8)를 내장 브라우저로 열면 도입부가 &quot;여섯 살 적에 나는 「체험한 이야기」라는 제목의, 원시림에 관한 책에서…&quot;로 한글 정상 표시된다</div></div><div class="ex-col bad"><h2>절대 깨지면 안 되는 인접 영역</h2><div class="ex-item">UTF-8 파일을 레거시로 오판(또는 그 반대)하여 새로 깨뜨림 — 잘못된 인코딩 감지 자체가 새 버그다 (UTF-8은 자기검증적이므로 &#x27;strict UTF-8 우선, 실패 시 CP949&#x27; 순서가 안전한 것으로 검증됨)</div><div class="ex-item">보안 헤더(nosniff/CSP)를 제거해 임의 HTML 스니핑/렌더를 허용 — 보안 invariant 위반이다</div><div class="ex-item">다운로드되어야 할 비텍스트를 인라인 렌더로 바꾸거나 브라우저 밖 영역(터미널/캔버스)을 손대는 것 — 범위 밖 + 회귀 위험이다</div></div></section>
+<section class="open-questions"><h2>아직 결정되지 않은 것</h2><ul><li>전략 선택: charset 헤더 부여 vs 서버측 UTF-8 트랜스코딩. 외부 charset 신호가 전무하고(file -I 오판) 커스텀 스킴에서 레거시 charset 라벨 준수 보장이 불확실 → &#x27;CP949 디코드 후 UTF-8 재인코딩 + charset=utf-8 제공&#x27;이 더 결정론적이라는 lean(검증 후 채택 권장). 구현/플래너 결정.</li><li>감지 순서: strict UTF-8 우선 → 실패 시 CP949 (UTF-8 자기검증성으로 오판 위험 낮음). 안전한 기본 전략으로 보이나 최종은 구현 결정.</li><li>의존성: encoding_rs(+ 필요 시 chardetng)는 net-new 크레이트(현재 src-tauri/Cargo.toml에 부재). 도입 여부/대안은 플래너 결정.</li></ul></section>
+
+<footer class="doc-foot">
+  사용자 확인 시각: <code>2026-06-21T22:12:11+0900</code>
+</footer>
+
+</div>
+</body>
+</html>
