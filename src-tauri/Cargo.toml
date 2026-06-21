@@ -23,6 +23,11 @@ base64 = "0.22"
 dirs = "6"
 serde_json = "1"
 mime_guess = "2"
+# Legacy Korean text decoding for the localfile:// scheme. EUC_KR decodes the
+# windows-949/UHC (CP949) superset, covering both EUC-KR and CP949 with one
+# decoder. Used by commands::localfile::decode_text_to_utf8 to transcode
+# non-UTF-8 text/* bodies to UTF-8 before serving.
+encoding_rs = "0.8"
 
 # Dashboard server (v4+v5 plan).
 # tokio: net for TcpListener, sync for broadcast, time for interval timer.
