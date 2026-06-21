@@ -68,11 +68,11 @@ flowchart TD
 - **호출 조건:** N1의 3번 분기에서만(이미 UTF-8 실패가 확인된 바이트). 따라서 BOM 처리 불필요 — `decode_without_bom_handling` 사용으로 의도 명확화.
 - **동작:** `encoding_rs::EUC_KR.decode_without_bom_handling(bytes).0.into_owned()` 반환. (`EUC_KR`은 windows-949/UHC = CP949 상위집합 → EUC-KR+CP949 단일 디코더로 커버.)
 - **시그니처(제안):** `fn decode_text_to_utf8(bytes: &[u8]) -> String`
-- **주의:** `had_errors`(decode 3번째 값)를 성공 판별자로 쓰지 말 것 — 비한국어 레거시(CP1252 등)가 had_errors=false로 *유효하지만 틀린* UHC 시퀀스를 만들 수 있음(§7 참조).
+- **주의:** `had_errors`(`decode_without_bom_handling`은 2-tuple → **2번째 값** `.1`; `decode()`였다면 3번째)를 성공 판별자로 쓰지 말 것 — 비한국어 레거시(CP1252 등)가 had_errors=false로 *유효하지만 틀린* UHC 시퀀스를 만들 수 있음(§7 참조).
 
 ### N3 — `build_localfile_response` (수정, localfile.rs:265)
 - **변경점:** `Content-Type` **헤더 값**만, `mime.starts_with("text/")`이면 `format!("{mime}; charset=utf-8")`, 아니면 `mime`. (charset은 상수 리터럴 — CR/LF 주입 없음.)
-- **⚠ disposition은 원본 mime 유지 (codex3):** `disposition_for_mime(mime, path)`에는 charset을 붙이지 않은 **원본 `mime`**을 그대로 넘길 것. charset 붙은 문자열을 넘기면 `mime == "application/pdf"` 같은 정확 비교가 깨진다. → 별도 `content_type` 지역변수를 헤더용으로만 만든다.
+- **disposition은 원본 mime 유지 (codex3 — 방어적 future-proofing, 현 설계선 active bug 아님):** `disposition_for_mime`에는 charset 없는 **원본 `mime`**을 넘기고, charset은 별도 `content_type` 지역변수(헤더 전용)에만 붙인다. *현 설계(text/*에만 charset)에선 실제로 깨지지 않는다* — disposition은 `starts_with("text/")` prefix 매칭이라 charset 접미가 무해하고 `application/pdf`엔 애초에 charset이 안 붙음(localfile.rs:303 정확 비교는 안전). 다만 나중에 charset을 더 넓게 붙이는 변경에 대비한 belt-and-suspenders.
 - **불변 유지:** Content-Length=`bytes.len()`(트랜스코딩된 버퍼), CSP, `nosniff`, Referrer-Policy.
 - **docstring 갱신 필수 (codex2/codex3):**
   - Content-Type postcondition에 `text/*` → `; charset=utf-8` 반영.
@@ -99,13 +99,15 @@ cargo test  --manifest-path src-tauri/Cargo.toml commands::localfile
 (워크트리 플래너 단계에선 스켈레톤이 없어 Phase 6는 헤더+Mermaid 스모크; 실제 컴파일/테스트 검증은 구현자 Phase에서.)
 
 **단위 테스트** (`#[cfg(test)]` in `localfile.rs`, **커밋된 인라인 바이트 벡터** — `~/Downloads` 의존 금지):
-- `decode_text_to_utf8`:
+- `decode_text_to_utf8` (**CP949 전용** — N1이 비-UTF-8 확인 후에만 호출):
   - CP949 `[0xbf,0xa9,0xbc,0xb8]` → `"여섯"` (샘플 도입부 바이트)
-  - 유효 UTF-8 `"안녕".as_bytes()` → `"안녕"` (통과)
-  - ASCII `b"hello"` → `"hello"`
-- `maybe_transcode_text`:
-  - `("text/plain", CP949 bytes)` → UTF-8 바이트로 변환됨
-  - `("image/png", &[0x89,0x50,0x4e,0x47,...])` → **바이트 동일**(보존)
+  - (선택) ASCII `b"hello"` → `"hello"` — CP949의 ASCII 상위호환 문서화용일 때만
+  - ⚠ **UTF-8 한글 패스스루 케이스는 여기 두지 말 것** — UTF-8 `"안녕"` 바이트(`ec 95 88 eb 85 95`)를 CP949로 디코드하면 깨진다(검증됨). 그 케이스는 N1 소관
+- `maybe_transcode_text` (**zero-copy 단축이 사는 곳** — UTF-8/ASCII 패스스루 검증 위치):
+  - `("text/plain", "안녕".as_bytes())` → **바이트 동일**(유효 UTF-8 zero-copy 패스스루)
+  - `("text/plain", b"hello")` → **바이트 동일**(ASCII 패스스루)
+  - `("text/plain", CP949 [0xbf,0xa9,0xbc,0xb8])` → UTF-8 "여섯" 바이트로 변환됨
+  - `("image/png", &[0x89,0x50,0x4e,0x47,...])` → **바이트 동일**(비텍스트 보존)
 - `build_localfile_response`:
   - `text/plain` → `Content-Type: text/plain; charset=utf-8`, `Content-Length == bytes.len()`
   - `image/png` → `Content-Type: image/png` (charset 없음)
@@ -131,6 +133,7 @@ cargo test  --manifest-path src-tauri/Cargo.toml commands::localfile
 - **text/* 확장자를 가진 바이너리** — 디코드 시 치환문자 발생 가능. 범위상 수용(확장자 기반; 바이너리 위장 감지는 out-of-scope).
 - **CP949 의도였으나 우연히 valid UTF-8인 파일** — UTF-8로 유지(정상; valid UTF-8은 모호하지 않음).
 - **MAX_BYTES ~1.5x 팽창** — 256MiB 경계 텍스트에서만 이론적 초과. v1 수용(원본 read cap로 의미 재정의, N3 docstring 갱신). 필요 시 post-transcode 413 체크는 후속.
+- **(비결정 기록, v1 범위 밖 — claude3)** `maybe_transcode_text`의 동기 CPU 디코드는 spawn된 async 블록(localfile.rs:556+) 안에서 실행되어, MAX_BYTES 근처 레거시 파일에서 async 워커 스레드를 잠깐(~sub-second) 블록한다. v1(사용자 단발 조회, 낮은 동시성)에선 수용. 문제가 되면 레거시 분기에 `spawn_blocking` 적용이 레버 — 의식적 비결정으로 기록.
 
 ## 8. Out-of-scope (구현자 금지)
 
