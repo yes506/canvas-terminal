@@ -36,11 +36,17 @@ export interface IPtyReattachClient {
    *   pty-exit listeners for sessionId; Rust re-emits up to replayBudget.maxBytes
    *   of its ring buffer through pty-data-{sessionId}, which the standard
    *   listener writes into the mounted terminal.
+   * Ordering (claude3 R4): Rust MUST flush the replay tail BEFORE (or atomically
+   *   ahead of) resuming live output on the same pty-data channel, so replayed
+   *   scrollback and new live bytes never interleave or duplicate. The re-subscribe
+   *   is idempotent (a second reattach for a session does not double-write).
    * Preconditions: the Rust PID is unchanged (reload, not restart); the xterm
    *   for sessionId is already mounted (restoreShell ran); listeners for
    *   sessionId are not already attached (idempotent re-subscribe required).
-   * Postconditions: on alive=true, live pty-data events flow again and the
-   *   replayed tail has been written; replayBytes <= replayBudget.maxBytes.
+   * Postconditions: on alive=true, the replayed tail is written in order then
+   *   live pty-data events flow; replayBytes <= replayBudget.maxBytes. On
+   *   alive=false the caller restores a dead/exited tile preserving handle/log
+   *   (per AgentSnapshot recovery policy) rather than dropping the pane.
    * Failure-modes:
    *   - Error — thrown when the IPC transport fails; a dead PTY is alive=false,
    *     NOT a throw; double-subscription is prevented (idempotent).

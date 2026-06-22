@@ -136,6 +136,12 @@ export interface ResilienceState {
  * re-spawning — the surviving Rust PTY is reattached instead. Mirrors the
  * Spawn shape in CollaboratorPane.tsx plus the collaboratorStore agent meta.
  * See codex2 H2 / claude3 #4 / codex3 #4.
+ *
+ * Recovery policy (CLOSED in the planner per round-3 codex2 MED / claude3 D):
+ * for an ALIVE Rust PTY, reattach is REQUIRED (lossless); for a DEAD PTY, the
+ * tile is restored as an exited/"needs restart" shell that PRESERVES `handle`,
+ * `nickname`, and log/transcript pointers — it is never silently dropped and
+ * never auto-respawned. Dead-PTY tiles surface in RestoreReport.failedSessions.
  */
 export interface AgentSnapshot {
   /** Agent PTY session id — reattach target (must be reused, never regenerated). */
@@ -236,6 +242,40 @@ export interface RecoveryDecision {
   action: RecoveryAction;
   /** Why this decision was reached (gating rationale). */
   reason: string;
+}
+
+/**
+ * Durable, generation-stamped recovery token. Carries recovery INTENT across a
+ * webview reload — the one thing the in-memory orchestrator cannot. Minted in
+ * the dying/old context (or by Rust on the A path) and read by the fresh
+ * context's bootstrap. See round-3 review (codex2/claude3/codex3 convergence):
+ * an in-memory recover() + isReloadInProgress flag cannot survive the reload
+ * they trigger.
+ */
+export type RecoveryToken = string;
+
+/**
+ * Durable recovery-session record, persisted (PID-stable Rust store or
+ * Rust-mirrored) so a FRESH JS context after reload knows a recovery is in
+ * progress, what to do, and to suppress teardown before any component mounts.
+ */
+export interface RecoverySession {
+  token: RecoveryToken;
+  /** What the orchestrator intends to do on resume. */
+  decision: RecoveryDecision;
+  /** True ⇒ component unmount must SKIP kill_pty during this recovery. */
+  suppressTeardown: boolean;
+  createdAt: number;
+  /** Generation/expiry guard so a stale session can't drive a spurious resume. */
+  expiresAt: number;
+}
+
+/** Result of staging a reload-crossing recovery in the old/live context. */
+export interface RecoveryLaunch {
+  token: RecoveryToken;
+  action: RecoveryAction;
+  /** True once the reload/recreate has been requested. */
+  reloadRequested: boolean;
 }
 
 /** Terminal outcome of a recovery run. */

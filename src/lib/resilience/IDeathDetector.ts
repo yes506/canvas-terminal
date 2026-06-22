@@ -51,15 +51,21 @@ export interface IDeathDetector {
    *   - boundaryCaught: boolean — read from IResilienceStore for `incidentId`
    *     (true ⇒ RootErrorBoundary caught a throw in THIS incident)
    *   - watermark: ResourceWatermark — latest sample (webglContextLosses gates C)
+   *   - blankObserved: boolean — implementer-supplied compositor/visual probe
+   *     result: true ⇒ content area is actually blank. REQUIRED for 'gpu-loss'
+   *     because WebGL context loss alone (no blank) is NOT root-content loss
+   *     (codex3 #2). Pass false when no probe exists — then C stays unreachable
+   *     rather than over-classified.
    *   - incidentId: IncidentId — the incident these inputs all belong to
-   * Outputs: SignClassification — sign + confidence(0..1) + rationale +
-   *   incidentId.
+   * Outputs: SignClassification — sign + confidence(0..1) + rationale + incidentId.
+   *   'gpu-loss' is always emitted at LOW confidence (advisory/diagnostic only;
+   *   shouldRecover never auto-recovers it).
    * Side-effects: None.
-   * Preconditions: verdict, boundaryCaught and watermark are all correlated to
-   *   `incidentId` (same incident window).
+   * Preconditions: verdict, boundaryCaught, watermark and blankObserved are all
+   *   correlated to `incidentId` (same incident window).
    * Postconditions: boundaryCaught ⇒ 'js-fatal'; else suspectDeath ⇒
-   *   'webcontent-death'; else recent webglContextLosses with a blank symptom ⇒
-   *   'gpu-loss'; else 'unknown'. Result carries the same incidentId.
+   *   'webcontent-death'; else (blankObserved && recent webglContextLosses) ⇒
+   *   'gpu-loss' (low confidence); else 'unknown'. Result carries the same incidentId.
    * Failure-modes: None. (total; ambiguity surfaces as 'unknown' low-confidence)
    * Collaborators: None. (pure function of its inputs)
    */
@@ -67,6 +73,7 @@ export interface IDeathDetector {
     verdict: LivenessVerdict,
     boundaryCaught: boolean,
     watermark: ResourceWatermark,
+    blankObserved: boolean,
     incidentId: IncidentId,
   ): SignClassification;
 }

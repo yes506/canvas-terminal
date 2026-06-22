@@ -8,5 +8,6 @@ export type { IDeathDetector } from "./IDeathDetector";
 export type { ITopologySnapshot } from "./ITopologySnapshot";
 export type { IPtyReattachClient } from "./IPtyReattachClient";
 export type { IRecoveryOrchestrator } from "./IRecoveryOrchestrator";
+export type { IRecoverySession } from "./IRecoverySession";
 export type { IWebglContextBudget } from "./IWebglContextBudget";
 export type { IScrollbackPolicy } from "./IScrollbackPolicy";
