@@ -1,11 +1,16 @@
 /**
- * IHeartbeat — liveness ticker.
+ * IHeartbeat — front-end liveness ticker (telemetry only).
  *
- * Cohesion source: owns the single "is the render loop alive" signal. A
- * monotonically-advancing tick whose last-beat timestamp lets the death
- * detector distinguish "we were backgrounded" (gap, then ticks resume)
- * from "the WebContent process died" (gap, ticks never resume because the
- * whole JS context is gone).
+ * Cohesion source: owns the in-memory "is the render loop alive" signal. It
+ * distinguishes "backgrounded-but-alive" (gap, then ticks resume) from a
+ * top-level JS stall, and it FORWARDS each beat to IWebContentWatchdog so a
+ * durable last-beat survives a dead JS context.
+ *
+ * SCOPE NOTE (round-2 review): the in-memory last-beat CANNOT by itself
+ * confirm hypothesis A (WebContent death) — a dead JS context takes its
+ * last-beat with it. Positive 'webcontent-death' confirmation is owned by
+ * IWebContentWatchdog (Rust-durable), never by lastBeatAt(). See
+ * IWebContentWatchdog and IDeathDetector.
  */
 export interface IHeartbeat {
   /**
@@ -23,15 +28,19 @@ export interface IHeartbeat {
   start(): void;
 
   /**
-   * Responsibility: Record that the render loop reached this instant alive.
-   * Pipeline-position: IHeartbeat.start (scheduler) -> THIS -> IDeathDetector.onVisibilityRegained
+   * Responsibility: Record that the render loop reached this instant alive,
+   *   and forward the beat to the durable watchdog sink.
+   * Pipeline-position: IHeartbeat.start (scheduler) -> THIS -> IWebContentWatchdog.reportBeat
    * Inputs: None.
    * Outputs: void.
-   * Side-effects: writes the last-beat timestamp to internal state.
+   * Side-effects: writes the in-memory last-beat timestamp; calls
+   *   IWebContentWatchdog.reportBeat(now) (throttled) so a durable copy
+   *   survives a dead JS context.
    * Preconditions: start() has been called.
-   * Postconditions: lastBeatAt() returns the time of this call.
-   * Failure-modes: None.
-   * Collaborators: None. (pure state write; readers poll lastBeatAt)
+   * Postconditions: lastBeatAt() returns the time of this call; the durable
+   *   sink has been asked to advance to >= that time.
+   * Failure-modes: None. (watchdog IPC failures are swallowed inside reportBeat)
+   * Collaborators: IWebContentWatchdog.reportBeat
    */
   recordTick(): void;
 

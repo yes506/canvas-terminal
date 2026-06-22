@@ -14,21 +14,23 @@ import type { RecoveryView, SignClassification } from "../lib/resilience/types";
  */
 export interface IResilienceBoundary {
   /**
-   * Responsibility: Capture a top-level render/runtime throw as sign 'js-fatal'.
-   * Pipeline-position: React error propagation -> THIS -> IDeathDetector.classifySign
+   * Responsibility: Capture a top-level render/runtime throw as sign 'js-fatal'
+   *   and tag it to the current incident.
+   * Pipeline-position: React error propagation -> THIS -> IResilienceStore.recordBoundaryCaught
    * Inputs:
    *   - error: Error — the thrown value React surfaced to the boundary
    *   - info: ErrorInfo — React component stack for the throw
-   * Outputs: SignClassification — sign 'js-fatal' with the error summarized
-   *   in rationale.
-   * Side-effects: records the sign (marks boundaryCaught=true for the
-   *   detector) and the error message for the fallback view.
+   * Outputs: SignClassification — sign 'js-fatal' carrying the active
+   *   incidentId (read from IResilienceStore.currentIncidentId, minting one via
+   *   beginIncident if none is open) so the detector can correlate this catch.
+   * Side-effects: calls IResilienceStore.recordBoundaryCaught(incidentId) and
+   *   stores the error message for the fallback view.
    * Preconditions: invoked from componentDidCatch within the boundary.
-   * Postconditions: a subsequent classifySign call in this incident sees
-   *   boundaryCaught=true; the fallback view's lastError is populated.
-   * Failure-modes: None. (must never itself throw — a throwing boundary
-   *   would unmount the root and produce the very symptom under repair)
-   * Collaborators: IResilienceStore.recordSign
+   * Postconditions: snapshotState().boundaryCaught === true for that incident;
+   *   the fallback view's lastError is populated.
+   * Failure-modes: None. (must never itself throw — a throwing boundary would
+   *   unmount the root and produce the very symptom under repair)
+   * Collaborators: IResilienceStore.currentIncidentId, IResilienceStore.recordBoundaryCaught
    */
   onTopLevelError(error: Error, info: ErrorInfo): SignClassification;
 

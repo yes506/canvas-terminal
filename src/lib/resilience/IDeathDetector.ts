@@ -1,49 +1,72 @@
-import type { LivenessVerdict, SignClassification } from "./types";
+import type {
+  LivenessVerdict,
+  SignClassification,
+  DeathEvidence,
+  ResourceWatermark,
+  IncidentId,
+} from "./types";
 
 /**
  * IDeathDetector — sign inference engine.
  *
- * Cohesion source: turns raw liveness/boundary observations into a
- * RootCauseSign. This is the discriminator the whole diagnosis hinges on:
- * a boundary catch implies hypothesis B (js-fatal); a heartbeat gap whose
- * ticks never resume (inferred indirectly, since a dead JS context cannot
- * self-report) plus a healthy boundary implies hypothesis A.
+ * Cohesion source: turns observations into a RootCauseSign + confidence for a
+ * single incident. It fuses THREE evidence sources, because no one source
+ * covers all hypotheses:
+ *   - IWebContentWatchdog.DeathEvidence (Rust-durable) → confirms A
+ *     (webcontent-death); the only source that survives a dead JS context.
+ *   - RootErrorBoundary boundaryCaught (read from IResilienceStore by
+ *     incidentId) → confirms B (js-fatal).
+ *   - ResourceWatermark.webglContextLosses → weak signal for C (gpu-loss):
+ *     blank screen while heartbeat still ticks and the boundary stays silent.
+ * Round-2 review fixes: A is no longer inferred from the in-memory heartbeat
+ * (G1/H1/#1/#5); boundaryCaught is correlated through an explicit incidentId
+ * (claude3 C2); C is a named sign rather than a silent "healthy" (claude2 G2).
  */
 export interface IDeathDetector {
   /**
-   * Responsibility: Analyze the heartbeat gap observed on visibility regain.
-   * Pipeline-position: IHeartbeat.lastBeatAt -> THIS -> IDeathDetector.classifySign
-   * Inputs: None. (reads the heartbeat's last-beat time + now)
-   * Outputs: LivenessVerdict — gapMs + suspectDeath flag + sampledAt.
-   * Side-effects: reads current time; no writes.
-   * Preconditions: invoked from a visibilitychange/pageshow handler on the
-   *   document becoming visible again.
-   * Postconditions: suspectDeath === (gapMs > threshold); verdict reflects
-   *   the instant of this call.
-   * Failure-modes: None. (a missing prior tick yields gapMs from epoch 0,
-   *   which the threshold treats as not-suspect on first run)
-   * Collaborators: IHeartbeat.lastBeatAt (reads last tick time)
+   * Responsibility: Analyze the liveness gap and durable death evidence on
+   *   visibility regain / fresh-context bootstrap.
+   * Pipeline-position: IWebContentWatchdog.readDeathEvidence -> THIS -> IDeathDetector.classifySign
+   * Inputs:
+   *   - evidence: DeathEvidence — durable Rust evidence (observedTermination,
+   *     lastGoodBeatAt, gapMs, launchCount); the authoritative A input
+   * Outputs: LivenessVerdict — gapMs + suspectDeath + sampledAt, derived from
+   *   the durable gap (not the in-memory heartbeat, which a dead context lost).
+   * Side-effects: reads IHeartbeat.lastBeatAt for the live-context case; reads
+   *   current time. No writes.
+   * Preconditions: invoked from a visibilitychange/pageshow handler OR the
+   *   post-reload bootstrap; evidence is freshly read for this incident.
+   * Postconditions: suspectDeath === (evidence.observedTermination ||
+   *   durable gapMs > threshold); verdict reflects the instant of this call.
+   * Failure-modes: None. (missing evidence yields suspectDeath=false, not a throw)
+   * Collaborators: IHeartbeat.lastBeatAt, IWebContentWatchdog.readDeathEvidence
    */
-  onVisibilityRegained(): LivenessVerdict;
+  onVisibilityRegained(evidence: DeathEvidence): LivenessVerdict;
 
   /**
-   * Responsibility: Combine liveness + boundary evidence into a sign.
+   * Responsibility: Fuse liveness + boundary + watermark evidence into a sign.
    * Pipeline-position: IDeathDetector.onVisibilityRegained -> THIS -> IResilienceStore.recordSign
    * Inputs:
    *   - verdict: LivenessVerdict — from onVisibilityRegained()
-   *   - boundaryCaught: boolean — true if RootErrorBoundary caught a throw
-   *     in the same incident window
-   * Outputs: SignClassification — sign + confidence(0..1) + rationale.
+   *   - boundaryCaught: boolean — read from IResilienceStore for `incidentId`
+   *     (true ⇒ RootErrorBoundary caught a throw in THIS incident)
+   *   - watermark: ResourceWatermark — latest sample (webglContextLosses gates C)
+   *   - incidentId: IncidentId — the incident these inputs all belong to
+   * Outputs: SignClassification — sign + confidence(0..1) + rationale +
+   *   incidentId.
    * Side-effects: None.
-   * Preconditions: verdict is fresh (same incident as boundaryCaught).
-   * Postconditions: boundaryCaught === true ⇒ sign 'js-fatal'; otherwise a
-   *   suspectDeath verdict ⇒ 'webcontent-death'; neither ⇒ 'unknown'.
-   * Failure-modes: None. (total over its inputs; ambiguity surfaces as
-   *   'unknown' with low confidence rather than a throw)
+   * Preconditions: verdict, boundaryCaught and watermark are all correlated to
+   *   `incidentId` (same incident window).
+   * Postconditions: boundaryCaught ⇒ 'js-fatal'; else suspectDeath ⇒
+   *   'webcontent-death'; else recent webglContextLosses with a blank symptom ⇒
+   *   'gpu-loss'; else 'unknown'. Result carries the same incidentId.
+   * Failure-modes: None. (total; ambiguity surfaces as 'unknown' low-confidence)
    * Collaborators: None. (pure function of its inputs)
    */
   classifySign(
     verdict: LivenessVerdict,
     boundaryCaught: boolean,
+    watermark: ResourceWatermark,
+    incidentId: IncidentId,
   ): SignClassification;
 }

@@ -2,6 +2,7 @@
 // Interface-only (system-lane skeleton); no implementations are exported.
 export type * from "./types";
 export type { IHeartbeat } from "./IHeartbeat";
+export type { IWebContentWatchdog } from "./IWebContentWatchdog";
 export type { IWatermarkSampler } from "./IWatermarkSampler";
 export type { IDeathDetector } from "./IDeathDetector";
 export type { ITopologySnapshot } from "./ITopologySnapshot";

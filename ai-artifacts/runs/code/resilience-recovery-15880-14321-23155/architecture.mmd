@@ -1,6 +1,7 @@
 graph LR
   IResilienceBoundary["IResilienceBoundary"]
   IHeartbeat["IHeartbeat"]
+  IWebContentWatchdog["IWebContentWatchdog"]
   IWatermarkSampler["IWatermarkSampler"]
   IDeathDetector["IDeathDetector"]
   ITopologySnapshot["ITopologySnapshot"]
@@ -11,8 +12,11 @@ graph LR
   IResilienceStore["IResilienceStore"]
   IResilienceBoundary --> IResilienceStore
   IResilienceBoundary --> IRecoveryOrchestrator
+  IHeartbeat --> IWebContentWatchdog
   IWatermarkSampler --> IWebglContextBudget
+  IWatermarkSampler --> IResilienceStore
   IDeathDetector --> IHeartbeat
+  IDeathDetector --> IWebContentWatchdog
   IRecoveryOrchestrator --> ITopologySnapshot
   IRecoveryOrchestrator --> IPtyReattachClient
   IRecoveryOrchestrator --> IResilienceStore

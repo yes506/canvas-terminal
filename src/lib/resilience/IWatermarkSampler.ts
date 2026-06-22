@@ -29,13 +29,15 @@ export interface IWatermarkSampler {
    * Inputs:
    *   - mark: ResourceWatermark — a fully-populated sample from sample()
    * Outputs: void.
-   * Side-effects: appends to the console/diagnostic log (and, per #2 design,
-   *   may forward to the Rust side for durable capture across reloads).
+   * Side-effects: appends to the console/diagnostic log AND calls
+   *   IResilienceStore.recordWatermark(mark) so the FSM's lastWatermark (the
+   *   diagnostic trail the evidence gate relies on) is populated.
    * Preconditions: mark was produced by sample() (fields internally consistent).
-   * Postconditions: the mark is observable in the diagnostic log/store.
+   * Postconditions: the mark is observable in the diagnostic log and in
+   *   IResilienceStore.snapshotState().lastWatermark.
    * Failure-modes: None surfaced to caller (logging failures are swallowed
    *   so instrumentation never destabilizes the app it observes).
-   * Collaborators: None. (terminal sink)
+   * Collaborators: IResilienceStore.recordWatermark
    */
   log(mark: ResourceWatermark): void;
 }
