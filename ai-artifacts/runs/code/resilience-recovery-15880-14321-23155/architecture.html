@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Architecture report — resilience-recovery</title>
+  <style>
+    body { font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", Roboto, system-ui, sans-serif;
+           max-width: 960px; margin: 0 auto; padding: 36px 32px 60px; color: #1a1a1a; background: #f7f7f5; }
+    h1 { font-size: 22px; font-weight: 600; border-bottom: 1px solid #e0e0dc; padding-bottom: 14px; margin: 0 0 8px; }
+    h1 .slug { color: #0f7a83; }
+    h2 { margin: 28px 0 12px; font-size: 14px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; color: #888; border: none; padding: 0; }
+    h4 { margin-bottom: .25em; color: #444; font-size: 13.5px; }
+    code { background: #f0f0ec; padding: .15em .4em; border-radius: 3px; font: 13px ui-monospace, SFMono-Regular, monospace; }
+    pre { background: #f9f9f7; padding: 1em; border-radius: 6px; overflow-x: auto; font-size: 12.5px; }
+    pre.doc { background: #fafaf2; border-left: 3px solid #ccc; padding: .6em .9em;
+              font-size: .85em; white-space: pre-wrap; }
+    summary { cursor: pointer; padding: .5em 0; }
+    details { margin: .5em 0; padding-left: 1em; border-left: 2px solid #eee; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 13.5px; }
+    th, td { border-bottom: 1px solid #ececec; padding: .5em .7em; text-align: left; }
+    th { background: #f9f9f7; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: #666; }
+    .meta { color: #666; font-size: .9em; }
+    .card { background: #fff; border: 1px solid #e0e0dc; border-radius: 8px; padding: 18px 22px; margin-bottom: 22px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .checklist { line-height: 1.8; }
+    .checklist li { list-style: none; }
+    .checklist li::before { content: "☐ "; color: #888; margin-right: .25em; }
+
+    /* ── PIPELINE BREADCRUMB (chain ubiquitous vocabulary) ──── */
+    .pipeline-wrap { margin: 0 0 18px; }
+    .pipeline-svg { width: 100%; height: auto; max-height: 76px; display: block; }
+
+    /* ── STAT TAPE ──────────────────────────────────────────── */
+    .stat-tape-wrap { background: #fff; border: 1px solid #e0e0dc; border-radius: 8px; padding: 8px 6px; margin-bottom: 22px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .stat-tape { width: 100%; height: auto; max-height: 64px; display: block; }
+
+    /* ── INTERFACE DAG (visual) ─────────────────────────────── */
+    .iface-dag { width: 100%; height: auto; display: block; }
+    .empty-dag { color: #888; font-style: italic; padding: 32px; text-align: center; }
+
+    @media print {
+      body { background: #fff; }
+      .card { box-shadow: none; page-break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="pipeline-wrap"><svg class="pipeline-svg" viewBox="0 0 880 76" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Pipeline position: interface"><line x1="88" y1="32" x2="792" y2="32" stroke="#d4d4cf" stroke-width="2" stroke-dasharray="4 3"/><polygon points="88,18 102,32 88,46 74,32" fill="#fff" stroke="#2b5fb5" stroke-width="1.5"/><text x="88" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">Intent</text><circle cx="264" cy="32" r="14" fill="#fff" stroke="#2f7c4f" stroke-width="1.5"/><text x="264" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">Seed</text><polygon points="440,18 454,44 426,44" fill="#fff" stroke="#7a3fb5" stroke-width="1.5"/><text x="440" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">Plan</text><rect x="602" y="19" width="28" height="26" rx="2" fill="#fff" stroke="#b87900" stroke-width="1.5"/><line x1="606" y1="29" x2="626" y2="29" stroke="#b87900" stroke-width="1.4"/><line x1="606" y1="35" x2="626" y2="35" stroke="#b87900" stroke-width="1.4"/><text x="616" y="62" text-anchor="middle" font-size="12" font-weight="400" fill="#888" font-family="-apple-system, system-ui, sans-serif">Doc Stub</text><rect x="778" y="19" width="28" height="26" rx="2" fill="#0f7a83" stroke="#0f7a83" stroke-width="2"/><line x1="792" y1="21" x2="792" y2="43" stroke="#fff" stroke-width="1.4"/><text x="792" y="62" text-anchor="middle" font-size="12" font-weight="600" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">Interface</text></svg></div>
+
+  <h1>Architecture report — <span class="slug">resilience-recovery</span></h1>
+  <p class="meta">Language: <strong>typescript</strong> · Last completed phase: <strong>validated</strong></p>
+
+  <div class="stat-tape-wrap"><svg class="stat-tape" viewBox="0 0 880 64" preserveAspectRatio="xMidYMid meet" role="img" aria-label="At a glance"><text x="110" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">4</text><text x="110" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">PACKAGES</text><line x1="220" y1="12" x2="220" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="330" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">10</text><text x="330" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">INTERFACES</text><line x1="440" y1="12" x2="440" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="550" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">25</text><text x="550" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">METHODS</text><line x1="660" y1="12" x2="660" y2="52" stroke="#e0e0dc" stroke-width="1"/><text x="770" y="32" text-anchor="middle" font-size="22" font-weight="700" fill="#b87900" font-family="-apple-system, system-ui, sans-serif">7</text><text x="770" y="52" text-anchor="middle" font-size="10.5" letter-spacing="0.05em" font-weight="600" fill="#5a5a5a" font-family="-apple-system, system-ui, sans-serif">EDGES</text></svg></div>
+
+  <h2>Project plan</h2>
+  <section class="card"><p><strong>Goal:</strong> 슬립/백그라운드 복귀 후 &#x27;헤더만 남고 콘텐츠 사망&#x27;하는 치명 버그를 사인확정→자동복구→압박완화 3층으로 구조 해소. 진단 미확정(A WebContent사망 vs B JS fatal)을 존중해 모든 seam을 설계하되 구현은 증거-게이팅.</p>
+<h4>In-scope</h4><ul>
+<li>#1 RootErrorBoundary (main.tsx 최상위 경계 = 사인 분기기; PaneErrorBoundary 패턴 재사용)</li>
+<li>#2 Instrumentation: heartbeat + WebContent-death 감지 + 메모리/컨텍스트 watermark</li>
+<li>#3 LosslessRecovery: topology 영속/복원 + 살아있는 Rust PTY 재attach 오케스트레이션</li>
+<li>#4 PressureMitigation: WebGL 컨텍스트 상한 + 스크롤백 상한 (비가시 탭 렌더 일시정지는 기존 IO 활용)</li>
+<li>Rust 계약 문서화: reattach_pty / persist_topology / load_topology / (옵션)webview-death 훅</li>
+</ul>
+<h4>Out-of-scope</h4><ul>
+<li>메서드 바디 구현 (다운스트림 implementer 소관)</li>
+<li>Rust PTY-reattach 스켈레톤 코드 생성 (계약 문서화만; 필요 시 별도 planner run)</li>
+<li>실제 OS jetsam 확진 (런타임 계측 수집은 #2 구현 후 운영 활동)</li>
+<li>멀티윈도우 / 비-macOS 플랫폼 분기</li>
+</ul>
+<h4>Constraints</h4><ul>
+<li>URL-scheme THREE-way invariant / localfile 토큰 규칙 등 기존 불변식 불침범</li>
+<li>공유메모리 dir은 PID 기반(memory.rs:21); reload는 PID 불변이라 dir·PTY 보존 — 설계 전제</li>
+<li>정상종료(Destroyed)→clear_memory_dir 능동삭제 경로 유지(복구는 Destroyed 미발화 경로 가정)</li>
+<li>버전 하드코딩 금지; tsc --noEmit 통과; 전 메서드 9-field docstring</li>
+</ul>
+<h4>Success criteria</h4><ul>
+<li>4개 권고의 모든 cross-boundary seam이 인터페이스/계약으로 명시됨</li>
+<li>구현 단계 게이트가 설계에 박혀 있음: #1+#2 우선 → 증거 → #3/#4 (shouldRecover 게이트)</li>
+<li>RootErrorBoundary가 사인 분기기로 동작(잡힘=B, 미잡힘=A)하는 계약 정의</li>
+<li>복구 경로 무손실: topology 복원 + 기존 PTY 재attach 계약 정의</li>
+<li>architecture.html + architecture.mmd 산출, tsc 통과(달성: TSC_OK)</li>
+</ul>
+<h4>Open questions</h4><ul>
+<li>Q1(확정: heartbeat 우선) WebContent 사망 1차 감지 메커니즘 — Rust webview delegate 훅은 계약만</li>
+<li>Q2(확정: in-place reload 1차) 복구 액션 — recreate-webview는 폴백 계약으로 보유</li>
+<li>Q3(확정: 신규 경량 IPC) topology 영속 위치 — persist_topology/load_topology</li>
+<li>Q4(확정: 신규 reattach_pty) 출력 버퍼 재생 범위 — ReplayBudget.maxBytes로 상한</li>
+<li>잔여: #3/#4 구현 착수 전 #2 런타임 증거로 사인(A/B) 확정 필요</li>
+</ul></section>
+
+  <h2>Package layout</h2>
+  <section class="card"><ul><li><code>src/components/IResilienceBoundary.ts (#1 boundary contract)</code></li><li><code>src/stores/IResilienceStore.ts (FSM store contract)</code></li><li><code>src/lib/resilience/ (#2 heartbeat/watermark/deathDetector, #3 topology/reattach/orchestrator, #4 webglBudget/scrollback)</code></li><li><code>src-tauri/src/commands/ (Rust 계약: reattach_pty/persist_topology/load_topology — 문서화만)</code></li></ul></section>
+
+  <h2>Interface dependency graph</h2>
+  <section class="card"><svg class="iface-dag" viewBox="0 0 880 390" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Interface dependency graph"><defs><marker id="iface-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#888"/></marker></defs><path d="M 321.3,80.0 C 321.3,165.0 440.0,165.0 440.0,250.0" fill="none" stroke="#888" stroke-width="1.5" marker-end="url(#iface-arrow)" opacity="0.75"/><path d="M 321.3,80.0 C 321.3,110.0 440.0,110.0 440.0,140.0" fill="none" stroke="#888" stroke-width="1.5" marker-end="url(#iface-arrow)" opacity="0.75"/><path d="M 796.0,80.0 C 796.0,110.0 796.0,110.0 796.0,140.0" fill="none" stroke="#888" stroke-width="1.5" marker-end="url(#iface-arrow)" opacity="0.75"/><path d="M 84.0,80.0 C 84.0,110.0 84.0,110.0 84.0,140.0" fill="none" stroke="#888" stroke-width="1.5" marker-end="url(#iface-arrow)" opacity="0.75"/><path d="M 440.0,190.0 C 440.0,220.0 796.0,220.0 796.0,250.0" fill="none" stroke="#888" stroke-width="1.5" marker-end="url(#iface-arrow)" opacity="0.75"/><path d="M 440.0,190.0 C 440.0,220.0 84.0,220.0 84.0,250.0" fill="none" stroke="#888" stroke-width="1.5" marker-end="url(#iface-arrow)" opacity="0.75"/><path d="M 440.0,190.0 C 440.0,220.0 440.0,220.0 440.0,250.0" fill="none" stroke="#888" stroke-width="1.5" marker-end="url(#iface-arrow)" opacity="0.75"/><rect x="0.0" y="30.0" width="168" height="50" rx="6" fill="#dff3f5" stroke="#0f7a83" stroke-width="1.8"/><text x="10.0" y="48.0" font-size="13" font-weight="700" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">IDeathDetector</text><text x="10.0" y="63.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/lib/resilience</text><text x="158.0" y="48.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">2m</text><rect x="237.3" y="30.0" width="168" height="50" rx="6" fill="#dff3f5" stroke="#0f7a83" stroke-width="1.8"/><text x="247.3" y="48.0" font-size="13" font-weight="700" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">IResilienceBoundary</text><text x="247.3" y="63.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/components</text><text x="395.3" y="48.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">2m</text><rect x="474.7" y="30.0" width="168" height="50" rx="6" fill="#dff3f5" stroke="#0f7a83" stroke-width="1.8"/><text x="484.7" y="48.0" font-size="13" font-weight="700" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">IScrollbackPolicy</text><text x="484.7" y="63.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/lib/resilience</text><text x="632.7" y="48.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">2m</text><rect x="712.0" y="30.0" width="168" height="50" rx="6" fill="#dff3f5" stroke="#0f7a83" stroke-width="1.8"/><text x="722.0" y="48.0" font-size="13" font-weight="700" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">IWatermarkSampler</text><text x="722.0" y="63.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/lib/resilience</text><text x="870.0" y="48.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#0f7a83" font-family="-apple-system, system-ui, sans-serif">2m</text><rect x="0.0" y="140.0" width="168" height="50" rx="6" fill="#e8f0fb" stroke="#2b5fb5" stroke-width="1.8"/><text x="10.0" y="158.0" font-size="13" font-weight="700" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">IHeartbeat</text><text x="10.0" y="173.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/lib/resilience</text><text x="158.0" y="158.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">4m</text><rect x="356.0" y="140.0" width="168" height="50" rx="6" fill="#e8f0fb" stroke="#2b5fb5" stroke-width="1.8"/><text x="366.0" y="158.0" font-size="13" font-weight="700" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">IRecoveryOrchestrator</text><text x="366.0" y="173.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/lib/resilience</text><text x="514.0" y="158.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">3m</text><rect x="712.0" y="140.0" width="168" height="50" rx="6" fill="#e8f0fb" stroke="#2b5fb5" stroke-width="1.8"/><text x="722.0" y="158.0" font-size="13" font-weight="700" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">IWebglContextBudget</text><text x="722.0" y="173.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/lib/resilience</text><text x="870.0" y="158.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#2b5fb5" font-family="-apple-system, system-ui, sans-serif">3m</text><rect x="0.0" y="250.0" width="168" height="50" rx="6" fill="#f1e8fb" stroke="#7a3fb5" stroke-width="1.8"/><text x="10.0" y="268.0" font-size="13" font-weight="700" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">IPtyReattachClient</text><text x="10.0" y="283.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/lib/resilience</text><text x="158.0" y="268.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">2m</text><rect x="356.0" y="250.0" width="168" height="50" rx="6" fill="#f1e8fb" stroke="#7a3fb5" stroke-width="1.8"/><text x="366.0" y="268.0" font-size="13" font-weight="700" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">IResilienceStore</text><text x="366.0" y="283.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/stores</text><text x="514.0" y="268.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">3m</text><rect x="712.0" y="250.0" width="168" height="50" rx="6" fill="#f1e8fb" stroke="#7a3fb5" stroke-width="1.8"/><text x="722.0" y="268.0" font-size="13" font-weight="700" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">ITopologySnapshot</text><text x="722.0" y="283.0" font-size="10" fill="#5a5a5a" font-family="ui-monospace, SFMono-Regular, monospace">src/lib/resilience</text><text x="870.0" y="268.0" font-size="10.5" text-anchor="end" font-weight="600" fill="#7a3fb5" font-family="-apple-system, system-ui, sans-serif">2m</text></svg></section>
+
+  <h2>Interfaces &amp; method docstrings</h2>
+  <p class="meta">All interfaces are expanded by default so the reviewer can spot-check the 9-field docstrings without scrolling through a chat log.</p>
+  <section class="card"><details open><summary><strong>IResilienceBoundary</strong> <small>(src/components, cohesion: #1 Root error-boundary = sign discriminator (caught ⇒ js-fatal/B; silent blank ⇒ WebContent death/A))</small></summary>
+<ul>
+<li><code>onTopLevelError</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Capture a top-level throw as sign &#x27;js-fatal&#x27;; marks boundaryCaught for the detector. Must never itself throw.</pre>
+</li>
+<li><code>renderFallback</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Render the recovery fallback UI (status + retry control) from a RecoveryView; retry delegates to the orchestrator.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>IHeartbeat</strong> <small>(src/lib/resilience, cohesion: #2 Liveness ticker — last-beat timestamp distinguishes &#x27;backgrounded&#x27; from &#x27;WebContent died&#x27;)</small></summary>
+<ul>
+<li><code>start</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Begin emitting liveness ticks; idempotent while running.</pre>
+</li>
+<li><code>recordTick</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Record that the render loop reached this instant alive (writes last-beat).</pre>
+</li>
+<li><code>lastBeatAt</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Report epoch-ms of the last tick; non-decreasing within one live JS context.</pre>
+</li>
+<li><code>stop</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Stop ticking and release the timer; idempotent.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>IWatermarkSampler</strong> <small>(src/lib/resilience, cohesion: #2 Resource-pressure observer — memory/GPU/tab watermarks that correlate with jettison)</small></summary>
+<ul>
+<li><code>sample</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Capture a point-in-time ResourceWatermark; missing APIs degrade to null fields, not throws.</pre>
+</li>
+<li><code>log</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Persist/emit a watermark; logging failures swallowed so instrumentation never destabilizes the app.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>IDeathDetector</strong> <small>(src/lib/resilience, cohesion: #2 Sign inference — turns liveness gap + boundary evidence into RootCauseSign (the A/B discriminator))</small></summary>
+<ul>
+<li><code>onVisibilityRegained</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Analyze the heartbeat gap on visibility regain → LivenessVerdict (gapMs, suspectDeath).</pre>
+</li>
+<li><code>classifySign</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Combine verdict + boundaryCaught into a SignClassification; ambiguity ⇒ &#x27;unknown&#x27; low-confidence, not a throw.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>ITopologySnapshot</strong> <small>(src/lib/resilience, cohesion: #3 Topology (de)serializer — the seam making webview reload non-destructive (front-end topology is memory-only today))</small></summary>
+<ul>
+<li><code>capture</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Serialize live terminal+collaborator topology to a versioned TopologySnapshot (best-effort per-leaf cwd).</pre>
+</li>
+<li><code>restore</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Rebuild stores from a snapshot; per-leaf failures collected into failedSessions; throws only on unsupported version.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>IPtyReattachClient</strong> <small>(src/lib/resilience, cohesion: #3 Front-end client for the Rust reattach_pty contract — rebinds xterm to PTYs that survived reload)</small></summary>
+<ul>
+<li><code>reattach</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Rebind one session to its surviving Rust PTY via reattach_pty IPC; dead PTY ⇒ alive:false (not a throw).</pre>
+</li>
+<li><code>replayInto</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Write a PTY&#x27;s replay buffer into its xterm and scroll to bottom; disposed-terminal writes guarded.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>IRecoveryOrchestrator</strong> <small>(src/lib/resilience, cohesion: #3 Recovery control loop — only seam allowed to trigger reload; hosts the staged-implementation evidence gate)</small></summary>
+<ul>
+<li><code>shouldRecover</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Gate whether recovery runs for a sign; while the #3 evidence gate is closed, returns proceed:false regardless of sign.</pre>
+</li>
+<li><code>recover</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Run capture→persist→reload→restore→reattach→verify; per-session losses surface in lostSessions; abort ⇒ failed, not throw.</pre>
+</li>
+<li><code>abort</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Abort an in-flight recovery and settle to a safe state; idempotent; restored panes left intact.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>IWebglContextBudget</strong> <small>(src/lib/resilience, cohesion: #4 WebGL context cap allocator — bounds simultaneous xterm WebGL contexts (over-allocation feeds jettison))</small></summary>
+<ul>
+<li><code>acquire</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Request a WebGL slot for a main terminal; denial ⇒ granted:false and caller uses the DOM renderer.</pre>
+</li>
+<li><code>release</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Return a granted slot to the pool; idempotent; tolerant of unknown sessions.</pre>
+</li>
+<li><code>activeCount</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Report live granted contexts (0..cap); never negative.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>IScrollbackPolicy</strong> <small>(src/lib/resilience, cohesion: #4 Per-terminal scrollback cap — bounds unbounded buffer growth across many tabs/mini-panes)</small></summary>
+<ul>
+<li><code>limitFor</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Resolve the scrollback line cap for a TerminalKind; &#x27;mini&#x27; cap ≤ &#x27;main&#x27; cap.</pre>
+</li>
+<li><code>enforce</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Apply the resolved cap to a live xterm (sets scrollback option); idempotent; disposed terminals skipped.</pre>
+</li>
+</ul></details>
+<details open><summary><strong>IResilienceStore</strong> <small>(src/stores, cohesion: #1/#2/#3 Recovery FSM + last-observation store (Zustand) — single source of truth for phase/sign/watermark)</small></summary>
+<ul>
+<li><code>recordSign</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Record the classified sign for the current incident; notifies subscribers.</pre>
+</li>
+<li><code>transition</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Move the FSM to a new phase; illegal transitions coerced to &#x27;failed&#x27;; increments attempts on &#x27;recovering&#x27;.</pre>
+</li>
+<li><code>snapshotState</code>
+ <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
+<pre class="doc">Return an immutable ResilienceState snapshot; mutating it does not affect the store.</pre>
+</li>
+</ul></details></section>
+
+  <details>
+    <summary><strong>Mermaid source</strong> (for pasting into mermaid.live — the inline SVG above is the canonical visual)</summary>
+    <pre>
+graph LR
+  IResilienceBoundary["IResilienceBoundary"]
+  IHeartbeat["IHeartbeat"]
+  IWatermarkSampler["IWatermarkSampler"]
+  IDeathDetector["IDeathDetector"]
+  ITopologySnapshot["ITopologySnapshot"]
+  IPtyReattachClient["IPtyReattachClient"]
+  IRecoveryOrchestrator["IRecoveryOrchestrator"]
+  IWebglContextBudget["IWebglContextBudget"]
+  IScrollbackPolicy["IScrollbackPolicy"]
+  IResilienceStore["IResilienceStore"]
+  IResilienceBoundary --> IResilienceStore
+  IResilienceBoundary --> IRecoveryOrchestrator
+  IWatermarkSampler --> IWebglContextBudget
+  IDeathDetector --> IHeartbeat
+  IRecoveryOrchestrator --> ITopologySnapshot
+  IRecoveryOrchestrator --> IPtyReattachClient
+  IRecoveryOrchestrator --> IResilienceStore
+    </pre>
+  </details>
+
+  <h2>Self-verification rubric</h2>
+  <section class="card"><table><thead><tr><th>Criterion</th><th>Score</th></tr></thead><tbody><tr><td>Plan fidelity (진단 4권고 반영)</td><td>4/4</td></tr><tr><td>Decomposition↔interface 일치</td><td>4/4</td></tr><tr><td>Interface cohesion</td><td>4/4</td></tr><tr><td>Docstring completeness (9-field)</td><td>4/4</td></tr><tr><td>DAG acyclicity</td><td>4/4</td></tr><tr><td>No implementation (interface-only)</td><td>4/4</td></tr></tbody></table></section>
+
+  <h2>Reviewer checklist</h2>
+  <section class="card"><ul class="checklist">
+  <li>The decomposition table in Phase 3 matches the interfaces actually emitted in Phase 5</li>
+  <li>Every method has all 9 docstring fields (skim 3 random methods to spot-check)</li>
+  <li>No interface looks like a grab-bag of unrelated methods</li>
+  <li>The Mermaid DAG (architecture.mmd) is acyclic</li>
+  <li>No method body has been written (interface-only)</li>
+  <li>The validation command (Phase 6) passed — see <code>.planner-state.json</code>: <code>validation_status</code></li>
+</ul></section>
+</body>
+</html>

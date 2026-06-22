@@ -1,0 +1,18 @@
+graph LR
+  IResilienceBoundary["IResilienceBoundary"]
+  IHeartbeat["IHeartbeat"]
+  IWatermarkSampler["IWatermarkSampler"]
+  IDeathDetector["IDeathDetector"]
+  ITopologySnapshot["ITopologySnapshot"]
+  IPtyReattachClient["IPtyReattachClient"]
+  IRecoveryOrchestrator["IRecoveryOrchestrator"]
+  IWebglContextBudget["IWebglContextBudget"]
+  IScrollbackPolicy["IScrollbackPolicy"]
+  IResilienceStore["IResilienceStore"]
+  IResilienceBoundary --> IResilienceStore
+  IResilienceBoundary --> IRecoveryOrchestrator
+  IWatermarkSampler --> IWebglContextBudget
+  IDeathDetector --> IHeartbeat
+  IRecoveryOrchestrator --> ITopologySnapshot
+  IRecoveryOrchestrator --> IPtyReattachClient
+  IRecoveryOrchestrator --> IResilienceStore
