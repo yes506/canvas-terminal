@@ -19,12 +19,24 @@ import { ptyReattachClient } from "./PtyReattachClient";
 import { resilienceStore } from "../../stores/resilienceStore";
 import { resilienceConfig } from "./config";
 
-/** Collect every leaf session id of a persisted snapshot, in tree order. */
-function collectSnapshotSessionIds(snapshot: TopologySnapshot): string[] {
+/**
+ * Collect the session ids that have a backing Rust PTY and therefore need
+ * reattach, in tree order. A `terminal` leaf owns one PTY (its own sessionId).
+ * A `collaborator` leaf is a CONTAINER — it renders <CollaboratorPane> and has
+ * NO PTY of its own; the PTYs live in its per-agent tiles
+ * (`leaf.agents[].sessionId`). Reattaching the container id targets a
+ * non-existent PTY (Rust returns alive=false) and skips the agent ids that
+ * actually survived — so we descend into agents and skip the container id.
+ */
+export function collectSnapshotSessionIds(snapshot: TopologySnapshot): string[] {
   const ids: string[] = [];
   const walk = (node: SnapshotPane): void => {
     if (node.type === "leaf") {
-      ids.push(node.sessionId);
+      if (node.kind === "terminal") {
+        ids.push(node.sessionId);
+      } else if (node.kind === "collaborator" && node.agents) {
+        for (const agent of node.agents) ids.push(agent.sessionId);
+      }
       return;
     }
     walk(node.children[0]);
