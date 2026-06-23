@@ -242,4 +242,21 @@ describe("RecoveryOrchestrator.resumeAfterReload", () => {
     expect(h.phases).toContain("failed");
     expect(h.calls).toContain("clear");
   });
+
+  it("records the sign from session.decision even when it DIFFERS from what the evidence would classify to", async () => {
+    // Discriminating provenance check (@claude3 task-33): EVIDENCE has
+    // observedTermination=true, so a (wrong) fresh classifySign of it would
+    // yield 'webcontent-death'. The durable decision carries a deliberately
+    // different sentinel sign — so the assertion fails if the code ever
+    // classifies the evidence instead of honoring session.decision.sign.
+    const sentinel: RootCauseSign = "js-fatal";
+    const h = makeHarness({
+      pending: session({ decision: decision(sentinel) }),
+      claimed: session({ decision: decision(sentinel) }),
+    });
+    const out = await h.o.resumeAfterReload(EVIDENCE);
+    expect(out.phase).toBe("recovered");
+    expect(h.signs).toEqual([sentinel]);
+    expect(h.signs).not.toContain("webcontent-death");
+  });
 });
