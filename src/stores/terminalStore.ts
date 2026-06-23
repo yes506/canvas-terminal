@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Terminal } from "@xterm/xterm";
 import type { SearchAddon } from "@xterm/addon-search";
 import type { Tab, PaneNode, PaneLeaf, ClosedTab } from "../types/terminal";
+import type { TabSnapshot, SnapshotPane } from "../lib/resilience/types";
 import { generateSessionId } from "../lib/sessionId";
 import { destroySession as destroyManagedSession } from "../lib/terminalManager";
 
@@ -92,6 +93,25 @@ function collectSessionIds(node: PaneNode): string[] {
   ];
 }
 
+/**
+ * Convert a persisted SnapshotPane back into a live PaneNode, dropping the
+ * persistence-only fields (cwd, agents) that the live tree does not carry.
+ * Used by restoreTabs to rebuild the pane shell with ORIGINAL session ids.
+ */
+function snapshotPaneToPaneNode(p: SnapshotPane): PaneNode {
+  if (p.type === "leaf") {
+    return { type: "leaf", kind: p.kind, sessionId: p.sessionId };
+  }
+  return {
+    type: "split",
+    direction: p.direction,
+    children: [
+      snapshotPaneToPaneNode(p.children[0]),
+      snapshotPaneToPaneNode(p.children[1]),
+    ],
+  };
+}
+
 /** Find a collaborator leaf anywhere in the pane tree. */
 export function findCollaboratorLeaf(node: PaneNode): PaneLeaf | null {
   if (node.type === "leaf") return node.kind === "collaborator" ? node : null;
@@ -136,6 +156,13 @@ interface TerminalState {
 
   // Tab management
   addTab: (cwd?: string) => void;
+  /**
+   * Restore-only seam (resilience recovery): rebuild the tab/pane shell from a
+   * persisted snapshot binding the ORIGINAL session ids — never minting fresh
+   * ones via generateSessionId. The actual PTY binding is done separately by
+   * the reattach path; this only reconstructs the in-memory tree.
+   */
+  restoreTabs: (tabs: TabSnapshot[], activeTabId?: string | null) => void;
   openCollaboratorSplit: () => void;
   duplicateTab: (tabId: string) => void;
   removeTab: (id: string) => void;
@@ -222,6 +249,27 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       tabs: [...state.tabs, tab],
       activeTabId: tabId,
     }));
+  },
+
+  restoreTabs: (snapshotTabs, activeTabId) => {
+    const tabs: Tab[] = snapshotTabs.map((ts) => ({
+      id: ts.id,
+      title: ts.title,
+      paneTree: snapshotPaneToPaneNode(ts.paneTree),
+      activePaneSessionId: ts.activePaneSessionId,
+      maximizedPaneSessionId: ts.maximizedPaneSessionId,
+    }));
+    // Advance the tab-id counter past any restored numeric id so a later
+    // addTab() can never collide with a restored tab's id.
+    for (const ts of snapshotTabs) {
+      const m = ts.id.match(/^tab-(\d+)-/);
+      if (m) nextTabId = Math.max(nextTabId, parseInt(m[1], 10) + 1);
+    }
+    const resolvedActive =
+      activeTabId && tabs.some((t) => t.id === activeTabId)
+        ? activeTabId
+        : tabs[0]?.id ?? null;
+    set({ tabs, activeTabId: resolvedActive });
   },
 
   openCollaboratorSplit: () => {
