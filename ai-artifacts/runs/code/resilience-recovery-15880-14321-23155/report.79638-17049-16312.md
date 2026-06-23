@@ -91,3 +91,12 @@ After the initial landing, five peer agents reviewed the worktree. Verified + ad
 **Noted, no change (harmless):** `recreate-webview` branch in `prepareReloadRecovery` is currently unreachable (defensive); the crash-loop-fail `healthy→failed` uses the FSM's illegal-coercion safety path (lands correctly); `RestoreReport` counts are partially unused by the orchestrator. `adoptDetachedSession` is a near-clone of `createSession` (F3, LOW) — extract a shared builder when integration starts (touches `createSession`, so deferred).
 
 **Reviewer-confirmed-solid (independently re-verified):** sign provenance reads `session.decision.sign` on expected resume; crash-loop `claimAttempt` runs before any restore side-effect; proactive-persist/`loadPersisted` ordering; identity-verbatim `restoreAgents` + ordinal seeding; gate-closed `shouldRecover` safety switch; `RootErrorBoundary.onTopLevelError` never throws.
+
+## Round-2 peer fold (task-25→29: 5 re-reviews)
+
+codex1/claude3 **APPROVE** the update; codex2/claude2/codex3 approve as the dormant body layer with the deferred items tracked. F1 + the test suite were re-verified correct by all five. Two new items:
+
+**Folded in (in-scope):**
+- **resumeAfterReload orchestration test (claude2, MEDIUM, DI-testable now).** The reload-boundary crux was untested. Added 7 tests (injected fakes): no-pending fail-fast; `claimAttempt`-null and `attempts > maxAttempts` fail-fast; **claim-before-restore ordering**; happy-path `recovered` counts + sign-from-`session.decision` provenance; dead-PTY → `lostSessions`/`success:false`; no-snapshot → throw + `clear`. Suite now **398 passing**.
+
+**New deferred prerequisite — H4 (codex3, HIGH latent, verified):** `restoreShell` seeds restored agents via `restoreAgents`, but `CollaboratorPane` mount calls `startSession(collabId)`, which **wipes** every agent for that `collabSessionId` (`collaboratorStore.ts:1287` `agents.filter(a => a.collabSessionId !== id)`), and the pane renders mini-terminals from local `spawns` React state (`CollaboratorPane.tsx:273`), not `store.agents`. So restored `AgentSnapshot` rows are erased on mount and never materialize a tile/PTY listener — defeating `restoreAgents` even after H1/H2 land. **Tracked as a distinct gate-opening prerequisite** (not part of H1–H3): the restore path must suppress `startSession`'s agent-wipe during recovery and seed the pane's `spawns` from restored `store.agents`. Out of scope for body-generation (CollaboratorPane mount-lifecycle integration, gated). Verified accurate at the cited lines.
