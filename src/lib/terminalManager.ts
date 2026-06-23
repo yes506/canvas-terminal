@@ -430,6 +430,195 @@ export async function createSession(
 }
 
 /**
+ * Restore-only seam (resilience recovery): register a front-end xterm for an
+ * EXISTING Rust PTY that survived a webview reload, WITHOUT spawning a new
+ * shell. Mirrors createSession's terminal construction but omits the
+ * env-bootstrap + spawn_shell step — the PTY already lives in the (PID-stable)
+ * Rust process, and the actual rebind/replay is driven by reattach_pty
+ * (IPtyReattachClient) AFTER this returns. The pty-data listener is subscribed
+ * here so the replayed tail lands in this terminal. No-op if the session
+ * already exists.
+ */
+export async function adoptDetachedSession(
+  sessionId: string,
+  parentEl: HTMLElement,
+): Promise<ManagedTerminal | null> {
+  if (sessions.has(sessionId)) return sessions.get(sessionId)!;
+
+  ensureGlobalSubscriptions();
+
+  const { fontSize, themeName } = useTerminalStore.getState();
+  const theme = terminalThemes[themeName] ?? terminalThemes.catppuccin;
+
+  const containerEl = document.createElement("div");
+  containerEl.style.width = "100%";
+  containerEl.style.height = "100%";
+  parentEl.appendChild(containerEl);
+
+  const terminal = new Terminal({
+    theme,
+    fontFamily: "'JetBrainsMono Nerd Font Mono', 'Noto Sans Mono CJK KR', 'D2Coding', 'JetBrains Mono', Menlo, monospace",
+    fontSize,
+    lineHeight: 1.2,
+    cursorBlink: true,
+    cursorStyle: "bar",
+    scrollback: 10000,
+    allowProposedApi: true,
+  });
+
+  const fitAddon = new FitAddon();
+  const searchAddon = new SearchAddon();
+  const unicode11Addon = new Unicode11Addon();
+  terminal.loadAddon(fitAddon);
+  terminal.loadAddon(new WebLinksAddon());
+  terminal.loadAddon(searchAddon);
+  terminal.loadAddon(unicode11Addon);
+  terminal.unicode.activeVersion = "11";
+
+  terminal.attachCustomKeyEventHandler((e) => {
+    if (e.isComposing || e.keyCode === 229) return true;
+    if (e.key === "Enter" && e.shiftKey && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      if (e.type === "keydown") {
+        invoke("write_to_pty", { sessionId, data: "\x1b[13;2u" }).catch(() => {});
+      }
+      return false;
+    }
+    if ((e.metaKey || e.ctrlKey) && INTERCEPTED_KEYS.has(e.key)) return false;
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "[" || e.key === "]")) return false;
+    if ((e.metaKey || e.ctrlKey) && e.altKey && e.key.startsWith("Arrow")) return false;
+    return true;
+  });
+
+  terminal.open(containerEl);
+
+  try {
+    const webglAddon = new WebglAddon(false);
+    webglAddon.onContextLoss(() => { try { webglAddon.dispose(); } catch { /* already disposed */ } });
+    terminal.loadAddon(webglAddon);
+  } catch {
+    // Fall back to canvas renderer
+  }
+
+  if (containerEl.offsetWidth > 0 && containerEl.offsetHeight > 0) {
+    fitAddon.fit();
+  }
+
+  const managed: ManagedTerminal = {
+    terminal,
+    fitAddon,
+    searchAddon,
+    containerEl,
+    unlistenData: null,
+    unlistenExit: null,
+    observer: null,
+    imeHandle: null,
+    disposed: false,
+  };
+
+  sessions.set(sessionId, managed);
+  registerTerminal(sessionId, terminal, searchAddon);
+
+  const observer = new ResizeObserver(() => {
+    if (!managed.disposed && containerEl.offsetWidth > 0 && containerEl.offsetHeight > 0) {
+      const buf = terminal.buffer.active;
+      const wasAtBottom = buf.viewportY >= buf.baseY;
+      fitAddon.fit();
+      if (wasAtBottom) terminal.scrollToBottom();
+    }
+  });
+  observer.observe(containerEl);
+  managed.observer = observer;
+
+  // Subscribe BEFORE the caller invokes reattach_pty so the Rust replay tail
+  // lands in this terminal rather than the void.
+  managed.unlistenData = await listen<string>(
+    `pty-data-${sessionId}`,
+    (event) => {
+      if (!managed.disposed) {
+        terminal.write(event.payload);
+      }
+    },
+  );
+
+  if (managed.disposed) {
+    cleanupManaged(managed, sessionId);
+    return null;
+  }
+
+  managed.unlistenExit = await listen(
+    `pty-exit-${sessionId}`,
+    () => {
+      if (!managed.disposed) {
+        terminal.write("\r\n\x1b[33m[Process exited]\x1b[0m\r\n");
+      }
+    },
+  );
+
+  if (managed.disposed) {
+    cleanupManaged(managed, sessionId);
+    return null;
+  }
+
+  // NO ensureEnvBootstrapped / spawn_shell — the surviving Rust PTY is reused.
+
+  let lineBuffer = "";
+
+  managed.imeHandle = attachKoreanImeShim(terminal, containerEl, {
+    sessionId,
+    webgl: true,
+    defaultFontSize: 12,
+    onComposedFlush: (_committedText, terminator) => {
+      if (terminator === "\r") {
+        lineBuffer = "";
+      }
+    },
+    shouldBubbleShortcut: (e) => {
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if ((e.metaKey || e.ctrlKey) && INTERCEPTED_KEYS.has(k)) return true;
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "[" || e.key === "]")) return true;
+      if ((e.metaKey || e.ctrlKey) && e.altKey && e.key.startsWith("Arrow")) return true;
+      return false;
+    },
+  });
+
+  terminal.onData((data) => {
+    if (managed.disposed) return;
+
+    if (data === "\r") {
+      if (lineBuffer.trim() === "collaborator") {
+        lineBuffer = "";
+        invoke("write_to_pty", { sessionId, data: "\x15" }).catch(() => {});
+        useTerminalStore.getState().openCollaboratorSplit();
+        return;
+      }
+      lineBuffer = "";
+    } else if (data === "\x7f") {
+      lineBuffer = lineBuffer.slice(0, -1);
+    } else if (data.length === 1 && data >= " ") {
+      lineBuffer += data;
+    } else if (data === "\x03") {
+      lineBuffer = "";
+    }
+
+    invoke("write_to_pty", { sessionId, data }).catch(() => {});
+  });
+
+  let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  terminal.onResize(({ cols, rows }) => {
+    if (managed.disposed) return;
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (!managed.disposed) {
+        invoke("resize_pty", { sessionId, cols, rows }).catch(() => {});
+      }
+    }, 80);
+  });
+
+  return managed;
+}
+
+/**
  * Move the terminal's DOM element from the hidden host into a visible slot.
  * Re-fits the terminal to the new container dimensions.
  */

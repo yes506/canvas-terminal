@@ -9,6 +9,7 @@ import type {
   RenameResult,
 } from "../types/collaborator";
 import { TOOL_CONFIGS } from "../types/collaborator";
+import type { AgentSnapshot } from "../lib/resilience/types";
 import { muteCapture } from "../lib/agentOutputCapture";
 import { hasContextsBreadcrumb, sanitizeCollabSessionId } from "../lib/peerContext";
 import { useTerminalStore } from "./terminalStore";
@@ -284,6 +285,20 @@ function resetOrdinalCounters(forSession: string): void {
       toolOrdinalCounters.delete(key);
     }
   }
+}
+
+/**
+ * Restore-only: advance the per-tool ordinal counter so a restored agent's
+ * ordinal can never be re-minted by a later addAgent in the same session.
+ */
+function seedOrdinalCounter(
+  collabSessionId: string,
+  tool: ToolId,
+  ordinal: number,
+): void {
+  const key = `${collabSessionId}:${tool}`;
+  const cur = toolOrdinalCounters.get(key) ?? 0;
+  if (ordinal > cur) toolOrdinalCounters.set(key, ordinal);
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +849,15 @@ interface CollaboratorState {
   // Agent lifecycle
   addAgent: (agent: SpawnedAgentInit) => void;
   /**
+   * Restore-only seam (resilience recovery): seed materialized SpawnedAgent
+   * rows from persisted AgentSnapshots VERBATIM (ordinal / nicknameSlug /
+   * nameHistory / handle preserved) WITHOUT addAgent's identity minting, so a
+   * user rename survives recovery and mention/task routing rebuilds against the
+   * same identity. Idempotent per sessionId; advances the per-tool ordinal
+   * counter so a later addAgent in the same session cannot reuse an ordinal.
+   */
+  restoreAgents: (snapshots: AgentSnapshot[]) => void;
+  /**
    * Flip the cross-tool agent context surfacing opt-in for a given agent
    * (peer-context-mirror feature). The watch lifecycle in
    * `AgentMiniTerminal.tsx` reactively reads `publishOptedIn` + `status`
@@ -1380,6 +1404,38 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       publishOptedIn: raw.publishOptedIn ?? true,
     };
     set((s) => ({ agents: [...s.agents, agent] }));
+  },
+
+  restoreAgents: (snapshots) => {
+    const existing = new Set(get().agents.map((a) => a.sessionId));
+    const restored: SpawnedAgent[] = [];
+    for (const snap of snapshots) {
+      // Idempotent per sessionId — never double-seed a live tile.
+      if (existing.has(snap.sessionId)) continue;
+      existing.add(snap.sessionId);
+      const agent: SpawnedAgent = {
+        sessionId: snap.sessionId,
+        collabSessionId: snap.collabSessionId,
+        tool: snap.tool,
+        status: snap.status,
+        handle: snap.handle,
+        ordinal: snap.ordinal,
+        nickname: snap.nickname,
+        nicknameSlug: snap.nicknameSlug,
+        // Copy the audit so the restored record doesn't alias the snapshot's array.
+        nameHistory: snap.nameHistory.map((h) => ({
+          nickname: h.nickname,
+          setAt: h.setAt,
+          setBy: h.setBy,
+        })),
+        publishOptedIn: snap.publishOptedIn,
+      };
+      restored.push(agent);
+      // Keep the ordinal counter ahead of every restored ordinal.
+      seedOrdinalCounter(snap.collabSessionId, snap.tool, snap.ordinal);
+    }
+    if (restored.length === 0) return;
+    set((s) => ({ agents: [...s.agents, ...restored] }));
   },
 
   setPublishOptedIn: (sessionId, value) => {
