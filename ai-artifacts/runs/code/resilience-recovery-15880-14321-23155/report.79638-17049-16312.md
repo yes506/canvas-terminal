@@ -77,3 +77,17 @@ Total: **16 files, +1415 lines** (all additive; no existing logic altered).
 - The `invoke()` calls target Rust commands that **do not exist yet**; they compile (string-based IPC) but reject at runtime. Because `recoveryGateOpen` is CLOSED and the diagnostic forwards swallow IPC errors, this does not destabilize the app.
 - `resumeAfterReload`'s reattach loop runs without the full React mount-await synchronization (DOM-slot binding via `adoptDetachedSession` is gated integration); the body is structurally faithful and dormant until the gate opens.
 - Concrete classes are not yet wired into the live app (`main.tsx` / `terminalManager.createSession`); wiring is staged-rollout integration beyond the ratified body-generation scope.
+
+## Peer review fold (task-24, 5 reviewers: codex1/2/3, claude2/3)
+
+After the initial landing, five peer agents reviewed the worktree. Verified + adjudicated:
+
+**Folded in (in-scope):**
+- **F1 (claude3, real bug)** — `collectSnapshotSessionIds` ignored `leaf.kind`, feeding collaborator-*container* ids (which have no backing PTY) into the `reattach_pty` loop → `success:false` on every recovery containing a collab pane, while skipping the actual agent PTYs in `leaf.agents[]`. **Fixed**: now collects terminal-leaf ids ∪ agent ids, skips container ids. Locked by a regression test.
+- **F2 (unanimous, test gap)** — ~1494 lines shipped with the suite at the 364 baseline. **Added 27 unit tests** for the pure-FE logic (FSM legal/illegal/idempotent transitions + incident guards; classifier precedence + durable-gap fallback; WebGL budget cap/idempotency; scrollback caps; gate-closed/open `shouldRecover`; F1 regression). Suite now 391 passing.
+
+**Deferred (out of ratified scope — gate-opening prerequisites, NOT this run's defects):** the wiring findings H1 (thread `isReloadInProgress` through `AgentMiniTerminal`/`CollaboratorPane`/`collaboratorStore.killAllAgents`/`terminalManager.cleanupManaged`), H2 (route restored terminal leaves through `adoptDetachedSession`, not `createSession`), H3 (`main.tsx` bootstrap: mount `RootErrorBoundary`, `heartbeat.start()`, `loadPending`→`resumeAfterReload`), and M (schedule proactive `capture`/`persist`; wire `ScrollbackPolicy`/`WebglContextBudget` into `createSession`). The two deepest scope adjudications (claude2, claude3-addendum) agree these are defensibly deferred per the planner's "메서드 바디 구현" Out-of-scope and are entangled with the deferred Rust run — *"not a protocol violation."* They are tracked here as explicit prerequisites that MUST land (with the Rust run) before `recoveryGateOpen` is flipped.
+
+**Noted, no change (harmless):** `recreate-webview` branch in `prepareReloadRecovery` is currently unreachable (defensive); the crash-loop-fail `healthy→failed` uses the FSM's illegal-coercion safety path (lands correctly); `RestoreReport` counts are partially unused by the orchestrator. `adoptDetachedSession` is a near-clone of `createSession` (F3, LOW) — extract a shared builder when integration starts (touches `createSession`, so deferred).
+
+**Reviewer-confirmed-solid (independently re-verified):** sign provenance reads `session.decision.sign` on expected resume; crash-loop `claimAttempt` runs before any restore side-effect; proactive-persist/`loadPersisted` ordering; identity-verbatim `restoreAgents` + ordinal seeding; gate-closed `shouldRecover` safety switch; `RootErrorBoundary.onTopLevelError` never throws.
