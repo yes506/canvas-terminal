@@ -17,6 +17,14 @@ import type { ReplayBudget, PtyReattachResult } from "./types";
  *    Replay is delivered through the EXISTING `pty-data-{sessionId}` event the
  *    front end already listens on — NOT returned inline — which is why
  *    restoreShell (mount) must precede reattach (replay into mounted xterm).
+ *  - ALWAYS-ON ring, not allocated at reattach (round-4 — claude2 SHOULD-FIX #2,
+ *    sharpens codex3 #3 — @claude1 task-6): the ring MUST be populated by the
+ *    existing reader thread UNCONDITIONALLY from PTY creation. During the reload
+ *    gap the old context's pty-data listener is dead and the new one has not yet
+ *    re-subscribed, so the reader keeps emitting into the void — and exactly
+ *    those listener-gap bytes are the ones replay must recover. An on-demand ring
+ *    started at reattach would miss precisely the gap window. `reattach` therefore
+ *    only sets the replay cursor + flush order; it does NOT start buffering.
  *  - Sequencing (claude3 C4 / codex3 #2): a single reattach() call replaces
  *    the prior reattach()+replayInto() pair, removing the "replayInto needs a
  *    mounted terminal before restore" contradiction.

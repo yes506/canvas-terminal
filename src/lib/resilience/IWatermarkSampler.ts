@@ -4,9 +4,12 @@ import type { ResourceWatermark } from "./types";
  * IWatermarkSampler — resource-pressure observer.
  *
  * Cohesion source: owns sampling + logging of the memory/GPU/tab-count
- * watermarks that correlate with WebContent jettison. Produces the
- * evidence trail that confirms hypothesis A (memory pressure → death)
- * before any heavyweight recovery is implemented.
+ * watermarks that CORRELATE with WebContent jettison. Produces the
+ * diagnostic pressure trail that SUPPORTS (gates/contextualizes) hypothesis A
+ * before any heavyweight recovery is implemented — it never CONFIRMS A on its
+ * own (round-4 — codex1 LOW — @claude1 task-6: only IWebContentWatchdog's
+ * durable DeathEvidence positively confirms 'webcontent-death'; memory pressure
+ * alone must not be over-classified as death).
  */
 export interface IWatermarkSampler {
   /**

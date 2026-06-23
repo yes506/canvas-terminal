@@ -57,18 +57,28 @@ export interface IResilienceStore {
   recordBoundaryCaught(incidentId: IncidentId): void;
 
   /**
-   * Responsibility: Record the classified sign for the current incident.
+   * Responsibility: Record the classified sign for a specific incident.
    * Pipeline-position: IDeathDetector.classifySign -> THIS -> IResilienceStore.transition
    * Inputs:
    *   - sign: RootCauseSign — the inferred root-cause sign
+   *   - incidentId: IncidentId — the incident this sign belongs to (carried
+   *     through from SignClassification.incidentId)
    * Outputs: void.
-   * Side-effects: writes lastSign; notifies subscribers.
-   * Preconditions: None.
-   * Postconditions: snapshotState().lastSign === sign.
-   * Failure-modes: None.
+   * Side-effects: writes lastSign iff incidentId === current incident; notifies
+   *   subscribers. A stale incidentId is a silent no-op.
+   * Round-4 fix (claude2 SHOULD-FIX #1 — @claude1 task-6): previously `recordSign`
+   *   took no incidentId and wrote `lastSign` for the implicit "current" incident,
+   *   while `classifySign` already carries `incidentId` and `recordBoundaryCaught`
+   *   guards on it. If a new incident is minted between classify and record, the
+   *   sign would land on the wrong incident with no guard — asymmetric with the
+   *   store's own correlation model. This restores symmetry.
+   * Preconditions: incidentId was obtained from beginIncident() (via SignClassification).
+   * Postconditions: for the matching incident, snapshotState().lastSign === sign;
+   *   for a stale incident, state is unchanged.
+   * Failure-modes: None. (stale id is a silent no-op, by design)
    * Collaborators: None.
    */
-  recordSign(sign: RootCauseSign): void;
+  recordSign(sign: RootCauseSign, incidentId: IncidentId): void;
 
   /**
    * Responsibility: Record the latest resource-pressure watermark.

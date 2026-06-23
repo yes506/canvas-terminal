@@ -24,7 +24,8 @@ export interface IRecoverySession {
    * Inputs:
    *   - decision: RecoveryDecision — proceed===true intent to carry across reload
    * Outputs: Promise<RecoverySession> — the persisted record incl. a fresh
-   *   generation token, suppressTeardown=true, and an expiry.
+   *   generation token, suppressTeardown=true, an expiry, and attempts=0 with a
+   *   maxAttempts cap (round-4 crash-loop guard — claude3 MED-1).
    * Side-effects: writes the durable recovery-session via Rust IPC, BEFORE the
    *   reload is requested.
    * Preconditions: called from the live context that is about to reload (or by
@@ -49,7 +50,9 @@ export interface IRecoverySession {
    * Preconditions: called once, very early in bootstrap, before collaborator
    *   components mount (so isReloadInProgress can be seeded synchronously after).
    * Postconditions: a non-null result obligates bootstrap to enter
-   *   resumeAfterReload instead of normal startup; the token matches begin().
+   *   resumeAfterReload instead of normal startup; the token matches begin();
+   *   the returned `attempts`/`maxAttempts` let resume fail fast on a crash-loop
+   *   (resume increments-and-persists `attempts` before restore — round-4 claude3 MED-1).
    * Failure-modes:
    *   - Error — thrown only on IPC transport failure; "nothing pending" is null.
    * Collaborators: load_recovery_session (Rust IPC)

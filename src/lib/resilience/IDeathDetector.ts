@@ -29,7 +29,10 @@ export interface IDeathDetector {
    * Pipeline-position: IWebContentWatchdog.readDeathEvidence -> THIS -> IDeathDetector.classifySign
    * Inputs:
    *   - evidence: DeathEvidence — durable Rust evidence (observedTermination,
-   *     lastGoodBeatAt, gapMs, launchCount); the authoritative A input
+   *     lastGoodBeatAt, gapMs, reloadedSinceLastBeat); the authoritative A input.
+   *     The reload decision reads the Rust-computed `reloadedSinceLastBeat`, NOT a
+   *     frontend re-derivation of `launchCount` (no in-memory baseline survives —
+   *     round-4 codex1 MED).
    * Outputs: LivenessVerdict — gapMs + suspectDeath + sampledAt, derived from
    *   the durable gap (not the in-memory heartbeat, which a dead context lost).
    * Side-effects: reads IHeartbeat.lastBeatAt for the live-context case; reads
@@ -37,7 +40,8 @@ export interface IDeathDetector {
    * Preconditions: invoked from a visibilitychange/pageshow handler OR the
    *   post-reload bootstrap; evidence is freshly read for this incident.
    * Postconditions: suspectDeath === (evidence.observedTermination ||
-   *   durable gapMs > threshold); verdict reflects the instant of this call.
+   *   evidence.reloadedSinceLastBeat || durable gapMs > threshold); verdict
+   *   reflects the instant of this call.
    * Failure-modes: None. (missing evidence yields suspectDeath=false, not a throw)
    * Collaborators: IHeartbeat.lastBeatAt, IWebContentWatchdog.readDeathEvidence
    */

@@ -34,14 +34,22 @@ export interface IRecoveryOrchestrator {
    * Inputs:
    *   - sign: RootCauseSign — the classified incident sign
    * Outputs: RecoveryDecision — proceed flag + chosen action + reason.
-   * Side-effects: None. (pure policy; reads config/evidence-gate state)
+   * Side-effects: None. (pure policy; reads the #3 evidence-gate state)
+   * Evidence-gate ownership (round-4 — claude2 NOTE #3 / claude3 LOW-2 —
+   *   @claude1 task-6): the #3 gate is the central safety switch of the staged
+   *   rollout (#1+#2 ship first → collect evidence → flip the gate to enable
+   *   #3/#4). It is NOT an ambient global the implementer invents. It is owned
+   *   by a single named config flag — `resilienceConfig.recoveryGateOpen`
+   *   (a build/runtime feature flag, default CLOSED) — read here; no FSM
+   *   transition flips it. When closed, shouldRecover returns proceed:false for
+   *   every sign so only diagnostics accrue.
    * Preconditions: a sign has been recorded for the current incident.
    * Postconditions: proceed===false ⇒ action 'none'; while the #3 evidence gate
    *   is closed, returns proceed:false regardless of sign; 'gpu-loss' and
    *   'unknown' return proceed:false (advisory only — no auto-reload) until
    *   their handling is explicitly enabled.
    * Failure-modes: None. (total)
-   * Collaborators: None.
+   * Collaborators: None. (reads resilienceConfig.recoveryGateOpen)
    */
   shouldRecover(sign: RootCauseSign): RecoveryDecision;
 
@@ -79,6 +87,18 @@ export interface IRecoveryOrchestrator {
    *   A/bootstrap path (IResilienceStore.beginIncident — the path-A issuance owner,
    *   per claude3 R2); runs loadPersisted → restoreShell → (await xterm refs) →
    *   reattach → verify; clears the durable session and the flag at the end.
+   * Crash-loop guard (round-4 — claude3 MED-1 — @claude1 task-6): BEFORE restore
+   *   begins, the durable RecoverySession.attempts is incremented-and-persisted;
+   *   if it now exceeds RecoverySession.maxAttempts the run fails fast to 'failed'
+   *   and clears the session, rather than re-reading the same session and
+   *   thrash-retrying until expiry (the in-memory recoveryAttempts resets each
+   *   reload and cannot bound this).
+   * A/bootstrap invariant (round-4 — claude2 NOTE #4): on this path the prior
+   *   context's boundary state died with it, so beginIncident() mints a fresh
+   *   incident with boundaryCaught=false; classifySign therefore always sees
+   *   boundaryCaught=false here and correctly resolves 'webcontent-death'. Do NOT
+   *   rehydrate boundaryCaught from any persisted source — a true value implies a
+   *   live JS context that would not be on the reload path (mutual exclusion).
    * Preconditions: IRecoverySession.loadPending() returned a non-expired session
    *   for this boot; called once, before normal app startup proceeds.
    * Postconditions: alive PTYs reattached + visible; dead PTYs become exited tiles
@@ -88,6 +108,7 @@ export interface IRecoveryOrchestrator {
    *   - Error — thrown if no durable snapshot exists to restore; per-session
    *     failures surface in lostSessions, not thrown.
    *   - Cancelled — abort() mid-run resolves success:false / phase:'failed'.
+   *   - Attempt-exhausted — attempts > maxAttempts resolves phase:'failed' fast.
    * Collaborators: IRecoverySession.loadPending, IRecoverySession.clear,
    *   ITopologySnapshot.loadPersisted, ITopologySnapshot.restoreShell,
    *   IPtyReattachClient.reattach, IResilienceStore.beginIncident,
@@ -107,10 +128,23 @@ export interface IRecoveryOrchestrator {
    *   valid in the new context even though the prior in-memory flag was lost.
    * Preconditions: bootstrap has read IRecoverySession.loadPending() and seeded
    *   the flag before the first collaborator mount.
-   * Postconditions: a true result obligates collaborator mini-terminal cleanup
-   *   (AgentMiniTerminal.tsx:820) and any destroySession() restore path to SKIP
-   *   invoke("kill_pty")/removeAgent. (Main terminal unmount already only parks —
-   *   useTerminal.ts:42 — so it needs no guard.)
+   * Postconditions: a true result obligates EVERY collaborator kill path to SKIP
+   *   its PTY teardown. There are TWO such paths and the contract binds BOTH
+   *   (round-4 4-way convergent blocker: codex1 H / codex2 H / codex3 #1 /
+   *   claude2 BLOCKER — @claude1 task-6 re-verified in code):
+   *     1. child mini-terminal cleanup — AgentMiniTerminal.tsx:821
+   *        `invoke("kill_pty")` + `removeAgent(sessionId)` — must be skipped;
+   *     2. PARENT pane cleanup — CollaboratorPane.tsx:82-83
+   *        `killAllAgents(collabId)` (collaboratorStore.ts:1544 → per-agent
+   *        `kill_pty`) + `endSession(collabId)` (clears the session memory dir).
+   *        A restore that remounts/reorders the collaborator subtree unmounts the
+   *        pane and would kill the very PTYs recovery means to reattach, defeating
+   *        the lossless guarantee even with path #1 guarded. While true, BOTH
+   *        `killAllAgents` and `endSession`'s memory-dir clear MUST be suppressed
+   *        (else the PTY survives but collaborator identity/memory is erased);
+   *        `removeAgent` is likewise suppressed so the tile is not dropped.
+   *   Any destroySession() restore path is covered by the same rule.
+   *   (Main terminal unmount already only parks — useTerminal.ts:42 — no guard.)
    * Failure-modes: None.
    * Collaborators: None. (seed source is IRecoverySession; read is in-memory)
    */

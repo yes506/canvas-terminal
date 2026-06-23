@@ -26,6 +26,10 @@ export interface ITopologySnapshot {
    * Outputs: TopologySnapshot — versioned, isomorphic to the live PaneNode;
    *   collaborator leaves carry their AgentSnapshot[] (tool/cwd/status/handle/…).
    * Side-effects: may invoke get_pty_cwd per leaf to capture cwd; no mutations.
+   *   cwd is NOT re-sampled via IPC on every capture (round-4 — codex1 MED —
+   *   @claude1 task-6): get_pty_cwd is sampled opportunistically and CACHED per
+   *   session (refreshed on shell-cwd-change events), so a high-frequency capture
+   *   reads the cached value rather than issuing one IPC per leaf per persist.
    * Preconditions: stores are initialized and the JS context is alive
    *   (i.e. called while HEALTHY, not after a suspected death).
    * Postconditions: snapshot mirrors the live tab/pane tree (incl.
@@ -44,6 +48,12 @@ export interface ITopologySnapshot {
    * Outputs: Promise<void>.
    * Side-effects: invokes persist_topology Rust IPC, writing to the PID-stable
    *   memory dir (NOT a front-end-named file — so a reload re-reads the same key).
+   * Persist trigger (round-4 — codex1 MED — @claude1 task-6): persistence is
+   *   driven by a DIRTINESS model, not every store update. It fires (debounced
+   *   ~250-500ms) only on restore-relevant changes — pane tree add/remove/split,
+   *   active/maximized tab change, agent identity/status change, and cached-cwd
+   *   refresh — and is explicitly DECOUPLED from high-frequency churn (terminal
+   *   output, task-state updates, watermark ticks) so it never floods IPC.
    * Preconditions: snapshot is internally consistent (from capture()).
    * Postconditions: a subsequent loadPersisted() (even on a fresh JS context
    *   with the same Rust PID) returns this snapshot; idempotent per snapshot.
@@ -82,8 +92,24 @@ export interface ITopologySnapshot {
    * Side-effects: mutates terminalStore/collaboratorStore to recreate tabs,
    *   panes, maximized state, and seeds collaborator `spawns` from AgentSnapshot[].
    *   MUST run under the recovery-teardown-suppression guard so component
-   *   unmount/remount during rebuild does NOT invoke kill_pty (see
-   *   IRecoveryOrchestrator.isReloadInProgress; AgentMiniTerminal.tsx:820).
+   *   unmount/remount during rebuild does NOT invoke kill_pty on EITHER kill path
+   *   (AgentMiniTerminal.tsx:821 AND CollaboratorPane.tsx:82-83
+   *   killAllAgents/endSession — see IRecoveryOrchestrator.isReloadInProgress).
+   * Required restore seams (round-4 — codex1 HIGH, 3-way — @claude1 task-6
+   *   verified): the EXISTING store APIs cannot satisfy the no-spawn/original-ID
+   *   postcondition — terminalStore.addTab (terminalStore.ts:208) and splitPane
+   *   (:403) MINT a fresh id via generateSessionId(), and useTerminal
+   *   (useTerminal.ts:38) calls createSession()→spawn_shell whenever the FE
+   *   manager lacks a session. So restoreShell MUST go through NEW restore-only
+   *   seams the implementer adds, NOT the spawn-minting ones:
+   *     - terminalStore.restoreTabs(snapshot.tabs) — rebuild tabs/panes binding
+   *       the ORIGINAL sessionIds (no generateSessionId);
+   *     - terminalManager.adoptDetachedSession(sessionId, parentEl) — register a
+   *       FE terminal for an existing id WITHOUT createSession()/spawn_shell;
+   *     - collaboratorStore.restoreAgents(AgentSnapshot[]) — seed materialized
+   *       SpawnedAgent rows (ordinal/nicknameSlug/nameHistory verbatim) WITHOUT
+   *       addAgent's identity minting.
+   *   The actual PTY binding is reattach_pty (IPtyReattachClient), never spawn_shell.
    * Preconditions: snapshot.version is supported; called on the fresh post-reload
    *   stores; IRecoveryOrchestrator.isReloadInProgress() is true (teardown suppressed).
    * Postconditions: a pane exists for each restorable leaf bound to its ORIGINAL

@@ -80,6 +80,7 @@
 <li>architecture.html + architecture.mmd 산출, tsc 통과(달성: TSC_OK)</li>
 <li>round-2 4-peer convergent defects all reflected (10 items in revision_log); tsc --noEmit clean after revision</li>
 <li>round-3 reload-crossing blocking finding (3-peer convergence) resolved via durable IRecoverySession + 2-phase orchestration; tsc clean</li>
+<li>round-4 5-peer review (codex1/2/3 + claude2/3, collected+verified by @claude1 task-6): 4-way teardown blocker (CollaboratorPane 2nd kill-path) + 3-way AgentSnapshot identity gap + 3-way restoreShell no-spawn seam folded; novel recordSign-incidentId, always-on replay ring, durable crash-loop counter, evidence-gate owner, main.tsx bootstrap contract, watermark wording — all reflected; tsc --noEmit clean after revision</li>
 </ul>
 <h4>Open questions</h4><ul>
 <li>Q1 RESOLVED: A detection = Rust IWebContentWatchdog (didTerminateWebProcess + durable last-beat), first-class/REQUIRED (not optional)</li>
@@ -87,6 +88,13 @@
 <li>Q3 RESOLVED: persist_topology/load_topology + persist/load/clear_recovery_session to PID-stable dir; proactive debounced</li>
 <li>Q4 RESOLVED: Rust bounded per-session ring; replay flush precedes live resume(ordering) via pty-data stream</li>
 <li>Collaborator 정책 CLOSED: alive PTY=reattach 필수 / dead PTY=핸들·로그 보존한 exited 타일(미드롭·미재spawn)</li>
+<li>round-4 CLOSED (teardown 2-path): suppression contract는 AgentMiniTerminal:821 + 부모 CollaboratorPane:82-83 killAllAgents/endSession 양쪽 모두 구속 (4-way blocker)</li>
+<li>round-4 CLOSED (restore seam): restoreShell은 신규 restore-only 시ーム(terminalStore.restoreTabs / terminalManager.adoptDetachedSession / collaboratorStore.restoreAgents)을 통해 원본 sessionId로 복원 — addTab/splitPane(generateSessionId)·createSession(spawn_shell) 미사용</li>
+<li>round-4 CLOSED (replay ring): Rust per-session ring은 PTY 생성 시점부터 ALWAYS-ON(리스너 공백 구간 캡처); reattach는 cursor+flush order만 설정</li>
+<li>round-4 CLOSED (crash-loop): RecoverySession.attempts/maxAttempts durable 카운터로 resume 무한 thrash 방지(in-memory recoveryAttempts는 reload마다 reset)</li>
+<li>round-4 CLOSED (evidence-gate owner): #3 게이트는 named config flag `resilienceConfig.recoveryGateOpen`(default CLOSED)가 소유 — ambient global 아님</li>
+<li>round-4 CLOSED (bootstrap contract): main.tsx는 명시적 contract surface — loadPending() resolve 전까지 첫 React render 차단 + isReloadInProgress 첫 mount 이전 seed</li>
+<li>A-path BLOCKED behind prerequisite Rust planner run: 메인 앱 WebView(브라우저 child가 아닌)의 native didTerminateWebProcess delegate 설치 지점 + Tauri/Wry feasibility는 미해결 — A 자동 reload는 그 Rust run 이전에는 미배송(문서화만; codex1 HIGH)</li>
 <li>OPEN(implementer at #3): ring 보존 cap(bytes), blankObserved 컴포지터 probe 구현 방식</li>
 </ul></section>
 
@@ -177,21 +185,21 @@
 </li>
 <li><code>restoreShell</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
-<pre class="doc">Phase-1: rebuild panes/tabs/maximized + seed collaborator spawns WITHOUT spawning/killing PTY; under teardown-suppression guard.</pre>
+<pre class="doc">Phase-1: rebuild panes/tabs/maximized + seed collaborator spawns WITHOUT spawning/killing PTY; under teardown-suppression guard (both kill paths). Uses NEW restore-only seams (restoreTabs/adoptDetachedSession/restoreAgents) binding ORIGINAL sessionIds — never addTab/splitPane(generateSessionId) or createSession(spawn_shell) (round-4 codex1 HIGH).</pre>
 </li>
 </ul></details>
 <details open><summary><strong>IPtyReattachClient</strong> <small>(src/lib/resilience, cohesion: #3 Rust reattach client; replay via existing pty-data event stream (fixes mounted-xterm contradiction + thin replay contract))</small></summary>
 <ul>
 <li><code>reattach</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
-<pre class="doc">Rebind session to surviving Rust PTY; Rust flushes ring replay BEFORE live resume (no interleave, idempotent) via pty-data event into mounted xterm; alive=false⇒restore dead/exited tile preserving handle/log (not dropped).</pre>
+<pre class="doc">Rebind session to surviving Rust PTY; Rust flushes ring replay BEFORE live resume (no interleave, idempotent) via pty-data event into mounted xterm; alive=false⇒restore dead/exited tile preserving handle/log (not dropped). Ring is ALWAYS-ON from PTY creation (captures the reload listener-gap bytes); reattach only sets replay cursor+flush order, never starts buffering (round-4 claude2 #2).</pre>
 </li>
 </ul></details>
 <details open><summary><strong>IRecoveryOrchestrator</strong> <small>(src/lib/resilience, cohesion: #3 Reload-crossing recovery loop — split prepareReloadRecovery(old ctx)/resumeAfterReload(fresh ctx) joined by durable IRecoverySession; in-memory recover() can&#x27;t survive the reload it triggers)</small></summary>
 <ul>
 <li><code>shouldRecover</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
-<pre class="doc">Gate whether/how recovery runs for a sign; gate-closed/gpu-loss/unknown⇒proceed:false (advisory, no auto-reload).</pre>
+<pre class="doc">Gate whether/how recovery runs for a sign; gate-closed/gpu-loss/unknown⇒proceed:false (advisory, no auto-reload). #3 evidence gate owned by named config flag resilienceConfig.recoveryGateOpen (default CLOSED), not an ambient global (round-4 claude2 #3/claude3 LOW-2).</pre>
 </li>
 <li><code>prepareReloadRecovery</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
@@ -199,11 +207,11 @@
 </li>
 <li><code>resumeAfterReload</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
-<pre class="doc">FRESH ctx: seed isReloadInProgress from durable session before mounts; beginIncident(path-A owner); loadPersisted→restoreShell→reattach→verify; clear durable session.</pre>
+<pre class="doc">FRESH ctx: seed isReloadInProgress from durable session before mounts; beginIncident(path-A owner, boundaryCaught=false by construction); increment durable RecoverySession.attempts BEFORE restore (fail-fast past maxAttempts — crash-loop guard, round-4 claude3 MED-1); loadPersisted→restoreShell→reattach→verify; clear durable session.</pre>
 </li>
 <li><code>isReloadInProgress</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
-<pre class="doc">Synchronous read SEEDED from durable IRecoverySession at bootstrap (prior in-memory flag lost on reload); collaborator unmount(AgentMiniTerminal:820) skips kill_pty when true. Main terminal only parks (useTerminal:42) — no guard needed.</pre>
+<pre class="doc">Synchronous read SEEDED from durable IRecoverySession at bootstrap (prior in-memory flag lost on reload); when true BOTH collaborator kill paths skip teardown — AgentMiniTerminal:821 kill_pty/removeAgent AND parent CollaboratorPane:82-83 killAllAgents/endSession (round-4 4-way blocker). Main terminal only parks (useTerminal:42) — no guard.</pre>
 </li>
 <li><code>abort</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
@@ -214,7 +222,7 @@
 <ul>
 <li><code>begin</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
-<pre class="doc">OLD ctx: durably write recovery-session(token+expiry+suppressTeardown) before reload; persist_recovery_session IPC.</pre>
+<pre class="doc">OLD ctx: durably write recovery-session(token+expiry+suppressTeardown+attempts:0/maxAttempts) before reload; persist_recovery_session IPC.</pre>
 </li>
 <li><code>loadPending</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
@@ -263,7 +271,7 @@
 </li>
 <li><code>recordSign</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
-<pre class="doc">Record classified sign for current incident.</pre>
+<pre class="doc">Record classified sign for a specific incidentId (stale id = no-op); symmetric with recordBoundaryCaught (round-4 claude2 #1).</pre>
 </li>
 <li><code>recordWatermark</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>

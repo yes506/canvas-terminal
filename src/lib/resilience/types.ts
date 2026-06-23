@@ -77,8 +77,18 @@ export interface DeathEvidence {
   lastGoodBeatAt: number | null;
   /** now − lastGoodBeatAt, computed on the post-reload bootstrap, or null. */
   gapMs: number | null;
-  /** Webview launch generation; an increment across a beat-gap implies a reload. */
+  /** Webview launch generation (current). The fresh JS context has NO prior
+   *  in-memory baseline to compare against, so the "did we reload" decision is
+   *  NOT derivable on the frontend from this value alone — see
+   *  `reloadedSinceLastBeat`, which Rust computes by comparing its own durable
+   *  previous generation. `launchCount` is retained for diagnostics/telemetry. */
   launchCount: number;
+  /** Rust-computed: true iff `launchCount` incremented across the durable
+   *  last-beat gap (i.e. the webview relaunched, not merely backgrounded).
+   *  Round-4 fix (codex1 MED — @claude1 task-6): the comparison must be
+   *  Rust-internal because the dead JS context lost the prior count. The
+   *  detector reads THIS boolean, never re-derives it from `launchCount`. */
+  reloadedSinceLastBeat: boolean;
 }
 
 /** A point-in-time resource-pressure sample. */
@@ -131,11 +141,33 @@ export interface ResilienceState {
 }
 
 /**
+ * One rename-audit entry — isomorphic to AgentNameRecord
+ * (src/types/collaborator.ts), inlined here so the snapshot stays serializable
+ * and decoupled from the live store type. `nameHistory[0]` is the system birth
+ * name; the last entry is the current nickname.
+ */
+export interface AgentNameSnapshot {
+  nickname: string;
+  /** ISO timestamp this nickname became active. */
+  setAt: string;
+  /** Who set it: "system" (auto), "user" (UI/slash), or "@<handle>" (programmatic). */
+  setBy: "system" | "user" | `@${string}`;
+}
+
+/**
  * One collaborator agent tile inside a collaborator pane. Captured so the
  * pane re-hydrates its (component-local `spawns`) state after reload WITHOUT
  * re-spawning — the surviving Rust PTY is reattached instead. Mirrors the
  * Spawn shape in CollaboratorPane.tsx plus the collaboratorStore agent meta.
  * See codex2 H2 / claude3 #4 / codex3 #4.
+ *
+ * Round-4 review fix (codex1 MED / codex2 MED — 3-way; @claude1 task-6 verified
+ * against SpawnedAgent collaborator.ts:65-97): the snapshot now mirrors the FULL
+ * materialized identity model so a restore neither re-mints it via `addAgent`
+ * (which would recompute ordinal/nicknameSlug and DROP a user rename) nor leaves
+ * mention/AtMention/task-routing resolution unable to rebuild the tile. The
+ * restore path MUST seed `collaboratorStore` directly from these fields, bypassing
+ * `addAgent`'s ordinal/slug/history minting.
  *
  * Recovery policy (CLOSED in the planner per round-3 codex2 MED / claude3 D):
  * for an ALIVE Rust PTY, reattach is REQUIRED (lossless); for a DEAD PTY, the
@@ -146,16 +178,27 @@ export interface ResilienceState {
 export interface AgentSnapshot {
   /** Agent PTY session id — reattach target (must be reused, never regenerated). */
   sessionId: string;
+  /** Parent collaborator pane/session id (collabSessionId) this tile belongs to.
+   *  REQUIRED to re-home the tile into the correct pane and to scope killAllAgents
+   *  suppression; without it the restore cannot reconstruct pane membership. */
+  collabSessionId: string;
   /** Tool id the agent was spawned with (claude / codex / gemini …). */
   tool: string;
   /** Agent working directory, or null if unresolved at capture. */
   cwd: string | null;
   /** Last known agent status (spawning / active / exited …). */
   status: string;
-  /** Stable @handle for the agent. */
+  /** IMMUTABLE protocol @handle ("claude1" …) — restored verbatim (tasks/logs key on it). */
   handle: string;
-  /** User-assigned nickname, or null. */
+  /** Monotonic per-tool ordinal within the collab session — restored verbatim so
+   *  reattach does NOT re-mint it via addAgent (which would drift identity). */
+  ordinal: number;
+  /** User-assigned/display nickname, or null. */
   nickname: string | null;
+  /** Cached slugify(nickname) for O(1) mention/collision — restored, not recomputed. */
+  nicknameSlug: string;
+  /** Append-only rename audit — restored verbatim so a user rename survives recovery. */
+  nameHistory: AgentNameSnapshot[];
   /** Whether the agent opted into peer-context publishing. */
   publishOptedIn: boolean;
 }
@@ -268,6 +311,18 @@ export interface RecoverySession {
   createdAt: number;
   /** Generation/expiry guard so a stale session can't drive a spurious resume. */
   expiresAt: number;
+  /**
+   * Durable resume-attempt counter. Round-4 fix (claude3 MED-1 — @claude1
+   * task-6): the FSM's in-memory `recoveryAttempts` RESETS on every reload, so
+   * a `resumeAfterReload` that itself re-triggers a WebContent death would re-read
+   * this same session and thrash-retry until `expiresAt`. This counter is
+   * INCREMENTED-and-persisted by `loadPending()`/`resumeAfterReload` BEFORE
+   * restore begins; when it exceeds `maxAttempts` the orchestrator fails fast to
+   * 'failed' instead of looping. Time-expiry remains the outer backstop.
+   */
+  attempts: number;
+  /** Upper bound on `attempts` before recovery is abandoned to 'failed'. */
+  maxAttempts: number;
 }
 
 /** Result of staging a reload-crossing recovery in the old/live context. */
