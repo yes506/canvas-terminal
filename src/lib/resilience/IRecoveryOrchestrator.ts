@@ -87,32 +87,41 @@ export interface IRecoveryOrchestrator {
    *   A/bootstrap path (IResilienceStore.beginIncident — the path-A issuance owner,
    *   per claude3 R2); runs loadPersisted → restoreShell → (await xterm refs) →
    *   reattach → verify; clears the durable session and the flag at the end.
-   * Crash-loop guard (round-4 — claude3 MED-1 — @claude1 task-6): BEFORE restore
-   *   begins, the durable RecoverySession.attempts is incremented-and-persisted;
-   *   if it now exceeds RecoverySession.maxAttempts the run fails fast to 'failed'
-   *   and clears the session, rather than re-reading the same session and
-   *   thrash-retrying until expiry (the in-memory recoveryAttempts resets each
-   *   reload and cannot bound this).
-   * A/bootstrap invariant (round-4 — claude2 NOTE #4): on this path the prior
+   * Crash-loop guard (round-4 claude3 MED-1; round-5 codex1/codex2/claude3 HIGH —
+   *   @claude1 task-6/task-12): BEFORE any restore side-effect, call
+   *   IRecoverySession.claimAttempt(token) — the durable, generation-matched
+   *   compare-increment-persist seam. If it returns null, or the returned
+   *   `attempts > maxAttempts`, the run clears the session and fails fast to
+   *   'failed' WITHOUT restoring (the in-memory recoveryAttempts resets each
+   *   reload and cannot bound this; a local non-durable increment would let the
+   *   next crash re-read the old count).
+   * Sign provenance (round-5 claude3 LOW — @claude1 task-12): this path serves BOTH
+   *   A (webcontent-death) and B-escalation. On an EXPECTED resume (a session is
+   *   pending) the recorded sign MUST come from session.decision.sign, NOT a fresh
+   *   classifySign — otherwise a self-induced B-escalation reload (reloadedSinceLastBeat
+   *   =true, no surviving boundaryCaught) would mislabel itself 'webcontent-death' and
+   *   pollute the very evidence trail that gates the #3 rollout. A fresh classifySign
+   *   from DeathEvidence is only for an UNEXPECTED reload (no pending session).
+   * A/bootstrap invariant (round-4 — claude2 NOTE #4): on the A path the prior
    *   context's boundary state died with it, so beginIncident() mints a fresh
-   *   incident with boundaryCaught=false; classifySign therefore always sees
-   *   boundaryCaught=false here and correctly resolves 'webcontent-death'. Do NOT
-   *   rehydrate boundaryCaught from any persisted source — a true value implies a
-   *   live JS context that would not be on the reload path (mutual exclusion).
+   *   incident with boundaryCaught=false. Do NOT rehydrate boundaryCaught from any
+   *   persisted source — a true value implies a live JS context that would not be
+   *   on the reload path (mutual exclusion).
    * Preconditions: IRecoverySession.loadPending() returned a non-expired session
    *   for this boot; called once, before normal app startup proceeds.
    * Postconditions: alive PTYs reattached + visible; dead PTYs become exited tiles
-   *   preserving handle/log (per AgentSnapshot policy); durable session cleared;
-   *   isReloadInProgress()===false; phase 'recovered' or 'failed'.
+   *   preserving handle + derivable log identity (per AgentSnapshot policy); durable
+   *   session cleared; isReloadInProgress()===false; phase 'recovered' or 'failed'.
    * Failure-modes:
    *   - Error — thrown if no durable snapshot exists to restore; per-session
    *     failures surface in lostSessions, not thrown.
    *   - Cancelled — abort() mid-run resolves success:false / phase:'failed'.
-   *   - Attempt-exhausted — attempts > maxAttempts resolves phase:'failed' fast.
-   * Collaborators: IRecoverySession.loadPending, IRecoverySession.clear,
-   *   ITopologySnapshot.loadPersisted, ITopologySnapshot.restoreShell,
-   *   IPtyReattachClient.reattach, IResilienceStore.beginIncident,
-   *   IResilienceStore.transition
+   *   - Attempt-exhausted — claimAttempt null or attempts > maxAttempts resolves
+   *     phase:'failed' fast, no restore.
+   * Collaborators: IRecoverySession.loadPending, IRecoverySession.claimAttempt,
+   *   IRecoverySession.clear, ITopologySnapshot.loadPersisted,
+   *   ITopologySnapshot.restoreShell, IPtyReattachClient.reattach,
+   *   IResilienceStore.beginIncident, IResilienceStore.transition
    */
   resumeAfterReload(evidence: DeathEvidence): Promise<RecoveryOutcome>;
 
@@ -135,14 +144,19 @@ export interface IRecoveryOrchestrator {
    *     1. child mini-terminal cleanup — AgentMiniTerminal.tsx:821
    *        `invoke("kill_pty")` + `removeAgent(sessionId)` — must be skipped;
    *     2. PARENT pane cleanup — CollaboratorPane.tsx:82-83
-   *        `killAllAgents(collabId)` (collaboratorStore.ts:1544 → per-agent
-   *        `kill_pty`) + `endSession(collabId)` (clears the session memory dir).
-   *        A restore that remounts/reorders the collaborator subtree unmounts the
-   *        pane and would kill the very PTYs recovery means to reattach, defeating
-   *        the lossless guarantee even with path #1 guarded. While true, BOTH
-   *        `killAllAgents` and `endSession`'s memory-dir clear MUST be suppressed
-   *        (else the PTY survives but collaborator identity/memory is erased);
-   *        `removeAgent` is likewise suppressed so the tile is not dropped.
+   *        `killAllAgents(collabId)` + `endSession(collabId)`. Per the live code
+   *        (round-5 attribution fix — codex1 LOW / claude3 — @claude1 task-12):
+   *        `killAllAgents` (collaboratorStore.ts:1544) invokes per-agent `kill_pty`
+   *        AND deletes the session memory files (`delete_memory_file` for
+   *        conversation-/tasks-{sid}.md, :1599-1612); `endSession` (:1268) does NOT
+   *        delete files — it aborts the session write-chains + clears in-memory
+   *        store state. A restore that remounts/reorders the collaborator subtree
+   *        unmounts the pane and would kill the very PTYs recovery means to
+   *        reattach, defeating the lossless guarantee even with path #1 guarded.
+   *        So BOTH must be suppressed: `killAllAgents` (else PTYs die + memory
+   *        files are deleted) and `endSession` (else in-memory collaborator state
+   *        is erased while the PTY survives); `removeAgent` is likewise suppressed
+   *        so the tile is not dropped.
    *   Any destroySession() restore path is covered by the same rule.
    *   (Main terminal unmount already only parks — useTerminal.ts:42 — no guard.)
    * Failure-modes: None.

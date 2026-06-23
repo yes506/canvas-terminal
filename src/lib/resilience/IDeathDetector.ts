@@ -70,6 +70,13 @@ export interface IDeathDetector {
    * Postconditions: boundaryCaught ⇒ 'js-fatal'; else suspectDeath ⇒
    *   'webcontent-death'; else (blankObserved && recent webglContextLosses) ⇒
    *   'gpu-loss' (low confidence); else 'unknown'. Result carries the same incidentId.
+   * Caller note (round-5 claude3 LOW — @claude1 task-12): this is a pure
+   *   classifier of fresh evidence. On a post-reload resume where a RecoverySession
+   *   is pending (a SELF-INDUCED reload, incl. B-escalation), the orchestrator must
+   *   NOT route the death branch through this function — it records
+   *   session.decision.sign instead, so a self-induced reload is not mislabeled
+   *   'webcontent-death'. classifySign is for live-context visibility-regain and
+   *   for UNEXPECTED reloads (no pending session).
    * Failure-modes: None. (total; ambiguity surfaces as 'unknown' low-confidence)
    * Collaborators: None. (pure function of its inputs)
    */

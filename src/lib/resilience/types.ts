@@ -5,6 +5,12 @@
 // ResourceWatermark, DeathEvidence) so the implementer can persist + restore
 // them without re-deriving the schema.
 //
+// `ToolId` is imported (type-only — still just string literals at runtime, so
+// serializability holds) so AgentSnapshot.tool stays in lock-step with the live
+// tool set instead of drifting from a hand-mirrored union (round-5 codex1/codex2/
+// claude3/codex3 — @claude1 task-12).
+import type { ToolId } from "../../types/collaborator";
+//
 // Revised after the round-2 peer review (codex2 task-39, claude3 task-40,
 // codex3 task-41, claude2 task-38): the snapshot schema is now ISOMORPHIC to
 // the live PaneNode (src/types/terminal.ts), collaborator agents are first
@@ -87,7 +93,13 @@ export interface DeathEvidence {
    *  last-beat gap (i.e. the webview relaunched, not merely backgrounded).
    *  Round-4 fix (codex1 MED — @claude1 task-6): the comparison must be
    *  Rust-internal because the dead JS context lost the prior count. The
-   *  detector reads THIS boolean, never re-derives it from `launchCount`. */
+   *  detector reads THIS boolean, never re-derives it from `launchCount`.
+   *  Round-5 caveat (claude3 LOW — @claude1 task-12): a reload can be
+   *  SELF-INDUCED (recovery's own prepareReloadRecovery, incl. B-escalation),
+   *  so this is only valid death-evidence for an UNEXPECTED reload — i.e. when
+   *  NO recovery session is pending. On an expected resume the sign comes from
+   *  the pending RecoverySession.decision, not from re-deriving death here (see
+   *  IDeathDetector.classifySign + IRecoveryOrchestrator.resumeAfterReload). */
   reloadedSinceLastBeat: boolean;
 }
 
@@ -169,11 +181,20 @@ export interface AgentNameSnapshot {
  * restore path MUST seed `collaboratorStore` directly from these fields, bypassing
  * `addAgent`'s ordinal/slug/history minting.
  *
+ * Round-5 review fix (codex1/codex2/claude3/codex3 — 4-way; @claude1 task-12):
+ * field types are tightened to the live `SpawnedAgent` shape (`tool: ToolId`,
+ * `status` union, NON-null `nickname`) so the snapshot cannot represent a state
+ * `restoreAgents` would have to invent. Note there is intentionally NO separate
+ * transcript/log-pointer field: a tile's durable log identity is DERIVABLE from
+ * (`collabSessionId`, `sessionId`, `handle`) — the session memory dir + per-task
+ * report files are keyed on exactly those — so "log preservation" means the
+ * restore re-homes the tile under the same keys, not that a pointer is stored.
+ *
  * Recovery policy (CLOSED in the planner per round-3 codex2 MED / claude3 D):
  * for an ALIVE Rust PTY, reattach is REQUIRED (lossless); for a DEAD PTY, the
- * tile is restored as an exited/"needs restart" shell that PRESERVES `handle`,
- * `nickname`, and log/transcript pointers — it is never silently dropped and
- * never auto-respawned. Dead-PTY tiles surface in RestoreReport.failedSessions.
+ * tile is restored as an exited shell that PRESERVES `handle`, `nickname`, and
+ * its (derivable) log identity — it is never silently dropped and never
+ * auto-respawned. Dead-PTY tiles surface in RestoreReport.failedSessions.
  */
 export interface AgentSnapshot {
   /** Agent PTY session id — reattach target (must be reused, never regenerated). */
@@ -182,24 +203,29 @@ export interface AgentSnapshot {
    *  REQUIRED to re-home the tile into the correct pane and to scope killAllAgents
    *  suppression; without it the restore cannot reconstruct pane membership. */
   collabSessionId: string;
-  /** Tool id the agent was spawned with (claude / codex / gemini …). */
-  tool: string;
+  /** Tool the agent was spawned with — live ToolId union (not a loose string),
+   *  so restore seeds a valid SpawnedAgent row directly. */
+  tool: ToolId;
   /** Agent working directory, or null if unresolved at capture. */
   cwd: string | null;
-  /** Last known agent status (spawning / active / exited …). */
-  status: string;
+  /** Last known agent status — live SpawnedAgentInit union. A dead-PTY tile is
+   *  restored as 'exited' (per the recovery policy above). */
+  status: "spawning" | "running" | "exited";
   /** IMMUTABLE protocol @handle ("claude1" …) — restored verbatim (tasks/logs key on it). */
   handle: string;
   /** Monotonic per-tool ordinal within the collab session — restored verbatim so
    *  reattach does NOT re-mint it via addAgent (which would drift identity). */
   ordinal: number;
-  /** User-assigned/display nickname, or null. */
-  nickname: string | null;
+  /** Display nickname — NON-null, mirroring live SpawnedAgent.nickname (a system
+   *  birth name always exists; `nameHistory[last]` is its source of truth). */
+  nickname: string;
   /** Cached slugify(nickname) for O(1) mention/collision — restored, not recomputed. */
   nicknameSlug: string;
   /** Append-only rename audit — restored verbatim so a user rename survives recovery. */
   nameHistory: AgentNameSnapshot[];
-  /** Whether the agent opted into peer-context publishing. */
+  /** Peer-context publishing opt-in, resolved to a concrete boolean at capture
+   *  (live SpawnedAgent.publishOptedIn is optional with `=== true` semantics; the
+   *  snapshot stores the resolved value so restore needs no defaulting). */
   publishOptedIn: boolean;
 }
 

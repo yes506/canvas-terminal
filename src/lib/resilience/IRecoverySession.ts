@@ -15,7 +15,8 @@ import type { RecoveryDecision, RecoverySession, RecoveryToken } from "./types";
  *
  * Rust-side contract (documented in architecture.html, skeleton not emitted
  * this run): persist_recovery_session / load_recovery_session /
- * clear_recovery_session, each keyed to the PID-stable session dir.
+ * claim_recovery_attempt / clear_recovery_session, each keyed to the PID-stable
+ * session dir.
  */
 export interface IRecoverySession {
   /**
@@ -58,6 +59,38 @@ export interface IRecoverySession {
    * Collaborators: load_recovery_session (Rust IPC)
    */
   loadPending(): Promise<RecoverySession | null>;
+
+  /**
+   * Responsibility: Atomically + durably claim ONE recovery attempt before any
+   *   restore side-effects run, so a crash-looping recovery fails fast.
+   * Pipeline-position: IRecoveryOrchestrator.resumeAfterReload -> THIS -> (restore | fail-fast)
+   * Inputs:
+   *   - token: RecoveryToken — the pending session to claim (generation-matched)
+   * Outputs: Promise<RecoverySession | null> — the session with `attempts`
+   *   already INCREMENTED-and-persisted, or null if the token is expired/cleared/
+   *   non-matching (treat as "nothing to resume").
+   * Round-5 fix (codex1 HIGH / codex2 HIGH / claude3 HIGH — 3-way REQUIRED;
+   *   @claude1 task-12): round-4 added RecoverySession.attempts/maxAttempts and
+   *   said resume "increments-and-persists before restore", but the only seams
+   *   were begin/loadPending(read-only)/clear — no durable mutation. A local
+   *   increment is NOT durable (the next crash/reload re-reads the old count, so
+   *   the guard does nothing). This is the missing atomic compare-increment-persist
+   *   step, owned by Rust so it survives the very crash it bounds.
+   * Side-effects: invokes claim_recovery_attempt Rust IPC — durably increments
+   *   `attempts` (and persists) in a single generation-matched operation BEFORE
+   *   returning. No-op-returns-null for a stale/cleared token.
+   * Preconditions: loadPending() returned this token on this boot; called ONCE
+   *   per resume, before restoreShell/reattach run.
+   * Postconditions: the returned session's `attempts` is the new durable value;
+   *   if `attempts > maxAttempts` the caller MUST NOT start restore and instead
+   *   clears the session + settles the FSM to 'failed' (exhausted ⇒ fail fast,
+   *   not loop to expiry). A null return likewise skips restore.
+   * Failure-modes:
+   *   - Error — thrown only on IPC transport failure; an exhausted-but-valid
+   *     session is a normal (non-throwing) return with attempts > maxAttempts.
+   * Collaborators: claim_recovery_attempt (Rust IPC)
+   */
+  claimAttempt(token: RecoveryToken): Promise<RecoverySession | null>;
 
   /**
    * Responsibility: Durably clear a completed/aborted recovery session.
