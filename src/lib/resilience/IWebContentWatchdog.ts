@@ -41,13 +41,16 @@ export interface IWebContentWatchdog {
    * Pipeline-position: app bootstrap -> THIS -> IDeathDetector.classifySign
    * Inputs: None.
    * Outputs: Promise<DeathEvidence> — observedTermination + lastGoodBeatAt +
-   *   gapMs + launchCount; the authoritative input for the 'webcontent-death'
-   *   branch of classification.
+   *   gapMs + reloadedSinceLastBeat (the Rust-computed reload flag); the
+   *   authoritative input for the 'webcontent-death' branch of classification.
+   *   (`launchCount` is also carried but is diagnostic/telemetry only — the
+   *   reload decision reads `reloadedSinceLastBeat`, not a FE launchCount delta.)
    * Side-effects: invokes the read_death_evidence Rust IPC (read-only).
    * Preconditions: called once early on the fresh JS context, before the
    *   first new heartbeat overwrites the durable last-beat.
    * Postconditions: gapMs, when non-null, reflects (bootstrap now − durable
-   *   last-beat); launchCount reflects the current webview generation.
+   *   last-beat); reloadedSinceLastBeat is true iff the webview generation
+   *   incremented across the gap (Rust-internal comparison).
    * Failure-modes:
    *   - Error — thrown only if the IPC transport itself fails; "no prior
    *     evidence" is reported as observedTermination=false / nulls, not a throw.

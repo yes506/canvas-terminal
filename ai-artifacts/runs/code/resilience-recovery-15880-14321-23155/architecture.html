@@ -145,7 +145,7 @@
 </li>
 <li><code>readDeathEvidence</code>
  <small class="meta">fields: Responsibility, Pipeline-position, Inputs, Outputs, Side-effects, Preconditions, Postconditions, Failure-modes, Collaborators</small>
-<pre class="doc">Post-reload read of durable DeathEvidence (observedTermination/lastGoodBeat/gap/launchCount) — authoritative A input.</pre>
+<pre class="doc">Post-reload read of durable DeathEvidence (observedTermination/lastGoodBeat/gap/reloadedSinceLastBeat; launchCount diagnostic-only) — authoritative A input.</pre>
 </li>
 </ul></details>
 <details open><summary><strong>IWatermarkSampler</strong> <small>(src/lib/resilience, cohesion: #2 Resource-pressure observer; now writes to the FSM store)</small></summary>

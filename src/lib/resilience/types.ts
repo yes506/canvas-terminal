@@ -342,9 +342,11 @@ export interface RecoverySession {
    * task-6): the FSM's in-memory `recoveryAttempts` RESETS on every reload, so
    * a `resumeAfterReload` that itself re-triggers a WebContent death would re-read
    * this same session and thrash-retry until `expiresAt`. This counter is
-   * INCREMENTED-and-persisted by `loadPending()`/`resumeAfterReload` BEFORE
-   * restore begins; when it exceeds `maxAttempts` the orchestrator fails fast to
-   * 'failed' instead of looping. Time-expiry remains the outer backstop.
+   * durably INCREMENTED-and-persisted by `IRecoverySession.claimAttempt()` BEFORE
+   * any restore side-effect (round-5 fix — codex1/codex2/claude3 — @claude1
+   * task-12: `loadPending()` is read-only and cannot mutate it); when it exceeds
+   * `maxAttempts` the orchestrator fails fast to 'failed' instead of looping.
+   * Time-expiry remains the outer backstop.
    */
   attempts: number;
   /** Upper bound on `attempts` before recovery is abandoned to 'failed'. */

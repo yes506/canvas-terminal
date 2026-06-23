@@ -51,9 +51,11 @@ export interface IRecoverySession {
    * Preconditions: called once, very early in bootstrap, before collaborator
    *   components mount (so isReloadInProgress can be seeded synchronously after).
    * Postconditions: a non-null result obligates bootstrap to enter
-   *   resumeAfterReload instead of normal startup; the token matches begin();
-   *   the returned `attempts`/`maxAttempts` let resume fail fast on a crash-loop
-   *   (resume increments-and-persists `attempts` before restore — round-4 claude3 MED-1).
+   *   resumeAfterReload instead of normal startup; the token matches begin().
+   *   This read is NON-mutating — it exposes the current `attempts`/`maxAttempts`
+   *   for inspection, but the durable increment that bounds a crash-loop is done
+   *   separately by `claimAttempt()` before restore (round-5 — @claude1 task-12;
+   *   not by loadPending, which stays read-only).
    * Failure-modes:
    *   - Error — thrown only on IPC transport failure; "nothing pending" is null.
    * Collaborators: load_recovery_session (Rust IPC)
