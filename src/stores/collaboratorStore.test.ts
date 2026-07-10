@@ -5,6 +5,7 @@ import {
   getIndicatorPresentation,
   scanForTaskCompletions,
   formatTaskSummaryForAgent,
+  toolShortName,
   _resetWriteStateForTests,
   _isRenamePendingForTests,
   RECENT_OUTCOME_TTL_MS,
@@ -12,8 +13,11 @@ import {
   slugify,
 } from "./collaboratorStore";
 import type { CollabTask, SpawnedAgent } from "../types/collaborator";
+import { TOOL_CONFIGS, supportsPeerContextPublishing } from "../types/collaborator";
+import { reserveAgentHandle } from "../lib/peerContext";
 import { parseInput, resolveAgent, executeCommand, getHelpText } from "../components/collaborator/commands";
 import { useTerminalStore } from "./terminalStore";
+import { _resetMemoryDirCacheForTests } from "../lib/scopedCollabMemory";
 import { invoke } from "@tauri-apps/api/core";
 
 // Mock the Tauri invoke to avoid native calls during tests
@@ -22,6 +26,21 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const SESSION = "test-session-1";
+
+/**
+ * Base invoke mock: resolves the scoped session-dir IPC (the header builders
+ * await it before printing any path line) and null for everything else.
+ * Tests that override `mockImplementation` should fall back to this for
+ * commands they don't care about, or the header path block silently
+ * disappears from inject payloads.
+ */
+const baseInvokeMock = async (cmd: string, args?: unknown): Promise<unknown> => {
+  if (cmd === "get_memory_session_dir") {
+    const sid = (args as { collabSessionId?: string })?.collabSessionId ?? "";
+    return `/mem/session-123/${sid}`;
+  }
+  return null;
+};
 
 function resetStores() {
   useTerminalStore.setState({
@@ -43,6 +62,9 @@ function resetStores() {
   // A teardown-race test can leave an abort marker that would short-circuit
   // a subsequent test using the same SESSION ID — clear it here for isolation.
   _resetWriteStateForTests();
+  // The facade's per-session dir cache is module-level too — a stale entry
+  // would let one test's mocked dir leak into the next test's headers.
+  _resetMemoryDirCacheForTests();
 }
 
 // (PR-A footer-status tests removed in task-16: the 4 s setStatus-on-terminal
@@ -747,7 +769,7 @@ describe("task-45 — scanForTaskCompletions in-loop re-read (real integration)"
     // Restore the default for subsequent describe blocks. We use
     // mockImplementation here (not mockReset) to preserve any pending
     // microtask chain that may still inspect the result.
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
   });
 
   it("calling scanForTaskCompletions twice over the same .done.json fires only ONE terminal transition", async () => {
@@ -835,7 +857,7 @@ describe("task-45 — sendToAgent bumps the freshest active task, not the oldest
   });
   afterEach(() => {
     vi.useRealTimers();
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
   });
 
   it("when an agent has multiple active tasks, send bumps the freshest one (matches indicator label)", async () => {
@@ -880,7 +902,7 @@ describe("task-45 — sendToAgent bumps the freshest active task, not the oldest
     // delete IPC, so the in-flight write settles first. That ordering
     // is implicit in `await store.killAllAgents(...)`.)
     const store = useCollaboratorStore.getState();
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
 
     // Pre-abort: add a task — its persistTasks call should fire normally.
     store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
@@ -907,49 +929,50 @@ describe("task-45 — sendToAgent bumps the freshest active task, not the oldest
     expect(tasksWritesAfter).toBe(tasksWritesBefore);
   });
 
-  it("killAllAgents awaits in-flight writes BEFORE issuing delete IPCs (claude3 D5 + claude1 self-D2 ordering pin)", async () => {
+  it("killAllAgents awaits in-flight writes BEFORE issuing the scoped clear IPC (claude3 D5 + claude1 self-D2 ordering pin)", async () => {
     // The abort flag short-circuits QUEUED writes, but a write already
-    // past the abort check must complete BEFORE the delete fires (Tauri
-    // doesn't guarantee ordering between independent commands). Verify
-    // by recording the order of write_memory_file vs delete_memory_file
-    // mock invocations: write must precede delete for the same file.
+    // past the abort check must complete BEFORE the teardown clear fires
+    // (Tauri doesn't guarantee ordering between independent commands).
+    // Teardown is now ONE scoped clear_memory_dir(sid) covering the whole
+    // session subtree (plan node 19) — verify write-then-clear order and
+    // that the clear is scoped to THIS session.
     const store = useCollaboratorStore.getState();
     const order: string[] = [];
+    let clearedSession: string | null = null;
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
       const path = (args as { relativePath?: string })?.relativePath ?? "";
       if (cmd === "write_memory_file") {
         if (path.startsWith("tasks-")) order.push("write_tasks");
         else if (path.startsWith("conversation-")) order.push("write_conversation");
-      } else if (cmd === "delete_memory_file") {
-        if (path.startsWith("tasks-")) order.push("delete_tasks");
-        else if (path.startsWith("conversation-")) order.push("delete_conversation");
+      } else if (cmd === "clear_memory_dir") {
+        order.push("clear_session");
+        clearedSession = (args as { collabSessionId?: string })?.collabSessionId ?? null;
       }
-      return null;
+      return baseInvokeMock(cmd, args);
     });
 
     store.addTask({ objective: "x", title: "y", assignee: "@claude1" }, SESSION);
     // Drain microtasks so the chain steps fire write_memory_file BEFORE
     // killAllAgents sets the abort flag — this gives us an "in-flight"
-    // write that the explicit await must serialize against the delete.
+    // write that the explicit await must serialize against the clear.
     // (Without these drains, the abort-flag check would short-circuit
     // both writes synchronously, giving us no in-flight ordering to test.)
     for (let i = 0; i < 5; i++) await Promise.resolve();
     await store.killAllAgents(SESSION);
 
-    // Both write/delete pairs must appear in write-then-delete order.
-    // Use `lastIndexOf` for writes so the assertion holds even if MULTIPLE
-    // writes happened before the delete — a future test extension that
-    // adds more in-flight writes shouldn't silently weaken the contract
-    // (claude3 round-10 D6).
+    // Both writes must precede the single scoped clear. Use `lastIndexOf`
+    // for writes so the assertion holds even if MULTIPLE writes happened
+    // before the clear (claude3 round-10 D6).
+    const clearIdx = order.indexOf("clear_session");
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
     const wTasksLast = order.lastIndexOf("write_tasks");
-    const dTasks = order.indexOf("delete_tasks");
     expect(wTasksLast).toBeGreaterThanOrEqual(0);
-    expect(dTasks).toBeGreaterThan(wTasksLast);
-
+    expect(clearIdx).toBeGreaterThan(wTasksLast);
     const wConvLast = order.lastIndexOf("write_conversation");
-    const dConv = order.indexOf("delete_conversation");
     expect(wConvLast).toBeGreaterThanOrEqual(0);
-    expect(dConv).toBeGreaterThan(wConvLast);
+    expect(clearIdx).toBeGreaterThan(wConvLast);
+    // Scoped: the clear names THIS session, never a sibling or the root.
+    expect(clearedSession).toBe(SESSION);
   });
 
   it("a queued conversation-log write is also short-circuited after teardown (claude1 round-8 D3)", async () => {
@@ -958,7 +981,7 @@ describe("task-45 — sendToAgent bumps the freshest active task, not the oldest
     // before the abort could fire after killAllAgents deletes
     // conversation-{sid}.md and recreate it with stale content.
     const store = useCollaboratorStore.getState();
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
 
     // Pre-abort: an appendLog (via addTask) schedules a conversation
     // write through conversationWriteChain.
@@ -1226,7 +1249,7 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
     // only sees this test's invocations. Implementation override is the
     // simple "succeeds" default; individual tests can override per-test.
     vi.mocked(invoke).mockClear();
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
     // Seed an agent so sendToAgent has something to send to.
     useCollaboratorStore.setState({
       agents: [{
@@ -1243,7 +1266,7 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
     });
   });
   afterEach(() => {
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
   });
 
   it("first send injects the FULL TASK_PROTOCOL block", async () => {
@@ -1331,12 +1354,12 @@ describe("task-46 — contextSentByAgent slim-header gating", () => {
     let resolveFirstInject!: () => void;
     const firstInjectGate = new Promise<void>((r) => { resolveFirstInject = r; });
     let injectCount = 0;
-    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === "inject_into_pty") {
         injectCount++;
         if (injectCount === 1) await firstInjectGate;  // hold first inject open
       }
-      return null;
+      return baseInvokeMock(cmd, args);
     });
 
     const store = useCollaboratorStore.getState();
@@ -1565,7 +1588,7 @@ describe("slim-header correctness (B1 + B2)", () => {
   beforeEach(() => {
     resetStores();
     vi.mocked(invoke).mockClear();
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
     useCollaboratorStore.setState({
       agents: [{
         sessionId: "pty-1",
@@ -1581,7 +1604,7 @@ describe("slim-header correctness (B1 + B2)", () => {
     });
   });
   afterEach(() => {
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
   });
 
   // B1
@@ -1591,7 +1614,7 @@ describe("slim-header correctness (B1 + B2)", () => {
       if (cmd === "read_memory_file" && (args as { relativePath?: string })?.relativePath === "context.md") {
         return "important shared constraint";
       }
-      return null;
+      return baseInvokeMock(cmd, args);
     });
 
     const store = useCollaboratorStore.getState();
@@ -2051,7 +2074,7 @@ describe("renamePendingByAgent — consume path (claude2 G7 / claude3 I8-2)", ()
   beforeEach(() => {
     _resetWriteStateForTests();
     vi.mocked(invoke).mockClear();
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
     useCollaboratorStore.setState({
       agents: [
         {
@@ -2074,7 +2097,7 @@ describe("renamePendingByAgent — consume path (claude2 G7 / claude3 I8-2)", ()
     });
   });
   afterEach(() => {
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
   });
 
   it("after rename, sendToAgent's NEXT send uses the FULL header", async () => {
@@ -2277,7 +2300,7 @@ describe("executeCommand — /rename and /task add canonicalization (claude3 I9-
   beforeEach(() => {
     _resetWriteStateForTests();
     vi.mocked(invoke).mockClear();
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
     useCollaboratorStore.setState({
       agents: [
         {
@@ -2386,7 +2409,7 @@ describe("Phase 1.3 — orphan `.done.json` cleanup (task-31)", () => {
   });
   afterEach(() => {
     vi.useRealTimers();
-    vi.mocked(invoke).mockImplementation(async () => null);
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
   });
 
   it("empty-session pane scans the loop and deletes orphan with mtime > 24h", async () => {
@@ -2640,3 +2663,240 @@ describe("Copilot CLI roster registration", () => {
 });
 
 
+
+// ---------------------------------------------------------------------------
+// collab-isolation-agy — per-session isolation of injected paths, scans,
+// and slash commands (plan nodes 9-12). The Rust side enforces structural
+// scoping; these tests pin the TS side: every path printed into an agent
+// prompt is a prefix-descendant of the agent's OWN session dir, and every
+// memory IPC carries the session scope.
+// ---------------------------------------------------------------------------
+describe("collab-isolation — scoped headers, scans, and commands (nodes 9-12)", () => {
+  const SESSION_B = "test-session-2";
+  const DIR_A = `/mem/session-123/${SESSION}`;
+  const DIR_B = `/mem/session-123/${SESSION_B}`;
+
+  const injectCalls = () =>
+    vi.mocked(invoke).mock.calls
+      .filter((c) => c[0] === "inject_into_pty")
+      .map((c) => (c[1] as { text: string }).text);
+
+  const seedAgent = (sessionId: string, collabSessionId: string, handle: string) => ({
+    sessionId,
+    tool: "claude_code" as const,
+    status: "running" as const,
+    collabSessionId,
+    ordinal: 1,
+    handle,
+    nickname: "Claude Code #1",
+    nicknameSlug: "claude-code-1",
+    nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" as const }],
+  });
+
+  beforeEach(() => {
+    resetStores();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
+    useCollaboratorStore.setState({
+      agents: [seedAgent("pty-a", SESSION, "claude1"), seedAgent("pty-b", SESSION_B, "claude1")],
+    });
+  });
+
+  it("full header prints ONLY the agent's own session-dir paths (node 9)", async () => {
+    await useCollaboratorStore.getState().sendToAgent("pty-a", "hello");
+    const [full] = injectCalls();
+    expect(full).toContain(`[Collaborator shared memory: ${DIR_A}]`);
+    expect(full).toContain(`[Conversation log: ${DIR_A}/conversation-${SESSION}.md]`);
+    expect(full).toContain(`[Task definitions: ${DIR_A}/tasks-${SESSION}.md]`);
+    // Rule-2 grep target is absolute and inside the session subtree.
+    expect(full).toContain(`${DIR_A}/contexts/*.jsonl`);
+    // No sibling session's dir may leak into the payload.
+    expect(full).not.toContain(DIR_B);
+  });
+
+  it("two panes' agents each get their own session dir in headers (cross-pane isolation)", async () => {
+    const store = useCollaboratorStore.getState();
+    await store.sendToAgent("pty-a", "to A");
+    await store.sendToAgent("pty-b", "to B");
+    const [toA, toB] = injectCalls();
+    expect(toA).toContain(DIR_A);
+    expect(toA).not.toContain(DIR_B);
+    expect(toB).toContain(DIR_B);
+    expect(toB).not.toContain(DIR_A);
+  });
+
+  it("peer-contexts breadcrumb points at <sessionDir>/contexts/ when mirrors exist (node 9)", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") {
+        return ["contexts/claude1.jsonl"];
+      }
+      return baseInvokeMock(cmd, args);
+    });
+    await useCollaboratorStore.getState().sendToAgent("pty-a", "hello");
+    const [full] = injectCalls();
+    expect(full).toContain(`[Peer contexts: ${DIR_A}/contexts/]`);
+  });
+
+  it("protocol text carries the sibling-session prohibition rule (node 10)", async () => {
+    await useCollaboratorStore.getState().sendToAgent("pty-a", "hello");
+    const [full] = injectCalls();
+    expect(full).toContain("Stay inside YOUR session directory");
+    expect(full).toContain("Do NOT read, grep, or write sibling session directories");
+  });
+
+  it("scanForTaskCompletions lists with the session scope (node 11)", async () => {
+    await scanForTaskCompletions(SESSION);
+    expect(invoke).toHaveBeenCalledWith("list_memory_files", {
+      collabSessionId: SESSION,
+    });
+  });
+
+  it("/context set writes context.md scoped to THIS pane's session (node 12)", async () => {
+    await executeCommand(parseInput("/context important constraint"), SESSION);
+    expect(invoke).toHaveBeenCalledWith("write_memory_file", {
+      collabSessionId: SESSION,
+      relativePath: "context.md",
+      content: "important constraint",
+    });
+  });
+
+  it("/context without a collaborator session refuses instead of touching a shared root (node 12)", async () => {
+    await executeCommand(parseInput("/context leak me"), undefined);
+    const writes = vi.mocked(invoke).mock.calls.filter((c) => c[0] === "write_memory_file");
+    expect(writes.length).toBe(0);
+  });
+
+  it("/memory clear clears ONLY this session's subtree via the scoped IPC (node 12)", async () => {
+    await executeCommand(parseInput("/memory clear"), SESSION);
+    expect(invoke).toHaveBeenCalledWith("clear_memory_dir", {
+      collabSessionId: SESSION,
+    });
+  });
+
+  it("/memory list uses the scoped list IPC (node 12)", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return ["contexts/claude1.jsonl"];
+      return baseInvokeMock(cmd, args);
+    });
+    await executeCommand(parseInput("/memory list"), SESSION);
+    expect(invoke).toHaveBeenCalledWith("list_memory_files", {
+      collabSessionId: SESSION,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// collab-isolation-agy — Antigravity CLI (agy) migration (plan nodes 15/15b/18)
+// ---------------------------------------------------------------------------
+describe("agy migration — tool registration + handle preservation (nodes 15/15b)", () => {
+  beforeEach(() => {
+    resetStores();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
+  });
+
+  it("gemini slot spawns agy with the Antigravity CLI label (node 15)", () => {
+    const gemini = TOOL_CONFIGS.find((t) => t.id === "gemini_cli")!;
+    expect(gemini.command).toBe("agy");
+    expect(gemini.label).toBe("Antigravity CLI");
+    // ToolId unchanged — the slot identity survives the CLI swap.
+    expect(gemini.id).toBe("gemini_cli");
+  });
+
+  it("toolShortName prefers handlePrefix so the @gemini* family survives the command swap (node 15b)", () => {
+    expect(toolShortName("gemini_cli")).toBe("gemini");
+    // Tools without handlePrefix keep deriving from command.
+    expect(toolShortName("claude_code")).toBe("claude");
+    expect(toolShortName("codex_cli")).toBe("codex");
+  });
+
+  it("addAgent mints @gemini1 (not @agy1) for a gemini-slot spawn (node 15b)", () => {
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-g1",
+      tool: "gemini_cli",
+      status: "spawning",
+      collabSessionId: SESSION,
+    });
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
+    expect(agent.handle).toBe("gemini1");
+  });
+
+  it("reserveAgentHandle also mints from the gemini prefix (node 15b, reservation path)", () => {
+    const reservation = reserveAgentHandle(SESSION, "gemini_cli");
+    expect(reservation.handle).toMatch(/^gemini\d+$/);
+  });
+
+  it("help text keeps the @gemini mention (node 15b)", () => {
+    expect(getHelpText()).toMatch(/@gemini\b/);
+  });
+});
+
+describe("agy migration — state-level publish disable (node 18)", () => {
+  beforeEach(() => {
+    resetStores();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
+  });
+
+  it("capability predicate: only the gemini slot is unsupported", () => {
+    expect(supportsPeerContextPublishing("gemini_cli")).toBe(false);
+    expect(supportsPeerContextPublishing("claude_code")).toBe(true);
+    expect(supportsPeerContextPublishing("codex_cli")).toBe(true);
+    expect(supportsPeerContextPublishing("copilot_cli")).toBe(true);
+  });
+
+  it("addAgent forces publishOptedIn=false for agy even when the caller passes true", () => {
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-g1",
+      tool: "gemini_cli",
+      status: "running",
+      collabSessionId: SESSION,
+      publishOptedIn: true,
+    });
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
+    expect(agent.publishOptedIn).toBe(false);
+  });
+
+  it("addAgent keeps the cycle-F default (true) for supported tools", () => {
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-c1",
+      tool: "claude_code",
+      status: "running",
+      collabSessionId: SESSION,
+    });
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-c1")!;
+    expect(agent.publishOptedIn).toBe(true);
+  });
+
+  it("restoreAgents coerces a pre-migration snapshot's publishOptedIn=true to false for agy", () => {
+    useCollaboratorStore.getState().restoreAgents([
+      {
+        sessionId: "pty-g1",
+        collabSessionId: SESSION,
+        tool: "gemini_cli",
+        status: "running",
+        handle: "gemini1",
+        ordinal: 1,
+        nickname: "Gemini CLI #1",
+        nicknameSlug: "gemini-cli-1",
+        nameHistory: [{ nickname: "Gemini CLI #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
+        publishOptedIn: true, // old snapshot from before the agy migration
+        cwd: null,
+      },
+    ]);
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
+    expect(agent.publishOptedIn).toBe(false);
+  });
+
+  it("setPublishOptedIn(true) is a silent no-op for an unsupported tool", () => {
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-g1",
+      tool: "gemini_cli",
+      status: "running",
+      collabSessionId: SESSION,
+    });
+    useCollaboratorStore.getState().setPublishOptedIn("pty-g1", true);
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
+    expect(agent.publishOptedIn).toBe(false);
+  });
+});

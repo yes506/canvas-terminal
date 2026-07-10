@@ -1,19 +1,22 @@
 // Per-stream byte tailer with inode-anchored offset persistence.
 //
-// State storage layout: a single JSON file at
-// `<session-memory-dir>/contexts/.state.json` holding a map keyed by the
-// source-path string (per `persist_offset`'s explicit
-// "keyed by `state.path` inside the JSON document" contract). Each value
-// is a `TailState` carrying path / inode / byte_offset /
+// State storage layout: one JSON file PER COLLAB SESSION at
+// `<handle.memory_dir>/contexts/.state.json` — for a CT collab watch
+// `handle.memory_dir` is the session subtree
+// `collab-memory/session-<pid>/<collabSessionId>/` (re-pointed by
+// `populate_entry` once the id is known), so two collab sessions tailing
+// transcripts NEVER share crash-resume state. The file holds a map keyed
+// by the source-path string (per `persist_offset`'s explicit "keyed by
+// `state.path` inside the JSON document" contract). Each value is a
+// `TailState` carrying path / inode / byte_offset /
 // last_normalized_turn_index. The store is read-modify-write per persist
 // — the watcher serializes calls per-token, so concurrent writers race
 // only on distinct keys at worst, and the atomic-rename underlying
-// `memory::write_memory_file_atomic` makes the final visibility atomic.
+// `memory::write_file_atomic_under` makes the final visibility atomic.
 //
 // In-bounds writable path is supplied via `TranscriptHandle::memory_dir`
 // (planner touch-up `bffb828` delta A): the external transcript root is
-// strictly read-only by the peer-context-mirror "one-way mirror" rule;
-// state lives inside `collab-memory/session-<pid>/contexts/`.
+// strictly read-only by the peer-context-mirror "one-way mirror" rule.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -23,8 +26,8 @@ use std::path::PathBuf;
 use super::super::memory;
 use super::{TranscriptHandle, WatcherError};
 
-/// Resumable tail state — written to and read from
-/// `session-<pid>/contexts/.state.json` per agent (multi-agent map keyed
+/// Resumable tail state — written to and read from the per-session
+/// `<handle.memory_dir>/contexts/.state.json` (multi-agent map keyed
 /// by source-path string).
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct TailState {
@@ -34,18 +37,20 @@ pub struct TailState {
     pub last_normalized_turn_index: u64,
 }
 
-/// `relative_path` argument used with `memory::write_memory_file_atomic` and
-/// equivalent direct reads. Single source of truth so resume / persist /
-/// inode-change agree on layout.
+/// `relative_path` argument used with `memory::write_file_atomic_under` and
+/// equivalent direct reads — always joined under `handle.memory_dir`.
+/// Single source of truth so resume / persist / inode-change agree on layout.
 const STATE_FILE_RELPATH: &str = "contexts/.state.json";
 
 /// Compute the absolute on-disk path of the multi-agent `.state.json`.
 ///
-/// Uses `handle.memory_dir` (populated by `TranscriptWatcher::watch` from
-/// `memory::get_memory_dir()` at watch-registration time). In-process this
-/// equals `memory::get_memory_dir()`; on the write side `persist_offset`
-/// calls `memory::write_memory_file_atomic` which re-derives the same dir
-/// — by construction the read and write target the same file.
+/// Uses `handle.memory_dir` — for a CT collab watch this is the SESSION
+/// subtree `session-<pid>/<collabSessionId>/` (re-pointed by
+/// `populate_entry` after the collab_session_id lands on the handle); for
+/// a manual/non-CT watch (empty id) it stays the process-level
+/// `session-<pid>/` dir, preserving legacy behavior. `persist_offset`
+/// writes through the SAME `handle.memory_dir`, so read and write target
+/// the same per-session file by construction.
 fn state_file_path(handle: &TranscriptHandle) -> PathBuf {
     handle.memory_dir.join(STATE_FILE_RELPATH)
 }
@@ -132,14 +137,15 @@ pub fn poll_new_bytes(handle: &TranscriptHandle, offset: u64) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-pub fn persist_offset(state: &TailState) -> Result<(), WatcherError> {
-    // Read-modify-write. memory::write_memory_file_atomic uses
-    // memory::get_memory_dir() (process-scoped session-<pid>); in-process
-    // this agrees with the handle.memory_dir resume_from_state read from,
-    // so the round-trip is consistent.
-    let dir = memory::get_memory_dir()
-        .map_err(|e| WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-    let full_path = dir.join(STATE_FILE_RELPATH);
+pub fn persist_offset(
+    handle: &TranscriptHandle,
+    state: &TailState,
+) -> Result<(), WatcherError> {
+    // Read-modify-write against the SAME per-session base dir
+    // `state_file_path` resolves reads from (`handle.memory_dir`), so the
+    // round-trip is consistent and two collab sessions' tailers never
+    // touch each other's `.state.json`.
+    let full_path = state_file_path(handle);
 
     let mut map = read_state_map(&full_path)?;
     map.insert(key_for(&state.path), state.clone());
@@ -148,7 +154,7 @@ pub fn persist_offset(state: &TailState) -> Result<(), WatcherError> {
         WatcherError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })?;
 
-    memory::write_memory_file_atomic(STATE_FILE_RELPATH.to_string(), serialized)
+    memory::write_file_atomic_under(&handle.memory_dir, STATE_FILE_RELPATH, &serialized)
         .map_err(|e| WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
     Ok(())
@@ -166,7 +172,7 @@ pub fn handle_inode_change(handle: &TranscriptHandle) -> Result<TailState, Watch
         byte_offset: 0,
         last_normalized_turn_index: 0,
     };
-    persist_offset(&new_state)?;
+    persist_offset(handle, &new_state)?;
     Ok(new_state)
 }
 

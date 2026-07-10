@@ -81,7 +81,11 @@ function filterCliNoise(text: string): string {
  * immediately rather than waiting for the full quietMs timeout.
  */
 const RESPONSE_DONE_PATTERNS = [
-  /(?:^|\n)(?:\w+\s)?>\s*$/,  // CLI prompt: "> ", "gemini > ", "codex > " (rejects ">>>")
+  // CLI prompt: "> ", "agy > ", "codex > " (rejects ">>>"). Audited for the
+  // agy migration: the `(?:\w+\s)?>` shape matches any word-prefixed
+  // prompt, so an agy-branded prompt is covered without a new pattern;
+  // a miss only delays the flush to the quietMs debounce, never drops it.
+  /(?:^|\n)(?:\w+\s)?>\s*$/,
   /(?:^|\n)\$\s*$/,            // shell prompt at line start
 ];
 

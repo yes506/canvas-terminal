@@ -550,6 +550,11 @@ pub fn get_pty_cwd(state: State<'_, AppState>, session_id: String) -> Result<Str
 /// triggering premature submission of just the first line.
 fn format_for_tool(text: &str, tool: Option<&str>) -> String {
     match tool {
+        // gemini_cli slot now spawns Antigravity CLI (agy). The `\n`→`\r`
+        // conversion was measured against the old Gemini CLI TUI; per the
+        // plan's open question it is KEPT until measured against agy's TUI
+        // (decide empirically after agy onboarding — flagged in the
+        // implementer report's validation notes).
         Some("gemini_cli") => text.replace('\n', "\r"),
         // Claude Code and Codex handle \n natively inside bracketed paste
         _ => text.to_string(),

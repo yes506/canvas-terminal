@@ -159,7 +159,7 @@ pub fn run() {
             commands::canvas::check_import_file,
             commands::canvas::read_import_file,
             commands::canvas::cleanup_import_file,
-            commands::memory::init_memory_dir,
+            commands::memory::get_memory_session_dir,
             commands::memory::write_memory_file,
             commands::memory::write_memory_file_atomic,
             commands::memory::read_memory_file,
@@ -247,8 +247,11 @@ pub fn run() {
                 if let Some(tw) = window.try_state::<commands::transcripts::TranscriptWatcher>() {
                     tw.shutdown();
                 }
-                // Wipe shared collaborator memory on window close
-                let _ = commands::memory::clear_memory_dir();
+                // Wipe shared collaborator memory on window close. This is
+                // the process-wide wipe (every collab session's subtree at
+                // once) — the scoped IPC `clear_memory_dir(collab_session_id)`
+                // only ever clears one session subtree.
+                let _ = commands::memory::clear_process_memory_root();
             }
         })
         .build(tauri::generate_context!())
