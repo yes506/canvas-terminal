@@ -22,6 +22,10 @@ graph LR
   SlashCommandMemoryOps --> ScopedMemoryIpc
   PeerContextReader --> ContextMirrorWriter
   ToolRegistry --> PtyInjector
+  ToolRegistry --> AgentHeaderBuilder
   PtyInjector --> OutputCapture
   TailerStateScoping --> ScopedMemoryPath
   TailerStateScoping --> ScopedMemoryIpc
+  AgyAdapterDegradation --> ToolRegistry
+  AgyAdapterDegradation --> OutputCapture
+  TeardownSplit --> ScopedMemoryPath

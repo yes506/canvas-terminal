@@ -175,7 +175,7 @@ export interface ScopedMemoryClient {
    * Failure-modes:
    *   - Error("Invalid collab session id") — id empty after sanitize
    *   - Error("Cannot determine home directory") / Error(io) — root resolution or mkdir failed
-   * Collaborators: Rust memory::init_memory_dir (scoped variant); ScopedMemoryIpc.* (path base).
+   * Collaborators: Rust memory::get_memory_session_dir (the scoped successor of init_memory_dir); ScopedMemoryIpc.* (path base).
    */
   getMemorySessionDir(collabSessionId: string): Promise<string>;
 }

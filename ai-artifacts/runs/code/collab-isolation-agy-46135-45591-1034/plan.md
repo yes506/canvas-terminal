@@ -2,8 +2,10 @@
 
 Planner run `46135-45591-1034` · lane `feature` · base `dev` · stack `typescript` (+ Rust IPC side)
 Origin: collaborator task `task-1-1783644753660` (session-22-1783644131641).
-Rev 2 — folds verified findings from 5 peer reviews (@codex1 task-11, @claude2 task-12,
-@codex2 task-13, @claude3 task-14, @codex3 task-15). Disposition table at the end.
+Rev 3 — round 1 fold (5 reviews: @codex1 task-11, @claude2 task-12, @codex2 task-13,
+@claude3 task-14, @codex3 task-15) + round 2 fold (5 rev-2 reviews: @codex1 task-23,
+@claude2 task-24, @codex2 task-25, @claude3 task-26, @codex3 feedback-rev2). All rev-2
+reviewers APPROVE; rev 3 folds their residual findings. Disposition tables at the end.
 
 ## Goal
 
@@ -33,6 +35,9 @@ canvas-terminal collaborator 모드에서 각 collaborator 세션의 공유 메�
     agent prompts (`getMemoryDir()` at `collaboratorStore.ts:785-789`), so leaving it
     root-scoped would keep inviting agents into the mixed root. The TS-side
     `memoryDirCache` becomes **keyed by collabSessionId** (Map), not a single global string.
+    The rename MUST update the Tauri `invoke_handler` registration at `lib.rs:162` (all three
+    refs: `memory.rs:69` def, `lib.rs:162` registration, `collaboratorStore.ts:787` call) —
+    a missed registration is a runtime "command not found", not a compile error.
   - new helpers: `sanitize_collab_session_id` (empty-after-sanitize = error, never root
     fallback), `get_memory_session_dir`
   - **teardown split**: window-close wipe at `src-tauri/src/lib.rs:251` currently calls
@@ -46,9 +51,12 @@ canvas-terminal collaborator 모드에서 각 collaborator 세션의 공유 메�
   `ScopedMemoryClient` — emitted by this planner run, tsc-validated). **All raw
   `invoke("<memory-command>")` call sites are REPLACED by a typed facade implementing
   `ScopedMemoryIpc`/`ScopedMemoryClient`** so a missed `collabSessionId` is a compile error,
-  not a silent runtime deserialization failure. Known call-site anchors:
-  `collaboratorStore.ts:754, 769, 1055, 1064, 1078, 1111, 1214, 1656, 1663, 1992, 2220` and
-  `commands.ts:328, 333, 339, 526, 533, 543, 548`.
+  not a silent runtime deserialization failure. The facade lives in a standalone
+  `src/lib/scopedCollabMemory.ts` module (NOT inside the Zustand store) so
+  `src/lib/peerContext.ts` can consume it without importing the store. Known call-site
+  anchors: `collaboratorStore.ts:754, 769, 1055, 1064, 1078, 1111, 1214, 1656, 1663, 1992,
+  2220` and `commands.ts:328, 333, 339, 526, 533, 543, 548`, plus the peerContext readers
+  (`peerContext.ts:297-356, 425-456`).
 - Update header builders `prependContextHeader` / `buildSlimHeader` and `buildTaskProtocol`
   (`src/stores/collaboratorStore.ts`) so every injected path points ONLY at the agent's own
   session directory, and add an explicit protocol rule prohibiting access to sibling session
@@ -72,19 +80,46 @@ canvas-terminal collaborator 모드에서 각 collaborator 세션의 공유 메�
 - Wire TS consumers to the scoped facade: `/memory` + `/context` handlers
   (`src/components/collaborator/commands.ts`), done.json scanning (`scanForTaskCompletions`),
   peer-context reader glob + breadcrumbs (`src/lib/peerContext.ts:297-356, 425-456` →
-  `contexts/...` relative to the scoped session root).
+  `contexts/...` relative to the scoped session root). Simplification: once the reader glob is
+  relative to the scoped root, the `<sid>` path segment disappears from TS-composed relative
+  paths, so the TS `sanitizeCollabSessionId` mirror (`peerContext.ts:41`, used at `:301,:347`
+  and `collaboratorStore.ts:1126`) is **deleted** — eliminating the raw-vs-Rust sanitize drift
+  surface instead of merely constraining it.
 - Replace the retired Gemini CLI: `TOOL_CONFIGS.gemini_cli` `command: "gemini"` → `"agy"`,
   `label: "Gemini CLI"` → `"Antigravity CLI"` (`src/types/collaborator.ts`); ToolId and
-  `@gemini*` handles unchanged.
+  `@gemini*` handles unchanged. **Handle preservation requires a code change, not just the
+  command edit**: `toolShortName()` returns `cfg.command` (`collaboratorStore.ts:80-82`) and
+  both `addAgent` (`:1372,:1387` — `handle = ${short}${ordinal}`) and `reserveAgentHandle`
+  derive handles from it, so a bare command swap would mint `@agy1`. Add a `handlePrefix`
+  field to `ToolConfig` (gemini_cli → `"gemini"`) and make `toolShortName()` prefer it over
+  `command`; tests assert spawned/reserved gemini-slot agents still get `@gemini1` and the
+  help text (`commands.ts:177`) stays intentional.
 - **agy peer-context publishing: consciously disabled in this feature.** Empirically verified
   (2026-07-10): agy v1.1.0 stores conversations as SQLite databases with WAL
   (`~/.gemini/antigravity-cli/conversations/<uuid>.db` + `-shm`/`-wal`), NOT the JSONL the
   Gemini adapter tails (`~/.gemini/tmp/<slug>/chats/*.jsonl`). A JSONL tailer cannot capture
-  them. Scope decision: `adapter_for("gemini" | "gemini_cli")` (`adapters/mod.rs:511-516`)
-  returns **None** (adapter unregistered), the frontend handles watch-registration failure
-  gracefully (publish Eye toggle disabled/hidden for agy agents), `fs_gate::ALLOWED_ROOTS`
-  keeps or drops the `.gemini/tmp` entry accordingly, and tests lock the graceful-degradation
-  path. A dedicated SQLite-reading antigravity adapter is recorded as a follow-up feature.
+  them. Scope decision, decomposed to state level (not UI-only):
+  - Rust: `adapter_for("gemini" | "gemini_cli")` (`adapters/mod.rs:511-516`) returns **None**;
+    `watch_transcript` then errors "unknown tool" (`transcripts/mod.rs:1737-1738`) — the
+    frontend must not depend on that swallowed error alone.
+  - TS capability predicate: add `supportsPeerContextPublishing(toolId): boolean`; in
+    `addAgent`, `publishOptedIn: supports ? (raw.publishOptedIn ?? true) : false`
+    (`collaboratorStore.ts:1404`); the restore flow coerces restored unsupported-tool agents
+    to `false` even if old snapshots carry `true` (`:1431`).
+  - Watch effect guard: the existing registration/failure path (`AgentMiniTerminal.tsx:889-930`
+    watch effect, `:684-685` Eye-toggle default comment, failure catch near `:943`) gains the
+    same capability guard so no `watch_transcript` IPC is even attempted for agy; the Eye
+    toggle is hidden/disabled for unsupported tools. Tests assert zero `watch_transcript`
+    invocations for the gemini_cli slot.
+  - `fs_gate::ALLOWED_ROOTS` (`fs_gate.rs:139`): the `.gemini/tmp` entry MAY stay
+    (dead-but-unreachable is harmless defense-in-depth); dropping it is optional — no
+    security-gate edit is required by this feature.
+  - A dedicated SQLite-reading antigravity adapter is recorded as a follow-up feature.
+
+  **Accepted asymmetry (explicit user sign-off at the merge gate)**: in this feature, agy runs
+  as a full mini-agent (spawn, prompts, task protocol, reads peers' contexts) but is
+  **write-only toward the peer-context store** — other agents cannot grep agy's transcript
+  until the follow-up adapter lands.
 - Re-verify `format_for_tool`'s gemini-only `\n`→`\r` branch (`src-tauri/src/commands/pty.rs:551`)
   against agy's TUI and keep/remove per measurement; audit prompt/readiness regexes
   (`src/lib/agentOutputCapture.ts`, `AgentMiniTerminal` READY_PATTERNS) for agy.
@@ -157,6 +192,10 @@ canvas-terminal collaborator 모드에서 각 collaborator 세션의 공유 메�
 (Resolved in rev 2: dashboard filename parsing — SPA renders raw `f.path`, no grouping logic;
 risk closed with a smoke test. See disposition table.)
 
+(Accepted in rev 3, pending user sign-off at the merge gate: agy is a write-only collaborator
+in this feature — runs fully as a mini-agent but peers cannot grep its transcript until the
+follow-up SQLite adapter lands.)
+
 ## Package layout
 
 No new packages introduced — the feature lives in existing modules:
@@ -211,9 +250,10 @@ New on-disk layout (runtime artifact, not source):
 | 13 | peer-context reader glob | src/lib/peerContext.ts | pairs with nodes 7/7b/7c in one commit |
 | 14 | dashboard snapshot smoke test | src-tauri dashboard + src/dashboard/App.tsx | verified compatible; lock with test |
 | 15 | agy tool registration | src/types/collaborator.ts | command `agy`, label `Antigravity CLI` |
+| 15b | handle-prefix preservation | src/types/collaborator.ts + src/stores/collaboratorStore.ts | new `ToolConfig.handlePrefix`; `toolShortName()` prefers it; tests lock `@gemini1` minting + help text |
 | 16 | PTY injection format decision | src-tauri pty.rs | empirical keep/remove of `\n`→`\r` for agy |
 | 17 | prompt/readiness pattern audit | src/lib/agentOutputCapture.ts | agy prompt shape vs existing regexes |
-| 18 | agy adapter unregistration + graceful degradation | src-tauri transcripts/adapters/mod.rs + fs_gate.rs + frontend Eye toggle | agy transcripts are SQLite (.db/WAL) — JSONL tailer cannot capture; publishing disabled with tests; follow-up adapter recorded |
+| 18 | agy adapter unregistration + state-level publish disable | src-tauri adapters/mod.rs + collaboratorStore.ts + AgentMiniTerminal.tsx | `adapter_for`→None; `supportsPeerContextPublishing` predicate; `publishOptedIn` default-off + restore coercion (`:1404/:1431`); watch-effect guard (`AgentMiniTerminal.tsx:889-930`); Eye toggle hidden; fs_gate entry may stay; SQLite adapter = follow-up |
 | 19 | teardown split | src-tauri memory.rs + lib.rs + collaboratorStore.ts | internal `clear_process_memory_root()` for window close; scoped `clear_memory_dir(sid)` for /memory clear + endSession |
 
 ## Interfaces emitted
@@ -257,3 +297,16 @@ skeleton language for this run).
 | Updater/restart assumption implicit | claude2 F4 | FOLDED — constraint added |
 | Raw-vs-sanitized id divergence in TS-composed paths | codex2 | FOLDED — constraint added (Rust-resolved root only) |
 | Gemini CLI not universally dead (enterprise tiers unaffected) | codex1 | NOTED — migration targets the user's personal-tier slot; no plan change |
+
+## Peer-review disposition (rev 3 — round 2, all five reviewers APPROVED rev 2)
+
+| Finding | Reviewers | Disposition |
+|---|---|---|
+| HIGH: handle minting derives from `ToolConfig.command` — bare `agy` swap mints `@agy1`, breaking the "handles unchanged" contract (`toolShortName` :80-82, `addAgent` :1372/:1387, `reserveAgentHandle`, help text `commands.ts:177`) | codex1 | FOLDED — node 15b: `ToolConfig.handlePrefix` + `toolShortName()` preference + minting/help-text tests |
+| HIGH: agy publish disable must be state-level, not UI-only (`publishOptedIn ?? true` :1404; watch effect fires on truthy triple; restore path :1431; Rust "unknown tool" error is swallowed) | codex3 | FOLDED — node 18 expanded: `supportsPeerContextPublishing` predicate, addAgent default-off, watch-effect guard, restore coercion, zero-IPC test |
+| LOW: skeleton TSDoc still cites `init_memory_dir` in `ScopedMemoryClient` collaborators | codex1, codex2 | FIXED — TSDoc line corrected in rev 3 commit |
+| Anchor: `init_memory_dir` rename must update `lib.rs:162` invoke_handler registration | claude2 | FOLDED — cited in the 8th-command bullet |
+| Anchor: node 18 graceful path already exists (`AgentMiniTerminal.tsx:922/:943`, Eye `:684`); fs_gate `.gemini/tmp` entry harmless to keep | claude2 | FOLDED — anchors added; fs_gate edit made optional |
+| Simplification: facade in standalone `src/lib/scopedCollabMemory.ts` (peerContext must not import the store); TS `sanitizeCollabSessionId` mirror deletable post-relocation | codex3, claude2 | FOLDED — facade location fixed; node 13 deletes the TS sanitize mirror |
+| Scope acceptance: agy = write-only collaborator asymmetry needs explicit user sign-off | claude3 | SURFACED — stated in Goal-adjacent note + raised at the Phase 8 gate for explicit confirmation |
+| plan.mmd disconnected rev-2 nodes | codex3 (low) | FIXED — collaborator links added; mmd re-rendered |
