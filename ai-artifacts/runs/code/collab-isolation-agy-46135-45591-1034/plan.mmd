@@ -1,0 +1,22 @@
+graph LR
+  ScopedMemoryIpc["ScopedMemoryIpc"]
+  ScopedMemoryClient["ScopedMemoryClient"]
+  ScopedMemoryPath["ScopedMemoryPath"]
+  ContextMirrorWriter["ContextMirrorWriter"]
+  AgentHeaderBuilder["AgentHeaderBuilder"]
+  TaskCompletionScanner["TaskCompletionScanner"]
+  SlashCommandMemoryOps["SlashCommandMemoryOps"]
+  PeerContextReader["PeerContextReader"]
+  SessionSnapshotWalker["SessionSnapshotWalker"]
+  ToolRegistry["ToolRegistry"]
+  PtyInjector["PtyInjector"]
+  OutputCapture["OutputCapture"]
+  ScopedMemoryPath --> ScopedMemoryIpc
+  ScopedMemoryPath --> ContextMirrorWriter
+  ContextMirrorWriter --> PeerContextReader
+  AgentHeaderBuilder --> ScopedMemoryClient
+  TaskCompletionScanner --> ScopedMemoryClient
+  SlashCommandMemoryOps --> ScopedMemoryIpc
+  PeerContextReader --> ContextMirrorWriter
+  ToolRegistry --> PtyInjector
+  PtyInjector --> OutputCapture
