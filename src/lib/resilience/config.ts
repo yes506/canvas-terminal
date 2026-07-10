@@ -44,6 +44,12 @@ export interface ResilienceConfig {
   recoverySessionTtlMs: number;
   /** Max durable resume attempts before recovery fails fast to 'failed'. */
   recoveryMaxAttempts: number;
+  /**
+   * How long resumeAfterReload's adoption-readiness barrier waits for the
+   * restored panes to mount + subscribe their pty-data listeners before the
+   * unready ids are reported lost (webcontent-death-recovery node 12b).
+   */
+  adoptionReadinessTimeoutMs: number;
 }
 
 export const resilienceConfig: ResilienceConfig = {
@@ -63,4 +69,5 @@ export const resilienceConfig: ResilienceConfig = {
 
   recoverySessionTtlMs: 60000,
   recoveryMaxAttempts: 2,
+  adoptionReadinessTimeoutMs: 10000,
 };
