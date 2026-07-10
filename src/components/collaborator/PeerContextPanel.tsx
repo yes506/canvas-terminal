@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 
-import { loadSnapshot, sanitizeCollabSessionId } from "../../lib/peerContext";
+import { loadSnapshot } from "../../lib/peerContext";
 import type {
   NormalizedTurn,
   PeerContextSnapshot,
@@ -21,7 +21,7 @@ export interface PeerContextPanelProps {
   isPublishing: boolean;
   /**
    * Collab session id — scopes the mirror read to
-   * `contexts/<collabSessionId>/<agent>.jsonl` so peers from other sessions
+   * `contexts/<agent>.jsonl` so peers from other sessions
    * are not mixed in (plan N15).
    */
   collabSessionId: string;
@@ -141,11 +141,7 @@ export function PeerContextPanel(props: PeerContextPanelProps): JSX.Element {
         <span className="peer-context-panel__status">publishing</span>
       </div>
       {renderFenced(ordered)}
-      {renderTruncationFooter(
-        agentHandle,
-        snapshot.archivesBeyondWindow,
-        collabSessionId,
-      )}
+      {renderTruncationFooter(agentHandle, snapshot.archivesBeyondWindow)}
     </div>
   );
 }
@@ -212,11 +208,11 @@ export function renderFenced(turns: NormalizedTurn[]): JSX.Element {
  *
  * Returns: a React node containing a single-line text breadcrumb
  * "History truncated — older turns at
- * <session-dir>/contexts/<collabSessionId>/<agent>.0..N-2.jsonl" when
- * `archivesBeyondWindow >= 1`; returns `null` otherwise. The path is
- * session-scoped to match the actual mirror layout (the writer + readers all
- * use `contexts/<collabSessionId>/`), so the debug hint points where the
- * archives really live.
+ * <session-dir>/contexts/<agent>.0..N-2.jsonl" when
+ * `archivesBeyondWindow >= 1`; returns `null` otherwise. `<session-dir>` is
+ * the per-collab-session subtree (`session-<pid>/<collabSessionId>/`), so the
+ * debug hint points where the archives really live under the relocated
+ * `<sid>/contexts/` layout.
  *
  * Errors: never.
  *
@@ -236,12 +232,10 @@ export function renderFenced(turns: NormalizedTurn[]): JSX.Element {
 export function renderTruncationFooter(
   agentHandle: string,
   archivesBeyondWindow: number,
-  collabSessionId: string,
 ): JSX.Element | null {
   if (archivesBeyondWindow < 1) {
     return null;
   }
-  const scope = sanitizeCollabSessionId(collabSessionId);
   // Per the docstring test-contract: archivesBeyondWindow=5 → "0..3"
   // (5 hidden archives, indices 0..4 inclusive — but the rendered
   // breadcrumb shows the range as 0..N-2 where N is the total archive
@@ -262,7 +256,7 @@ export function renderTruncationFooter(
     <div className="peer-context-panel__truncation-footer">
       History truncated — older turns at{" "}
       <code>
-        &lt;session-dir&gt;/contexts/{scope}/{agentHandle}.{oldest}..
+        &lt;session-dir&gt;/contexts/{agentHandle}.{oldest}..
         {newestHidden}.jsonl
       </code>
     </div>

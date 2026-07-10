@@ -458,3 +458,87 @@ describe("visibility-restore IntersectionObserver", () => {
     );
   });
 });
+
+describe("agy migration — watch-effect capability guard + Eye toggle (node 18)", () => {
+  // Source-text checks in the established pattern above: the watch effect
+  // and the header JSX are not extracted into unit-testable helpers, and
+  // rendering the full component would drag in xterm/PTY plumbing. The
+  // state-level behavior (publishOptedIn forced false for agy) is covered
+  // in collaboratorStore.test.ts; these lock the belt-and-suspenders
+  // wiring that guarantees ZERO `watch_transcript` IPC attempts for the
+  // gemini_cli slot even if a stale snapshot slips a `true` through.
+  const source = readFileSync(
+    resolve(process.cwd(), "src/components/collaborator/AgentMiniTerminal.tsx"),
+    "utf8",
+  );
+
+  it("gates the watch effect on supportsPeerContextPublishing(toolId)", () => {
+    expect(source).toMatch(
+      /!supportsPeerContextPublishing\(toolId\)\s*\)\s*\{\s*\n\s*return;/,
+    );
+  });
+
+  it("hides the Eye toggle for unsupported tools", () => {
+    expect(source).toMatch(
+      /\{agent && supportsPeerContextPublishing\(tool\.id\) && \(/,
+    );
+  });
+
+  it("imports the predicate from the tool registry (single source of truth)", () => {
+    expect(source).toContain(
+      'import { supportsPeerContextPublishing } from "../../types/collaborator";',
+    );
+  });
+});
+
+describe("webcontent-death-recovery — teardown suppression + adopt mode (nodes 13/17/18)", () => {
+  // Source-text checks in the established pattern: the cleanup closure and
+  // the adopt branches live inside effects that would need full xterm/PTY
+  // plumbing to render. Behavior-level coverage lives in
+  // src/lib/resilience/bootstrap.test.ts (barrier + restore flow).
+  const source = readFileSync(
+    resolve(process.cwd(), "src/components/collaborator/AgentMiniTerminal.tsx"),
+    "utf8",
+  );
+  const paneSource = readFileSync(
+    resolve(process.cwd(), "src/components/collaborator/CollaboratorPane.tsx"),
+    "utf8",
+  );
+  const useTerminalSource = readFileSync(
+    resolve(process.cwd(), "src/components/terminal/useTerminal.ts"),
+    "utf8",
+  );
+
+  it("gates kill_pty/removeAgent on isReloadInProgress (node 13)", () => {
+    expect(source).toMatch(
+      /if \(!recoveryOrchestrator\.isReloadInProgress\(\)\) \{\s*\n\s*invoke\("kill_pty", \{ sessionId \}\)\.catch\(\(\) => \{\}\);\s*\n\s*useCollaboratorStore\.getState\(\)\.removeAgent\(sessionId\);/,
+    );
+  });
+
+  it("gates killAllAgents/endSession on isReloadInProgress (node 14)", () => {
+    expect(paneSource).toMatch(
+      /if \(!recoveryOrchestrator\.isReloadInProgress\(\)\) \{\s*\n\s*killAllAgents\(collabId\);\s*\n\s*endSession\(collabId\);/,
+    );
+  });
+
+  it("adopt mode skips reservation/spawn/addAgent and signals readiness (node 18)", () => {
+    // Reservation + spawn pipeline is inside the !adopt branch…
+    expect(source).toMatch(/if \(!adopt\) \{\s*\n\s*try \{\s*\n\s*reservation = reserveAgentHandle/);
+    // …and the adopt branch signals the barrier instead of addAgent.
+    expect(source).toMatch(/if \(adopt\) \{[\s\S]*?signalAdoptionReady\(sessionId\);/);
+    // Readiness detection must never resurrect an adopted exited tile.
+    expect(source).toContain("if (adopt || readyDetected) return;");
+  });
+
+  it("restored terminal leaves adopt instead of spawning (node 17)", () => {
+    expect(useTerminalSource).toMatch(
+      /isRestoredSessionId\(sessionId\)[\s\S]*?adoptDetachedSession\(sessionId, slot\)\.then\(\(\) => \{\s*\n\s*signalAdoptionReady\(sessionId\);/,
+    );
+  });
+
+  it("CollaboratorPane materializes adopt-mode spawns from restored rows (node 18)", () => {
+    expect(paneSource).toContain("recoveryOrchestrator.isReloadInProgress()");
+    expect(paneSource).toMatch(/adopt: true,/);
+    expect(paneSource).toMatch(/adopt=\{spawn\.adopt === true\}/);
+  });
+});

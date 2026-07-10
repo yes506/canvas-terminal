@@ -1,5 +1,9 @@
-import { describe, it, expect } from "vitest";
-import { RecoveryOrchestrator } from "./RecoveryOrchestrator";
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  RecoveryOrchestrator,
+  signalAdoptionReady,
+  _resetAdoptionBarrierForTests,
+} from "./RecoveryOrchestrator";
 import type { ITopologySnapshot } from "./ITopologySnapshot";
 import type { IRecoverySession } from "./IRecoverySession";
 import type { IPtyReattachClient } from "./IPtyReattachClient";
@@ -167,7 +171,28 @@ function makeHarness(opts: {
 
 // ---- tests -----------------------------------------------------------------
 
+/**
+ * Drive resumeAfterReload the way the app does post-rev-2: restoreShell arms
+ * the adoption-readiness barrier, the (here simulated) adopt-mode mounts
+ * signal listener readiness, and only then does Phase 2 reattach. Without
+ * the signals the barrier would (correctly) hold until its timeout.
+ */
+async function resumeWithMounts(
+  o: RecoveryOrchestrator,
+  evidence: DeathEvidence,
+  ids: string[] = ["term-1", "term-2"],
+) {
+  const outcome = o.resumeAfterReload(evidence);
+  // Let loadPending/claim/loadPersisted/restoreShell land and arm the barrier.
+  await new Promise((r) => setTimeout(r, 0));
+  for (const id of ids) signalAdoptionReady(id);
+  return outcome;
+}
+
 describe("RecoveryOrchestrator.resumeAfterReload", () => {
+  beforeEach(() => {
+    _resetAdoptionBarrierForTests();
+  });
   it("no pending session → fails fast without any restore side-effect", async () => {
     const h = makeHarness({ pending: null });
     const out = await h.o.resumeAfterReload(EVIDENCE);
@@ -198,7 +223,7 @@ describe("RecoveryOrchestrator.resumeAfterReload", () => {
 
   it("claims ONE attempt BEFORE any restore side-effect (crash-loop ordering)", async () => {
     const h = makeHarness({ pending: session(), claimed: session() });
-    await h.o.resumeAfterReload(EVIDENCE);
+    await resumeWithMounts(h.o, EVIDENCE);
     expect(h.calls.indexOf("claimAttempt")).toBeLessThan(h.calls.indexOf("restoreShell"));
     expect(h.calls.indexOf("restoreShell")).toBeLessThan(h.calls.indexOf("reattach:term-1"));
   });
@@ -208,7 +233,7 @@ describe("RecoveryOrchestrator.resumeAfterReload", () => {
       pending: session({ decision: decision("webcontent-death") }),
       claimed: session({ decision: decision("webcontent-death") }),
     });
-    const out = await h.o.resumeAfterReload(EVIDENCE);
+    const out = await resumeWithMounts(h.o, EVIDENCE);
     expect(out.phase).toBe("recovered");
     expect(out.success).toBe(true);
     expect(out.restoredSessions).toBe(2);
@@ -229,7 +254,7 @@ describe("RecoveryOrchestrator.resumeAfterReload", () => {
         replayBytes: 0,
       }),
     });
-    const out = await h.o.resumeAfterReload(EVIDENCE);
+    const out = await resumeWithMounts(h.o, EVIDENCE);
     expect(out.phase).toBe("recovered");
     expect(out.success).toBe(false);
     expect(out.restoredSessions).toBe(1);
@@ -254,7 +279,7 @@ describe("RecoveryOrchestrator.resumeAfterReload", () => {
       pending: session({ decision: decision(sentinel) }),
       claimed: session({ decision: decision(sentinel) }),
     });
-    const out = await h.o.resumeAfterReload(EVIDENCE);
+    const out = await resumeWithMounts(h.o, EVIDENCE);
     expect(out.phase).toBe("recovered");
     expect(h.signs).toEqual([sentinel]);
     expect(h.signs).not.toContain("webcontent-death");

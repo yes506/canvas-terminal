@@ -122,7 +122,22 @@ pub fn run() {
             app.set_menu(menu)?;
             // Remove only stale session directories from dead processes.
             let _ = commands::memory::clear_stale_sessions();
+            // Same reaping policy for the resilience store (separate root —
+            // deliberately NOT wiped by the window-close collab-memory path).
+            let _ = commands::resilience::clear_stale_resilience_sessions();
             Ok(())
+        })
+        // Webview launch-generation counter (resilience node 3): every page
+        // load — cold start, user reload, or the watchdog's own recovery
+        // reload — increments the durable generation so read_death_evidence
+        // can compute reloadedSinceLastBeat Rust-internally (the fresh JS
+        // context has no prior in-memory baseline to compare against).
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished
+                && webview.label() == "main"
+            {
+                commands::resilience::record_page_load();
+            }
         })
         .on_menu_event(|app, event| {
             if event.id() == "close_tab" {
@@ -159,7 +174,7 @@ pub fn run() {
             commands::canvas::check_import_file,
             commands::canvas::read_import_file,
             commands::canvas::cleanup_import_file,
-            commands::memory::init_memory_dir,
+            commands::memory::get_memory_session_dir,
             commands::memory::write_memory_file,
             commands::memory::write_memory_file_atomic,
             commands::memory::read_memory_file,
@@ -187,8 +202,33 @@ pub fn run() {
             commands::localfile::mint_localfile_token,
             commands::transcripts::watch_transcript,
             commands::transcripts::unwatch_transcript,
+            // resilience-recovery — exact 10-command checklist (plan node 11):
+            // 8 resilience IPCs + reattach_pty (pty.rs) + recreate_webview stub.
+            commands::resilience::report_heartbeat,
+            commands::resilience::read_death_evidence,
+            commands::resilience::persist_recovery_session,
+            commands::resilience::load_recovery_session,
+            commands::resilience::claim_recovery_attempt,
+            commands::resilience::clear_recovery_session,
+            commands::resilience::persist_topology,
+            commands::resilience::load_topology,
+            commands::resilience::recreate_webview,
+            commands::pty::reattach_pty,
         ])
         .on_window_event(|window, event| {
+            // Focus-probe watchdog (resilience node 7): returning to the app
+            // is exactly when a jetsam'd WebContent process becomes visible
+            // as a blank body — probe liveness and, on a death verdict, the
+            // A-path (evidence + Rust-minted recovery session + reload) runs.
+            if let tauri::WindowEvent::Focused(true) = event {
+                if window.label() == "main" {
+                    if let Some(webview_window) =
+                        window.app_handle().get_webview_window("main")
+                    {
+                        commands::resilience::run_focus_probe(webview_window);
+                    }
+                }
+            }
             if let tauri::WindowEvent::Destroyed = event {
                 // SESSION_ALIVE = false is the FIRST statement of the destroy
                 // arm (v4 §3.4 / v5 §3.6) — it MUST run before any cleanup so
@@ -247,8 +287,11 @@ pub fn run() {
                 if let Some(tw) = window.try_state::<commands::transcripts::TranscriptWatcher>() {
                     tw.shutdown();
                 }
-                // Wipe shared collaborator memory on window close
-                let _ = commands::memory::clear_memory_dir();
+                // Wipe shared collaborator memory on window close. This is
+                // the process-wide wipe (every collab session's subtree at
+                // once) — the scoped IPC `clear_memory_dir(collab_session_id)`
+                // only ever clears one session subtree.
+                let _ = commands::memory::clear_process_memory_root();
             }
         })
         .build(tauri::generate_context!())

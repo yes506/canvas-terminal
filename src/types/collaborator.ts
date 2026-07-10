@@ -4,15 +4,47 @@ export interface ToolConfig {
   id: ToolId;
   label: string;
   command: string;
+  /**
+   * Optional @-handle family prefix. `toolShortName()` prefers this over
+   * `command`, so swapping a slot's CLI binary (gemini → agy) does NOT
+   * re-mint the handle family — `@gemini1` stays the immutable protocol
+   * handle that tasks (`assignee`), `.done.json` author fields, and
+   * conversation-log tags keep matching. Omitted for tools whose command
+   * IS the handle family.
+   */
+  handlePrefix?: string;
   colorClass: string;
 }
 
 export const TOOL_CONFIGS: ToolConfig[] = [
   { id: "claude_code", label: "Claude Code", command: "claude", colorClass: "text-purple-400" },
   { id: "codex_cli", label: "Codex CLI", command: "codex", colorClass: "text-orange-400" },
-  { id: "gemini_cli", label: "Gemini CLI", command: "gemini", colorClass: "text-blue-400" },
+  // Antigravity CLI replaces the retired personal-tier Gemini CLI in the
+  // gemini slot (2026-06-18 sunset). ToolId and the @gemini* handle family
+  // are unchanged — only the spawned binary and the display label move.
+  { id: "gemini_cli", label: "Antigravity CLI", command: "agy", handlePrefix: "gemini", colorClass: "text-blue-400" },
   { id: "copilot_cli", label: "Copilot CLI", command: "copilot", colorClass: "text-emerald-400" },
 ];
+
+/**
+ * Whether transcripts from this tool can be mirrored into the peer-context
+ * store (the Eye toggle / `watch_transcript` pipeline).
+ *
+ * Antigravity CLI (agy, the gemini slot) stores conversations as SQLite
+ * databases with WAL (`~/.gemini/antigravity-cli/conversations/<uuid>.db`),
+ * NOT the JSONL the transcript tailer reads — so publishing is disabled at
+ * the STATE level (`publishOptedIn` is forced false in `addAgent` and on
+ * restore) and the watch effect never even attempts the IPC. A dedicated
+ * SQLite-reading antigravity adapter is a recorded follow-up feature; until
+ * it lands, agy runs as a full mini-agent that reads peers' contexts but
+ * cannot be read by them (accepted asymmetry, user-signed-off).
+ *
+ * Other tools keep their status quo — including copilot_cli, whose watch
+ * attempt fails gracefully Rust-side today (no adapter registered).
+ */
+export function supportsPeerContextPublishing(tool: ToolId): boolean {
+  return tool !== "gemini_cli";
+}
 
 /** Raw spawn facts passed by AgentMiniTerminal to addAgent(). Identity fields are computed by the store. */
 export interface SpawnedAgentInit {

@@ -8,10 +8,11 @@ import type {
   AgentNameRecord,
   RenameResult,
 } from "../types/collaborator";
-import { TOOL_CONFIGS } from "../types/collaborator";
+import { TOOL_CONFIGS, supportsPeerContextPublishing } from "../types/collaborator";
 import type { AgentSnapshot } from "../lib/resilience/types";
 import { muteCapture } from "../lib/agentOutputCapture";
-import { hasContextsBreadcrumb, sanitizeCollabSessionId } from "../lib/peerContext";
+import { hasContextsBreadcrumb } from "../lib/peerContext";
+import { scopedMemoryClient, scopedMemoryIpc } from "../lib/scopedCollabMemory";
 import { useTerminalStore } from "./terminalStore";
 
 // ---------------------------------------------------------------------------
@@ -76,10 +77,13 @@ export function toolLabel(tool: string): string {
   return TOOL_LABELS[tool] ?? tool;
 }
 
-/** Short name used for @-mentions (e.g. "claude", "codex", "gemini"). */
+/** Short name used for @-mentions (e.g. "claude", "codex", "gemini").
+ *  Prefers `handlePrefix` over `command` so a slot's CLI binary can be
+ *  swapped (gemini → agy) without re-minting the immutable @-handle
+ *  family that tasks, logs, and done.json author fields reference. */
 export function toolShortName(tool: ToolId): string {
   const cfg = TOOL_CONFIGS.find((t) => t.id === tool);
-  return cfg?.command ?? tool;
+  return cfg?.handlePrefix ?? cfg?.command ?? tool;
 }
 
 /** Return the current display label for an agent. Always reads `nickname`,
@@ -435,10 +439,15 @@ export function _isRenamePendingForTests(sessionId: string): boolean {
  *
  * `peerContextGlob` is the session-scoped grep target for Rule 2 — it MUST
  * match the path the Rust writer mirrors into
- * (`contexts/<collabSessionId>/*.jsonl`) and the `[Peer contexts: …]`
+ * (`<sessionDir>/contexts/*.jsonl`) and the `[Peer contexts: …]`
  * breadcrumb, or the agent greps an empty/foreign directory and the
  * collaboration deadlocks on a missing-info gap that is actually present
  * (plan N18, load-bearing — this text is injected on every first send).
+ *
+ * Rule 7 is the shell-vector half of the isolation guarantee: the app IPC
+ * is structurally scoped, but a spawned CLI reaches the filesystem
+ * directly, so the protocol must explicitly prohibit sibling-session
+ * access (layout + instruction scoping per the plan's threat model).
  */
 function buildTaskProtocol(peerContextGlob: string): string {
   return `
@@ -453,6 +462,7 @@ You are a participant in a multi-agent collaboration.
 4. **Reference by task ID** (e.g. "task-1-...").
 5. **Signal blockers**: State the blocking task ID and what you need. Try Rule 2 first before declaring blocked on a missing-info gap.
 6. **Signal completion**: When done, write a JSON file to the shared memory directory to signal task completion. The system will automatically update the task and generate a report in the conversation log.
+7. **Stay inside YOUR session directory**: Every path above lives in this session's own memory directory. Do NOT read, grep, or write sibling session directories (other subdirectories next to your session directory, e.g. \`../<other-session-id>/\`) — they belong to other collaborator panes and are off-limits.
 
 \`\`\`bash
 cat > SHARED_MEMORY_DIR/TASK_ID.done.json << 'EOF'
@@ -746,47 +756,34 @@ function bumpAssignedAt(
 
 function ensureSessionMemoryFiles(collabSessionId: string): void {
   const conversationPath = `conversation-${collabSessionId}.md`;
-  invoke<string | null>("read_memory_file", {
-    relativePath: conversationPath,
-  })
+  scopedMemoryIpc
+    .readMemoryFile(collabSessionId, conversationPath)
     .then((existing) => {
       if (existing === null) {
-        return invoke("write_memory_file", {
-          relativePath: conversationPath,
-          content: "# Collaborator Conversation Log\n",
-        });
+        return scopedMemoryIpc.writeMemoryFile(
+          collabSessionId,
+          conversationPath,
+          "# Collaborator Conversation Log\n",
+        );
       }
       return null;
     })
     .catch(() => {});
 
   const tasksPath = taskFileRelativePath(collabSessionId);
-  invoke<string | null>("read_memory_file", {
-    relativePath: tasksPath,
-  })
+  scopedMemoryIpc
+    .readMemoryFile(collabSessionId, tasksPath)
     .then((existing) => {
       if (existing === null) {
-        return invoke("write_memory_file", {
-          relativePath: tasksPath,
-          content: formatTasksMarkdown([]),
-        });
+        return scopedMemoryIpc.writeMemoryFile(
+          collabSessionId,
+          tasksPath,
+          formatTasksMarkdown([]),
+        );
       }
       return null;
     })
     .catch(() => {});
-}
-
-// ---------------------------------------------------------------------------
-// Shared memory helpers
-// ---------------------------------------------------------------------------
-
-let memoryDirCache: string | null = null;
-
-async function getMemoryDir(): Promise<string> {
-  if (!memoryDirCache) {
-    memoryDirCache = await invoke<string>("init_memory_dir");
-  }
-  return memoryDirCache;
 }
 
 // ---------------------------------------------------------------------------
@@ -987,7 +984,9 @@ const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
  */
 export async function scanForTaskCompletions(forSession: string): Promise<void> {
   try {
-    const files = await invoke<string[]>("list_memory_files");
+    // Scoped list: only THIS session's subtree is walked, so a sibling
+    // pane's .done.json files are structurally invisible to this scan.
+    const files = await scopedMemoryIpc.listMemoryFiles(forSession);
     const doneFiles = files.filter((f) => f.endsWith(".done.json"));
     if (doneFiles.length === 0) return;
 
@@ -999,7 +998,7 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
 
     for (const relPath of doneFiles) {
       try {
-        const raw = await invoke<string | null>("read_memory_file", { relativePath: relPath });
+        const raw = await scopedMemoryIpc.readMemoryFile(forSession, relPath);
         if (!raw) continue;
         const data = JSON.parse(raw) as {
           task_id?: string;
@@ -1041,7 +1040,7 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
           if (!foundInAnySession) {
             let mtimeMs: number | null;
             try {
-              mtimeMs = await invoke<number>("get_memory_file_mtime", { relativePath: relPath });
+              mtimeMs = await scopedMemoryIpc.getMemoryFileMtime(forSession, relPath);
             } catch {
               // File gone or stat failed (e.g. mtime-unsupported FS).
               // Skip — preserves pre-cleanup behavior on such filesystems.
@@ -1052,7 +1051,7 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
             // false-deleted. Forward jumps >24h would still false-delete,
             // but that's a rare scenario and the 24h grace bounds the risk.
             if (mtimeMs !== null && Math.max(0, Date.now() - mtimeMs) > ORPHAN_GRACE_MS) {
-              await invoke("delete_memory_file", { relativePath: relPath }).catch(() => {});
+              await scopedMemoryIpc.deleteMemoryFile(forSession, relPath).catch(() => {});
             }
           }
           continue;
@@ -1061,7 +1060,7 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
         if (task.status === "completed" || task.status === "blocked") {
           // The race winner already terminalized this task. Best-effort
           // delete so the file doesn't accumulate; ignore if it's gone.
-          await invoke("delete_memory_file", { relativePath: relPath }).catch(() => {});
+          await scopedMemoryIpc.deleteMemoryFile(forSession, relPath).catch(() => {});
           continue;
         }
 
@@ -1075,7 +1074,7 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
         }, forSession);
 
         // Delete the signal file after processing
-        await invoke("delete_memory_file", { relativePath: relPath });
+        await scopedMemoryIpc.deleteMemoryFile(forSession, relPath);
       } catch {
         // Skip malformed files
       }
@@ -1085,7 +1084,15 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
   }
 }
 
-/** Build context header prepended to every message sent to agents. */
+/** Build context header prepended to every message sent to agents.
+ *
+ * Every path printed here is a prefix-descendant of THIS session's memory
+ * subtree (`session-<pid>/<collabSessionId>/`, Rust-resolved via
+ * `getMemorySessionDir`) — never the mixed process root, never a sibling
+ * session's subtree. Without a collab session there is no session subtree,
+ * so the path block is omitted entirely (identity/protocol/tasks still
+ * render).
+ */
 async function prependContextHeader(
   text: string,
   collabSessionId: string | null,
@@ -1093,61 +1100,48 @@ async function prependContextHeader(
   agentIdentity?: string | null,
   agentNickname?: string | null,
 ): Promise<string> {
-  const dir = await getMemoryDir();
+  const dir = collabSessionId
+    ? await scopedMemoryClient.getMemorySessionDir(collabSessionId)
+    : null;
   const parts: string[] = [];
 
-  parts.push(`[Collaborator shared memory: ${dir}]`);
-
-  if (collabSessionId) {
+  if (collabSessionId && dir) {
+    parts.push(`[Collaborator shared memory: ${dir}]`);
     parts.push(
       `[Conversation log: ${dir}/conversation-${collabSessionId}.md]`,
     );
     parts.push(`[Task definitions: ${dir}/${taskFileRelativePath(collabSessionId)}]`);
-  } else {
-    parts.push(`[Task definitions: ${dir}/tasks.md]`);
-  }
 
-  try {
-    const content = await invoke<string | null>("read_memory_file", {
-      relativePath: "context.md",
-    });
-    if (content) {
-      parts.push(`[Shared context: ${dir}/context.md]`);
+    try {
+      const content = await scopedMemoryIpc.readMemoryFile(collabSessionId, "context.md");
+      if (content) {
+        parts.push(`[Shared context: ${dir}/context.md]`);
+      }
+    } catch {
+      // No context file
     }
-  } catch {
-    // No context file
-  }
 
-  // Session-scoped peer-context paths (N16/N18). The breadcrumb and the
-  // TASK_PROTOCOL Rule-2 grep target must BOTH point at the same session
-  // subdir the Rust writer mirrors into — `contexts/<collabSessionId>/` — or
-  // the agent greps an empty/foreign path and collaboration deadlocks.
-  const contextsScope = collabSessionId
-    ? sanitizeCollabSessionId(collabSessionId)
-    : null;
-  const peerContextsDir = contextsScope
-    ? `${dir}/contexts/${contextsScope}/`
-    : `${dir}/contexts/`;
-  const peerContextsGlob = contextsScope
-    ? `contexts/${contextsScope}/*.jsonl`
-    : `contexts/*.jsonl`;
-
-  // Peer-context-mirror breadcrumb (Q3-A wording): mirrors the
-  // context.md conditional above. Surfaces the session-scoped contexts/
-  // directory only when this session has at least one peer mirror file —
-  // the agent can enumerate via list_memory_files. hasContextsBreadcrumb
-  // already silent-falses on IPC failure (see peerContext.ts).
-  try {
-    if (await hasContextsBreadcrumb(collabSessionId)) {
-      parts.push(`[Peer contexts: ${peerContextsDir}]`);
+    // Peer-context-mirror breadcrumb (Q3-A wording): mirrors the context.md
+    // conditional above. The breadcrumb and the TASK_PROTOCOL Rule-2 grep
+    // target below must BOTH point at the path the Rust writer mirrors into
+    // — `<sessionDir>/contexts/` — or the agent greps an empty/foreign path
+    // and collaboration deadlocks. hasContextsBreadcrumb already
+    // silent-falses on IPC failure (see peerContext.ts).
+    try {
+      if (await hasContextsBreadcrumb(collabSessionId)) {
+        parts.push(`[Peer contexts: ${dir}/contexts/]`);
+      }
+    } catch {
+      // No peer contexts available
     }
-  } catch {
-    // No peer contexts available
+
+    parts.push(
+      "[To share notes with other agents, write files to the shared memory directory above.]",
+    );
   }
 
-  parts.push(
-    "[To share notes with other agents, write files to the shared memory directory above.]",
-  );
+  // Rule-2 grep target: absolute, inside THIS session's subtree only.
+  const peerContextsGlob = dir ? `${dir}/contexts/*.jsonl` : `contexts/*.jsonl`;
 
   // Inject agent identity so each agent knows who it is. We surface BOTH
   // the canonical immutable handle (`@claudeN`/`@codexN`) AND the current
@@ -1200,25 +1194,26 @@ async function buildSlimHeader(
   agentIdentity?: string | null,
   agentNickname?: string | null,
 ): Promise<string> {
-  const dir = await getMemoryDir();
-  const parts: string[] = [`[Collaborator shared memory: ${dir}]`];
-  if (collabSessionId) {
+  const dir = collabSessionId
+    ? await scopedMemoryClient.getMemorySessionDir(collabSessionId)
+    : null;
+  const parts: string[] = [];
+  if (collabSessionId && dir) {
+    parts.push(`[Collaborator shared memory: ${dir}]`);
     parts.push(`[Tasks file: ${dir}/${taskFileRelativePath(collabSessionId)}]`);
     parts.push(`[Conversation log: ${dir}/conversation-${collabSessionId}.md]`);
-  }
-  // Re-surface the [Shared context] breadcrumb when context.md exists.
-  // The full header probes for this in `prependContextHeader`; the slim
-  // path used to skip it, so a `/context` set AFTER message #1 was
-  // invisible to all subsequent slim sends. (codex2 task-4, codex3 task-6.)
-  try {
-    const content = await invoke<string | null>("read_memory_file", {
-      relativePath: "context.md",
-    });
-    if (content) {
-      parts.push(`[Shared context: ${dir}/context.md]`);
+    // Re-surface the [Shared context] breadcrumb when context.md exists.
+    // The full header probes for this in `prependContextHeader`; the slim
+    // path used to skip it, so a `/context` set AFTER message #1 was
+    // invisible to all subsequent slim sends. (codex2 task-4, codex3 task-6.)
+    try {
+      const content = await scopedMemoryIpc.readMemoryFile(collabSessionId, "context.md");
+      if (content) {
+        parts.push(`[Shared context: ${dir}/context.md]`);
+      }
+    } catch {
+      // No context file
     }
-  } catch {
-    // No context file
   }
   if (agentIdentity) {
     // Slim variant of the full header's identity line — same handle-first,
@@ -1227,10 +1222,12 @@ async function buildSlimHeader(
     const nick = agentNickname?.trim();
     parts.push(nick ? `[You are @${agentIdentity} (${nick})]` : `[You are @${agentIdentity}]`);
   }
-  parts.push(
-    `[Protocol reminder: signal completion via ${dir}/{TASK_ID}.done.json — ` +
-    `full protocol was sent in this session's first message]`,
-  );
+  if (dir) {
+    parts.push(
+      `[Protocol reminder: signal completion via ${dir}/{TASK_ID}.done.json — ` +
+      `full protocol was sent in this session's first message]`,
+    );
+  }
   // Active-task summary first, then the read-discipline hint that refers
   // to it as "above". Earlier ordering pushed the hint before the summary,
   // making the wording literally wrong (codex3 task-6). The hint is also
@@ -1401,7 +1398,14 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // dropped in favor of frictionless cross-agent context surfacing.
       // `raw.publishOptedIn` takes precedence if the caller explicitly
       // sets it (e.g. for tests verifying the watch-lifecycle's off-state).
-      publishOptedIn: raw.publishOptedIn ?? true,
+      //
+      // Capability gate: tools without a tailable transcript (agy —
+      // SQLite/WAL storage) are forced to false at the STATE level, even
+      // when the caller passes true, so the watch effect never attempts
+      // the IPC and the Eye toggle reflects "unsupported".
+      publishOptedIn: supportsPeerContextPublishing(raw.tool)
+        ? (raw.publishOptedIn ?? true)
+        : false,
     };
     set((s) => ({ agents: [...s.agents, agent] }));
   },
@@ -1428,7 +1432,12 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
           setAt: h.setAt,
           setBy: h.setBy,
         })),
-        publishOptedIn: snap.publishOptedIn,
+        // Coerce restored unsupported-tool agents to false even when an
+        // old snapshot (written before the agy migration) carries true —
+        // otherwise a restore would resurrect a watch the tool can't serve.
+        publishOptedIn: supportsPeerContextPublishing(snap.tool)
+          ? snap.publishOptedIn
+          : false,
       };
       restored.push(agent);
       // Keep the ordinal counter ahead of every restored ordinal.
@@ -1445,6 +1454,12 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // idempotent writes (UI toggle that fires the same value twice).
       const target = s.agents.find((a) => a.sessionId === sessionId);
       if (!target || target.publishOptedIn === value) {
+        return s;
+      }
+      // Capability gate (state-level, mirrors addAgent): an opt-IN for a
+      // tool that cannot publish is a silent no-op — the Eye toggle is
+      // hidden for such tools, so this only defends programmatic callers.
+      if (value === true && !supportsPeerContextPublishing(target.tool)) {
         return s;
       }
       return {
@@ -1652,19 +1667,15 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // block the other; the per-session split (round-9) means we no
       // longer block on OTHER sessions' log writes.
       await Promise.allSettled([pendingTaskWrite, pendingConversationWrite]);
+      // Per-session teardown clears the WHOLE session subtree — conversation,
+      // tasks, context.md, peer reports, done.json signals, and the contexts/
+      // mirror — via the scoped IPC (explicit plan decision, node 19). The
+      // scope argument is the isolation guarantee: sibling panes' subtrees
+      // are structurally untouchable from here.
       try {
-        await invoke("delete_memory_file", {
-          relativePath: `conversation-${sid}.md`,
-        });
+        await scopedMemoryIpc.clearMemoryDir(sid);
       } catch {
-        // Non-critical — file may not exist
-      }
-      try {
-        await invoke("delete_memory_file", {
-          relativePath: taskFileRelativePath(sid),
-        });
-      } catch {
-        // Non-critical — file may not exist
+        // Non-critical — subtree may not exist
       }
     }
   },
@@ -1850,9 +1861,13 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         }
       }
     }
-    const sessionTasks = sid ? (get().tasksBySession[sid] ?? []) : [];
     let sent = 0;
     for (const agent of targetAgents) {
+      // Header scoping is per-AGENT: even on a session-less broadcast, each
+      // agent's header must print paths from ITS OWN session subtree — never
+      // a sibling pane's, never the mixed process root.
+      const headerSid = sid ?? agent.collabSessionId ?? null;
+      const sessionTasks = headerSid ? (get().tasksBySession[headerSid] ?? []) : [];
       // Queue for agents that are still starting up
       if (agent.status === "spawning") {
         set((s) => ({
@@ -1894,7 +1909,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
           }));
           const work = (async () => {
             try {
-              const text = await prependContextHeader(content, sid, sessionTasks, identity, identityNickname);
+              const text = await prependContextHeader(content, headerSid, sessionTasks, identity, identityNickname);
               muteCapture(aSid, 1500);
               await invoke("inject_into_pty", { sessionId: aSid, text, tool: agent.tool });
               // PAIRED INVARIANT: see sendToAgent's matching comment. Both
@@ -1919,7 +1934,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
             firstSendInflight.delete(aSid);
           }
         } else {
-          const text = await buildSlimHeader(content, sid, sessionTasks, identity, identityNickname);
+          const text = await buildSlimHeader(content, headerSid, sessionTasks, identity, identityNickname);
           muteCapture(aSid, 1500);
           await invoke("inject_into_pty", { sessionId: aSid, text, tool: agent.tool });
         }
@@ -1982,17 +1997,19 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // skip the read+write so we don't recreate `conversation-{sid}.md`
       // after killAllAgents/endSession deleted it (claude1 round-8 D3).
       if (abortedSessions.has(forSession)) return;
-      return invoke<string | null>("read_memory_file", { relativePath: relPath })
+      return scopedMemoryIpc
+        .readMemoryFile(forSession, relPath)
         .then((existing) => {
           // Re-check post-read: the abort could have landed during the
           // I/O-bound read. Without this, a slow read followed by a
           // teardown would still write back the (just-read) content.
           if (abortedSessions.has(forSession)) return;
           const base = existing ?? "# Collaborator Conversation Log\n";
-          return invoke("write_memory_file", {
-            relativePath: relPath,
-            content: base + "\n" + newBlock,
-          });
+          return scopedMemoryIpc.writeMemoryFile(
+            forSession,
+            relPath,
+            base + "\n" + newBlock,
+          );
         })
         .catch(() => {});
     });
@@ -2217,12 +2234,11 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
         // the just-deleted tasks-{sid}.md with stale content
         // (codex1 round-7 / claude3 round-7 teardown race).
         if (abortedSessions.has(forSession)) return;
-        return invoke("write_memory_file", {
-          relativePath: taskFileRelativePath(forSession),
-          content,
-        }).catch(() => {
-          // Non-critical write failure (disk full, IPC error, etc.).
-        });
+        return scopedMemoryIpc
+          .writeMemoryFile(forSession, taskFileRelativePath(forSession), content)
+          .catch(() => {
+            // Non-critical write failure (disk full, IPC error, etc.).
+          });
       });
     taskWriteChainsBySession.set(forSession, next);
     await next;

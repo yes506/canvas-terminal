@@ -373,7 +373,7 @@ pub fn on_fs_event(subscription: &Subscription, event_path: &PathBuf) {
         byte_offset: offset + consumed as u64,
         last_normalized_turn_index: next_turn_index,
     };
-    let _ = super::tailer::persist_offset(&new_state);
+    let _ = super::tailer::persist_offset(&handle, &new_state);
     if let Ok(mut g) = inner.lock() {
         if let Some(entry) = g.entries.get_mut(&token_id) {
             entry.tail_state = Some(new_state);

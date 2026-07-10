@@ -1,8 +1,59 @@
 use portable_pty::{Child, MasterPty};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// Always-on bounded replay ring for one PTY session (resilience-recovery
+/// design, round-4 CLOSED item): buffering starts at PTY creation — NOT at
+/// reattach time — so output emitted while no frontend listener exists (the
+/// webview-reload gap) is captured. `reattach_pty` replays the tail through
+/// the same `pty-data-{sessionId}` event stream.
+///
+/// The mutex doubles as the per-session EMIT LOCK: the reader thread pushes
+/// and emits while holding it, and reattach replays while holding it, so a
+/// replay flush can never interleave with live output (design Q4 ordering).
+pub struct PtyRing {
+    data: VecDeque<u8>,
+    cap: usize,
+}
+
+/// Ring capacity per session — plan Q1 default (256 KiB), further bounded at
+/// replay time by the FE-supplied `ReplayBudget.maxBytes`.
+pub const PTY_RING_CAP_BYTES: usize = 256 * 1024;
+
+impl PtyRing {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            data: VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Append emitted output; evict the oldest bytes beyond the cap.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.data.extend(bytes.iter().copied());
+        while self.data.len() > self.cap {
+            self.data.pop_front();
+        }
+    }
+
+    /// Snapshot the newest `max_bytes` of the ring, aligned forward to a
+    /// UTF-8 character boundary so a replay never starts mid-codepoint (the
+    /// ring stores the reader thread's already-validated emit strings, so
+    /// scanning past continuation bytes is sufficient).
+    pub fn tail(&self, max_bytes: usize) -> Vec<u8> {
+        let len = self.data.len();
+        let take = max_bytes.min(len);
+        let mut bytes: Vec<u8> = self.data.iter().skip(len - take).copied().collect();
+        let boundary = bytes
+            .iter()
+            .position(|b| (b & 0b1100_0000) != 0b1000_0000)
+            .unwrap_or(bytes.len());
+        bytes.drain(..boundary);
+        bytes
+    }
+}
 
 pub struct PtySession {
     // Drop order matters: child first, then writer, then reader thread (join), then master last.
@@ -11,6 +62,8 @@ pub struct PtySession {
     pub writer: Box<dyn Write + Send>,
     pub reader_thread: Option<JoinHandle<()>>,
     pub master: Box<dyn MasterPty + Send>,
+    /// Shared with the reader thread (which pushes under the emit lock).
+    pub ring: Arc<Mutex<PtyRing>>,
 }
 
 impl Drop for PtySession {
@@ -645,5 +698,52 @@ impl LocalFileTokenStore for LocalFileTokenRegistry {
             }
             Err(_) => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod pty_ring_tests {
+    //! Ring cap + tail alignment (resilience node 16). Replay ordering is a
+    //! lock-discipline property (push+emit and replay share one mutex) —
+    //! asserted structurally in pty.rs code review; here we pin the byte math.
+    use super::*;
+
+    #[test]
+    fn ring_evicts_oldest_beyond_cap() {
+        let mut ring = PtyRing::new(8);
+        ring.push(b"0123456789"); // 10 bytes into an 8-byte ring
+        assert_eq!(ring.tail(64), b"23456789".to_vec());
+    }
+
+    #[test]
+    fn tail_respects_max_bytes() {
+        let mut ring = PtyRing::new(64);
+        ring.push(b"hello world");
+        assert_eq!(ring.tail(5), b"world".to_vec());
+        assert_eq!(ring.tail(0), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn tail_aligns_to_utf8_boundary() {
+        let mut ring = PtyRing::new(64);
+        ring.push("한글ab".as_bytes()); // 3+3+1+1 bytes
+        // Requesting 7 bytes would slice into the middle of "글" (bytes
+        // 3..6); the tail must skip the partial codepoint's continuation
+        // bytes and start at the next boundary.
+        let tail = ring.tail(7);
+        assert!(std::str::from_utf8(&tail).is_ok());
+        assert_eq!(tail, "글ab".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn tail_of_pure_continuation_window_is_empty_safe() {
+        let mut ring = PtyRing::new(64);
+        ring.push("한".as_bytes());
+        // A 1-byte window lands on the final continuation byte — no boundary
+        // exists inside the window, so the tail degrades to empty rather
+        // than emitting invalid UTF-8.
+        let tail = ring.tail(1);
+        assert!(std::str::from_utf8(&tail).is_ok());
+        assert!(tail.is_empty());
     }
 }

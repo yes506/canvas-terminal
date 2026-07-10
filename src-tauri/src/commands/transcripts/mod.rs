@@ -54,9 +54,13 @@ pub struct TranscriptHandle {
     /// (Linux) one-time at session-bind (M8).
     pub pid: i32,
     /// Session memory directory the Tailer writes its `.state.json` into.
-    /// Populated by `TranscriptWatcher::watch` from `memory::get_memory_dir()`
-    /// at watch-registration time — e.g.
-    /// `~/.cache/canvas-terminal/collab-memory/session-<pid>`.
+    /// Adapters seed it from the process-level `memory::get_memory_dir()`
+    /// at discovery time; for a CT collab watch `populate_entry` RE-POINTS
+    /// it at the collab-session subtree once the sanitized
+    /// `collab_session_id` is known — e.g.
+    /// `~/.cache/canvas-terminal/collab-memory/session-<pid>/<collabSessionId>`
+    /// — so per-session tailers never share `.state.json` crash-resume
+    /// state. A manual/non-CT watch (empty id) keeps the process-level dir.
     ///
     /// Invariant: Tailer state I/O (`resume_from_state`, `persist_offset`,
     /// `handle_inode_change`) MUST write inside this directory, NEVER inside
@@ -68,7 +72,7 @@ pub struct TranscriptHandle {
     /// Collaborator-session id, sanitized to a single path segment. Namespaces
     /// the mirror path so two collab sessions that each spawn a `claude1`
     /// write to distinct files:
-    /// `contexts/<collab_session_id>/<agent_handle>.jsonl`.
+    /// `<collab_session_id>/contexts/<agent_handle>.jsonl`.
     ///
     /// WATCHER-OWNED, NOT adapter-derived: `discover_session` constructs the
     /// handle with an empty placeholder; `populate_entry` overwrites it (after
@@ -83,17 +87,16 @@ pub struct TranscriptHandle {
 
 /// Sanitize a collaborator-session id into a single safe path segment.
 ///
-/// SINGLE SHARED RULE with the TS reader
-/// (`src/lib/peerContext.ts::sanitizeCollabSessionId`): retain only
-/// `[A-Za-z0-9_-]`, drop every other character. Writer (this side) and reader
-/// (TS) MUST apply the identical filter or the agent's grep path diverges from
-/// the on-disk write path and collaboration deadlocks (plan "sanitize contract").
-/// In practice collab ids are `session-<n>-<ts>` so the filter is a no-op; it
-/// exists as defense-in-depth.
+/// The TS side no longer mirrors this rule: every TS-visible session path is
+/// resolved Rust-side via `get_memory_session_dir`, and the reader's globs
+/// are session-RELATIVE (`contexts/…`), so the former raw-vs-sanitized drift
+/// surface is gone. In practice collab ids are `session-<n>-<ts>` so the
+/// filter is a no-op; it exists as defense-in-depth.
 pub fn sanitize_collab_session_id(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect()
+    // Delegates to the crate-wide single source of truth in memory.rs so
+    // the transcripts writer and the scoped memory IPC can never drift on
+    // the sanitize rule.
+    super::memory::sanitize_collab_session_id(raw)
 }
 
 /// Opaque registration token returned by `TranscriptWatcher::watch`. Passed
@@ -101,7 +104,7 @@ pub fn sanitize_collab_session_id(raw: &str) -> String {
 pub struct WatchToken(pub u64);
 
 /// Canonical mirrored record format. One per accepted turn in
-/// `session-<pid>/contexts/<collab_session_id>/<agent>.jsonl`.
+/// `session-<pid>/<collab_session_id>/contexts/<agent>.jsonl`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct NormalizedTurn {
     pub normalized_schema_version: u32,
@@ -1019,7 +1022,7 @@ impl TranscriptWatcher {
     ///   present, populate the trio.
     /// - Initial drain (outside the lock): synthesize an on_fs_event so
     ///   any content already on disk replays into
-    ///   `contexts/<collab_session_id>/<agent>.jsonl` without waiting for the
+    ///   `<collab_session_id>/contexts/<agent>.jsonl` without waiting for the
     ///   next FSEvents notification.
     ///
     /// Returns `true` when the handle was bound (discovery is done); `false`
@@ -1039,6 +1042,27 @@ impl TranscriptWatcher {
         // field — adapters construct handles with an empty placeholder (plan
         // N6: collab_session_id is watcher-owned, not adapter-derived).
         handle.collab_session_id = sanitize_collab_session_id(&collab_session_id);
+
+        // Re-point the tailer's writable base at THIS session's subtree.
+        // `discover_*` captured `memory_dir` from the process-level
+        // `get_memory_dir()` BEFORE the collab_session_id was known; the
+        // `.state.json` must live per-session
+        // (`session-<pid>/<sid>/contexts/.state.json`) or two collab
+        // sessions tailing transcripts would share crash-resume state.
+        // Only for CT collab watches — a manual/non-CT watch (empty id)
+        // keeps the process-level dir (legacy behavior).
+        if !handle.collab_session_id.is_empty() {
+            match super::memory::get_memory_session_root(&handle.collab_session_id) {
+                Ok(dir) => handle.memory_dir = dir,
+                Err(e) => {
+                    eprintln!(
+                        "transcripts: session-root resolution failed for token {}: {}",
+                        token_id, e
+                    );
+                    return false;
+                }
+            }
+        }
 
         // Phase A: cheap presence check.
         {
@@ -1218,7 +1242,7 @@ impl TranscriptWatcher {
 
         // Initial drain: synthesize one on_fs_event so any content
         // already present in the source JSONL replays into
-        // contexts/<collab_session_id>/<agent>.jsonl without waiting for the
+        // <collab_session_id>/contexts/<agent>.jsonl without waiting for the
         // next FSEvents notification. Outside-lock: on_fs_event re-acquires
         // the lock internally.
         watcher::on_fs_event(&watcher::Subscription(0), &source_path_for_drain);
@@ -1302,7 +1326,7 @@ impl TranscriptWatcher {
                         g.parent_dir_refs.remove(&parent_path);
                         // Capture parent path for the post-lock-release
                         // notify::unwatch call. The mirror file in
-                        // `contexts/<collab_session_id>/<agent>.jsonl` (if any) stays on disk;
+                        // `<collab_session_id>/contexts/<agent>.jsonl` (if any) stays on disk;
                         // clean-up is the user's call, matching the
                         // session-lifetime retention default.
                         Some(parent_path)
@@ -1334,7 +1358,7 @@ impl TranscriptWatcher {
         }
     }
 
-    /// Persist one normalized turn to `contexts/<collab_session_id>/<agent>.jsonl`.
+    /// Persist one normalized turn to `<collab_session_id>/contexts/<agent>.jsonl`.
     ///
     /// # Inputs
     /// - `token`: identifies which agent stream this turn belongs to.
@@ -1413,11 +1437,14 @@ impl TranscriptWatcher {
             WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
         })?;
         let full_path = dir
-            .join("contexts")
             .join(&collab_session_id)
+            .join("contexts")
             .join(format!("{}.jsonl", agent_handle));
-        // mkdir -p the session-scoped contexts dir (one extra level deeper
-        // than the legacy flat layout).
+        // mkdir -p the session-scoped contexts dir. Layout is
+        // `<sid>/contexts/<agent>.jsonl` — the contexts mirror lives INSIDE
+        // the session subtree so the scoped memory IPC (list/read/clear
+        // rooted at `session-<pid>/<sid>/`) can reach it and per-session
+        // teardown wipes it together with the rest of the session's files.
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent).map_err(WatcherError::Io)?;
         }
@@ -1444,7 +1471,7 @@ impl TranscriptWatcher {
         Ok(())
     }
 
-    /// Rotate `contexts/<collab_session_id>/<agent>.jsonl` if it exceeds the active-file cap.
+    /// Rotate `<collab_session_id>/contexts/<agent>.jsonl` if it exceeds the active-file cap.
     ///
     /// # Inputs
     /// `token`: stream to check.
@@ -1507,7 +1534,7 @@ impl TranscriptWatcher {
         })?;
         // Session-scoped active path — same rule as append (N6) so rotation
         // operates on the file the appends actually wrote.
-        let contexts_dir = dir.join("contexts").join(&collab_session_id);
+        let contexts_dir = dir.join(&collab_session_id).join("contexts");
         let active_path = contexts_dir.join(format!("{}.jsonl", agent_handle));
 
         let size = match std::fs::metadata(&active_path) {
@@ -1552,7 +1579,7 @@ impl TranscriptWatcher {
     ///
     /// # Returns
     /// Sorted ascending vector of integer N values from existing
-    /// `contexts/<collab_session_id>/<agent>.<N>.jsonl` files. Empty if no
+    /// `<collab_session_id>/contexts/<agent>.<N>.jsonl` files. Empty if no
     /// archives yet.
     ///
     /// # Errors
@@ -1584,7 +1611,7 @@ impl TranscriptWatcher {
         // stores a sanitized id, but this method is pub).
         let scope = sanitize_collab_session_id(collab_session_id);
         let dir = match super::memory::get_memory_dir() {
-            Ok(d) => d.join("contexts").join(&scope),
+            Ok(d) => d.join(&scope).join("contexts"),
             Err(_) => return Vec::new(),
         };
         let prefix = format!("{}.", agent_handle);
@@ -1758,7 +1785,7 @@ pub fn unwatch_transcript(state: tauri::State<'_, TranscriptWatcher>, token: u64
 #[cfg(test)]
 mod writer_tests {
     //! Plan N20 (Defense-1): prove the mirror writer is session-namespaced —
-    //! appends land in `contexts/<collab_session_id>/<agent>.jsonl` (NOT the
+    //! appends land in `<collab_session_id>/contexts/<agent>.jsonl` (NOT the
     //! legacy flat path), and `scan_archive_indices` only sees THIS session's
     //! archives. These exercise the load-bearing N6/N7/N8 path-construction
     //! that the sanitize/marker unit tests do not.
@@ -1820,13 +1847,19 @@ mod writer_tests {
             .expect("append should succeed");
 
         let dir = super::super::memory::get_memory_dir().unwrap();
-        let scoped = dir.join("contexts").join(sid).join("claude1.jsonl");
+        let scoped = dir.join(sid).join("contexts").join("claude1.jsonl");
         let flat = dir.join("contexts").join("claude1.jsonl");
+        let pre_relocation = dir.join("contexts").join(sid).join("claude1.jsonl");
         assert!(scoped.exists(), "expected session-scoped file at {:?}", scoped);
         assert!(
             !flat.exists(),
             "must NOT write the legacy flat path {:?} (collision bug)",
             flat
+        );
+        assert!(
+            !pre_relocation.exists(),
+            "must NOT write the pre-relocation `contexts/<sid>/` layout {:?}",
+            pre_relocation
         );
 
         // Two sessions' claude1 land in distinct files.
@@ -1835,13 +1868,14 @@ mod writer_tests {
         watcher
             .append_normalized_turn(&WatchToken(2), sample_turn("claude1"))
             .expect("append B should succeed");
-        let scoped_b = dir.join("contexts").join(sid_b).join("claude1.jsonl");
+        let scoped_b = dir.join(sid_b).join("contexts").join("claude1.jsonl");
         assert!(scoped_b.exists());
         assert_ne!(scoped, scoped_b);
 
         // Cleanup.
-        let _ = std::fs::remove_dir_all(dir.join("contexts").join(sid));
-        let _ = std::fs::remove_dir_all(dir.join("contexts").join(sid_b));
+        let _ = std::fs::remove_dir_all(dir.join(sid));
+        let _ = std::fs::remove_dir_all(dir.join(sid_b));
+        let _ = std::fs::remove_dir_all(dir.join("contexts"));
     }
 
     #[test]
@@ -1849,8 +1883,8 @@ mod writer_tests {
         let sid = "session-scan-N8-1";
         let other = "session-scan-N8-2";
         let dir = super::super::memory::get_memory_dir().unwrap();
-        let mine = dir.join("contexts").join(sid);
-        let theirs = dir.join("contexts").join(other);
+        let mine = dir.join(sid).join("contexts");
+        let theirs = dir.join(other).join("contexts");
         std::fs::create_dir_all(&mine).unwrap();
         std::fs::create_dir_all(&theirs).unwrap();
         std::fs::write(mine.join("claude1.1.jsonl"), b"").unwrap();
@@ -1862,8 +1896,49 @@ mod writer_tests {
         let indices = watcher.scan_archive_indices("claude1", sid);
         assert_eq!(indices, vec![1, 3], "scan must be scoped to this session only");
 
-        let _ = std::fs::remove_dir_all(&mine);
-        let _ = std::fs::remove_dir_all(&theirs);
+        let _ = std::fs::remove_dir_all(dir.join(sid));
+        let _ = std::fs::remove_dir_all(dir.join(other));
+    }
+
+    #[test]
+    fn tail_state_is_per_session_not_shared() {
+        // Plan node 7b success criterion: two collaborator sessions tailing
+        // transcripts never share `.state.json` — each handle's re-pointed
+        // `memory_dir` yields a distinct `<sid>/contexts/.state.json`.
+        let dir = super::super::memory::get_memory_dir().unwrap();
+        let sid_a = "session-state-7b-1";
+        let sid_b = "session-state-7b-2";
+
+        let mut ha = handle_with("claude1", sid_a);
+        ha.memory_dir = super::super::memory::get_memory_session_root(sid_a).unwrap();
+        ha.source_path = PathBuf::from("/tmp/ct-state-src-a.jsonl");
+        let mut hb = handle_with("claude1", sid_b);
+        hb.memory_dir = super::super::memory::get_memory_session_root(sid_b).unwrap();
+        hb.source_path = PathBuf::from("/tmp/ct-state-src-b.jsonl");
+
+        let mk_state = |h: &TranscriptHandle, off: u64| tailer::TailState {
+            path: h.source_path.clone(),
+            inode: 1,
+            byte_offset: off,
+            last_normalized_turn_index: off,
+        };
+        tailer::persist_offset(&ha, &mk_state(&ha, 42)).unwrap();
+        tailer::persist_offset(&hb, &mk_state(&hb, 7)).unwrap();
+
+        let state_a = dir.join(sid_a).join("contexts").join(".state.json");
+        let state_b = dir.join(sid_b).join("contexts").join(".state.json");
+        assert!(state_a.exists(), "expected per-session state at {:?}", state_a);
+        assert!(state_b.exists(), "expected per-session state at {:?}", state_b);
+        assert_ne!(state_a, state_b);
+
+        // Each file carries ONLY its own session's source entry.
+        let content_a = std::fs::read_to_string(&state_a).unwrap();
+        let content_b = std::fs::read_to_string(&state_b).unwrap();
+        assert!(content_a.contains("ct-state-src-a") && !content_a.contains("ct-state-src-b"));
+        assert!(content_b.contains("ct-state-src-b") && !content_b.contains("ct-state-src-a"));
+
+        let _ = std::fs::remove_dir_all(dir.join(sid_a));
+        let _ = std::fs::remove_dir_all(dir.join(sid_b));
     }
 }
 

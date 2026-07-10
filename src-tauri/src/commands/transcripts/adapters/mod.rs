@@ -445,7 +445,7 @@ fn parse_identity_preamble_handle(line: &[u8]) -> Option<Vec<u8>> {
 
 /// Whether `line` references the expected collab session via one of the
 /// preamble's embedded path tokens (`conversation-<sid>.md` /
-/// `contexts/<sid>/`). The expected id is sanitized first so raw vs sanitized
+/// `<sid>/contexts/`). The expected id is sanitized first so raw vs sanitized
 /// ids match consistently (plan "session-token match format").
 ///
 /// **Format coupling (peer-review note — claude3, latent):** the on-disk bracket
@@ -461,7 +461,9 @@ fn line_references_collab_session(line: &[u8], expected_collab_session_id: &str)
         return false;
     }
     let conversation = format!("conversation-{}.md", sid);
-    let contexts = format!("contexts/{}/", sid);
+    // Post-relocation layout: the contexts mirror lives INSIDE the session
+    // subtree (`<sid>/contexts/`), so the needle leads with the sid segment.
+    let contexts = format!("{}/contexts/", sid);
     contains_subslice(line, conversation.as_bytes())
         || contains_subslice(line, contexts.as_bytes())
 }
@@ -492,6 +494,11 @@ pub mod gemini;
 pub(super) static CLAUDE_CODE_ADAPTER: claude_code::ClaudeCodeAdapter =
     claude_code::ClaudeCodeAdapter;
 pub(super) static CODEX_ADAPTER: codex::CodexAdapter = codex::CodexAdapter;
+// Unreferenced since `adapter_for` stopped routing the gemini slot (agy
+// stores SQLite/WAL, not tailable JSONL). Retained — with its module and
+// unit tests — as the starting point for the follow-up antigravity
+// SQLite adapter rather than deleted-and-restored later.
+#[allow(dead_code)]
 pub(super) static GEMINI_ADAPTER: gemini::GeminiAdapter = gemini::GeminiAdapter;
 
 /// Map `adapter_id` (the `&'static str` carried on every `TranscriptHandle`)
@@ -512,7 +519,16 @@ pub(super) fn adapter_for(adapter_id: &str) -> Option<&'static dyn TranscriptAda
     match adapter_id {
         "claude_code" => Some(&CLAUDE_CODE_ADAPTER),
         "codex" | "codex_cli" => Some(&CODEX_ADAPTER),
-        "gemini" | "gemini_cli" => Some(&GEMINI_ADAPTER),
+        // Antigravity CLI (agy — the gemini slot's replacement) stores
+        // conversations as SQLite databases with WAL
+        // (`~/.gemini/antigravity-cli/conversations/<uuid>.db`), NOT the
+        // JSONL this tailer pipeline reads, so the gemini adapter can no
+        // longer apply. `watch_transcript` errors "unknown tool"; the
+        // frontend's capability predicate
+        // (`supportsPeerContextPublishing`) disables publishing at the
+        // state level so the IPC is never even attempted. A dedicated
+        // SQLite-reading antigravity adapter is a recorded follow-up.
+        "gemini" | "gemini_cli" => None,
         _ => None,
     }
 }
@@ -1301,7 +1317,7 @@ mod marker_tests {
     fn preamble_line(handle: &str, sid: &str) -> String {
         format!(
             "{{\"role\":\"user\",\"text\":\"[You are @{h}] [Conversation log: \
-             /m/conversation-{s}.md] [contexts/{s}/x.jsonl]\"}}",
+             /m/{s}/conversation-{s}.md] [{s}/contexts/x.jsonl]\"}}",
             h = handle,
             s = sid
         )
