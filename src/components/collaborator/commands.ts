@@ -1,10 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
 import {
   useCollaboratorStore,
   agentDisplayName,
   toolLabel,
   slugify,
 } from "../../stores/collaboratorStore";
+import { scopedMemoryIpc } from "../../lib/scopedCollabMemory";
 import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps";
 import type { SpawnedAgent, TaskStatus } from "../../types/collaborator";
 
@@ -322,22 +322,29 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
     }
 
     case "context": {
+      // context.md is session-scoped: a /context set in pane A must never
+      // be injected into pane B's agents. Without a session there is no
+      // subtree to scope to.
+      if (!collabSessionId) {
+        status("Context commands require a collaborator session.");
+        break;
+      }
       try {
         if (cmd.message === "clear") {
-          await invoke<boolean>("delete_memory_file", {
-            relativePath: "context.md",
-          });
+          await scopedMemoryIpc.deleteMemoryFile(collabSessionId, "context.md");
           status("Shared context cleared.");
         } else if (cmd.message) {
-          await invoke<string>("write_memory_file", {
-            relativePath: "context.md",
-            content: cmd.message,
-          });
+          await scopedMemoryIpc.writeMemoryFile(
+            collabSessionId,
+            "context.md",
+            cmd.message,
+          );
           status("Shared context updated.");
         } else {
-          const content = await invoke<string | null>("read_memory_file", {
-            relativePath: "context.md",
-          });
+          const content = await scopedMemoryIpc.readMemoryFile(
+            collabSessionId,
+            "context.md",
+          );
           status(content ? `Context: ${content}` : "No shared context set.");
         }
       } catch (err) {
@@ -519,10 +526,16 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
     }
 
     case "memory": {
+      // All memory ops are scoped to THIS pane's session subtree — /memory
+      // clear wipes one session, never siblings or the process root.
+      if (!collabSessionId) {
+        status("Memory commands require a collaborator session.");
+        break;
+      }
       try {
         const sub = cmd.message ?? "";
         if (sub === "list" || sub === "") {
-          const files = await invoke<string[]>("list_memory_files");
+          const files = await scopedMemoryIpc.listMemoryFiles(collabSessionId);
           status(
             files.length === 0
               ? "No shared memory files."
@@ -530,9 +543,10 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           );
         } else if (sub.startsWith("read ")) {
           const relPath = sub.slice("read ".length).trim();
-          const content = await invoke<string | null>("read_memory_file", {
-            relativePath: relPath,
-          });
+          const content = await scopedMemoryIpc.readMemoryFile(
+            collabSessionId,
+            relPath,
+          );
           status(
             content
               ? `${relPath}: ${content.slice(0, 200)}`
@@ -540,12 +554,13 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
           );
         } else if (sub.startsWith("delete ")) {
           const relPath = sub.slice("delete ".length).trim();
-          const deleted = await invoke<boolean>("delete_memory_file", {
-            relativePath: relPath,
-          });
+          const deleted = await scopedMemoryIpc.deleteMemoryFile(
+            collabSessionId,
+            relPath,
+          );
           status(deleted ? `Deleted: ${relPath}` : `Not found: ${relPath}`);
         } else if (sub === "clear") {
-          await invoke("clear_memory_dir");
+          await scopedMemoryIpc.clearMemoryDir(collabSessionId);
           status("All shared memory files cleared.");
         } else {
           status("Usage: /memory list|read <p>|delete <p>|clear");
