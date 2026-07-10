@@ -445,7 +445,7 @@ fn parse_identity_preamble_handle(line: &[u8]) -> Option<Vec<u8>> {
 
 /// Whether `line` references the expected collab session via one of the
 /// preamble's embedded path tokens (`conversation-<sid>.md` /
-/// `contexts/<sid>/`). The expected id is sanitized first so raw vs sanitized
+/// `<sid>/contexts/`). The expected id is sanitized first so raw vs sanitized
 /// ids match consistently (plan "session-token match format").
 ///
 /// **Format coupling (peer-review note — claude3, latent):** the on-disk bracket
@@ -461,7 +461,9 @@ fn line_references_collab_session(line: &[u8], expected_collab_session_id: &str)
         return false;
     }
     let conversation = format!("conversation-{}.md", sid);
-    let contexts = format!("contexts/{}/", sid);
+    // Post-relocation layout: the contexts mirror lives INSIDE the session
+    // subtree (`<sid>/contexts/`), so the needle leads with the sid segment.
+    let contexts = format!("{}/contexts/", sid);
     contains_subslice(line, conversation.as_bytes())
         || contains_subslice(line, contexts.as_bytes())
 }
@@ -1301,7 +1303,7 @@ mod marker_tests {
     fn preamble_line(handle: &str, sid: &str) -> String {
         format!(
             "{{\"role\":\"user\",\"text\":\"[You are @{h}] [Conversation log: \
-             /m/conversation-{s}.md] [contexts/{s}/x.jsonl]\"}}",
+             /m/{s}/conversation-{s}.md] [{s}/contexts/x.jsonl]\"}}",
             h = handle,
             s = sid
         )

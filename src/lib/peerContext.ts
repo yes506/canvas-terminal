@@ -1,12 +1,16 @@
 // Frontend reader helpers for cross-tool agent context surfacing.
 //
-// Wraps `read_memory_file` / `list_memory_files` Tauri IPC into a typed
-// shape consumed by `PeerContextPanel`. Per Q3 the reader makes TWO
-// separate `read_memory_file` calls (active + last archive), each ≤ 8 MB
-// by rotation cap, well under the 10 MB read cap — concat happens
-// client-side.
-
-import { invoke } from "@tauri-apps/api/core";
+// Wraps the scoped memory facade (`scopedMemoryIpc`) into a typed shape
+// consumed by `PeerContextPanel`. Per Q3 the reader makes TWO separate
+// `readMemoryFile` calls (active + last archive), each ≤ 8 MB by rotation
+// cap, well under the 10 MB read cap — concat happens client-side.
+//
+// Session-scope: peer-context mirror files live at
+// `session-<pid>/<collabSessionId>/contexts/<agent>.jsonl`. Every facade
+// call is rooted at the session subtree by the RUST side (single source of
+// truth for id sanitization), so the reader composes only session-RELATIVE
+// `contexts/…` paths — the former TS `sanitizeCollabSessionId` mirror is
+// deleted, eliminating the raw-vs-Rust sanitize drift surface entirely.
 
 import {
   NORMALIZED_SCHEMA_VERSION,
@@ -19,28 +23,7 @@ import {
   reserveOrdinalForPeerContext,
   toolShortName,
 } from "../stores/collaboratorStore";
-
-// ---------------------------------------------------------------------------
-// Session-scope path helper
-// ---------------------------------------------------------------------------
-//
-// Peer-context mirror files live under `contexts/<collabSessionId>/<agent>.jsonl`
-// so two collab sessions that each spawn a `claude1` never collide on one
-// file. The collabSessionId must be sanitized to a single safe path segment
-// using the SAME rule the Rust writer applies
-// (`transcripts/mod.rs::sanitize_collab_session_id`): retain only
-// `[A-Za-z0-9_-]`, drop everything else. Reader (here) and writer (Rust) MUST
-// agree, or the agent's grep path diverges from the on-disk write path and the
-// collaboration deadlocks (plan "sanitize contract").
-
-/**
- * Sanitize a collab session id into a single path segment. Mirror of the Rust
- * `sanitize_collab_session_id`. In practice ids are `session-<n>-<ts>` so this
- * is a no-op; it exists as defense-in-depth so reader/writer never drift.
- */
-export function sanitizeCollabSessionId(raw: string): string {
-  return raw.replace(/[^A-Za-z0-9_-]/g, "");
-}
+import { scopedMemoryIpc } from "./scopedCollabMemory";
 
 // ---------------------------------------------------------------------------
 // Cluster F — reservation API
@@ -257,12 +240,11 @@ function parseJsonlNormalizedTurns(text: string): NormalizedTurn[] {
  * Derive whether the conditional `contexts/` breadcrumb belongs in the
  * prompt header.
  *
- * Per K2 (cumulative fold): the existing `list_memory_files()` IPC takes
- * no prefix arg; the conditional check is implemented client-side by
+ * Per K2 (cumulative fold): the existing  * no prefix arg; the conditional check is implemented client-side by
  * filtering the full file list. No new IPC needed.
  *
  * Returns: `Promise<boolean>` — true iff any file under
- * `contexts/<collabSessionId>/` (i.e. `contexts/<collabSessionId>/<agent>.jsonl`
+ * `contexts/` (i.e. `contexts/<agent>.jsonl`
  * or any archive) exists in the current session's memory dir. PeerContextPanel
  * binds this to its visibility
  * indicator; `prependContextHeader` uses it to conditionally inject the
@@ -298,11 +280,12 @@ export async function hasContextsBreadcrumb(
   collabSessionId: string | null,
 ): Promise<boolean> {
   if (!collabSessionId) return false;
-  const scope = sanitizeCollabSessionId(collabSessionId);
-  if (scope.length === 0) return false;
-  const prefix = `contexts/${scope}/`;
+  // The scoped list is already rooted at THIS session's subtree, so the
+  // returned paths are session-relative — the mirror dir is plain
+  // `contexts/` with no session segment to re-derive client-side.
+  const prefix = "contexts/";
   try {
-    const files = await invoke<string[]>("list_memory_files");
+    const files = await scopedMemoryIpc.listMemoryFiles(collabSessionId);
     return files.some((f) => f.startsWith(prefix));
   } catch {
     return false;
@@ -313,7 +296,7 @@ export async function hasContextsBreadcrumb(
  * Load the active mirror file for a peer agent.
  *
  * Per Q3: this is a single
- * `read_memory_file('contexts/<collabSessionId>/<agent>.jsonl')` call; the file
+ * `read_memory_file('contexts/<agent>.jsonl')` call; the file
  * is ≤ 8 MB by rotation cap (well under 10 MB read cap).
  *
  * Inputs: `agentHandle` — bare handle, e.g. "claude3".
@@ -344,11 +327,8 @@ export async function loadActive(
   agentHandle: string,
   collabSessionId: string,
 ): Promise<NormalizedTurn[]> {
-  const scope = sanitizeCollabSessionId(collabSessionId);
-  const relative = `contexts/${scope}/${agentHandle}.jsonl`;
-  const text = await invoke<string | null>("read_memory_file", {
-    relativePath: relative,
-  });
+  const relative = `contexts/${agentHandle}.jsonl`;
+  const text = await scopedMemoryIpc.readMemoryFile(collabSessionId, relative);
   if (text === null) {
     return [];
   }
@@ -357,7 +337,7 @@ export async function loadActive(
 
 /**
  * Load the most-recent rolled archive
- * (`contexts/<collabSessionId>/<agent>.<N>.jsonl`).
+ * (`contexts/<agent>.<N>.jsonl`).
  *
  * Inputs: `agentHandle`, `archiveN` — the integer N selected by
  * `listArchives()`.
@@ -384,11 +364,8 @@ export async function loadLastArchive(
   archiveN: number,
   collabSessionId: string,
 ): Promise<NormalizedTurn[]> {
-  const scope = sanitizeCollabSessionId(collabSessionId);
-  const relative = `contexts/${scope}/${agentHandle}.${archiveN}.jsonl`;
-  const text = await invoke<string | null>("read_memory_file", {
-    relativePath: relative,
-  });
+  const relative = `contexts/${agentHandle}.${archiveN}.jsonl`;
+  const text = await scopedMemoryIpc.readMemoryFile(collabSessionId, relative);
   if (text === null) {
     return [];
   }
@@ -410,7 +387,7 @@ export async function loadLastArchive(
  * Side effects: one `list_memory_files` IPC call.
  *
  * Invariants: parsed N values match the file-name regex
- * `^contexts/<collabSessionId>/<agentHandle>\.(\d+)\.jsonl$`; ignores malformed
+ * `^contexts/<agentHandle>\.(\d+)\.jsonl$`; ignores malformed
  * names.
  *
  * Concurrency: idempotent.
@@ -428,7 +405,7 @@ export async function listArchives(
 ): Promise<number[]> {
   let files: string[];
   try {
-    files = await invoke<string[]>("list_memory_files");
+    files = await scopedMemoryIpc.listMemoryFiles(collabSessionId);
   } catch {
     return [];
   }
@@ -436,13 +413,11 @@ export async function listArchives(
   // backslash-and-dot characters that could appear in an agent handle
   // (in practice handles are `[a-z]+\d+` so this is defensive).
   const escapedHandle = agentHandle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // Include the session segment so this only matches THIS session's archives —
-  // `list_memory_files` walks recursively, so an un-scoped pattern would both
-  // miss the now-nested files AND risk cross-session matches (plan N13).
-  const scope = sanitizeCollabSessionId(collabSessionId);
-  const escapedScope = scope.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // The scoped list is rooted at THIS session's subtree, so cross-session
+  // matches are structurally impossible and the pattern needs no session
+  // segment — sibling agents' archives are still excluded by the handle.
   const pattern = new RegExp(
-    `^contexts/${escapedScope}/${escapedHandle}\\.(\\d+)\\.jsonl$`,
+    `^contexts/${escapedHandle}\\.(\\d+)\\.jsonl$`,
   );
   const indices: number[] = [];
   for (const f of files) {
