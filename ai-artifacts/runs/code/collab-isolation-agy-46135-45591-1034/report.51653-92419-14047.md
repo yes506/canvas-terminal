@@ -79,3 +79,19 @@ transcript_adapter_contract 1 ok; doc-tests 0
 ## Merge-gate 확인 필요 사항 (plan이 명시적으로 게이트에 올린 항목)
 1. **agy 비대칭 승인**: 이 피처에서 agy는 완전한 mini-agent로 동작하되 peer-context 스토어에는 **write-only**(다른 에이전트가 agy 트랜스크립트를 grep 불가 — 후속 SQLite 어댑터까지). plan rev 3이 merge gate에서 명시 승인 요구.
 2. **실증 잔여 항목**(코드 랜딩 후 사용자 환경 필요): agy 스폰 E2E(readiness→running, 주입 제출, 응답 스트림)와 `format_for_tool` `\n`→`\r` 유지/제거 실측.
+
+---
+
+## Addendum — 구현 라운드 피어 리뷰 처분 (5 리뷰: task-47 @codex1, task-48 @claude2, task-49 @codex2, task-50 @claude3, task-51 @codex3)
+
+5인 전원 APPROVE (각자 독립적으로 전체 검증 재실행, 전원 exit 0 / 424 vitest / 79 lib 재현). 지적 사항 처분:
+
+| Finding | Reviewers | 검증 결과 | 처분 |
+|---|---|---|---|
+| [MED] 검증 후 워크트리 더티 — `package-lock.json` 0.5.1→0.5.13, `Cargo.lock` 0.5.12→0.5.13 | 5인 전원 | 확인 — 원인은 **dev 자체의 사전 드리프트**(dev의 `package.json`=0.5.13 vs 커밋된 `package-lock.json`=0.5.1)를 검증용 `npm install`/cargo가 정규화한 것 | **폐기(restore)** — 피처 범위 밖의 릴리스-플로우 드리프트를 이 브랜치에 실어 보내지 않음. 워크트리 클린 확인. **후속 권고**: dev에서 별도 커밋으로 lockfile 동기화 (`npm install` + `cargo update -p canvas-terminal` 후 커밋) — 아니면 모든 워크트리/CI가 계속 더티해짐 |
+| [MINOR] `peerContext.ts` `hasContextsBreadcrumb` JSDoc 깨짐(perl 편집 잔해) | @claude3 (task-50) | 확인 | **수정** — 커밋 `d389064`; 같은 docstring의 사전-재배치 서술(Inputs/Test contract)도 스코프-리스트 시맨틱으로 정정 |
+| [LOW] 손상된 `.state.json`이 fresh-start 대신 바인드 대기 유발 | @claude2 (task-48) | 확인 — 이 diff 이전부터의 시맨틱; 재배치로 blast radius는 오히려 축소(전 세션 공유 → 단일 세션) | **변경 없음** (pre-existing; 수정은 스코프 확장). 향후 하드닝 후보로 기록 |
+| [INFO] 비원자 `write_memory_file`에 per-component 심링크 워크 부재 + non-ELOOP 폴백이 `O_NOFOLLOW` 미적용 | @claude2 (task-48) | 확인 — 이 diff는 시그니처/디렉토리 해석만 변경, 해당 경로 무변경; plan의 로컬 단일 사용자 위협 모델 내 | **변경 없음** (pre-existing) |
+| Merge-gate: agy write-only 비대칭 승인 + 실증 잔여 항목 | 5인 전원 재확인 | — | 게이트에서 인간 결정 (본 리포트 상단 참조) |
+
+재검증(수정 후): `tsc --noEmit && npm test && cargo check && cargo test` → **exit 0** (424 vitest / 79 lib 전부 통과), 워크트리 클린.
