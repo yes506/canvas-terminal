@@ -14,9 +14,11 @@
  */
 
 /**
- * Result triple for directory listings that must distinguish files from
- * directories without a second stat round-trip. Mirrors the existing
- * `list_directory` convention `[name, isDir, fullPath]`.
+ * One session-relative file path (e.g. `"contexts/claude1.jsonl"`) as
+ * returned by the scoped `list_memory_files`. Always relative to
+ * `session-<pid>/<collabSessionId>/`; never absolute, never a sibling
+ * session's path. (Plain string — NOT the `[name, isDir, fullPath]`
+ * triple used by the unrelated `list_directory` command.)
  */
 export type MemoryFileEntry = string;
 

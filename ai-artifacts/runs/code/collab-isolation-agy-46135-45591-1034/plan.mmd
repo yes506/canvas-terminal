@@ -11,6 +11,9 @@ graph LR
   ToolRegistry["ToolRegistry"]
   PtyInjector["PtyInjector"]
   OutputCapture["OutputCapture"]
+  TailerStateScoping["TailerStateScoping"]
+  AgyAdapterDegradation["AgyAdapterDegradation"]
+  TeardownSplit["TeardownSplit"]
   ScopedMemoryPath --> ScopedMemoryIpc
   ScopedMemoryPath --> ContextMirrorWriter
   ContextMirrorWriter --> PeerContextReader
@@ -20,3 +23,5 @@ graph LR
   PeerContextReader --> ContextMirrorWriter
   ToolRegistry --> PtyInjector
   PtyInjector --> OutputCapture
+  TailerStateScoping --> ScopedMemoryPath
+  TailerStateScoping --> ScopedMemoryIpc
