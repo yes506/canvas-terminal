@@ -240,12 +240,13 @@ function parseJsonlNormalizedTurns(text: string): NormalizedTurn[] {
  * Derive whether the conditional `contexts/` breadcrumb belongs in the
  * prompt header.
  *
- * Per K2 (cumulative fold): the existing  * no prefix arg; the conditional check is implemented client-side by
- * filtering the full file list. No new IPC needed.
+ * Per K2 (cumulative fold): the scoped `listMemoryFiles` IPC takes no
+ * prefix arg; the conditional check is implemented client-side by
+ * filtering the session-scoped file list. No new IPC needed.
  *
- * Returns: `Promise<boolean>` — true iff any file under
- * `contexts/` (i.e. `contexts/<agent>.jsonl`
- * or any archive) exists in the current session's memory dir. PeerContextPanel
+ * Returns: `Promise<boolean>` — true iff any file under `contexts/`
+ * (i.e. `contexts/<agent>.jsonl` or any archive) exists in THIS
+ * session's memory subtree. PeerContextPanel
  * binds this to its visibility
  * indicator; `prependContextHeader` uses it to conditionally inject the
  * breadcrumb (matching the existing `context.md` conditional pattern).
@@ -264,17 +265,17 @@ function parseJsonlNormalizedTurns(text: string): NormalizedTurn[] {
  * Lifecycle: called from `prependContextHeader` before each header
  * assembly; from `PeerContextPanel` to decide whether to render at all.
  *
- * Inputs: `collabSessionId` — scopes the check to THIS session's subdir.
- * `null` returns `false` (no session → nothing to surface). Without the
- * session segment a bare `startsWith("contexts/")` would cross-session
- * over-report any other session's mirror files, since `list_memory_files`
- * walks the memory dir recursively (plan N13/N14, claude3 finding).
+ * Inputs: `collabSessionId` — scopes the LIST IPC to THIS session's
+ * subtree (the Rust side roots the walk there). `null` returns `false`
+ * (no session → nothing to surface). Cross-session over-report is
+ * structurally impossible: another session's mirror files never appear
+ * in a scoped listing, so the bare `startsWith("contexts/")` is safe
+ * (plan N13/N14).
  *
- * Test contract: empty session returns `false`; presence of
- * `contexts/<session>/<agent>.jsonl` returns `true`; presence of only
- * `contexts/<session>/<agent>.1.jsonl` (archive without active) still returns
- * `true`; a DIFFERENT session's `contexts/<other>/<agent>.jsonl` returns
- * `false`.
+ * Test contract: a session with no mirror files returns `false`;
+ * presence of `contexts/<agent>.jsonl` returns `true`; presence of only
+ * `contexts/<agent>.1.jsonl` (archive without active) still returns
+ * `true`; `null` returns `false`.
  */
 export async function hasContextsBreadcrumb(
   collabSessionId: string | null,
