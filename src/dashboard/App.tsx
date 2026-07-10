@@ -183,7 +183,11 @@ function formatTime(ms: number): string {
   return `${hh}:${mm}:${ss}`;
 }
 
-function encodePathForUrl(path: string): string {
+// Exported for the collab-isolation smoke test: session files now live in
+// nested per-session subtrees (`<collabSessionId>/…`), so the per-segment
+// encoding (slashes preserved as separators) is what keeps the
+// `/api/sessions/current/files/*path` viewer working for nested paths.
+export function encodePathForUrl(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 

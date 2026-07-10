@@ -2660,3 +2660,124 @@ describe("Copilot CLI roster registration", () => {
 });
 
 
+
+// ---------------------------------------------------------------------------
+// collab-isolation-agy — per-session isolation of injected paths, scans,
+// and slash commands (plan nodes 9-12). The Rust side enforces structural
+// scoping; these tests pin the TS side: every path printed into an agent
+// prompt is a prefix-descendant of the agent's OWN session dir, and every
+// memory IPC carries the session scope.
+// ---------------------------------------------------------------------------
+describe("collab-isolation — scoped headers, scans, and commands (nodes 9-12)", () => {
+  const SESSION_B = "test-session-2";
+  const DIR_A = `/mem/session-123/${SESSION}`;
+  const DIR_B = `/mem/session-123/${SESSION_B}`;
+
+  const injectCalls = () =>
+    vi.mocked(invoke).mock.calls
+      .filter((c) => c[0] === "inject_into_pty")
+      .map((c) => (c[1] as { text: string }).text);
+
+  const seedAgent = (sessionId: string, collabSessionId: string, handle: string) => ({
+    sessionId,
+    tool: "claude_code" as const,
+    status: "running" as const,
+    collabSessionId,
+    ordinal: 1,
+    handle,
+    nickname: "Claude Code #1",
+    nicknameSlug: "claude-code-1",
+    nameHistory: [{ nickname: "Claude Code #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" as const }],
+  });
+
+  beforeEach(() => {
+    resetStores();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
+    useCollaboratorStore.setState({
+      agents: [seedAgent("pty-a", SESSION, "claude1"), seedAgent("pty-b", SESSION_B, "claude1")],
+    });
+  });
+
+  it("full header prints ONLY the agent's own session-dir paths (node 9)", async () => {
+    await useCollaboratorStore.getState().sendToAgent("pty-a", "hello");
+    const [full] = injectCalls();
+    expect(full).toContain(`[Collaborator shared memory: ${DIR_A}]`);
+    expect(full).toContain(`[Conversation log: ${DIR_A}/conversation-${SESSION}.md]`);
+    expect(full).toContain(`[Task definitions: ${DIR_A}/tasks-${SESSION}.md]`);
+    // Rule-2 grep target is absolute and inside the session subtree.
+    expect(full).toContain(`${DIR_A}/contexts/*.jsonl`);
+    // No sibling session's dir may leak into the payload.
+    expect(full).not.toContain(DIR_B);
+  });
+
+  it("two panes' agents each get their own session dir in headers (cross-pane isolation)", async () => {
+    const store = useCollaboratorStore.getState();
+    await store.sendToAgent("pty-a", "to A");
+    await store.sendToAgent("pty-b", "to B");
+    const [toA, toB] = injectCalls();
+    expect(toA).toContain(DIR_A);
+    expect(toA).not.toContain(DIR_B);
+    expect(toB).toContain(DIR_B);
+    expect(toB).not.toContain(DIR_A);
+  });
+
+  it("peer-contexts breadcrumb points at <sessionDir>/contexts/ when mirrors exist (node 9)", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") {
+        return ["contexts/claude1.jsonl"];
+      }
+      return baseInvokeMock(cmd, args);
+    });
+    await useCollaboratorStore.getState().sendToAgent("pty-a", "hello");
+    const [full] = injectCalls();
+    expect(full).toContain(`[Peer contexts: ${DIR_A}/contexts/]`);
+  });
+
+  it("protocol text carries the sibling-session prohibition rule (node 10)", async () => {
+    await useCollaboratorStore.getState().sendToAgent("pty-a", "hello");
+    const [full] = injectCalls();
+    expect(full).toContain("Stay inside YOUR session directory");
+    expect(full).toContain("Do NOT read, grep, or write sibling session directories");
+  });
+
+  it("scanForTaskCompletions lists with the session scope (node 11)", async () => {
+    await scanForTaskCompletions(SESSION);
+    expect(invoke).toHaveBeenCalledWith("list_memory_files", {
+      collabSessionId: SESSION,
+    });
+  });
+
+  it("/context set writes context.md scoped to THIS pane's session (node 12)", async () => {
+    await executeCommand(parseInput("/context important constraint"), SESSION);
+    expect(invoke).toHaveBeenCalledWith("write_memory_file", {
+      collabSessionId: SESSION,
+      relativePath: "context.md",
+      content: "important constraint",
+    });
+  });
+
+  it("/context without a collaborator session refuses instead of touching a shared root (node 12)", async () => {
+    await executeCommand(parseInput("/context leak me"), undefined);
+    const writes = vi.mocked(invoke).mock.calls.filter((c) => c[0] === "write_memory_file");
+    expect(writes.length).toBe(0);
+  });
+
+  it("/memory clear clears ONLY this session's subtree via the scoped IPC (node 12)", async () => {
+    await executeCommand(parseInput("/memory clear"), SESSION);
+    expect(invoke).toHaveBeenCalledWith("clear_memory_dir", {
+      collabSessionId: SESSION,
+    });
+  });
+
+  it("/memory list uses the scoped list IPC (node 12)", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "list_memory_files") return ["contexts/claude1.jsonl"];
+      return baseInvokeMock(cmd, args);
+    });
+    await executeCommand(parseInput("/memory list"), SESSION);
+    expect(invoke).toHaveBeenCalledWith("list_memory_files", {
+      collabSessionId: SESSION,
+    });
+  });
+});

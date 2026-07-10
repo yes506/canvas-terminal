@@ -436,10 +436,15 @@ export function _isRenamePendingForTests(sessionId: string): boolean {
  *
  * `peerContextGlob` is the session-scoped grep target for Rule 2 — it MUST
  * match the path the Rust writer mirrors into
- * (`contexts/<collabSessionId>/*.jsonl`) and the `[Peer contexts: …]`
+ * (`<sessionDir>/contexts/*.jsonl`) and the `[Peer contexts: …]`
  * breadcrumb, or the agent greps an empty/foreign directory and the
  * collaboration deadlocks on a missing-info gap that is actually present
  * (plan N18, load-bearing — this text is injected on every first send).
+ *
+ * Rule 7 is the shell-vector half of the isolation guarantee: the app IPC
+ * is structurally scoped, but a spawned CLI reaches the filesystem
+ * directly, so the protocol must explicitly prohibit sibling-session
+ * access (layout + instruction scoping per the plan's threat model).
  */
 function buildTaskProtocol(peerContextGlob: string): string {
   return `
@@ -454,6 +459,7 @@ You are a participant in a multi-agent collaboration.
 4. **Reference by task ID** (e.g. "task-1-...").
 5. **Signal blockers**: State the blocking task ID and what you need. Try Rule 2 first before declaring blocked on a missing-info gap.
 6. **Signal completion**: When done, write a JSON file to the shared memory directory to signal task completion. The system will automatically update the task and generate a report in the conversation log.
+7. **Stay inside YOUR session directory**: Every path above lives in this session's own memory directory. Do NOT read, grep, or write sibling session directories (other subdirectories next to your session directory, e.g. \`../<other-session-id>/\`) — they belong to other collaborator panes and are off-limits.
 
 \`\`\`bash
 cat > SHARED_MEMORY_DIR/TASK_ID.done.json << 'EOF'
