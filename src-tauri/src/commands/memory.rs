@@ -24,6 +24,37 @@ pub(crate) fn get_memory_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Sanitize a collaborator-session id into a single safe path segment.
+///
+/// SINGLE SOURCE OF TRUTH for the whole crate: retain only `[A-Za-z0-9_-]`,
+/// drop every other character. `transcripts::sanitize_collab_session_id`
+/// delegates here, and the TS side never composes session-root paths from
+/// raw ids (it always round-trips through `get_memory_session_dir`), so a
+/// raw-vs-sanitized divergence cannot arise across the IPC boundary.
+pub(crate) fn sanitize_collab_session_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
+}
+
+/// Resolve (and lazily create) the per-collab-session memory subtree
+/// `session-<pid>/<sanitized-id>/` — the root every scoped memory command
+/// resolves paths under.
+///
+/// An id that sanitizes to empty is an ERROR, never a fallback to the
+/// process-level `session-<pid>/` root: falling back would silently merge
+/// two panes' files back into the shared root this feature exists to split.
+pub(crate) fn get_memory_session_root(collab_session_id: &str) -> Result<PathBuf, String> {
+    let segment = sanitize_collab_session_id(collab_session_id);
+    if segment.is_empty() {
+        return Err("Invalid collab session id".to_string());
+    }
+    let dir = get_memory_dir()?.join(segment);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create collab session memory directory: {}", e))?;
+    Ok(dir)
+}
+
 fn parse_session_pid(path: &std::path::Path) -> Option<u32> {
     let name = path.file_name()?.to_str()?;
     let pid = name.strip_prefix("session-")?;
@@ -64,19 +95,27 @@ pub(crate) fn validate_relative_path(relative: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Ensure the memory directory exists and return its absolute path.
+/// Resolve (and lazily create) the absolute path of THIS collab session's
+/// memory subtree. Scoped successor of the removed `init_memory_dir`: it is
+/// the source of every path printed into agent prompts, so it MUST resolve
+/// to the per-session subtree — leaving it root-scoped would keep inviting
+/// agents into the mixed `session-<pid>/` root.
 #[tauri::command]
-pub fn init_memory_dir() -> Result<String, String> {
-    let dir = get_memory_dir()?;
+pub fn get_memory_session_dir(collab_session_id: String) -> Result<String, String> {
+    let dir = get_memory_session_root(&collab_session_id)?;
     Ok(dir.to_string_lossy().to_string())
 }
 
-/// Write a file to the shared memory directory.
+/// Write a file inside one collab session's memory subtree.
 /// Returns the absolute path of the written file.
 #[tauri::command]
-pub fn write_memory_file(relative_path: String, content: String) -> Result<String, String> {
+pub fn write_memory_file(
+    collab_session_id: String,
+    relative_path: String,
+    content: String,
+) -> Result<String, String> {
     validate_relative_path(&relative_path)?;
-    let dir = get_memory_dir()?;
+    let dir = get_memory_session_root(&collab_session_id)?;
     let full_path = dir.join(&relative_path);
 
     // Create parent directories
@@ -151,13 +190,29 @@ pub fn write_memory_file(relative_path: String, content: String) -> Result<Strin
 /// post-create canonical-parent re-check. Tracked for Day 2 hardening
 /// alongside the atomic-write fixture tests.
 #[tauri::command]
-pub fn write_memory_file_atomic(relative_path: String, content: String) -> Result<String, String> {
+pub fn write_memory_file_atomic(
+    collab_session_id: String,
+    relative_path: String,
+    content: String,
+) -> Result<String, String> {
+    let dir = get_memory_session_root(&collab_session_id)?;
+    write_file_atomic_under(&dir, &relative_path, &content)
+}
+
+/// Atomic-write engine shared by the scoped `write_memory_file_atomic` IPC
+/// command and the transcript tailer's `.state.json` persistence (the tailer
+/// resolves its own scoped base directory from the watch handle rather than
+/// re-deriving it from a raw collab-session id).
+pub(crate) fn write_file_atomic_under(
+    dir: &std::path::Path,
+    relative_path: &str,
+    content: &str,
+) -> Result<String, String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    validate_relative_path(&relative_path)?;
-    let dir = get_memory_dir()?;
-    let final_path = dir.join(&relative_path);
+    validate_relative_path(relative_path)?;
+    let final_path = dir.join(relative_path);
 
     // Reject existing symlink or directory at final path.
     if let Ok(meta) = std::fs::symlink_metadata(&final_path) {
@@ -174,8 +229,8 @@ pub fn write_memory_file_atomic(relative_path: String, content: String) -> Resul
     // nested paths — a planted symlink at a parent directory could redirect
     // writes outside the memory tree even though the final-path symlink
     // check passed. Cheap to do for every write.
-    let mut walk = dir.clone();
-    for component in std::path::Path::new(&relative_path).components() {
+    let mut walk = dir.to_path_buf();
+    for component in std::path::Path::new(relative_path).components() {
         if let std::path::Component::Normal(seg) = component {
             walk.push(seg);
             if let Ok(meta) = std::fs::symlink_metadata(&walk) {
@@ -266,12 +321,16 @@ pub fn write_memory_file_atomic(relative_path: String, content: String) -> Resul
     Ok(final_path.to_string_lossy().to_string())
 }
 
-/// Read a file from the shared memory directory.
-/// Returns None if the file doesn't exist.
+/// Read a file from one collab session's memory subtree.
+/// Returns None if the file doesn't exist (missing-vs-error distinction is
+/// load-bearing for context.md probing).
 #[tauri::command]
-pub fn read_memory_file(relative_path: String) -> Result<Option<String>, String> {
+pub fn read_memory_file(
+    collab_session_id: String,
+    relative_path: String,
+) -> Result<Option<String>, String> {
     validate_relative_path(&relative_path)?;
-    let dir = get_memory_dir()?;
+    let dir = get_memory_session_root(&collab_session_id)?;
     let full_path = dir.join(&relative_path);
 
     if !full_path.exists() {
@@ -291,12 +350,17 @@ pub fn read_memory_file(relative_path: String) -> Result<Option<String>, String>
     Ok(Some(contents))
 }
 
-/// Delete a file from the shared memory directory.
+/// Delete a file from one collab session's memory subtree.
 /// Returns true if the file was deleted, false if it didn't exist.
+/// Empty-parent pruning stops at the SESSION root — the session directory
+/// itself is never removed by this command.
 #[tauri::command]
-pub fn delete_memory_file(relative_path: String) -> Result<bool, String> {
+pub fn delete_memory_file(
+    collab_session_id: String,
+    relative_path: String,
+) -> Result<bool, String> {
     validate_relative_path(&relative_path)?;
-    let dir = get_memory_dir()?;
+    let dir = get_memory_session_root(&collab_session_id)?;
     let full_path = dir.join(&relative_path);
 
     if !full_path.exists() {
@@ -334,15 +398,32 @@ pub fn delete_memory_file(relative_path: String) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Remove the current app process's shared memory directory (all files).
+/// Remove ONE collab session's memory subtree and recreate it empty.
+/// Scoping is the isolation guarantee: sibling session subtrees and the
+/// process-level root are untouched. Used by `/memory clear` and per-session
+/// teardown (`killAllAgents`).
 #[tauri::command]
-pub fn clear_memory_dir() -> Result<(), String> {
-    let dir = get_memory_dir()?;
+pub fn clear_memory_dir(collab_session_id: String) -> Result<(), String> {
+    let dir = get_memory_session_root(&collab_session_id)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
         // Recreate the empty directory
         std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("Failed to recreate memory directory: {}", e))?;
+            .map_err(|e| format!("Failed to recreate collab session memory directory: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Remove the ENTIRE current-process memory root `session-<pid>/` (every
+/// collab session's subtree at once). Internal, non-IPC: this is the
+/// window-close wipe called from `lib.rs`'s `WindowEvent::Destroyed` arm.
+/// The scoped IPC `clear_memory_dir` above only ever clears one session
+/// subtree — exposing a process-wide wipe over IPC would hand any pane a
+/// way to delete its siblings' files, defeating the isolation.
+pub fn clear_process_memory_root() -> Result<(), String> {
+    let dir = get_memory_dir()?;
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -390,9 +471,12 @@ pub fn clear_stale_sessions() -> Result<(), String> {
 /// files, leaving them in place. Matches pre-orphan-cleanup behavior on
 /// such filesystems.
 #[tauri::command]
-pub fn get_memory_file_mtime(relative_path: String) -> Result<u64, String> {
+pub fn get_memory_file_mtime(
+    collab_session_id: String,
+    relative_path: String,
+) -> Result<u64, String> {
     validate_relative_path(&relative_path)?;
-    let dir = get_memory_dir()?;
+    let dir = get_memory_session_root(&collab_session_id)?;
     let full_path = dir.join(&relative_path);
     // `metadata` follows symlinks intentionally — consistent with
     // `read_memory_file`, which also follows. `write_memory_file` and
@@ -409,11 +493,13 @@ pub fn get_memory_file_mtime(relative_path: String) -> Result<u64, String> {
     Ok(ms)
 }
 
-/// List all files in the shared memory directory (recursive).
-/// Returns relative paths.
+/// List all files in one collab session's memory subtree (recursive).
+/// Returns session-relative paths. Structurally cannot cross sessions: the
+/// walk is rooted at the session subtree, so sibling sessions' files and
+/// root-level files never appear in the result.
 #[tauri::command]
-pub fn list_memory_files() -> Result<Vec<String>, String> {
-    let dir = get_memory_dir()?;
+pub fn list_memory_files(collab_session_id: String) -> Result<Vec<String>, String> {
+    let dir = get_memory_session_root(&collab_session_id)?;
     let mut files = Vec::new();
 
     fn walk(base: &std::path::Path, current: &std::path::Path, out: &mut Vec<String>) {
@@ -432,4 +518,132 @@ pub fn list_memory_files() -> Result<Vec<String>, String> {
     walk(&dir, &dir, &mut files);
     files.sort();
     Ok(files)
+}
+
+#[cfg(test)]
+mod scoped_memory_tests {
+    //! Per-collab-session isolation coverage: the sanitizer contract, the
+    //! empty-after-sanitize refusal (never a root fallback), and structural
+    //! cross-session denial for the scoped commands. Session ids are unique
+    //! per test because every test in the process shares one
+    //! `session-<pid>/` root.
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_allowed_drops_others() {
+        assert_eq!(sanitize_collab_session_id("session-1-123"), "session-1-123");
+        assert_eq!(sanitize_collab_session_id("a/b\\c..d e"), "abcde");
+        assert_eq!(sanitize_collab_session_id("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_collab_session_id("foo_bar-9"), "foo_bar-9");
+    }
+
+    #[test]
+    fn empty_after_sanitize_is_error_never_root() {
+        // Pure-stripped ids must refuse — a root fallback would silently
+        // merge two panes back into the shared session-<pid>/ root.
+        assert!(get_memory_session_root("").is_err());
+        assert!(get_memory_session_root("///").is_err());
+        assert!(get_memory_session_root("..").is_err());
+        assert!(get_memory_session_dir(String::new()).is_err());
+        assert!(clear_memory_dir(String::from("//")).is_err());
+        assert!(list_memory_files(String::from(".")).is_err());
+    }
+
+    #[test]
+    fn session_root_is_nested_under_process_dir() {
+        let sid = "session-mem-nest-1";
+        let root = get_memory_session_root(sid).unwrap();
+        let process_dir = get_memory_dir().unwrap();
+        assert_eq!(root, process_dir.join(sid));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn traversal_session_id_cannot_reach_sibling() {
+        // A hostile id carrying path syntax sanitizes to a flat, distinct
+        // segment — the '/' and '.' bytes are dropped, so it can never
+        // resolve to a parent dir or a sibling's subtree.
+        let victim = "session-mem-victim-1";
+        write_memory_file(victim.into(), "secret.md".into(), "s".into()).unwrap();
+
+        let hostile = format!("x/../{}", victim);
+        let root = get_memory_session_root(&hostile).unwrap();
+        let process_dir = get_memory_dir().unwrap();
+        assert_eq!(root, process_dir.join(format!("x{}", victim)));
+        assert!(list_memory_files(hostile.clone()).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(get_memory_session_root(victim).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_read_write_list_cross_session_denial() {
+        let a = "session-mem-iso-a";
+        let b = "session-mem-iso-b";
+        write_memory_file(a.into(), "notes/x.md".into(), "hello-a".into()).unwrap();
+
+        // Same relative path in session B: absent.
+        assert_eq!(read_memory_file(b.into(), "notes/x.md".into()).unwrap(), None);
+        // B's listing structurally cannot contain A's file.
+        assert!(list_memory_files(b.into()).unwrap().is_empty());
+        // A sees its own file, session-relative.
+        assert_eq!(
+            list_memory_files(a.into()).unwrap(),
+            vec!["notes/x.md".to_string()]
+        );
+        // Traversal out of the session subtree is rejected at input.
+        assert!(read_memory_file(b.into(), format!("../{}/notes/x.md", a)).is_err());
+        assert!(delete_memory_file(b.into(), format!("../{}/notes/x.md", a)).is_err());
+
+        let _ = std::fs::remove_dir_all(get_memory_session_root(a).unwrap());
+        let _ = std::fs::remove_dir_all(get_memory_session_root(b).unwrap());
+    }
+
+    #[test]
+    fn scoped_clear_leaves_sibling_intact() {
+        let a = "session-mem-clear-a";
+        let b = "session-mem-clear-b";
+        write_memory_file(a.into(), "f.md".into(), "a".into()).unwrap();
+        write_memory_file(b.into(), "f.md".into(), "b".into()).unwrap();
+
+        clear_memory_dir(a.into()).unwrap();
+
+        // A is empty but recreated; B untouched.
+        assert!(list_memory_files(a.into()).unwrap().is_empty());
+        assert_eq!(
+            read_memory_file(b.into(), "f.md".into()).unwrap().as_deref(),
+            Some("b")
+        );
+
+        let _ = std::fs::remove_dir_all(get_memory_session_root(a).unwrap());
+        let _ = std::fs::remove_dir_all(get_memory_session_root(b).unwrap());
+    }
+
+    #[test]
+    fn delete_prunes_parents_but_never_session_root() {
+        let sid = "session-mem-prune-1";
+        write_memory_file(sid.into(), "deep/nested/f.md".into(), "x".into()).unwrap();
+        assert!(delete_memory_file(sid.into(), "deep/nested/f.md".into()).unwrap());
+        let root = get_memory_session_root(sid).unwrap();
+        // Empty parents pruned…
+        assert!(!root.join("deep").exists());
+        // …but the session root itself survives.
+        assert!(root.exists());
+        // Idempotent second delete.
+        assert!(!delete_memory_file(sid.into(), "deep/nested/f.md".into()).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atomic_write_lands_inside_session_subtree() {
+        let sid = "session-mem-atomic-1";
+        let abs = write_memory_file_atomic(sid.into(), "agents-x.json".into(), "{}".into()).unwrap();
+        let root = get_memory_session_root(sid).unwrap();
+        assert!(std::path::Path::new(&abs).starts_with(&root));
+        assert_eq!(
+            read_memory_file(sid.into(), "agents-x.json".into()).unwrap().as_deref(),
+            Some("{}")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

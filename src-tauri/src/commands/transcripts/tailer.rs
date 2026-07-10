@@ -148,7 +148,7 @@ pub fn persist_offset(state: &TailState) -> Result<(), WatcherError> {
         WatcherError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })?;
 
-    memory::write_memory_file_atomic(STATE_FILE_RELPATH.to_string(), serialized)
+    memory::write_file_atomic_under(&dir, STATE_FILE_RELPATH, &serialized)
         .map_err(|e| WatcherError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
     Ok(())
