@@ -40,10 +40,15 @@ export interface IPtyReattachClient {
    *   - replayBudget: ReplayBudget — caps how much ring buffer Rust re-emits
    * Outputs: Promise<PtyReattachResult> — alive flag + replayBytes re-emitted;
    *   alive=false ⇒ the PTY is gone and the caller surfaces a dead pane.
-   * Side-effects: invokes reattach_pty IPC; re-subscribes the pty-data /
-   *   pty-exit listeners for sessionId; Rust re-emits up to replayBudget.maxBytes
-   *   of its ring buffer through pty-data-{sessionId}, which the standard
-   *   listener writes into the mounted terminal.
+   * Side-effects: invokes the reattach_pty IPC ONLY — listener setup is NOT
+   *   this method's job (impl-round correction): the adopt-mode mount
+   *   (adoptDetachedSession / AgentMiniTerminal adopt) subscribes the
+   *   pty-data / pty-exit listeners BEFORE the adoption-readiness barrier
+   *   releases and this is called. Rust then re-emits up to
+   *   replayBudget.maxBytes of its ring buffer through pty-data-{sessionId},
+   *   which those already-live listeners write into the mounted terminal.
+   *   Moving listener setup back into reattach() would reopen the
+   *   listenerless-replay bug the barrier exists to prevent.
    * Ordering (claude3 R4, amended by the webcontent-death-recovery impl
    *   review): Rust flushes the replay tail under the same per-session emit
    *   lock as live output, so replayed scrollback and live bytes never
@@ -52,18 +57,21 @@ export interface IPtyReattachClient {
    *   replay flush arrives live AND again inside the replay tail (cosmetic;
    *   bounded by the adoption-readiness timeout; idle sessions unaffected).
    *   Eliminating it needs an adopt-time ring high-water-mark IPC — recorded
-   *   follow-up (see reattach_pty's Rust docstring). The re-subscribe is
-   *   idempotent (a second reattach for a session does not double-write).
+   *   follow-up (see reattach_pty's Rust docstring). A second reattach for a
+   *   session does not double-subscribe anything (there is nothing to
+   *   subscribe here) — it only re-emits the ring tail again.
    * Preconditions: the Rust PID is unchanged (reload, not restart); the xterm
-   *   for sessionId is already mounted (restoreShell ran); listeners for
-   *   sessionId are not already attached (idempotent re-subscribe required).
+   *   for sessionId is already mounted (restoreShell ran); the pty-data /
+   *   pty-exit listeners for sessionId ARE already attached by the adopt-mode
+   *   mount (that is exactly what the adoption-readiness signal certifies).
    * Postconditions: on alive=true, the replayed tail is written in order then
    *   live pty-data events flow; replayBytes <= replayBudget.maxBytes. On
    *   alive=false the caller restores a dead/exited tile preserving handle/log
    *   (per AgentSnapshot recovery policy) rather than dropping the pane.
    * Failure-modes:
    *   - Error — thrown when the IPC transport fails; a dead PTY is alive=false,
-   *     NOT a throw; double-subscription is prevented (idempotent).
+   *     NOT a throw. (Listener double-subscription cannot originate here —
+   *     this method subscribes nothing; the adopt-mode mounts own that.)
    * Collaborators: reattach_pty (Rust IPC + Rust ring buffer)
    */
   reattach(
