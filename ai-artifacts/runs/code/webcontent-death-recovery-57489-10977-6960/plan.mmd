@@ -15,6 +15,10 @@ graph LR
   TeardownSuppressionPane["TeardownSuppressionPane"]
   TopologyPersistTrigger["TopologyPersistTrigger"]
   IsolationTests["IsolationTests"]
+  ReadinessBarrier["ReadinessBarrier"]
+  TerminalAdoptPath["TerminalAdoptPath"]
+  CollaboratorAdoptPath["CollaboratorAdoptPath"]
+  RecreateWebviewStub["RecreateWebviewStub"]
   DurableStore --> HeartbeatIpc
   DurableStore --> DeathEvidenceIpc
   DurableStore --> RecoverySessionIpcs
@@ -29,6 +33,10 @@ graph LR
   PtyReplayRing --> PtyReattachIpc
   PtyReattachIpc --> BootstrapGate
   InvokeHandlerRegistration --> BootstrapGate
+  BootstrapGate --> ReadinessBarrier
   BootstrapGate --> TeardownSuppressionAgent
   BootstrapGate --> TeardownSuppressionPane
   BootstrapGate --> IsolationTests
+  ReadinessBarrier --> TerminalAdoptPath
+  ReadinessBarrier --> CollaboratorAdoptPath
+  ReadinessBarrier --> PtyReattachIpc
