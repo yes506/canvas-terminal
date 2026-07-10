@@ -72,3 +72,18 @@ transcript_adapter_contract 1 ok
 ## Merge-gate 확인 필요 사항
 1. **수동 E2E는 머지 후 사용자 환경 항목** (plan Validation 절 그대로): 개발 모드 실행 → Activity Monitor에서 "Canvas Terminal Web Content" `kill -9` → 앱 포커스 복귀 → ~13초 내(프로브 3s + 판정) 자동 reload → 탭/PTY 복원 확인. CI에서는 재현 불가.
 2. 워치독 임계값(갭 10s/프로브 3s/장벽 10s)은 Q2 확정 제안값 — 실측 후 상수 조정 가능(전부 한 곳에 상수화).
+
+---
+
+## Addendum — 구현 라운드 피어 리뷰 처분 (5 리뷰: task-95 @codex1, task-96 @claude2, task-97 @codex2, task-98 @claude3, task-99 @codex3)
+
+5인 전원 APPROVE(비차단 항목 부가), 전원 독립 검증 재현(exit 0 / 437 vitest / 90 lib). 처분:
+
+| Finding | Reviewers | 검증 | 처분 |
+|---|---|---|---|
+| [MED] 복원된 `spawning` 행이 alive reattach 후에도 영구 잔류 → 메시지 무한 큐잉 | @codex3 (신규) | 확인 — adopt 모드가 readiness 감지를 의도적으로 생략하므로 승격 주체 부재 | **수정** (`f725889`) — alive reattach를 사용 가능 신호로 보고 spawning→running 승격 + `flushPendingMessages`; exited는 불변(부활 금지 정책 유지). 회귀 테스트 추가 |
+| [MED] `recoveryGateOpen`의 "닫히면 아무것도 자동 복구 안 됨" 불변식이 거짓 — A-경로는 완전 비게이트, `shouldRecover`는 프로덕션 호출자 0 | @claude3 (신규) | 확인 (grep 재현) | **문서 정정** (`f725889`) — A-경로 상시-가동은 이 피처의 목표 그 자체(플랜 success criteria)이므로 게이트 범위를 FE-주도(B-경로, 현재 미배선) 복구로 정정. 코드 게이팅 추가는 플랜 목표와 모순되어 기각 |
+| [LOW/MED] replay 중복 윈도우 — adopt 구독~장벽 해제 사이 출력이 live+replay 이중 표시 | @claude2, @codex2, @codex3 (3-way) | 확인 — 손실/크래시 없음, 코즈메틱, 유휴 세션 무영향 | **수용된 한계로 명시 문서화** (`reattach_pty` docstring) — 제거하려면 adopt-시점 ring high-water-mark **신규 IPC**가 필요한데 rev-2 플랜이 등록 체크리스트를 정확 10건으로 고정 → 스코프 밖, **후속 기록**. 머지 게이트에서 인간 확인 항목으로 상정 |
+| [MED/LOW] 검증이 `Cargo.lock` 더티 유발 (0.5.12→0.5.13 정규화; 리뷰어 검증 실행 포함 반복 발생) | 5인 전원 | 확인 — dev의 사전 드리프트가 원인(직전 런과 동일) | **폐기** — 워크트리 클린 확인. dev lockfile 동기화 별도 커밋 권고 재확인 |
+
+수정 후 재검증: **exit 0** (vitest 438건 — 승격 회귀 테스트 +1, cargo lib 90건), 워크트리 클린.
