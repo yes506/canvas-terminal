@@ -491,6 +491,16 @@ pub struct PtyReattachResult {
 /// ring (when the session entry still exists) is replayed regardless of
 /// liveness: an exited-but-registered session's final output is still useful
 /// scrollback.
+///
+/// ACCEPTED LIMITATION (review tasks 96/97/99, 3-way): output a PTY emits
+/// between the FE listener's adopt-subscribe and this replay flush is
+/// delivered live AND remains in the ring tail, so it appears twice in the
+/// restored scrollback (cosmetic; bounded by the adoption-readiness timeout;
+/// idle sessions — the common case — are unaffected). The lock discipline
+/// prevents interleaving/garbling, not duplication. Eliminating it needs a
+/// ring high-water-mark captured at adopt time, i.e. a new IPC outside the
+/// rev-2 plan's pinned 10-command registration checklist — recorded as a
+/// follow-up.
 #[tauri::command]
 pub fn reattach_pty(
     app: AppHandle,

@@ -294,3 +294,47 @@ describe("shared topology persist trigger (node 15)", () => {
     }
   });
 });
+
+describe("alive-reattach status promotion (review task-99 MED)", () => {
+  it("promotes a restored 'spawning' collaborator row to 'running' on alive reattach; exited rows stay exited", async () => {
+    const snapshot = JSON.parse(JSON.stringify(SNAPSHOT));
+    // Two agents: one captured mid-spawn, one already exited before death.
+    snapshot.tabs[0].paneTree.children[1].agents = [
+      { ...SNAPSHOT.tabs[0].paneTree.children[1].agents![0], sessionId: "agent-spawning", handle: "claude1", status: "spawning" },
+      { ...SNAPSHOT.tabs[0].paneTree.children[1].agents![0], sessionId: "agent-exited", handle: "claude2", ordinal: 2, nickname: "Claude Code #2", nicknameSlug: "claude-code-2", status: "exited" },
+    ];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      switch (cmd) {
+        case "load_recovery_session":
+          return PENDING_SESSION;
+        case "claim_recovery_attempt":
+          return { ...PENDING_SESSION, attempts: 1 };
+        case "load_topology":
+          return snapshot;
+        case "reattach_pty": {
+          const id = (args as { sessionId: string }).sessionId;
+          // Both agent PTYs report alive; the terminal leaf too.
+          return { sessionId: id, alive: true, replayBytes: 0 };
+        }
+        default:
+          return null;
+      }
+    });
+
+    await runResilienceBootstrap();
+    signalAdoptionReady("term-1");
+    signalAdoptionReady("agent-spawning");
+    signalAdoptionReady("agent-exited");
+
+    await vi.waitFor(() => {
+      expect(recoveryOrchestrator.isReloadInProgress()).toBe(false);
+    });
+
+    const agents = useCollaboratorStore.getState().agents;
+    // Mid-spawn survivor: alive reattach is the authoritative usability
+    // signal — promoted so queued messages stop piling up.
+    expect(agents.find((a) => a.sessionId === "agent-spawning")?.status).toBe("running");
+    // Exited tiles are NEVER resurrected by recovery (design policy).
+    expect(agents.find((a) => a.sessionId === "agent-exited")?.status).toBe("exited");
+  });
+});

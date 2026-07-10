@@ -174,8 +174,12 @@ export class RecoveryOrchestrator implements IRecoveryOrchestrator {
   ) {}
 
   shouldRecover(sign: RootCauseSign): RecoveryDecision {
-    // The #3 evidence gate is the central safety switch of the staged rollout.
-    // While closed, NOTHING auto-recovers — only diagnostics accrue.
+    // The #3 evidence gate guards FE-INITIATED recoveries (this method's
+    // callers — the B-escalation path, currently unwired in production).
+    // It does NOT govern the always-on Rust-watchdog A path, whose decision
+    // is minted Rust-side and resumed from the durable session without
+    // consulting this method (webcontent-death-recovery; task-98 invariant
+    // correction — the old "NOTHING auto-recovers" wording was false).
     if (!resilienceConfig.recoveryGateOpen) {
       return {
         proceed: false,
@@ -329,8 +333,23 @@ export class RecoveryOrchestrator implements IRecoveryOrchestrator {
           const result = await this.reattach.reattach(sessionId, {
             maxBytes: resilienceConfig.replayBudgetBytes,
           });
-          if (result.alive) restored += 1;
-          else {
+          if (result.alive) {
+            restored += 1;
+            // A restored collaborator row captured mid-spawn stays "spawning"
+            // forever otherwise: adopt mode deliberately skips readiness
+            // detection (it must not resurrect exited tiles), so nothing else
+            // flips it — and sendToAgent/broadcast would queue messages for
+            // it indefinitely (review task-99 MED). An ALIVE reattach is the
+            // authoritative "this PTY is usable" signal: promote spawning →
+            // running and flush the queue. Running/exited rows and terminal
+            // leaves (unknown ids) are untouched.
+            const collabStore = useCollaboratorStore.getState();
+            const row = collabStore.agents.find((a) => a.sessionId === sessionId);
+            if (row && row.status === "spawning") {
+              collabStore.setAgentStatus(sessionId, "running");
+              void collabStore.flushPendingMessages(sessionId);
+            }
+          } else {
             lost.push(sessionId);
             // Dead-PTY collaborator tiles restore as exited shells that keep
             // handle/nickname/log identity (design policy: never dropped,
