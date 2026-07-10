@@ -8,15 +8,26 @@
 // #3/#4 recovery) flips ONE flag.
 //
 // The gate defaults CLOSED: until it is opened, shouldRecover returns
-// proceed:false for every sign so only diagnostics accrue and the
-// reload-crossing recovery path (which depends on the deferred Rust IPC
-// layer) never fires.
+// proceed:false for every sign.
+//
+// SCOPE CORRECTION (webcontent-death-recovery): the gate governs only
+// FE-INITIATED recoveries — i.e. future callers of shouldRecover ->
+// prepareReloadRecovery (the B-escalation path, currently unwired). The
+// A path (Rust watchdog detects a WebContent death, mints the recovery
+// session itself, reloads, and the bootstrap resumes from the durable
+// session) is ALWAYS-ON by design: it is this feature's goal, its decision
+// is Rust-minted (never consults shouldRecover), and its own backstops are
+// the probe/gap thresholds + attempts/maxAttempts + expiresAt. "Closed"
+// therefore does NOT mean "no auto-recovery ever" — it means "no FE-decided
+// recovery" (review task-98 MED invariant fix).
 
 export interface ResilienceConfig {
   /**
-   * The #3 evidence gate. Default CLOSED. While closed, shouldRecover never
-   * authorizes a reload-crossing recovery regardless of sign — only the
-   * diagnostic trail (#1 heartbeat/watchdog/watermark, #2 detector) accrues.
+   * The #3 evidence gate for FE-INITIATED recoveries. Default CLOSED. While
+   * closed, shouldRecover never authorizes an FE-decided reload-crossing
+   * recovery regardless of sign. NOTE: the Rust-watchdog A path
+   * (webcontent-death auto-reload + resume) is deliberately NOT governed by
+   * this flag — see the module-header scope correction.
    */
   recoveryGateOpen: boolean;
 
@@ -44,6 +55,12 @@ export interface ResilienceConfig {
   recoverySessionTtlMs: number;
   /** Max durable resume attempts before recovery fails fast to 'failed'. */
   recoveryMaxAttempts: number;
+  /**
+   * How long resumeAfterReload's adoption-readiness barrier waits for the
+   * restored panes to mount + subscribe their pty-data listeners before the
+   * unready ids are reported lost (webcontent-death-recovery node 12b).
+   */
+  adoptionReadinessTimeoutMs: number;
 }
 
 export const resilienceConfig: ResilienceConfig = {
@@ -63,4 +80,5 @@ export const resilienceConfig: ResilienceConfig = {
 
   recoverySessionTtlMs: 60000,
   recoveryMaxAttempts: 2,
+  adoptionReadinessTimeoutMs: 10000,
 };

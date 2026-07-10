@@ -17,7 +17,116 @@ import { topologySnapshotService } from "./TopologySnapshotService";
 import { recoverySessionClient } from "./RecoverySessionClient";
 import { ptyReattachClient } from "./PtyReattachClient";
 import { resilienceStore } from "../../stores/resilienceStore";
+import { useCollaboratorStore } from "../../stores/collaboratorStore";
 import { resilienceConfig } from "./config";
+
+// ---------------------------------------------------------------------------
+// Adoption-readiness barrier (plan node 12b) + bootstrap reload seed.
+//
+// Module-scope, NOT class members: the restored components (useTerminal's
+// adopt branch, AgentMiniTerminal's adopt mode) signal readiness here without
+// holding an orchestrator reference, and the bootstrap seeds the
+// reload-in-progress flag BEFORE the first React render — the class field
+// alone cannot be seeded pre-render without changing the planner-committed
+// interface surface.
+//
+// Why the barrier exists (plan rev-2 3-way HIGH): `restoreShell()` only
+// mutates Zustand stores; the `pty-data-{sessionId}` listeners are installed
+// later, when React mounts the restored panes. Calling `reattach_pty` before
+// those mounts would flush the Rust replay ring into the void. The barrier
+// holds `resumeAfterReload()`'s Phase 2 until every expected adopt-mode mount
+// has subscribed its listener (or the timeout lapses — timed-out ids are
+// reported lost, never silently skipped).
+// ---------------------------------------------------------------------------
+
+/** Seeded true by the bootstrap when a durable pending session exists, so
+ *  `isReloadInProgress()` suppresses teardown from the very first mount.
+ *  Cleared on every `resumeAfterReload` exit path. */
+let bootstrapReloadPending = false;
+
+let barrierExpected: Set<string> | null = null;
+const barrierReady = new Set<string>();
+let barrierAllReady: (() => void) | null = null;
+let barrierArmedResolve: (() => void) | null = null;
+let barrierArmedPromise: Promise<void> | null = null;
+
+/** Pre-render seed (bootstrap Phase A). */
+export function seedReloadInProgress(pending: boolean): void {
+  bootstrapReloadPending = pending;
+  if (pending && barrierArmedPromise === null) {
+    barrierArmedPromise = new Promise((resolve) => {
+      barrierArmedResolve = resolve;
+    });
+  }
+}
+
+/**
+ * Resolves once the barrier has been ARMED with the restored-session id set
+ * (i.e. `restoreShell()` has seeded the stores) — or once recovery aborted
+ * before arming. The bootstrap awaits this before the first render so the
+ * default-tab effect never races the restore (tabs are already non-empty).
+ */
+export function adoptionBarrierArmed(): Promise<void> {
+  return barrierArmedPromise ?? Promise.resolve();
+}
+
+/** Whether `sessionId` belongs to the in-flight restore (adopt, don't spawn). */
+export function isRestoredSessionId(sessionId: string): boolean {
+  return barrierExpected?.has(sessionId) ?? false;
+}
+
+/** Called by adopt-mode mounts AFTER their pty-data listener is subscribed. */
+export function signalAdoptionReady(sessionId: string): void {
+  if (!barrierExpected?.has(sessionId)) return;
+  barrierReady.add(sessionId);
+  if (barrierReady.size >= barrierExpected.size) {
+    barrierAllReady?.();
+  }
+}
+
+function armAdoptionBarrier(sessionIds: string[]): void {
+  barrierExpected = new Set(sessionIds);
+  barrierReady.clear();
+  barrierArmedResolve?.();
+}
+
+/** Await all expected adoptions; returns the ids that timed out (⇒ lost). */
+async function awaitAdoptionReadiness(timeoutMs: number): Promise<string[]> {
+  if (!barrierExpected || barrierExpected.size === 0) return [];
+  if (barrierReady.size >= barrierExpected.size) return [];
+  await new Promise<void>((resolve) => {
+    barrierAllReady = resolve;
+    const timer = setTimeout(resolve, timeoutMs);
+    // Wrap so an all-ready resolution also clears the timer.
+    const prior = barrierAllReady;
+    barrierAllReady = () => {
+      clearTimeout(timer);
+      prior();
+    };
+    // Re-check: signals that landed between the size check and handler
+    // installation must not strand the barrier.
+    if (barrierReady.size >= barrierExpected!.size) barrierAllReady();
+  });
+  barrierAllReady = null;
+  return [...barrierExpected].filter((id) => !barrierReady.has(id));
+}
+
+/** Drop barrier state on every recovery exit path (also unblocks a bootstrap
+ *  waiting on `adoptionBarrierArmed()` when recovery aborts before arming). */
+function resetAdoptionBarrier(): void {
+  bootstrapReloadPending = false;
+  barrierExpected = null;
+  barrierReady.clear();
+  barrierAllReady = null;
+  barrierArmedResolve?.();
+  barrierArmedResolve = null;
+  barrierArmedPromise = null;
+}
+
+/** Test-only reset — vitest isolation for the module-scope barrier state. */
+export function _resetAdoptionBarrierForTests(): void {
+  resetAdoptionBarrier();
+}
 
 /**
  * Collect the session ids that have a backing Rust PTY and therefore need
@@ -65,8 +174,12 @@ export class RecoveryOrchestrator implements IRecoveryOrchestrator {
   ) {}
 
   shouldRecover(sign: RootCauseSign): RecoveryDecision {
-    // The #3 evidence gate is the central safety switch of the staged rollout.
-    // While closed, NOTHING auto-recovers — only diagnostics accrue.
+    // The #3 evidence gate guards FE-INITIATED recoveries (this method's
+    // callers — the B-escalation path, currently unwired in production).
+    // It does NOT govern the always-on Rust-watchdog A path, whose decision
+    // is minted Rust-side and resumed from the durable session without
+    // consulting this method (webcontent-death-recovery; task-98 invariant
+    // correction — the old "NOTHING auto-recovers" wording was false).
     if (!resilienceConfig.recoveryGateOpen) {
       return {
         proceed: false,
@@ -147,6 +260,7 @@ export class RecoveryOrchestrator implements IRecoveryOrchestrator {
     const pending = await this.session.loadPending();
     if (!pending) {
       // No durable session — this was not an orchestrated reload.
+      resetAdoptionBarrier();
       return {
         success: false,
         restoredSessions: 0,
@@ -165,6 +279,7 @@ export class RecoveryOrchestrator implements IRecoveryOrchestrator {
     if (!claimed || claimed.attempts > claimed.maxAttempts) {
       await this.session.clear(pending.token);
       this.reloadInProgress = false;
+      resetAdoptionBarrier();
       this.store.transition("failed");
       return {
         success: false,
@@ -195,23 +310,62 @@ export class RecoveryOrchestrator implements IRecoveryOrchestrator {
       const lost: string[] = [...report.failedSessions];
       let restored = 0;
 
+      // Adoption-readiness barrier (plan node 12b): arm with the full
+      // restored-id set — arming also unblocks the bootstrap's pre-render
+      // wait, so the first render mounts the RESTORED tabs (never the
+      // default-tab fallback) — then hold Phase 2 until every adopt-mode
+      // mount has subscribed its pty-data listener. Replay must never be
+      // emitted into a listenerless void (rev-2 3-way HIGH).
+      const allIds = collectSnapshotSessionIds(snapshot);
+      armAdoptionBarrier(allIds);
+      const timedOut = await awaitAdoptionReadiness(
+        resilienceConfig.adoptionReadinessTimeoutMs,
+      );
+      for (const sessionId of timedOut) {
+        lost.push(sessionId);
+      }
+      const readyIds = allIds.filter((id) => !timedOut.includes(id));
+
       // Phase 2: rebind each surviving PTY + replay its ring. A dead PTY comes
       // back alive=false (becomes a lost/exited tile, not a throw).
-      for (const sessionId of collectSnapshotSessionIds(snapshot)) {
+      for (const sessionId of readyIds) {
         try {
           const result = await this.reattach.reattach(sessionId, {
             maxBytes: resilienceConfig.replayBudgetBytes,
           });
-          if (result.alive) restored += 1;
-          else lost.push(sessionId);
+          if (result.alive) {
+            restored += 1;
+            // A restored collaborator row captured mid-spawn stays "spawning"
+            // forever otherwise: adopt mode deliberately skips readiness
+            // detection (it must not resurrect exited tiles), so nothing else
+            // flips it — and sendToAgent/broadcast would queue messages for
+            // it indefinitely (review task-99 MED). An ALIVE reattach is the
+            // authoritative "this PTY is usable" signal: promote spawning →
+            // running and flush the queue. Running/exited rows and terminal
+            // leaves (unknown ids) are untouched.
+            const collabStore = useCollaboratorStore.getState();
+            const row = collabStore.agents.find((a) => a.sessionId === sessionId);
+            if (row && row.status === "spawning") {
+              collabStore.setAgentStatus(sessionId, "running");
+              void collabStore.flushPendingMessages(sessionId);
+            }
+          } else {
+            lost.push(sessionId);
+            // Dead-PTY collaborator tiles restore as exited shells that keep
+            // handle/nickname/log identity (design policy: never dropped,
+            // never auto-respawned). Unknown ids (terminal leaves) no-op.
+            useCollaboratorStore.getState().setAgentStatus(sessionId, "exited");
+          }
         } catch {
           lost.push(sessionId);
+          useCollaboratorStore.getState().setAgentStatus(sessionId, "exited");
         }
       }
 
       this.store.transition("recovered");
       await this.session.clear(pending.token);
       this.reloadInProgress = false;
+      resetAdoptionBarrier();
       return {
         success: lost.length === 0,
         restoredSessions: restored,
@@ -223,12 +377,16 @@ export class RecoveryOrchestrator implements IRecoveryOrchestrator {
       this.store.transition("failed");
       await this.session.clear(pending.token);
       this.reloadInProgress = false;
+      resetAdoptionBarrier();
       throw err;
     }
   }
 
   isReloadInProgress(): boolean {
-    return this.reloadInProgress;
+    // OR-in the bootstrap seed: the durable pending session is known BEFORE
+    // the first render (Phase A), long before resumeAfterReload's own field
+    // write — and the very first mounts must already suppress teardown.
+    return this.reloadInProgress || bootstrapReloadPending;
   }
 
   abort(reason: string): void {

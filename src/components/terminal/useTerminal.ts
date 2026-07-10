@@ -3,11 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   hasSession,
   createSession,
+  adoptDetachedSession,
   getSession,
   reparentTo,
   parkInHost,
 } from "../../lib/terminalManager";
 import { consumeSessionCwd } from "../../stores/terminalStore";
+import {
+  isRestoredSessionId,
+  signalAdoptionReady,
+} from "../../lib/resilience/RecoveryOrchestrator";
 
 /**
  * Thin hook that manages the attachment of a persistent xterm Terminal
@@ -31,6 +36,16 @@ export function useTerminal(sessionId: string) {
     if (hasSession(sessionId)) {
       // Session already exists — just reparent into this slot
       reparentTo(sessionId, slot);
+    } else if (isRestoredSessionId(sessionId)) {
+      // Recovery restore (webcontent-death-recovery node 17): the Rust PTY
+      // for this id SURVIVED the webview reload — adopt it (subscribe the
+      // pty-data listener without spawn_shell) instead of spawning a fresh
+      // shell over the survivor. Readiness is signalled only after the
+      // listener is live so resumeAfterReload's barrier can't release the
+      // ring replay into a listenerless void.
+      void adoptDetachedSession(sessionId, slot).then(() => {
+        signalAdoptionReady(sessionId);
+      });
     } else {
       // First mount — create the session directly in the slot so xterm
       // measures correct cols/rows for spawn_shell.

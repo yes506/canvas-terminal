@@ -6,5 +6,6 @@ pub mod fs_safety;
 pub mod localfile;
 pub mod memory;
 pub mod pty;
+pub mod resilience;
 pub mod settings;
 pub mod transcripts;

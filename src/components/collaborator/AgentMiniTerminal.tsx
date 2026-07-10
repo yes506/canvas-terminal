@@ -23,6 +23,10 @@ import {
 import type { ToolConfig } from "../../types/collaborator";
 import { supportsPeerContextPublishing } from "../../types/collaborator";
 import {
+  recoveryOrchestrator,
+  signalAdoptionReady,
+} from "../../lib/resilience/RecoveryOrchestrator";
+import {
   consumeReservation,
   releaseReservation,
   reserveAgentHandle,
@@ -82,6 +86,16 @@ interface AgentMiniTerminalProps {
   tool: ToolConfig;
   cwd: string | null;
   onClose: (sessionId: string) => void;
+  /**
+   * Recovery adopt mode (webcontent-death-recovery node 18): the Rust PTY
+   * for `sessionId` SURVIVED a webview reload and the store row was already
+   * restored verbatim (`restoreAgents`). The mount must therefore skip
+   * `reserveAgentHandle` / `spawn_process` / `spawn_shell` / `addAgent`
+   * entirely — it only rebuilds the xterm surface, re-subscribes the
+   * pty-data/pty-exit listeners, and signals the adoption-readiness barrier
+   * so `resumeAfterReload` can flush the replay ring into a live listener.
+   */
+  adopt?: boolean;
 }
 
 /**
@@ -136,6 +150,7 @@ export function AgentMiniTerminal({
   tool,
   cwd,
   onClose,
+  adopt = false,
 }: AgentMiniTerminalProps) {
   const collabSessionId = useCollabSessionId();
   const termRef = useRef<HTMLDivElement | null>(null);
@@ -481,68 +496,75 @@ export function AgentMiniTerminal({
       // collabSessionId, which the outer initTerminal's React error
       // boundary would catch; in practice collabSessionId always
       // resolves from CollabSessionContext.
-      let reservation;
-      try {
-        reservation = reserveAgentHandle(collabSessionId, tool.id);
-      } catch (reserveErr) {
-        if (isCurrentRun()) {
-          writeWithFollowBottom(
-            `\r\n\x1b[31m[Failed to reserve handle: ${reserveErr}]\x1b[0m\r\n`,
-          );
-        }
-        return;
-      }
-
-      // L6: build extraEnv from the reservation. Using imported
-      // constants (not literal strings) so the keys stay aligned with
-      // the Rust adapter's expectations.
-      const extraEnv: Record<string, string> = {
-        [ENV_AGENT_ID]: reservation.handle,
-        [ENV_COLLAB_SESSION_ID]: collabSessionId,
-      };
-
-      try {
-        await invoke("spawn_process", {
-          sessionId,
-          program,
-          args: programArgs.length > 0 ? programArgs : null,
-          extraEnv,
-          cwd: cwd ?? null,
-          cols: terminal.cols,
-          rows: terminal.rows,
-        });
-      } catch {
-        // Fallback: spawn shell then type the command
-        spawnedViaShell = true;
+      //
+      // Recovery adopt mode skips the entire reservation+spawn pipeline:
+      // the PTY already exists in Rust and the identity row was restored
+      // verbatim — re-reserving would burn an ordinal, re-spawning would
+      // replace the survivor this feature exists to preserve.
+      let reservation: ReturnType<typeof reserveAgentHandle> | null = null;
+      if (!adopt) {
         try {
-          await invoke("spawn_shell", {
-            sessionId,
-            cols: terminal.cols,
-            rows: terminal.rows,
-            cwd: cwd ?? null,
-            login: !isEnvBootstrapped(),
-            extraEnv,
-          });
-        } catch (shellErr) {
-          // L8: release reservation on spawn failure so the ordinal
-          // slot can be reused. Idempotent; safe to fire on either
-          // catch path.
-          releaseReservation(reservation.reservationId);
+          reservation = reserveAgentHandle(collabSessionId, tool.id);
+        } catch (reserveErr) {
           if (isCurrentRun()) {
             writeWithFollowBottom(
-              `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
+              `\r\n\x1b[31m[Failed to reserve handle: ${reserveErr}]\x1b[0m\r\n`,
             );
           }
           return;
         }
-      }
 
-      if (!isCurrentRun()) {
-        // StrictMode dispose between spawn-success and post-spawn
-        // setup: release the reservation so the next mount's fresh
-        // reserveAgentHandle doesn't see a leaked slot.
-        releaseReservation(reservation.reservationId);
-        return;
+        // L6: build extraEnv from the reservation. Using imported
+        // constants (not literal strings) so the keys stay aligned with
+        // the Rust adapter's expectations.
+        const extraEnv: Record<string, string> = {
+          [ENV_AGENT_ID]: reservation.handle,
+          [ENV_COLLAB_SESSION_ID]: collabSessionId,
+        };
+
+        try {
+          await invoke("spawn_process", {
+            sessionId,
+            program,
+            args: programArgs.length > 0 ? programArgs : null,
+            extraEnv,
+            cwd: cwd ?? null,
+            cols: terminal.cols,
+            rows: terminal.rows,
+          });
+        } catch {
+          // Fallback: spawn shell then type the command
+          spawnedViaShell = true;
+          try {
+            await invoke("spawn_shell", {
+              sessionId,
+              cols: terminal.cols,
+              rows: terminal.rows,
+              cwd: cwd ?? null,
+              login: !isEnvBootstrapped(),
+              extraEnv,
+            });
+          } catch (shellErr) {
+            // L8: release reservation on spawn failure so the ordinal
+            // slot can be reused. Idempotent; safe to fire on either
+            // catch path.
+            releaseReservation(reservation.reservationId);
+            if (isCurrentRun()) {
+              writeWithFollowBottom(
+                `\r\n\x1b[31m[Failed to start: ${shellErr}]\x1b[0m\r\n`,
+              );
+            }
+            return;
+          }
+        }
+
+        if (!isCurrentRun()) {
+          // StrictMode dispose between spawn-success and post-spawn
+          // setup: release the reservation so the next mount's fresh
+          // reserveAgentHandle doesn't see a leaked slot.
+          releaseReservation(reservation.reservationId);
+          return;
+        }
       }
 
       // Let app-level shortcuts bubble past xterm
@@ -654,6 +676,15 @@ export function AgentMiniTerminal({
         }
       }
 
+      if (adopt) {
+        // Recovery adopt mode: the store row exists (restoreAgents seeded it
+        // verbatim — handle/nickname/nameHistory preserved), the PTY exists
+        // in Rust, and the pty-data listener above is live. Signal the
+        // adoption-readiness barrier so resumeAfterReload can release the
+        // ring replay into this now-listening terminal. Idempotent under
+        // StrictMode double-mount (the barrier tracks a Set).
+        signalAdoptionReady(sessionId);
+      } else {
       // Register in store as "spawning" — not ready for messages yet.
       // The readiness detector below will set status to "running" and flush
       // any queued messages once the CLI tool's prompt appears.
@@ -669,13 +700,13 @@ export function AgentMiniTerminal({
         // Same StrictMode-dispose-mid-flight case as the spawn-success
         // guard above: release the reservation so the next mount's
         // fresh reserveAgentHandle doesn't see a leaked slot.
-        releaseReservation(reservation.reservationId);
+        if (reservation) releaseReservation(reservation.reservationId);
         return;
       }
       // L7: consume the reservation (returns reserved handle data) and
       // pass the pre-minted handle into addAgent so the store record's
       // handle matches the env-injected CT_AGENT_ID.
-      const claimed = consumeReservation(reservation.reservationId);
+      const claimed = consumeReservation(reservation!.reservationId);
       useCollaboratorStore.getState().addAgent({
         sessionId,
         tool: tool.id,
@@ -685,6 +716,7 @@ export function AgentMiniTerminal({
         // publishOptedIn omitted — store defaults to `true` (cycle F
         // always-on). Eye toggle remains the per-agent opt-out.
       });
+      }
 
       // ---- CLI readiness detection ----
       // Watch PTY output for prompt patterns indicating the CLI is ready for input.
@@ -706,18 +738,24 @@ export function AgentMiniTerminal({
       // We accumulate a small tail buffer to match prompt patterns
       let readyBuf = "";
       const READY_BUF_MAX = 200;
-      // Also use a fallback timer in case prompt pattern isn't matched
-      readyTimeoutRef.current = setTimeout(() => {
-        if (!readyDetected && isCurrentRun()) {
-          readyDetected = true;
-          const store = useCollaboratorStore.getState();
-          store.setAgentStatus(sessionId, "running");
-          store.flushPendingMessages(sessionId);
-        }
-      }, 5000); // 5s fallback — if CLI doesn't show a recognizable prompt
+      // Also use a fallback timer in case prompt pattern isn't matched.
+      // Adopt mode skips readiness detection entirely: the restored row
+      // already carries the snapshot's status, and force-flipping an
+      // adopted EXITED tile back to "running" would resurrect a dead agent
+      // (design policy: dead tiles stay exited, identity preserved).
+      if (!adopt) {
+        readyTimeoutRef.current = setTimeout(() => {
+          if (!readyDetected && isCurrentRun()) {
+            readyDetected = true;
+            const store = useCollaboratorStore.getState();
+            store.setAgentStatus(sessionId, "running");
+            store.flushPendingMessages(sessionId);
+          }
+        }, 5000); // 5s fallback — if CLI doesn't show a recognizable prompt
+      }
 
       const checkReady = (raw: string) => {
-        if (readyDetected) return;
+        if (adopt || readyDetected) return;
         readyBuf += stripAnsi(raw);
         if (readyBuf.length > READY_BUF_MAX) {
           readyBuf = readyBuf.slice(-READY_BUF_MAX);
@@ -825,9 +863,15 @@ export function AgentMiniTerminal({
       imeHandleRef.current?.dispose();
       imeHandleRef.current = null;
 
-      // Kill PTY
-      invoke("kill_pty", { sessionId }).catch(() => {});
-      useCollaboratorStore.getState().removeAgent(sessionId);
+      // Kill PTY — SUPPRESSED across a recovery reload (webcontent-death-
+      // recovery node 13, system-design round-4 4-way blocker): the unmount
+      // that accompanies the dying/reloading webview must not kill the very
+      // Rust PTYs the recovery exists to reattach, nor drop the restored
+      // store rows.
+      if (!recoveryOrchestrator.isReloadInProgress()) {
+        invoke("kill_pty", { sessionId }).catch(() => {});
+        useCollaboratorStore.getState().removeAgent(sessionId);
+      }
 
       // Dispose xterm
       const term = terminalRef.current;

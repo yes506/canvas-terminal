@@ -1,16 +1,24 @@
-use crate::state::{AppState, PtySession};
+use crate::state::{AppState, PtyRing, PtySession, PTY_RING_CAP_BYTES};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tauri::{AppHandle, Emitter, State};
 
 /// Shared reader-thread setup for PTY sessions (used by both spawn_shell and spawn_process).
 /// Reads PTY output, handles UTF-8 decoding, and emits events to the frontend.
+///
+/// `ring` is the session's always-on replay buffer (resilience-recovery):
+/// every emitted chunk is pushed into it UNDER the ring mutex, and the emit
+/// happens while still holding that lock — the same lock `reattach_pty` holds
+/// while flushing a replay, so replay and live output can never interleave
+/// on the `pty-data-{sessionId}` stream (design Q4 ordering).
 fn start_reader_thread(
     app: AppHandle,
     session_id: String,
     mut reader: Box<dyn Read + Send>,
+    ring: Arc<Mutex<PtyRing>>,
 ) -> JoinHandle<()> {
     let event_id = session_id;
     std::thread::spawn(move || {
@@ -50,7 +58,12 @@ fn start_reader_thread(
                         }
                     }
                     if !emit_buf.is_empty() {
+                        // Push-then-emit under the ring/emit lock (see fn doc).
+                        let mut ring_guard =
+                            ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        ring_guard.push(emit_buf.as_bytes());
                         let _ = app.emit(&format!("pty-data-{}", event_id), emit_buf.as_str());
+                        drop(ring_guard);
                     }
                     if pos < pending.len() {
                         let remaining = pending[pos..].to_vec();
@@ -317,13 +330,15 @@ pub fn spawn_process(
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
     let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
-    let reader_thread = start_reader_thread(app, session_id.clone(), reader);
+    let ring = Arc::new(Mutex::new(PtyRing::new(PTY_RING_CAP_BYTES)));
+    let reader_thread = start_reader_thread(app, session_id.clone(), reader, ring.clone());
 
     let session = PtySession {
         child,
         writer,
         reader_thread: Some(reader_thread),
         master: pair.master,
+        ring,
     };
 
     state
@@ -435,13 +450,15 @@ pub fn spawn_shell(
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
     let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
-    let reader_thread = start_reader_thread(app, session_id.clone(), reader);
+    let ring = Arc::new(Mutex::new(PtyRing::new(PTY_RING_CAP_BYTES)));
+    let reader_thread = start_reader_thread(app, session_id.clone(), reader, ring.clone());
 
     let session = PtySession {
         child,
         writer,
         reader_thread: Some(reader_thread),
         master: pair.master,
+        ring,
     };
 
     state
@@ -451,6 +468,82 @@ pub fn spawn_shell(
         .insert(session_id, session);
 
     Ok(())
+}
+
+/// Wire shape of `PtyReattachResult` — pinned by src/lib/resilience/types.ts.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyReattachResult {
+    pub session_id: String,
+    pub alive: bool,
+    pub replay_bytes: u64,
+}
+
+/// Rebind a front-end terminal to a surviving Rust PTY after a webview
+/// reload (resilience-recovery node 10). The FE has already re-subscribed a
+/// `pty-data-{sessionId}` listener (adoptDetachedSession / adopt-mode mount)
+/// BEFORE calling this; the ring tail is re-emitted through that same event
+/// stream UNDER the ring/emit lock, so live reader output cannot interleave
+/// with the replay (design Q4: replay flush precedes live resume).
+///
+/// A missing session or an exited child reports `alive: false` — NOT an
+/// error — so the FE restores a dead/exited tile instead of throwing. The
+/// ring (when the session entry still exists) is replayed regardless of
+/// liveness: an exited-but-registered session's final output is still useful
+/// scrollback.
+///
+/// ACCEPTED LIMITATION (review tasks 96/97/99, 3-way): output a PTY emits
+/// between the FE listener's adopt-subscribe and this replay flush is
+/// delivered live AND remains in the ring tail, so it appears twice in the
+/// restored scrollback (cosmetic; bounded by the adoption-readiness timeout;
+/// idle sessions — the common case — are unaffected). The lock discipline
+/// prevents interleaving/garbling, not duplication. Eliminating it needs a
+/// ring high-water-mark captured at adopt time, i.e. a new IPC outside the
+/// rev-2 plan's pinned 10-command registration checklist — recorded as a
+/// follow-up. Follow-up spec note (review task-106): duplicated RELATIVE
+/// ANSI control sequences (e.g. cursor-up) in that window can briefly
+/// misposition a full-screen TUI, not just repeat text — the live repaint
+/// self-corrects, but it slightly raises the value of the high-water-mark.
+#[tauri::command]
+pub fn reattach_pty(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    max_bytes: u64,
+) -> Result<PtyReattachResult, String> {
+    let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return Ok(PtyReattachResult {
+            session_id,
+            alive: false,
+            replay_bytes: 0,
+        });
+    };
+
+    // try_wait: None = still running. An error conservatively reports dead.
+    let alive = session.child.try_wait().map(|st| st.is_none()).unwrap_or(false);
+    let ring = session.ring.clone();
+    // Release the sessions mutex before the (possibly large) emit — only the
+    // per-session ring lock is needed for replay/live mutual exclusion.
+    drop(sessions);
+
+    let ring_guard = ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tail = ring_guard.tail(max_bytes as usize);
+    let replay_bytes = tail.len() as u64;
+    if !tail.is_empty() {
+        // Ring content is concatenated already-validated emit strings; the
+        // boundary-aligned tail is valid UTF-8 (lossy is pure defense).
+        let text = String::from_utf8_lossy(&tail).to_string();
+        app.emit(&format!("pty-data-{}", session_id), text)
+            .map_err(|e| e.to_string())?;
+    }
+    drop(ring_guard);
+
+    Ok(PtyReattachResult {
+        session_id,
+        alive,
+        replay_bytes,
+    })
 }
 
 /// Maximum bytes per PTY write to prevent kernel buffer exhaustion

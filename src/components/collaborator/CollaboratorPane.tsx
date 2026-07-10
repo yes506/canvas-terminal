@@ -4,6 +4,8 @@ import { useShallow } from "zustand/react/shallow";
 import { useCollaboratorStore, scanForTaskCompletions } from "../../stores/collaboratorStore";
 import { useTerminalStore, getActiveSessionId } from "../../stores/terminalStore";
 import { generateSessionId } from "../../lib/sessionId";
+import { recoveryOrchestrator } from "../../lib/resilience/RecoveryOrchestrator";
+import { TOOL_CONFIGS } from "../../types/collaborator";
 import { CollabSessionContext } from "./CollabSessionContext";
 import { AgentToolbar } from "./AgentToolbar";
 import { AgentMiniTerminal } from "./AgentMiniTerminal";
@@ -45,6 +47,10 @@ interface Spawn {
   cwd: string | null;
   /** True once the initial CWD has been resolved (or failed). */
   cwdReady: boolean;
+  /** Recovery adopt mode — mount AgentMiniTerminal against the SURVIVING
+   *  Rust PTY without reserve/spawn/addAgent (webcontent-death-recovery
+   *  node 18). */
+  adopt?: boolean;
 }
 
 export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
@@ -74,13 +80,66 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
   // Session lifecycle
   useEffect(() => {
     mountedRef.current = true;
+
+    // Recovery restore path (webcontent-death-recovery node 18): when this
+    // pane mounts during a reload-crossing recovery, `restoreShell()` has
+    // already seeded the store rows for this collabSessionId verbatim. The
+    // pane renders its tiles from the component-local `spawns` array, so the
+    // rows alone would leave "No agents running" — materialize adopt-mode
+    // spawns from them. `startSession` clears this pane's agent rows as part
+    // of its fresh-session reset, so snapshot the rows FIRST and re-seed
+    // after via the restore-only `restoreAgents` seam (idempotent identity
+    // restore — never `addAgent`, which would re-mint ordinal/handle).
+    const restoredRows = recoveryOrchestrator.isReloadInProgress()
+      ? useCollaboratorStore
+          .getState()
+          .agents.filter((a) => a.collabSessionId === collabId)
+      : [];
+
     startSession(collabId);
+
+    if (restoredRows.length > 0) {
+      useCollaboratorStore.getState().restoreAgents(
+        restoredRows.map((a) => ({
+          sessionId: a.sessionId,
+          collabSessionId: a.collabSessionId,
+          tool: a.tool,
+          cwd: null,
+          status: a.status,
+          handle: a.handle,
+          ordinal: a.ordinal,
+          nickname: a.nickname,
+          nicknameSlug: a.nicknameSlug,
+          nameHistory: a.nameHistory.map((h) => ({
+            nickname: h.nickname,
+            setAt: h.setAt,
+            setBy: h.setBy,
+          })),
+          publishOptedIn: a.publishOptedIn === true,
+        })),
+      );
+      setSpawns(
+        restoredRows.map((a) => ({
+          sessionId: a.sessionId,
+          tool:
+            TOOL_CONFIGS.find((t) => t.id === a.tool) ?? TOOL_CONFIGS[0],
+          cwd: null,
+          cwdReady: true,
+          adopt: true,
+        })),
+      );
+    }
 
     return () => {
       mountedRef.current = false;
-      // Kill only this session's agents and clear memory on unmount
-      killAllAgents(collabId);
-      endSession(collabId);
+      // Kill only this session's agents and clear memory on unmount —
+      // SUPPRESSED across a recovery reload (node 14, design :82-83 / 4-way
+      // blocker): the dying webview's unmounts must not kill surviving PTYs
+      // or wipe the session subtree mid-recovery.
+      if (!recoveryOrchestrator.isReloadInProgress()) {
+        killAllAgents(collabId);
+        endSession(collabId);
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -278,6 +337,7 @@ export function CollaboratorPane({ paneSessionId }: CollaboratorPaneProps) {
                     tool={spawn.tool}
                     cwd={spawn.cwd}
                     onClose={handleClose}
+                    adopt={spawn.adopt === true}
                   />
                 ) : (
                   <div
