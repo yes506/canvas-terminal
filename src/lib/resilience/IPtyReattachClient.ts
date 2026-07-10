@@ -44,10 +44,16 @@ export interface IPtyReattachClient {
    *   pty-exit listeners for sessionId; Rust re-emits up to replayBudget.maxBytes
    *   of its ring buffer through pty-data-{sessionId}, which the standard
    *   listener writes into the mounted terminal.
-   * Ordering (claude3 R4): Rust MUST flush the replay tail BEFORE (or atomically
-   *   ahead of) resuming live output on the same pty-data channel, so replayed
-   *   scrollback and new live bytes never interleave or duplicate. The re-subscribe
-   *   is idempotent (a second reattach for a session does not double-write).
+   * Ordering (claude3 R4, amended by the webcontent-death-recovery impl
+   *   review): Rust flushes the replay tail under the same per-session emit
+   *   lock as live output, so replayed scrollback and live bytes never
+   *   INTERLEAVE/garble. Duplication, however, is an ACCEPTED LIMITATION:
+   *   output emitted between the adopt-time listener subscribe and the
+   *   replay flush arrives live AND again inside the replay tail (cosmetic;
+   *   bounded by the adoption-readiness timeout; idle sessions unaffected).
+   *   Eliminating it needs an adopt-time ring high-water-mark IPC — recorded
+   *   follow-up (see reattach_pty's Rust docstring). The re-subscribe is
+   *   idempotent (a second reattach for a session does not double-write).
    * Preconditions: the Rust PID is unchanged (reload, not restart); the xterm
    *   for sessionId is already mounted (restoreShell ran); listeners for
    *   sessionId are not already attached (idempotent re-subscribe required).

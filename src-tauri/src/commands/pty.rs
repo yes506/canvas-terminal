@@ -500,7 +500,10 @@ pub struct PtyReattachResult {
 /// prevents interleaving/garbling, not duplication. Eliminating it needs a
 /// ring high-water-mark captured at adopt time, i.e. a new IPC outside the
 /// rev-2 plan's pinned 10-command registration checklist — recorded as a
-/// follow-up.
+/// follow-up. Follow-up spec note (review task-106): duplicated RELATIVE
+/// ANSI control sequences (e.g. cursor-up) in that window can briefly
+/// misposition a full-screen TUI, not just repeat text — the live repaint
+/// self-corrects, but it slightly raises the value of the high-water-mark.
 #[tauri::command]
 pub fn reattach_pty(
     app: AppHandle,
