@@ -1,0 +1,42 @@
+graph LR
+  DurableStore["DurableStore"]
+  HeartbeatIpc["HeartbeatIpc"]
+  LaunchGeneration["LaunchGeneration"]
+  DeathEvidenceIpc["DeathEvidenceIpc"]
+  RecoverySessionIpcs["RecoverySessionIpcs"]
+  TopologyIpcs["TopologyIpcs"]
+  FocusProbeWatchdog["FocusProbeWatchdog"]
+  APathDeathHandler["APathDeathHandler"]
+  PtyReplayRing["PtyReplayRing"]
+  PtyReattachIpc["PtyReattachIpc"]
+  InvokeHandlerRegistration["InvokeHandlerRegistration"]
+  BootstrapGate["BootstrapGate"]
+  TeardownSuppressionAgent["TeardownSuppressionAgent"]
+  TeardownSuppressionPane["TeardownSuppressionPane"]
+  TopologyPersistTrigger["TopologyPersistTrigger"]
+  IsolationTests["IsolationTests"]
+  ReadinessBarrier["ReadinessBarrier"]
+  TerminalAdoptPath["TerminalAdoptPath"]
+  CollaboratorAdoptPath["CollaboratorAdoptPath"]
+  RecreateWebviewStub["RecreateWebviewStub"]
+  DurableStore --> HeartbeatIpc
+  DurableStore --> DeathEvidenceIpc
+  DurableStore --> RecoverySessionIpcs
+  DurableStore --> TopologyIpcs
+  HeartbeatIpc --> FocusProbeWatchdog
+  LaunchGeneration --> DeathEvidenceIpc
+  DeathEvidenceIpc --> BootstrapGate
+  RecoverySessionIpcs --> APathDeathHandler
+  RecoverySessionIpcs --> BootstrapGate
+  TopologyIpcs --> TopologyPersistTrigger
+  FocusProbeWatchdog --> APathDeathHandler
+  PtyReplayRing --> PtyReattachIpc
+  PtyReattachIpc --> BootstrapGate
+  InvokeHandlerRegistration --> BootstrapGate
+  BootstrapGate --> ReadinessBarrier
+  BootstrapGate --> TeardownSuppressionAgent
+  BootstrapGate --> TeardownSuppressionPane
+  BootstrapGate --> IsolationTests
+  ReadinessBarrier --> TerminalAdoptPath
+  ReadinessBarrier --> CollaboratorAdoptPath
+  ReadinessBarrier --> PtyReattachIpc
