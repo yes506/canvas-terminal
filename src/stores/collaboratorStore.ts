@@ -8,7 +8,7 @@ import type {
   AgentNameRecord,
   RenameResult,
 } from "../types/collaborator";
-import { TOOL_CONFIGS } from "../types/collaborator";
+import { TOOL_CONFIGS, supportsPeerContextPublishing } from "../types/collaborator";
 import type { AgentSnapshot } from "../lib/resilience/types";
 import { muteCapture } from "../lib/agentOutputCapture";
 import { hasContextsBreadcrumb } from "../lib/peerContext";
@@ -77,10 +77,13 @@ export function toolLabel(tool: string): string {
   return TOOL_LABELS[tool] ?? tool;
 }
 
-/** Short name used for @-mentions (e.g. "claude", "codex", "gemini"). */
+/** Short name used for @-mentions (e.g. "claude", "codex", "gemini").
+ *  Prefers `handlePrefix` over `command` so a slot's CLI binary can be
+ *  swapped (gemini → agy) without re-minting the immutable @-handle
+ *  family that tasks, logs, and done.json author fields reference. */
 export function toolShortName(tool: ToolId): string {
   const cfg = TOOL_CONFIGS.find((t) => t.id === tool);
-  return cfg?.command ?? tool;
+  return cfg?.handlePrefix ?? cfg?.command ?? tool;
 }
 
 /** Return the current display label for an agent. Always reads `nickname`,
@@ -1395,7 +1398,14 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // dropped in favor of frictionless cross-agent context surfacing.
       // `raw.publishOptedIn` takes precedence if the caller explicitly
       // sets it (e.g. for tests verifying the watch-lifecycle's off-state).
-      publishOptedIn: raw.publishOptedIn ?? true,
+      //
+      // Capability gate: tools without a tailable transcript (agy —
+      // SQLite/WAL storage) are forced to false at the STATE level, even
+      // when the caller passes true, so the watch effect never attempts
+      // the IPC and the Eye toggle reflects "unsupported".
+      publishOptedIn: supportsPeerContextPublishing(raw.tool)
+        ? (raw.publishOptedIn ?? true)
+        : false,
     };
     set((s) => ({ agents: [...s.agents, agent] }));
   },
@@ -1422,7 +1432,12 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
           setAt: h.setAt,
           setBy: h.setBy,
         })),
-        publishOptedIn: snap.publishOptedIn,
+        // Coerce restored unsupported-tool agents to false even when an
+        // old snapshot (written before the agy migration) carries true —
+        // otherwise a restore would resurrect a watch the tool can't serve.
+        publishOptedIn: supportsPeerContextPublishing(snap.tool)
+          ? snap.publishOptedIn
+          : false,
       };
       restored.push(agent);
       // Keep the ordinal counter ahead of every restored ordinal.
@@ -1439,6 +1454,12 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // idempotent writes (UI toggle that fires the same value twice).
       const target = s.agents.find((a) => a.sessionId === sessionId);
       if (!target || target.publishOptedIn === value) {
+        return s;
+      }
+      // Capability gate (state-level, mirrors addAgent): an opt-IN for a
+      // tool that cannot publish is a silent no-op — the Eye toggle is
+      // hidden for such tools, so this only defends programmatic callers.
+      if (value === true && !supportsPeerContextPublishing(target.tool)) {
         return s;
       }
       return {

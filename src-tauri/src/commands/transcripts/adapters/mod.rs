@@ -494,6 +494,11 @@ pub mod gemini;
 pub(super) static CLAUDE_CODE_ADAPTER: claude_code::ClaudeCodeAdapter =
     claude_code::ClaudeCodeAdapter;
 pub(super) static CODEX_ADAPTER: codex::CodexAdapter = codex::CodexAdapter;
+// Unreferenced since `adapter_for` stopped routing the gemini slot (agy
+// stores SQLite/WAL, not tailable JSONL). Retained — with its module and
+// unit tests — as the starting point for the follow-up antigravity
+// SQLite adapter rather than deleted-and-restored later.
+#[allow(dead_code)]
 pub(super) static GEMINI_ADAPTER: gemini::GeminiAdapter = gemini::GeminiAdapter;
 
 /// Map `adapter_id` (the `&'static str` carried on every `TranscriptHandle`)
@@ -514,7 +519,16 @@ pub(super) fn adapter_for(adapter_id: &str) -> Option<&'static dyn TranscriptAda
     match adapter_id {
         "claude_code" => Some(&CLAUDE_CODE_ADAPTER),
         "codex" | "codex_cli" => Some(&CODEX_ADAPTER),
-        "gemini" | "gemini_cli" => Some(&GEMINI_ADAPTER),
+        // Antigravity CLI (agy — the gemini slot's replacement) stores
+        // conversations as SQLite databases with WAL
+        // (`~/.gemini/antigravity-cli/conversations/<uuid>.db`), NOT the
+        // JSONL this tailer pipeline reads, so the gemini adapter can no
+        // longer apply. `watch_transcript` errors "unknown tool"; the
+        // frontend's capability predicate
+        // (`supportsPeerContextPublishing`) disables publishing at the
+        // state level so the IPC is never even attempted. A dedicated
+        // SQLite-reading antigravity adapter is a recorded follow-up.
+        "gemini" | "gemini_cli" => None,
         _ => None,
     }
 }

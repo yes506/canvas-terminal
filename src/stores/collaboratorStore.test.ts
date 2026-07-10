@@ -5,6 +5,7 @@ import {
   getIndicatorPresentation,
   scanForTaskCompletions,
   formatTaskSummaryForAgent,
+  toolShortName,
   _resetWriteStateForTests,
   _isRenamePendingForTests,
   RECENT_OUTCOME_TTL_MS,
@@ -12,6 +13,8 @@ import {
   slugify,
 } from "./collaboratorStore";
 import type { CollabTask, SpawnedAgent } from "../types/collaborator";
+import { TOOL_CONFIGS, supportsPeerContextPublishing } from "../types/collaborator";
+import { reserveAgentHandle } from "../lib/peerContext";
 import { parseInput, resolveAgent, executeCommand, getHelpText } from "../components/collaborator/commands";
 import { useTerminalStore } from "./terminalStore";
 import { _resetMemoryDirCacheForTests } from "../lib/scopedCollabMemory";
@@ -2779,5 +2782,121 @@ describe("collab-isolation — scoped headers, scans, and commands (nodes 9-12)"
     expect(invoke).toHaveBeenCalledWith("list_memory_files", {
       collabSessionId: SESSION,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// collab-isolation-agy — Antigravity CLI (agy) migration (plan nodes 15/15b/18)
+// ---------------------------------------------------------------------------
+describe("agy migration — tool registration + handle preservation (nodes 15/15b)", () => {
+  beforeEach(() => {
+    resetStores();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
+  });
+
+  it("gemini slot spawns agy with the Antigravity CLI label (node 15)", () => {
+    const gemini = TOOL_CONFIGS.find((t) => t.id === "gemini_cli")!;
+    expect(gemini.command).toBe("agy");
+    expect(gemini.label).toBe("Antigravity CLI");
+    // ToolId unchanged — the slot identity survives the CLI swap.
+    expect(gemini.id).toBe("gemini_cli");
+  });
+
+  it("toolShortName prefers handlePrefix so the @gemini* family survives the command swap (node 15b)", () => {
+    expect(toolShortName("gemini_cli")).toBe("gemini");
+    // Tools without handlePrefix keep deriving from command.
+    expect(toolShortName("claude_code")).toBe("claude");
+    expect(toolShortName("codex_cli")).toBe("codex");
+  });
+
+  it("addAgent mints @gemini1 (not @agy1) for a gemini-slot spawn (node 15b)", () => {
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-g1",
+      tool: "gemini_cli",
+      status: "spawning",
+      collabSessionId: SESSION,
+    });
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
+    expect(agent.handle).toBe("gemini1");
+  });
+
+  it("reserveAgentHandle also mints from the gemini prefix (node 15b, reservation path)", () => {
+    const reservation = reserveAgentHandle(SESSION, "gemini_cli");
+    expect(reservation.handle).toMatch(/^gemini\d+$/);
+  });
+
+  it("help text keeps the @gemini mention (node 15b)", () => {
+    expect(getHelpText()).toMatch(/@gemini\b/);
+  });
+});
+
+describe("agy migration — state-level publish disable (node 18)", () => {
+  beforeEach(() => {
+    resetStores();
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockImplementation(baseInvokeMock);
+  });
+
+  it("capability predicate: only the gemini slot is unsupported", () => {
+    expect(supportsPeerContextPublishing("gemini_cli")).toBe(false);
+    expect(supportsPeerContextPublishing("claude_code")).toBe(true);
+    expect(supportsPeerContextPublishing("codex_cli")).toBe(true);
+    expect(supportsPeerContextPublishing("copilot_cli")).toBe(true);
+  });
+
+  it("addAgent forces publishOptedIn=false for agy even when the caller passes true", () => {
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-g1",
+      tool: "gemini_cli",
+      status: "running",
+      collabSessionId: SESSION,
+      publishOptedIn: true,
+    });
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
+    expect(agent.publishOptedIn).toBe(false);
+  });
+
+  it("addAgent keeps the cycle-F default (true) for supported tools", () => {
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-c1",
+      tool: "claude_code",
+      status: "running",
+      collabSessionId: SESSION,
+    });
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-c1")!;
+    expect(agent.publishOptedIn).toBe(true);
+  });
+
+  it("restoreAgents coerces a pre-migration snapshot's publishOptedIn=true to false for agy", () => {
+    useCollaboratorStore.getState().restoreAgents([
+      {
+        sessionId: "pty-g1",
+        collabSessionId: SESSION,
+        tool: "gemini_cli",
+        status: "running",
+        handle: "gemini1",
+        ordinal: 1,
+        nickname: "Gemini CLI #1",
+        nicknameSlug: "gemini-cli-1",
+        nameHistory: [{ nickname: "Gemini CLI #1", setAt: "2024-01-01T00:00:00.000Z", setBy: "system" }],
+        publishOptedIn: true, // old snapshot from before the agy migration
+        cwd: null,
+      },
+    ]);
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
+    expect(agent.publishOptedIn).toBe(false);
+  });
+
+  it("setPublishOptedIn(true) is a silent no-op for an unsupported tool", () => {
+    useCollaboratorStore.getState().addAgent({
+      sessionId: "pty-g1",
+      tool: "gemini_cli",
+      status: "running",
+      collabSessionId: SESSION,
+    });
+    useCollaboratorStore.getState().setPublishOptedIn("pty-g1", true);
+    const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
+    expect(agent.publishOptedIn).toBe(false);
   });
 });

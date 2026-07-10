@@ -21,6 +21,7 @@ import {
   type KoreanImeShimHandle,
 } from "../../lib/xtermImeShim";
 import type { ToolConfig } from "../../types/collaborator";
+import { supportsPeerContextPublishing } from "../../types/collaborator";
 import {
   consumeReservation,
   releaseReservation,
@@ -688,11 +689,18 @@ export function AgentMiniTerminal({
       // ---- CLI readiness detection ----
       // Watch PTY output for prompt patterns indicating the CLI is ready for input.
       // Each CLI tool shows a prompt when ready (e.g. "> " for Claude, "❯ " for Codex).
+      // Audited for the agy migration (gemini slot → Antigravity CLI): the
+      // generic "> " pattern covers most REPL-style TUIs, and the retired
+      // Gemini CLI patterns (✦, >>>) are kept — harmless if agy never
+      // emits them. If agy's prompt matches none of these, the 5 s
+      // fallback timer below still flips the agent to running, so
+      // readiness detection degrades to a delay, never a hang. Re-measure
+      // against agy's real TUI after onboarding (plan open question).
       const READY_PATTERNS = [
-        />\s*$/,       // Claude Code prompt: "> "
+        />\s*$/,       // Claude Code prompt: "> " (also common REPL default)
         /❯\s*$/,      // Codex CLI prompt
-        /✦\s*$/,      // Gemini CLI prompt
-        />>>\s*$/,     // Gemini CLI alternate prompt
+        /✦\s*$/,      // legacy Gemini CLI prompt (kept for agy-slot compat)
+        />>>\s*$/,     // legacy Gemini CLI alternate prompt
       ];
       let readyDetected = false;
       // We accumulate a small tail buffer to match prompt patterns
@@ -915,7 +923,19 @@ export function AgentMiniTerminal({
     // always present, but guarding here is cheap defense-in-depth — a null/
     // empty id would otherwise be swallowed by the .catch() with no mirror and
     // no error (claude2 review L1).
-    if (!agentHandle || !isRunning || !isPublishing || !collabSessionId) {
+    //
+    // Capability guard: tools without a tailable transcript (agy —
+    // SQLite/WAL) never even attempt the watch IPC. The state level
+    // already forces publishOptedIn=false for them (addAgent + restore
+    // coercion), so this is belt-and-suspenders against a stale snapshot
+    // or a programmatic setPublishOptedIn slipping a true through.
+    if (
+      !agentHandle ||
+      !isRunning ||
+      !isPublishing ||
+      !collabSessionId ||
+      !supportsPeerContextPublishing(toolId)
+    ) {
       return;
     }
     let unmounted = false;
@@ -1081,7 +1101,7 @@ export function AgentMiniTerminal({
         >
           {indicator.label}
         </span>
-        {agent && (
+        {agent && supportsPeerContextPublishing(tool.id) && (
           <button
             className="text-text-dim hover:text-cyan-400 transition-colors p-0.5 shrink-0"
             onClick={() =>

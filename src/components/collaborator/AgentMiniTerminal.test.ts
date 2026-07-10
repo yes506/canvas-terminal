@@ -458,3 +458,35 @@ describe("visibility-restore IntersectionObserver", () => {
     );
   });
 });
+
+describe("agy migration — watch-effect capability guard + Eye toggle (node 18)", () => {
+  // Source-text checks in the established pattern above: the watch effect
+  // and the header JSX are not extracted into unit-testable helpers, and
+  // rendering the full component would drag in xterm/PTY plumbing. The
+  // state-level behavior (publishOptedIn forced false for agy) is covered
+  // in collaboratorStore.test.ts; these lock the belt-and-suspenders
+  // wiring that guarantees ZERO `watch_transcript` IPC attempts for the
+  // gemini_cli slot even if a stale snapshot slips a `true` through.
+  const source = readFileSync(
+    resolve(process.cwd(), "src/components/collaborator/AgentMiniTerminal.tsx"),
+    "utf8",
+  );
+
+  it("gates the watch effect on supportsPeerContextPublishing(toolId)", () => {
+    expect(source).toMatch(
+      /!supportsPeerContextPublishing\(toolId\)\s*\)\s*\{\s*\n\s*return;/,
+    );
+  });
+
+  it("hides the Eye toggle for unsupported tools", () => {
+    expect(source).toMatch(
+      /\{agent && supportsPeerContextPublishing\(tool\.id\) && \(/,
+    );
+  });
+
+  it("imports the predicate from the tool registry (single source of truth)", () => {
+    expect(source).toContain(
+      'import { supportsPeerContextPublishing } from "../../types/collaborator";',
+    );
+  });
+});
