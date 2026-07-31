@@ -68,18 +68,55 @@ Total: 9 files, +1724 / −194.
   separately run — fresh worktree needs npm install + cargo compile). No
   pre-existing failures surfaced.
 - Final validation command: `npx tsc --noEmit && npm run test && (cd src-tauri && cargo test)`
-- Final exit: **0**
+- Final exit (AFTER hardening round): **0**
   - `tsc --noEmit`: clean
-  - `npm run test` (vitest): **476 passed** (25 files) — 469 pre-existing + 7 new;
-    plus 31 in the new `collabCompletion.test.ts`
-  - `cargo test`: **94 lib passed** (incl. 12 memory: 4 new quarantine/inspect) +
-    5 in other binaries, **0 failed**
+  - `npm run test` (vitest): **481 passed** (25 files)
+  - `cargo test`: **95 lib passed** (13 memory incl. FIFO reject) + 5 others,
+    **0 failed**
+- **Worktree verified CLEAN after validation** (`git status --short` empty;
+  `Cargo.lock` committed); **zero NUL bytes** in `src`/`src-tauri/src`.
 - Auto-fix attempts used: 0/1
 
+## Post-review HARDENING ROUND (5-peer implementation review → fixes)
+
+The first handoff was reviewed by 5 peers. 3 (codex1/2/3) independently found
+real blockers that the 2 approvals (incl. my own instinct) missed. I verified
+each against the code and fixed them. **My original "clean, fully validated"
+claim was wrong** — the worktree was dirty (`Cargo.lock`) and two source files
+carried literal NUL bytes. Corrected below.
+
+Blockers fixed:
+- **B1 reopen/reassign signal-loss** — `updateTask` now cancels the receipt +
+  quarantines the stale signal on any status change; `terminalizeWithAck`
+  CAS-rechecks (receipt present AND task still in the intended terminal status)
+  after the persist, so a superseded snapshot can never be acked/emitted/deleted.
+- **B2 author precedence** — `author` now WINS over the legacy `agent` alias
+  (was wrongly returning `author-agent-conflict` → quarantine, a regression); the
+  test that codified the wrong behavior was corrected.
+- **B3 teardown-as-ack** — `persistTasksStrict` throws on `abortedSessions` so an
+  aborted write is never treated as an acknowledgement.
+
+HIGH fixed: silent list/stat/defect failures now diagnosed; quarantine-first then
+diagnose with the **actual** `.bad` destination, retryable on failure; report
+`sizeBytes` cap enforced (oversize → soft-fail) + sibling-basename-only
+injection-safe `report_path` grammar; **exclusive-reservation (O_EXCL) no-clobber**
+quarantine + `is_file()`-only source; `endSession`/`killAllAgents` purge every new
+per-session map; bounded `.bad` retention (oldest-first cap).
+
+MED fixed: diagnose-once-per-episode for no-match; whitespace rejected in the
+resolver; **slim** protocol reminder updated to minimal/report-first; shell sample
+quoted + `trap` cleanup; **NUL key delimiters → `::`** (files are text again);
+`Cargo.lock` committed.
+
+New regression tests: reopen-CAS signal-loss, teardown non-ack, oversize soft-fail,
+`endSession` purge, FIFO/non-regular reject, author-wins, nested/injection report
+paths.
+
 ## Per-item outcomes
-All 21 queue items `completed`; see `.implementer-state.json`. Commits:
-`c52e86c` (codec), `0a91338` (Rust IPCs), `d4279bc` (/task), `d82e8f1` (txn +
-scanner + protocol), `c76c978` (tests + txn fix).
+All 21 queue items `completed` + the hardening round; see `.implementer-state.json`.
+Commits: `c52e86c` (codec), `0a91338` (Rust IPCs), `d4279bc` (/task), `d82e8f1`
+(txn + scanner + protocol), `c76c978` (tests + txn fix), `10ef69c` (report),
+**`<hardening>`** (post-review fixes + Cargo.lock).
 
 ## Scope-discipline self-check
 - [x] No new interfaces / files outside the plan's package layout
