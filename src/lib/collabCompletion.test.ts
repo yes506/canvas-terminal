@@ -56,7 +56,7 @@ describe("resolveTaskId (N5, exact-first)", () => {
 
   it("rejects whitespace, arbitrary prefixes, extra suffixes → none", () => {
     const tasks = [t("task-1-1785474396813")];
-    expect(resolveTaskId(tasks, " task-1 ").kind).toBe("unique"); // trimmed
+    expect(resolveTaskId(tasks, " task-1 ").kind).toBe("none"); // whitespace rejected, not trimmed
     expect(resolveTaskId(tasks, "task-1x").kind).toBe("none");
     expect(resolveTaskId(tasks, "task-01").kind).toBe("none"); // leading zero
     expect(resolveTaskId(tasks, "ask-1").kind).toBe("none");
@@ -143,7 +143,7 @@ describe("validateSignal (N4, legacy-compatible strict schema)", () => {
     expect(r.ok && r.value.author).toBe("@claude2");
   });
 
-  it("author wins over agent when both present & equal; conflict when differ", () => {
+  it("author WINS over legacy agent alias — disagreement is never a rejection (plan N4)", () => {
     const same = validateSignal(
       `{"task_id":"task-1","status":"completed","author":"@a","agent":"@a"}`,
       fn,
@@ -153,7 +153,8 @@ describe("validateSignal (N4, legacy-compatible strict schema)", () => {
       `{"task_id":"task-1","status":"completed","author":"@a","agent":"@b"}`,
       fn,
     );
-    expect(diff).toEqual({ ok: false, reason: "author-agent-conflict" });
+    expect(diff.ok).toBe(true); // NOT rejected
+    expect(diff.ok && diff.value.author).toBe("@a"); // author wins
   });
 
   it("filename↔payload: full filename + stripped payload agree (and vice-versa)", () => {
@@ -210,6 +211,14 @@ describe("classifyReportPath", () => {
     expect(classifyReportPath("r.txt").kind).toBe("unsafe");
     expect(classifyReportPath("x.done.json").kind).toBe("unsafe");
     expect(classifyReportPath(42).kind).toBe("unsafe");
+  });
+  it("rejects nested paths, Markdown metacharacters, and control chars (injection-safe)", () => {
+    expect(classifyReportPath("sub/report.md").kind).toBe("unsafe"); // nested
+    expect(classifyReportPath("a b.md").kind).toBe("unsafe"); // space
+    expect(classifyReportPath("evil#heading.md").kind).toBe("unsafe"); // markdown meta
+    expect(classifyReportPath("a\nb.md").kind).toBe("unsafe"); // newline
+    expect(classifyReportPath("bad|table.md").kind).toBe("unsafe"); // pipe
+    expect(classifyReportPath("task-1-report.md").kind).toBe("usable");
   });
 });
 

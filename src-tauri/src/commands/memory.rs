@@ -564,22 +564,19 @@ pub(crate) fn quarantine_under(
     dir: &std::path::Path,
     relative_path: &str,
 ) -> Result<String, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let source = reject_symlinked_path(dir, relative_path)?;
 
-    // Source must be an existing regular file (never a symlink or directory).
+    // Source must be an existing REGULAR file — reject symlink, directory, AND
+    // every other non-regular node (FIFO, socket, device): `is_file()` is the
+    // positive check, stricter than "not symlink && not dir".
     let meta = std::fs::symlink_metadata(&source)
         .map_err(|e| format!("quarantine stat {}: {}", relative_path, e))?;
-    if meta.is_symlink() {
-        return Err("Refusing to quarantine a symlink".to_string());
-    }
-    if meta.is_dir() {
-        return Err("Refusing to quarantine a directory".to_string());
+    if !meta.is_file() {
+        return Err("Refusing to quarantine a non-regular file".to_string());
     }
 
-    // Collision-safe destination in the SAME parent directory. pid+nanos makes
-    // the name effectively unique so an earlier forensic `.bad` artifact is
-    // never clobbered (macOS has no RENAME_NOREPLACE; a unique name is the
-    // portable no-clobber). Verified non-existent before the rename anyway.
     let basename = source
         .file_name()
         .ok_or_else(|| "Source has no basename".to_string())?
@@ -588,15 +585,48 @@ pub(crate) fn quarantine_under(
     let parent = source
         .parent()
         .ok_or_else(|| "Source has no parent".to_string())?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_nanos();
-    let dest = parent.join(format!("{}.{}.{}.bad", basename, std::process::id(), nanos));
-    if std::fs::symlink_metadata(&dest).is_ok() {
-        return Err("Quarantine destination already exists (collision)".to_string());
+
+    // Exclusive-reservation no-clobber (portable — macOS lacks
+    // RENAME_NOREPLACE): atomically CREATE_NEW (O_EXCL) a unique `.bad`
+    // destination so the name is provably ours before we rename into it. If the
+    // name collides (astronomically unlikely with pid+nanos), bump the counter
+    // and retry. This guarantees no EARLIER forensic `.bad` artifact is ever
+    // overwritten by the subsequent rename (it would have a different name).
+    let mut dest = parent.join(String::new());
+    let mut reserved = false;
+    for attempt in 0..64u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let candidate = parent.join(format!(
+            "{}.{}.{}.{}.bad",
+            basename,
+            std::process::id(),
+            nanos,
+            attempt
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&candidate)
+        {
+            Ok(_) => {
+                dest = candidate;
+                reserved = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("quarantine reserve: {}", e)),
+        }
+    }
+    if !reserved {
+        return Err("quarantine: could not reserve a destination name".to_string());
     }
 
+    // Rename replaces our just-created empty reservation with the source bytes;
+    // atomic within the same parent directory.
     std::fs::rename(&source, &dest)
         .map_err(|e| format!("quarantine rename {}: {}", relative_path, e))?;
     Ok(dest.to_string_lossy().to_string())
@@ -818,6 +848,21 @@ mod scoped_memory_tests {
         let link = root.join("task-3.done.json");
         std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
         assert!(quarantine_memory_file(sid.into(), "task-3.done.json".into()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_rejects_non_regular_fifo() {
+        let sid = "session-mem-quar-fifo";
+        let root = get_memory_session_root(sid).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("task-4.done.json");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        if rc == 0 {
+            // A FIFO is not a regular file → must be refused (is_file() gate).
+            assert!(quarantine_memory_file(sid.into(), "task-4.done.json".into()).is_err());
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

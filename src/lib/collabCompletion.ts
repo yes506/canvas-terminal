@@ -65,18 +65,19 @@ export function resolveTaskId<T extends { id: string }>(
   tasks: ReadonlyArray<T>,
   id: string,
 ): ResolveResult<T> {
-  const trimmed = id.trim();
-  if (trimmed.length === 0) return { kind: "none" };
+  // Reject leading/trailing whitespace outright (plan N5) — do NOT silently
+  // trim, so a padded id can't masquerade as a valid one.
+  if (id.length === 0 || id !== id.trim()) return { kind: "none" };
 
   // Stage 1 — exact full/verbatim match takes precedence.
-  const exact = tasks.filter((t) => t.id === trimmed);
+  const exact = tasks.filter((t) => t.id === id);
   if (exact.length === 1) return { kind: "unique", task: exact[0] };
   if (exact.length > 1) return { kind: "ambiguous", matches: exact };
 
   // Stage 2 — normalized match, but only for a grammar-valid id (no arbitrary
   // prefixes). An id that isn't a valid short/full form matches nothing.
-  if (!isValidTaskId(trimmed)) return { kind: "none" };
-  const key = stripTaskId(trimmed);
+  if (!isValidTaskId(id)) return { kind: "none" };
+  const key = stripTaskId(id);
   const norm = tasks.filter((t) => stripTaskId(t.id) === key);
   if (norm.length === 1) return { kind: "unique", task: norm[0] };
   if (norm.length > 1) return { kind: "ambiguous", matches: norm };
@@ -119,8 +120,7 @@ export type IngestFailReason =
   | "missing-status"
   | "bad-status"
   | "bad-field-type"
-  | "filename-payload-mismatch"
-  | "author-agent-conflict";
+  | "filename-payload-mismatch";
 
 export type ValidateResult =
   | { ok: true; value: CompletionSignal }
@@ -148,11 +148,10 @@ export function classifyReportPath(v: unknown): ReportPathFlag {
     return { kind: "unsafe", raw: String(v) };
   }
   const raw = v.trim();
-  // Session-relative, `.md`, no absolute root, no traversal, not a signal file.
+  const SAFE_REPORT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.md$/;
   const unsafe =
-    raw.startsWith("/") ||
-    raw.split("/").some((seg) => seg === ".." || seg === ".") ||
-    !raw.endsWith(".md") ||
+    !SAFE_REPORT_NAME.test(raw) ||
+    raw.includes("..") ||
     raw.endsWith(".done.json");
   return unsafe ? { kind: "unsafe", raw } : { kind: "usable", path: raw };
 }
@@ -216,14 +215,18 @@ export function validateSignal(raw: string, fileName: string): ValidateResult {
   ) {
     return { ok: false, reason: "bad-field-type" };
   }
-  // author precedence over legacy agent; conflict only when BOTH present & differ.
-  if (
-    authorRes.value !== null && agentRes.value !== null &&
-    authorRes.value !== agentRes.value
-  ) {
-    return { ok: false, reason: "author-agent-conflict" };
-  }
+  // Author precedence over the legacy `agent` alias (plan N4): `author` WINS on
+  // disagreement — it is NEVER a rejection (rejecting would send a valid
+  // completion to quarantine, a backward-compat regression). A disagreeing
+  // `agent` alias is simply ignored; the scanner may log it as an aside.
   const author = authorRes.value ?? agentRes.value;
+  const ignoredAgentAlias =
+    authorRes.value !== null &&
+    agentRes.value !== null &&
+    authorRes.value !== agentRes.value
+      ? agentRes.value
+      : null;
+  void ignoredAgentAlias; // reserved for an optional diagnostic; never blocks
 
   return {
     ok: true,
@@ -343,7 +346,7 @@ export class StabilityTracker {
 
   /**
    * Record one observation of a content failure and report whether it is now
-   * stable enough to quarantine + diagnose. `key` is `${session} ${relPath}`.
+   * stable enough to quarantine + diagnose. `key` is `${session}::${relPath}`.
    */
   observe(
     key: string,
@@ -395,7 +398,7 @@ export class StabilityTracker {
 
   /** Drop every record whose key belongs to `session` (session teardown). */
   purgeSession(session: string): void {
-    const prefix = `${session} `;
+    const prefix = `${session}::`;
     for (const k of this.records.keys()) {
       if (k.startsWith(prefix)) this.records.delete(k);
     }
@@ -414,5 +417,5 @@ export class StabilityTracker {
 
 /** Compose a tracker key from session + relative path. */
 export function stabilityKey(session: string, relPath: string): string {
-  return `${session} ${relPath}`;
+  return `${session}::${relPath}`;
 }

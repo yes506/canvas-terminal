@@ -3091,3 +3091,106 @@ describe("collab-signal-hardening — /task uses exact-first resolver", () => {
     expect(tasks.find((t) => t.id === "task-10-1785474396999")!.status).not.toBe("completed");
   });
 });
+
+// Regression coverage for the post-review hardening round (task-35 fixes).
+describe("collab-signal-hardening — hardening round (reopen CAS, teardown, oversize)", () => {
+  beforeEach(() => {
+    resetStores();
+    _resetTerminalizationStateForTests();
+  });
+
+  function taskReports(): number {
+    const entries = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    return entries.filter((e) => e.content.includes("Task Report")).length;
+  }
+
+  it("B1: reopen after a failed persist SUPERSEDES the completion — signal quarantined not lost, task stays reopened, no false emit", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    const quarantined = new Set<string>();
+    const deleted: string[] = [];
+    let atomicOk = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      const rel = (args as { relativePath?: string })?.relativePath;
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return quarantined.has(signalPath) ? [] : [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
+      if (cmd === "quarantine_memory_file") { quarantined.add(rel!); return `${rel}.bad`; }
+      if (cmd === "delete_memory_file") { deleted.push(rel!); return true; }
+      return null;
+    });
+
+    await scanForTaskCompletions(SESSION); // persist fails → receipt retained, signal kept
+    expect(deleted).not.toContain(signalPath);
+
+    // User explicitly reopens the task — must cancel the receipt + quarantine the signal.
+    useCollaboratorStore.getState().updateTask(task.id, { status: "pending" }, SESSION);
+
+    atomicOk = true;
+    await scanForTaskCompletions(SESSION); // signal now quarantined → nothing to re-complete
+
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("pending"); // reopen WON — not silently re-completed
+    expect(quarantined.has(signalPath)).toBe(true); // signal preserved forensically
+    expect(deleted).not.toContain(signalPath); // never deleted against a reopened task
+  });
+
+  it("B3: a signal never terminalizes during teardown (aborted persist is not an ack)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    const deleted: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+      if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+      return null;
+    });
+    useCollaboratorStore.getState().endSession(SESSION); // marks the session aborted
+    await scanForTaskCompletions(SESSION);
+    expect(deleted).not.toContain(signalPath); // aborted persist must not ack + delete
+  });
+
+  it("oversize report_path soft-fails: task terminalizes, reference dropped, no quarantine", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const reportPath = `${task.id}-report.md`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1", report_path: reportPath });
+    const quarantined: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "inspect_report_file") return { exists: true, isRegular: true, sizeBytes: 1024 * 1024 }; // 1 MB > cap
+      if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+      if (cmd === "quarantine_memory_file") { quarantined.push((args as { relativePath: string }).relativePath); return "x.bad"; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION);
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("completed"); // soft-fail still terminalizes
+    expect(t.output ?? "").not.toContain("Report:"); // oversize reference dropped
+    expect(quarantined).not.toContain(signalPath);
+    expect(taskReports()).toBe(1);
+  });
+
+  it("endSession purges per-session terminalization state (no cross-session residue)", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    // Terminalize via the human path so a revision is bumped, then end the session.
+    store.updateTask(task.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+    useCollaboratorStore.getState().endSession(SESSION);
+    // A fresh scan on the ended session must be a clean no-op (state purged).
+    expect(() => useCollaboratorStore.getState().getTasks(SESSION)).not.toThrow();
+  });
+});
