@@ -154,6 +154,49 @@ export interface ScopedMemoryIpc {
    * Collaborators: Rust memory::get_memory_file_mtime (scoped); memory::get_memory_session_dir.
    */
   getMemoryFileMtime(collabSessionId: string, relativePath: string): Promise<number>;
+
+  /**
+   * Responsibility: Quarantine a bad completion-signal file by renaming it to a
+   *   collision-safe `<name>.<pid>.<nanos>.bad` sibling (no-clobber), removing it
+   *   from the `*.done.json` scan filter and preserving the bytes as evidence.
+   * Pipeline-position: CompletionScanner.ingestSignalFile (stable content failure) -> THIS -> reportIngestFailure
+   * Inputs:
+   *   - collabSessionId: string — same constraint as readMemoryFile
+   *   - relativePath: string — the `.done.json` to quarantine
+   * Outputs: Promise<string> — absolute path of the `.bad` artifact
+   * Side-effects: renames the file within its parent dir (atomic on one fs)
+   * Preconditions: caller owns collabSessionId; source is a regular file
+   * Postconditions: original relativePath no longer exists; a `.bad` sibling does
+   * Failure-modes: Error("Refusing to quarantine a symlink"/"...directory"),
+   *   Error("Path traversal ...") / gate violations, Error on rename failure
+   * Collaborators: Rust memory::quarantine_memory_file (scoped).
+   */
+  quarantineMemoryFile(collabSessionId: string, relativePath: string): Promise<string>;
+
+  /**
+   * Responsibility: Inspect a completion `report_path` reference WITHOUT following
+   *   symlinks (the generic read/mtime IPCs follow them; a report path is
+   *   agent-influenced, so it needs a no-follow inspector).
+   * Pipeline-position: CompletionScanner.ingestSignalFile (report-ref map, N8) -> THIS
+   * Inputs:
+   *   - collabSessionId: string — same constraint as readMemoryFile
+   *   - relativePath: string — session-relative `.md` report path from the signal
+   * Outputs: Promise<ReportFileInfo> — {exists,isRegular,sizeBytes}; content never read
+   * Side-effects: None (symlink_metadata stat only)
+   * Preconditions: caller owns collabSessionId
+   * Postconditions: no state change
+   * Failure-modes: Error("Refusing to inspect a symlinked report") / gate
+   *   violations — caller treats any error as an unsafe reference (soft-fail)
+   * Collaborators: Rust memory::inspect_report_file (scoped).
+   */
+  inspectReportFile(collabSessionId: string, relativePath: string): Promise<ReportFileInfo>;
+}
+
+/** Structural facts about a completion report file, discovered no-follow. */
+export interface ReportFileInfo {
+  exists: boolean;
+  isRegular: boolean;
+  sizeBytes: number;
 }
 
 /**
