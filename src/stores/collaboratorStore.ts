@@ -13,6 +13,14 @@ import type { AgentSnapshot } from "../lib/resilience/types";
 import { muteCapture } from "../lib/agentOutputCapture";
 import { hasContextsBreadcrumb } from "../lib/peerContext";
 import { scopedMemoryClient, scopedMemoryIpc } from "../lib/scopedCollabMemory";
+import {
+  validateSignal,
+  resolveTaskId,
+  StabilityTracker,
+  stabilityKey,
+  contentHash,
+  type CompletionSignal,
+} from "../lib/collabCompletion";
 import { useTerminalStore } from "./terminalStore";
 
 // ---------------------------------------------------------------------------
@@ -360,6 +368,70 @@ const taskWriteChainsBySession = new Map<string, Promise<unknown>>();
 // write paths, not just tasks.
 const abortedSessions = new Set<string>();
 
+// ---------------------------------------------------------------------------
+// Persistence-acknowledged terminalization (collab-signal-hardening N9/N10/N11).
+//
+// The scanner terminalizes a task only after the task-ledger write is
+// ACKNOWLEDGED (strict, non-swallowing) — never fire-and-forget like the
+// human `/task done` path — so a persist failure can't consume the signal
+// while leaving the on-disk ledger stale. A monotonic per-session revision
+// fences a stale ordinary write from clobbering a newer acknowledged terminal
+// write; JS being single-threaded, the synchronous terminal-mark + strict
+// enqueue already prevents the primary interleave, and this is defense in
+// depth. "Acknowledged" ≠ fsync-durable and ≠ reload-surviving.
+// ---------------------------------------------------------------------------
+const ledgerRevBySession = new Map<string, number>();
+const landedRevBySession = new Map<string, number>();
+
+function bumpLedgerRev(forSession: string): number {
+  const next = (ledgerRevBySession.get(forSession) ?? 0) + 1;
+  ledgerRevBySession.set(forSession, next);
+  return next;
+}
+
+type ReceiptPhase =
+  | "terminal_unpersisted"
+  | "ledger_acknowledged"
+  | "effects_emitted"
+  | "signal_deleted";
+
+interface TerminalizationReceipt {
+  phase: ReceiptPhase;
+  rev: number;
+}
+
+/** Keyed by `${session}\0${taskId}\0${signalPath}`. */
+const terminalizationReceipts = new Map<string, TerminalizationReceipt>();
+
+function receiptKey(forSession: string, taskId: string, signalPath: string): string {
+  return `${forSession} ${taskId} ${signalPath}`;
+}
+
+// Per-`(session,relPath)` in-flight guard: overlapping scans (onFlush + 2s poll
+// + pty-exit) must not both enter ingestion for the same file, or they could
+// double-quarantine / double-diagnose / double-terminalize.
+const ingestInFlight = new Map<string, Promise<void>>();
+
+// Module-scoped stability gate (persists across scan invocations). Injected
+// clock defaults to the system clock; tests construct their own tracker.
+const scanStabilityTracker = new StabilityTracker();
+
+// Rate-limit / dedupe peer-visible ingestion diagnostics, keyed by
+// `${session} ${relPath} ${reason}`. Cleared on corrected-success / quarantine
+// / file-gone / teardown / TTL so a fixed file re-diagnoses cleanly.
+const ingestDiagnosticDedupe = new Map<string, number>();
+const INGEST_DIAG_TTL_MS = 60_000;
+
+/** Test-only reset of the terminalization-txn module state (vitest isolation). */
+export function _resetTerminalizationStateForTests(): void {
+  ledgerRevBySession.clear();
+  landedRevBySession.clear();
+  terminalizationReceipts.clear();
+  ingestInFlight.clear();
+  ingestDiagnosticDedupe.clear();
+  scanStabilityTracker.clearAll();
+}
+
 // Per-agent in-flight first-send promise. Enforces ORDERING during the
 // first-send window: while a first-send is running for a sessionId, any
 // concurrent send to the same agent waits for it to settle before deciding
@@ -461,23 +533,32 @@ You are a participant in a multi-agent collaboration.
 3. **Be self-contained**: Include enough detail that any other agent can understand what you did.
 4. **Reference by task ID** (e.g. "task-1-...").
 5. **Signal blockers**: State the blocking task ID and what you need. Try Rule 2 first before declaring blocked on a missing-info gap.
-6. **Signal completion**: When done, write a JSON file to the shared memory directory to signal task completion. The system will automatically update the task and generate a report in the conversation log.
+6. **Signal completion**: When done, FIRST write your full report (reasoning, conclusion, outputs) as a Markdown file, THEN write a MINIMAL JSON signal that points at it. Keep the JSON to the fixed fields below and put ALL prose in the \`.md\` report — free prose inside the JSON is the #1 cause of malformed signals that get silently dropped. Write each file to a temp path and \`mv\` it into place (atomic), and write the report BEFORE the signal so the signal never appears before its report.
 7. **Stay inside YOUR session directory**: Every path above lives in this session's own memory directory. Do NOT read, grep, or write sibling session directories (other subdirectories next to your session directory, e.g. \`../<other-session-id>/\`) — they belong to other collaborator panes and are off-limits.
 
 \`\`\`bash
-cat > SHARED_MEMORY_DIR/TASK_ID.done.json << 'EOF'
+# 1) Report FIRST (atomic: temp then mv). All prose goes here, not in the JSON.
+cat > SHARED_MEMORY_DIR/.TASK_ID-report.md.tmp << 'EOF'
+# TASK_ID — report
+**Reasoning**: Why this approach, alternatives considered, trade-offs
+**Conclusion**: What was decided/done (1-3 sentences)
+**Output**: file paths, artifacts, or key results
+EOF
+mv SHARED_MEMORY_DIR/.TASK_ID-report.md.tmp SHARED_MEMORY_DIR/TASK_ID-report.md
+
+# 2) Then the MINIMAL signal (atomic: temp then mv). No prose fields here.
+cat > SHARED_MEMORY_DIR/.TASK_ID.done.json.tmp << 'EOF'
 {
   "task_id": "TASK_ID",
-  "author": "YOUR_IDENTITY",
   "status": "completed",
-  "reasoning": "Why this approach, alternatives considered, trade-offs",
-  "conclusion": "What was decided/done (1-3 sentences)",
-  "output": "file paths, artifacts, or key results"
+  "author": "YOUR_IDENTITY",
+  "report_path": "TASK_ID-report.md"
 }
 EOF
+mv SHARED_MEMORY_DIR/.TASK_ID.done.json.tmp SHARED_MEMORY_DIR/TASK_ID.done.json
 \`\`\`
 
-Replace \`SHARED_MEMORY_DIR\` with the path shown above, \`TASK_ID\` with your assigned task ID, and \`YOUR_IDENTITY\` with your agent identity (shown in the header above, e.g. @claude1).
+Replace \`SHARED_MEMORY_DIR\` with the path shown above, \`TASK_ID\` with your assigned task ID, and \`YOUR_IDENTITY\` with your agent identity (shown in the header above, e.g. @claude1). \`status\` must be \`completed\` or \`blocked\`. \`report_path\` is a session-relative \`.md\` filename — it's how the orchestrator finds your write-up.
 
 ### File Conventions
 - \`conversation-*.md\` — **Read only** for context. Do NOT write to it directly. The system appends task reports automatically when task status changes.
@@ -941,6 +1022,30 @@ interface CollaboratorState {
   ) => void;
   getTasks: (forSession: string) => CollabTask[];
   persistTasks: (forSession: string) => Promise<void>;
+  /** Emit the terminal Task Report + in-frame outcome + unread for a task that
+   *  is ALREADY terminal in memory. Shared by `updateTask` (human path) and the
+   *  scanner's `terminalizeWithAck` so the two can't drift. */
+  emitTaskTerminalOutcome: (taskId: string, forSession: string) => void;
+  /** Strict, revision-fenced, visibility-atomic ledger write that REJECTS on
+   *  IPC failure (unlike fire-and-forget `persistTasks`). */
+  persistTasksStrict: (forSession: string, rev: number) => Promise<void>;
+  /** Persistence-acknowledged terminalization: mark terminal → strict ledger
+   *  write → emit side effects once → delete the signal. Returns false (signal
+   *  retained) if the ledger write was not acknowledged. */
+  terminalizeWithAck: (
+    taskId: string,
+    updates: Partial<Pick<CollabTask, "status" | "reasoning" | "conclusion" | "output" | "completedBy">>,
+    forSession: string,
+    signalPath: string,
+  ) => Promise<boolean>;
+  /** Peer-visible (conversation-log) + console-fallback ingestion diagnostic,
+   *  rate-limited per `(session, path, reason)`. */
+  reportIngestFailure: (
+    reason: string,
+    relPath: string,
+    forSession: string,
+    hint?: string,
+  ) => void;
 
   // Input history
   pushHistory: (input: string, forSession: string) => void;
@@ -982,105 +1087,235 @@ const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
  * the orphan check uses the SAME predicate as the in-loop `find` to
  * avoid silently classifying prefix-matching files as orphans.
  */
-export async function scanForTaskCompletions(forSession: string): Promise<void> {
+/** Clear every diagnostic-dedupe entry for one file (on corrected success). */
+function clearIngestDedupe(forSession: string, relPath: string): void {
+  const prefix = `${forSession} ${relPath} `;
+  for (const k of ingestDiagnosticDedupe.keys()) {
+    if (k.startsWith(prefix)) ingestDiagnosticDedupe.delete(k);
+  }
+}
+
+/**
+ * Content-derived failure (bad JSON/schema/filename OR ambiguous id): gate BOTH
+ * the peer-visible diagnostic AND quarantine on stability, so a legacy heredoc
+ * caught mid-write (bytes still changing) is neither quarantined nor falsely
+ * reported. Only once the same `(hash, reason, mtime)` is stable across the
+ * time window does it quarantine + diagnose.
+ */
+async function handleContentError(
+  forSession: string,
+  relPath: string,
+  raw: string,
+  reason: string,
+): Promise<void> {
+  const store = useCollaboratorStore.getState();
+  const key = stabilityKey(forSession, relPath);
+  let mtimeMs: number;
   try {
-    // Scoped list: only THIS session's subtree is walked, so a sibling
-    // pane's .done.json files are structurally invisible to this scan.
-    const files = await scopedMemoryIpc.listMemoryFiles(forSession);
-    const doneFiles = files.filter((f) => f.endsWith(".done.json"));
-    if (doneFiles.length === 0) return;
-
-    const store = useCollaboratorStore.getState();
-    // NOTE: the previous `if (store.getTasks(forSession).length === 0) return;`
-    // early-return blocked empty-session panes from running orphan cleanup.
-    // Removed so the loop below can walk `doneFiles` even when this session
-    // has no tasks — orphans by definition aren't in any session's list.
-
-    for (const relPath of doneFiles) {
-      try {
-        const raw = await scopedMemoryIpc.readMemoryFile(forSession, relPath);
-        if (!raw) continue;
-        const data = JSON.parse(raw) as {
-          task_id?: string;
-          status?: string;
-          author?: string;
-          agent?: string;
-          reasoning?: string;
-          conclusion?: string;
-          output?: string;
-        };
-        if (!data.task_id) continue;
-
-        // Prefix-tolerant matcher — agents sometimes drop the
-        // `-${Date.now()}` suffix from `task_id` in their `.done.json`
-        // payloads (e.g. `"task-1"` vs stored `"task-1-1234"`). The
-        // orphan check below MUST use this same predicate so prefix
-        // matches aren't classified as orphan.
-        const matches = (t: CollabTask) =>
-          t.id === data.task_id || t.id.startsWith(data.task_id!);
-
-        // Re-read the current task list inside the loop (codex2's recurring
-        // race finding). Using a snapshot taken before the loop lets two
-        // concurrent scans both see a non-terminal task and double-fire
-        // updateTask + delete_memory_file. By reading fresh state per
-        // iteration, the second scan sees the already-terminal task and
-        // bails instead of producing duplicate "Task updated:" log lines.
-        const tasksNow = store.getTasks(forSession);
-        const task = tasksNow.find(matches);
-
-        if (!task) {
-          // Cross-session orphan check — per-iteration re-read of
-          // `tasksBySession` mirrors the in-loop pattern above so a
-          // mid-scan `addTask` (e.g. from `sendToAgent` auto-creating a
-          // task) is seen by later iterations.
-          const allBySession = useCollaboratorStore.getState().tasksBySession;
-          const foundInAnySession = Object.values(allBySession).some((ts) =>
-            ts.some(matches),
-          );
-          if (!foundInAnySession) {
-            let mtimeMs: number | null;
-            try {
-              mtimeMs = await scopedMemoryIpc.getMemoryFileMtime(forSession, relPath);
-            } catch {
-              // File gone or stat failed (e.g. mtime-unsupported FS).
-              // Skip — preserves pre-cleanup behavior on such filesystems.
-              mtimeMs = null;
-            }
-            // `Math.max(0, …)` clamps backward clock skew (NTP correction,
-            // VM resume, manual clock change) so a recent file isn't
-            // false-deleted. Forward jumps >24h would still false-delete,
-            // but that's a rare scenario and the 24h grace bounds the risk.
-            if (mtimeMs !== null && Math.max(0, Date.now() - mtimeMs) > ORPHAN_GRACE_MS) {
-              await scopedMemoryIpc.deleteMemoryFile(forSession, relPath).catch(() => {});
-            }
-          }
-          continue;
-        }
-
-        if (task.status === "completed" || task.status === "blocked") {
-          // The race winner already terminalized this task. Best-effort
-          // delete so the file doesn't accumulate; ignore if it's gone.
-          await scopedMemoryIpc.deleteMemoryFile(forSession, relPath).catch(() => {});
-          continue;
-        }
-
-        const status = data.status === "blocked" ? "blocked" : "completed";
-        store.updateTask(task.id, {
-          status: status as CollabTask["status"],
-          reasoning: data.reasoning ?? null,
-          conclusion: data.conclusion ?? null,
-          output: data.output ?? null,
-          completedBy: data.author ?? data.agent ?? null,
-        }, forSession);
-
-        // Delete the signal file after processing
-        await scopedMemoryIpc.deleteMemoryFile(forSession, relPath);
-      } catch {
-        // Skip malformed files
-      }
-    }
+    mtimeMs = await scopedMemoryIpc.getMemoryFileMtime(forSession, relPath);
   } catch {
-    // Non-critical
+    return; // can't stat (file gone / unsupported) → treat as transient, retry
+  }
+  const stable = scanStabilityTracker.observe(key, {
+    hash: contentHash(raw),
+    errorCategory: reason,
+    mtimeMs,
+  });
+  if (!stable) return; // first/unstable observation is internal telemetry only
+  store.reportIngestFailure(reason, relPath, forSession, "inspect the quarantined .bad file");
+  await scopedMemoryIpc.quarantineMemoryFile(forSession, relPath).catch(() => {});
+  scanStabilityTracker.purge(key);
+}
+
+/**
+ * No unique match in THIS session. Honor the 24h hydration/orphan grace, then
+ * quarantine (never silent-delete — preserves forensics; never "leave it" —
+ * scoped memory means a sibling scanner can't see this file, so leaving strands
+ * it forever). Distinguishes `wrong_session` (unique match in another loaded
+ * session) for a clearer diagnostic, but never moves across sessions.
+ */
+async function handleNoMatch(
+  forSession: string,
+  relPath: string,
+  taskId: string,
+): Promise<void> {
+  const store = useCollaboratorStore.getState();
+  const allBySession = useCollaboratorStore.getState().tasksBySession;
+  let owner: string | null = null;
+  for (const [sid, ts] of Object.entries(allBySession)) {
+    if (sid === forSession) continue;
+    if (resolveTaskId(ts, taskId).kind === "unique") {
+      owner = sid;
+      break;
+    }
+  }
+  let mtimeMs: number | null;
+  try {
+    mtimeMs = await scopedMemoryIpc.getMemoryFileMtime(forSession, relPath);
+  } catch {
+    return; // can't stat → skip, retry next scan
+  }
+  if (mtimeMs === null) return;
+  const pastGrace = Math.max(0, Date.now() - mtimeMs) > ORPHAN_GRACE_MS;
+  const reason = owner ? "wrong-session" : "no-match";
+  if (!pastGrace) {
+    // Within grace: the owning session may not be hydrated yet — retain +
+    // diagnose once (deduped). A foreign scanner can't consume this file, so
+    // this is purely informational until the grace expires.
+    store.reportIngestFailure(
+      reason,
+      relPath,
+      forSession,
+      owner ? `owner session ${owner}; use /task ${taskId} done there` : `use /task ${taskId} done`,
+    );
+    return;
+  }
+  store.reportIngestFailure(
+    `${reason}-stale`,
+    relPath,
+    forSession,
+    owner ? `owner session ${owner}` : "no matching task after 24h",
+  );
+  await scopedMemoryIpc.quarantineMemoryFile(forSession, relPath).catch(() => {});
+}
+
+/**
+ * Map a signal's `report_path` (N8) into a discoverable Task-Report reference
+ * WITHOUT following symlinks. Missing / unreadable / unsafe reports SOFT-fail:
+ * the task still terminalizes, the reference is dropped, and a diagnostic is
+ * emitted (never quarantine — a valid completion must never hang on its report).
+ * Legacy `output` is preserved and the reference appended, discarding neither.
+ */
+async function resolveReportReference(
+  forSession: string,
+  relPath: string,
+  signal: CompletionSignal,
+): Promise<string | null> {
+  const store = useCollaboratorStore.getState();
+  const legacy = signal.output;
+  const rp = signal.reportPath;
+  if (rp.kind === "absent") return legacy;
+  if (rp.kind === "unsafe") {
+    store.reportIngestFailure("unsafe-report-path", relPath, forSession);
+    return legacy; // drop reference, still terminalize
+  }
+  try {
+    const info = await scopedMemoryIpc.inspectReportFile(forSession, rp.path);
+    if (info.exists && info.isRegular) {
+      const ref = `Report: ${rp.path}`;
+      return legacy ? `${legacy}\n${ref}` : ref;
+    }
+    store.reportIngestFailure("missing-report", rp.path, forSession);
+    return legacy;
+  } catch {
+    // symlinked/unsafe target or transient stat IPC error → soft-fail
+    store.reportIngestFailure("unreadable-report", rp.path, forSession);
+    return legacy;
+  }
+}
+
+/**
+ * Ingest ONE completion-signal file end to end (N15). The ONLY place the
+ * ok/fail branch lives. Every disposition is typed (see the plan's taxonomy);
+ * a signal read error is transient (never quarantine); a valid+matched signal
+ * terminalizes via the acknowledged transaction; report-path problems soft-fail.
+ */
+async function ingestSignalFile(forSession: string, relPath: string): Promise<void> {
+  const store = useCollaboratorStore.getState();
+  const key = stabilityKey(forSession, relPath);
+
+  let raw: string | null;
+  try {
+    raw = await scopedMemoryIpc.readMemoryFile(forSession, relPath);
+  } catch {
+    // Transient read failure — content unknown, so NEVER quarantine. Retry.
+    store.reportIngestFailure("read-error", relPath, forSession);
+    return;
+  }
+  if (raw === null) {
+    scanStabilityTracker.purge(key); // file gone between list and read — benign
+    return;
+  }
+
+  const result = validateSignal(raw, relPath);
+  if (!result.ok) {
+    await handleContentError(forSession, relPath, raw, result.reason);
+    return;
+  }
+  const signal = result.value;
+
+  const tasksNow = store.getTasks(forSession);
+  const res = resolveTaskId(tasksNow, signal.taskId);
+
+  if (res.kind === "ambiguous") {
+    await handleContentError(forSession, relPath, raw, "ambiguous-id");
+    return;
+  }
+  if (res.kind === "none") {
+    await handleNoMatch(forSession, relPath, signal.taskId);
+    return;
+  }
+  const task = res.task;
+
+  // Already-terminal short-circuit, RECEIPT-AWARE: only delete when there is no
+  // outstanding `terminal_unpersisted` receipt (i.e. durability is confirmed).
+  const rkey = receiptKey(forSession, task.id, relPath);
+  const isTerminal = task.status === "completed" || task.status === "blocked";
+  if (isTerminal && !terminalizationReceipts.has(rkey)) {
+    await scopedMemoryIpc.deleteMemoryFile(forSession, relPath).catch(() => {});
+    scanStabilityTracker.purge(key);
+    clearIngestDedupe(forSession, relPath);
+    return;
+  }
+
+  const output = await resolveReportReference(forSession, relPath, signal);
+
+  const ok = await store.terminalizeWithAck(
+    task.id,
+    {
+      status: signal.status,
+      reasoning: signal.reasoning,
+      conclusion: signal.conclusion,
+      output,
+      completedBy: signal.author,
+    },
+    forSession,
+    relPath,
+  );
+  if (ok) {
+    scanStabilityTracker.purge(key);
+    clearIngestDedupe(forSession, relPath);
+  }
+  // !ok → ledger write not acknowledged: signal + receipt retained, retried.
+}
+
+/**
+ * Scan one session's memory subtree for completion-signal files and ingest each
+ * (N16). Scoped list → a sibling pane's files are structurally invisible. A
+ * per-`(session,relPath)` in-flight guard prevents two overlapping scans
+ * (onFlush + 2s poll + pty-exit) from double-entering ingestion for one file.
+ */
+export async function scanForTaskCompletions(forSession: string): Promise<void> {
+  let doneFiles: string[];
+  try {
+    const files = await scopedMemoryIpc.listMemoryFiles(forSession);
+    doneFiles = files.filter((f) => f.endsWith(".done.json"));
+  } catch {
+    // Top-level list IPC failure — no file to attribute; retry next scan.
+    return;
+  }
+  if (doneFiles.length === 0) return;
+
+  for (const relPath of doneFiles) {
+    const guardKey = `${forSession} ${relPath}`;
+    if (ingestInFlight.has(guardKey)) continue; // another scan owns this file
+    const p = ingestSignalFile(forSession, relPath)
+      .catch(() => {}) // per-file failures are handled inside; never break the loop
+      .finally(() => {
+        ingestInFlight.delete(guardKey);
+      });
+    ingestInFlight.set(guardKey, p);
+    await p;
   }
 }
 
@@ -2126,87 +2361,89 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     }));
     const task = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
     if (task) {
-      // Append a structured task report when status changes to a terminal state
+      // Append a structured task report when status changes to a terminal state.
       const isTerminal = task.status === "completed" || task.status === "blocked";
       const statusChanged = task.status !== prevStatus;
       if (isTerminal && statusChanged) {
-        // Decorate the resolved author handle with its current nickname,
-        // when the agent is still in the session roster. Falls back to the
-        // bare handle (existing behavior) for assignees whose agent has
-        // since exited or was never in this session — this preserves the
-        // codex3 round-6 invariant that an empty `completedBy` falls
-        // through to `assignee` and never produces an empty Agent line.
-        const author = resolveTaskAuthor(task);
-        const sessionAgents = get().agents.filter((a) => a.collabSessionId === forSession);
-        const authorNick = author ? buildNicknameIndex(sessionAgents).get(author.trim()) : null;
-        const report = [
-          `# ${task.id} — ${task.status}`,
-          // Use the shared resolveTaskAuthor helper so this header and
-          // the outcome-routing fallback below can't drift (claude3
-          // round-7 D6 — both sites previously open-coded the same
-          // trim()+|| pattern).
-          `**Agent**: ${formatAgentRef(author, authorNick)}`,
-          `**Subject**: ${task.title}`,
-          task.reasoning ? `**Reasoning**: ${task.reasoning}` : null,
-          task.conclusion ? `**Conclusion**: ${task.conclusion}` : null,
-          task.output ? `**Output**: ${task.output}` : null,
-        ].filter(Boolean).join("\n");
-        get().appendLog("system", `Task Report\n${report}`, forSession);
-
-        // (PR-A's 4 s footer status was removed in task-16: it duplicated the
-        // new per-agent in-frame indicator on every terminal-state transition.)
-
-        // Per-agent in-frame outcome — replaces the previous global toast.
-        // Keyed by handle (e.g. "claude1") within the collab session, so the
-        // mini-terminal for the responsible agent can light up + show a state
-        // message. Uses the shared resolveTaskAuthor helper (DRY with the
-        // Task Report header above).
-        const mention = resolveTaskAuthor(task);
-        const handle = mention ? mention.replace(/^@/, "") : null;
-        if (handle) {
-          const outcome: AgentRecentOutcome = {
-            kind: task.status === "blocked" ? "blocked" : "completed",
-            taskId: task.id,
-            taskTitle: task.title,
-            at: Date.now(),
-          };
-          set((s) => ({
-            recentOutcomesBySession: {
-              ...s.recentOutcomesBySession,
-              [forSession]: {
-                ...(s.recentOutcomesBySession[forSession] ?? {}),
-                [handle]: outcome,
-              },
-            },
-          }));
-          setTimeout(() => {
-            const cur = get().recentOutcomesBySession[forSession]?.[handle];
-            if (cur && cur.taskId === outcome.taskId && cur.at === outcome.at) {
-              set((s) => {
-                const sessionMap = s.recentOutcomesBySession[forSession];
-                if (!sessionMap) return s;
-                const { [handle]: _, ...rest } = sessionMap;
-                const nextSession =
-                  Object.keys(rest).length === 0
-                    ? (() => {
-                        const { [forSession]: _drop, ...others } = s.recentOutcomesBySession;
-                        return others;
-                      })()
-                    : { ...s.recentOutcomesBySession, [forSession]: rest };
-                return { recentOutcomesBySession: nextSession };
-              });
-            }
-          }, RECENT_OUTCOME_TTL_MS);
-        }
-        // Per-tab unread badge stays — it surfaces completions for sessions
-        // the user isn't currently viewing, which is orthogonal to the
-        // in-frame light.
-        useTerminalStore.getState().incrementUnread(forSession);
+        // Human/direct path (`/task done`, direct updateTask): emit the terminal
+        // outcome synchronously. The scanner instead routes through
+        // `terminalizeWithAck` so deletion of the completion signal waits on an
+        // acknowledged ledger write — but the SAME emitter is reused so the two
+        // paths can't drift (collab-signal-hardening N9/N11).
+        get().emitTaskTerminalOutcome(taskId, forSession);
       } else {
         get().appendLog("system", `Task updated: ${taskId} → ${task.status}`, forSession);
       }
     }
+    // Advance the per-session ledger revision on every mutation so the
+    // terminalization txn's fence can order writes (defense in depth).
+    bumpLedgerRev(forSession);
     get().persistTasks(forSession);
+  },
+
+  emitTaskTerminalOutcome: (taskId, forSession) => {
+    const task = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
+    if (!task) return;
+    // Decorate the resolved author handle with its current nickname, when the
+    // agent is still in the session roster. Falls back to the bare handle for
+    // assignees whose agent has since exited or was never in this session —
+    // preserving the codex3 round-6 invariant that an empty `completedBy` falls
+    // through to `assignee` and never produces an empty Agent line.
+    const author = resolveTaskAuthor(task);
+    const sessionAgents = get().agents.filter((a) => a.collabSessionId === forSession);
+    const authorNick = author ? buildNicknameIndex(sessionAgents).get(author.trim()) : null;
+    const report = [
+      `# ${task.id} — ${task.status}`,
+      `**Agent**: ${formatAgentRef(author, authorNick)}`,
+      `**Subject**: ${task.title}`,
+      task.reasoning ? `**Reasoning**: ${task.reasoning}` : null,
+      task.conclusion ? `**Conclusion**: ${task.conclusion}` : null,
+      task.output ? `**Output**: ${task.output}` : null,
+    ].filter(Boolean).join("\n");
+    get().appendLog("system", `Task Report\n${report}`, forSession);
+
+    // Per-agent in-frame outcome, keyed by handle within the collab session, so
+    // the responsible agent's mini-terminal can light up + show a state message.
+    const mention = resolveTaskAuthor(task);
+    const handle = mention ? mention.replace(/^@/, "") : null;
+    if (handle) {
+      const outcome: AgentRecentOutcome = {
+        kind: task.status === "blocked" ? "blocked" : "completed",
+        taskId: task.id,
+        taskTitle: task.title,
+        at: Date.now(),
+      };
+      set((s) => ({
+        recentOutcomesBySession: {
+          ...s.recentOutcomesBySession,
+          [forSession]: {
+            ...(s.recentOutcomesBySession[forSession] ?? {}),
+            [handle]: outcome,
+          },
+        },
+      }));
+      setTimeout(() => {
+        const cur = get().recentOutcomesBySession[forSession]?.[handle];
+        if (cur && cur.taskId === outcome.taskId && cur.at === outcome.at) {
+          set((s) => {
+            const sessionMap = s.recentOutcomesBySession[forSession];
+            if (!sessionMap) return s;
+            const { [handle]: _, ...rest } = sessionMap;
+            const nextSession =
+              Object.keys(rest).length === 0
+                ? (() => {
+                    const { [forSession]: _drop, ...others } = s.recentOutcomesBySession;
+                    return others;
+                  })()
+                : { ...s.recentOutcomesBySession, [forSession]: rest };
+            return { recentOutcomesBySession: nextSession };
+          });
+        }
+      }, RECENT_OUTCOME_TTL_MS);
+    }
+    // Per-tab unread badge surfaces completions for sessions the user isn't
+    // currently viewing — orthogonal to the in-frame light.
+    useTerminalStore.getState().incrementUnread(forSession);
   },
 
   getTasks: (forSession) => get().tasksBySession[forSession] ?? [],
@@ -2242,6 +2479,115 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       });
     taskWriteChainsBySession.set(forSession, next);
     await next;
+  },
+
+  persistTasksStrict: async (forSession, rev) => {
+    // Strict sibling of persistTasks used ONLY by the terminalization txn: it
+    // (a) reads task state FRESH inside its chain turn (not at call time) so it
+    // reflects any concurrent mutation; (b) writes VISIBILITY-ATOMICALLY; and
+    // (c) REJECTS on IPC failure instead of swallowing — so the caller can keep
+    // the completion signal and retry rather than deleting it against a stale
+    // ledger. A monotonic revision fence skips a write that a newer one already
+    // superseded.
+    const prev = taskWriteChainsBySession.get(forSession) ?? Promise.resolve();
+    const next = prev
+      .catch(() => {}) // a previous failure must not block this write
+      .then(async () => {
+        if (abortedSessions.has(forSession)) return;
+        if ((landedRevBySession.get(forSession) ?? 0) >= rev) return; // stale — newer landed
+        const tasks = get().tasksBySession[forSession] ?? [];
+        const sessionAgents = get().agents.filter((a) => a.collabSessionId === forSession);
+        const content = formatTasksMarkdown(tasks, sessionAgents);
+        await scopedMemoryIpc.writeMemoryFileAtomic(
+          forSession,
+          taskFileRelativePath(forSession),
+          content,
+        );
+        landedRevBySession.set(
+          forSession,
+          Math.max(landedRevBySession.get(forSession) ?? 0, rev),
+        );
+      });
+    // Chain-link is the swallowed variant so a strict rejection never stalls
+    // unrelated later writes; the caller awaits the un-swallowed `next`.
+    taskWriteChainsBySession.set(forSession, next.catch(() => {}));
+    await next;
+  },
+
+  terminalizeWithAck: async (taskId, updates, forSession, signalPath) => {
+    const rkey = receiptKey(forSession, taskId, signalPath);
+    const existing = terminalizationReceipts.get(rkey);
+
+    const task0 = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
+    if (!task0) return false; // task vanished (removed/reassigned) — nothing to drive
+    const wasTerminalBefore = task0.status === "completed" || task0.status === "blocked";
+
+    // 1. Mark terminal in-memory WITHOUT side effects + bump rev, synchronously,
+    //    so no ordinary mutation can interleave with pre-terminal state behind
+    //    the strict write we enqueue next.
+    let rev: number;
+    if (existing) {
+      rev = existing.rev; // idempotent retry of a prior terminal_unpersisted attempt
+    } else {
+      const nowIso = new Date().toISOString();
+      const clean = Object.fromEntries(
+        Object.entries(updates).filter(([, v]) => v !== undefined),
+      ) as typeof updates;
+      set((s) => ({
+        tasksBySession: {
+          ...s.tasksBySession,
+          [forSession]: (s.tasksBySession[forSession] ?? []).map((t) =>
+            t.id === taskId ? { ...t, ...clean, updatedAt: nowIso } : t,
+          ),
+        },
+      }));
+      rev = bumpLedgerRev(forSession);
+      terminalizationReceipts.set(rkey, { phase: "terminal_unpersisted", rev });
+    }
+
+    // 2. Acknowledged ledger write.
+    try {
+      await get().persistTasksStrict(forSession, rev);
+    } catch {
+      return false; // keep terminal state + signal + receipt; retried next scan
+    }
+
+    // 3. Emit terminal side effects EXACTLY ONCE (unless a human path already
+    //    terminalized this task before the txn began), then advance the receipt.
+    const cur = terminalizationReceipts.get(rkey);
+    if (cur && cur.phase === "terminal_unpersisted") {
+      terminalizationReceipts.set(rkey, { phase: "ledger_acknowledged", rev });
+      if (!wasTerminalBefore) get().emitTaskTerminalOutcome(taskId, forSession);
+      terminalizationReceipts.set(rkey, { phase: "effects_emitted", rev });
+    }
+
+    // 4. Delete the signal; a delete failure is retried by the receipt-aware
+    //    already-terminal branch on the next scan.
+    await scopedMemoryIpc.deleteMemoryFile(forSession, signalPath).catch(() => {});
+    terminalizationReceipts.delete(rkey); // consume
+    return true;
+  },
+
+  reportIngestFailure: (reason, relPath, forSession, hint) => {
+    const dedupeK = `${forSession} ${relPath} ${reason}`;
+    const now = Date.now();
+    const last = ingestDiagnosticDedupe.get(dedupeK);
+    if (last !== undefined && now - last < INGEST_DIAG_TTL_MS) return; // deduped
+    ingestDiagnosticDedupe.set(dedupeK, now);
+    // Console fallback ALWAYS executes — appendLog's on-disk write is
+    // best-effort (it swallows IPC errors), so this guarantees the failure is
+    // observable even when the conversation-log persist itself fails.
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[collab-ingest] session=${forSession} reason=${reason} file=${relPath}` +
+        (hint ? ` recover=${hint}` : ""),
+    );
+    const body = [
+      `**Reason**: ${reason}`,
+      `**File**: ${relPath}`,
+      hint ? `**Recovery**: ${hint}` : null,
+    ].filter(Boolean).join("\n");
+    get().appendLog("system", `Ingestion Diagnostic\n${body}`, forSession);
   },
 
   // -- Input history ------------------------------------------------------

@@ -2412,19 +2412,24 @@ describe("Phase 1.3 — orphan `.done.json` cleanup (task-31)", () => {
     vi.mocked(invoke).mockImplementation(baseInvokeMock);
   });
 
-  it("empty-session pane scans the loop and deletes orphan with mtime > 24h", async () => {
-    // Session has NO tasks. The pre-Phase-1.3 early-return at line 921
-    // would short-circuit here; with the early-return removed, the
-    // orphan loop runs.
+  it("empty-session pane scans the loop and QUARANTINES orphan with mtime > 24h", async () => {
+    // Session has NO tasks. Post collab-signal-hardening, a no-match signal
+    // past the 24h grace is QUARANTINED (rename → .bad) for forensics, NOT
+    // silently deleted — the reworked taxonomy replaced the orphan delete.
     const orphanPath = "task-orphan-1.done.json";
     const orphanJson = JSON.stringify({ task_id: "task-orphan-1", status: "completed" });
     const oldMtime = Date.now() - ORPHAN_GRACE_MS - 1000; // 24h + 1s old
+    const quarantinedFiles: string[] = [];
     const deletedFiles: string[] = [];
 
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === "list_memory_files") return [orphanPath];
       if (cmd === "read_memory_file") return orphanJson;
       if (cmd === "get_memory_file_mtime") return oldMtime;
+      if (cmd === "quarantine_memory_file") {
+        quarantinedFiles.push((args as { relativePath: string }).relativePath);
+        return `${(args as { relativePath: string }).relativePath}.123.bad`;
+      }
       if (cmd === "delete_memory_file") {
         deletedFiles.push((args as { relativePath: string }).relativePath);
         return null;
@@ -2433,7 +2438,8 @@ describe("Phase 1.3 — orphan `.done.json` cleanup (task-31)", () => {
     });
 
     await scanForTaskCompletions(SESSION);
-    expect(deletedFiles).toContain(orphanPath);
+    expect(quarantinedFiles).toContain(orphanPath);
+    expect(deletedFiles).not.toContain(orphanPath); // no silent delete
   });
 
   it("preserves orphan with mtime < 24h (hydration-race safety)", async () => {

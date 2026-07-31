@@ -401,6 +401,11 @@ export class StabilityTracker {
     }
   }
 
+  /** Drop every tracked record (session teardown / test isolation). */
+  clearAll(): void {
+    this.records.clear();
+  }
+
   /** Test/inspection helper: number of tracked keys. */
   size(): number {
     return this.records.size;
