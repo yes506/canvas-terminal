@@ -4,6 +4,11 @@ graph LR
   CompletionCodec["CompletionCodec"]
   TaskIdResolver["TaskIdResolver"]
   IngestFailurePolicy["IngestFailurePolicy"]
+  StabilityTracker["StabilityTracker"]
+  ReportRefValidator["ReportRefValidator"]
+  TerminalizationTxn["TerminalizationTxn"]
+  TaskLedger["TaskLedger"]
+  TerminalizationReceipt["TerminalizationReceipt"]
   MemorySignalStore["MemorySignalStore"]
   QuarantineCmd["QuarantineCmd"]
   IngestDiagnostics["IngestDiagnostics"]
@@ -13,6 +18,13 @@ graph LR
   CompletionScanner --> CompletionCodec
   CompletionScanner --> TaskIdResolver
   CompletionScanner --> IngestFailurePolicy
+  CompletionScanner --> ReportRefValidator
   CompletionScanner --> IngestDiagnostics
+  CompletionScanner --> TerminalizationTxn
+  IngestFailurePolicy --> StabilityTracker
+  ReportRefValidator --> MemorySignalStore
+  TerminalizationTxn --> TaskLedger
+  TerminalizationTxn --> TerminalizationReceipt
+  TaskLedger --> MemorySignalStore
   MemorySignalStore --> QuarantineCmd
   SlashCommands --> TaskIdResolver
