@@ -520,6 +520,175 @@ pub fn list_memory_files(collab_session_id: String) -> Result<Vec<String>, Strin
     Ok(files)
 }
 
+/// Reject any existing symlink among the relative path's components (parents)
+/// or at the final path itself. Shared by the quarantine + report-inspect
+/// commands so neither can be redirected outside the session subtree by a
+/// planted symlink, mirroring the walk in `write_file_atomic_under`.
+fn reject_symlinked_path(dir: &std::path::Path, relative_path: &str) -> Result<PathBuf, String> {
+    validate_relative_path(relative_path)?;
+    let mut walk = dir.to_path_buf();
+    for component in std::path::Path::new(relative_path).components() {
+        if let std::path::Component::Normal(seg) = component {
+            walk.push(seg);
+            if let Ok(meta) = std::fs::symlink_metadata(&walk) {
+                if meta.is_symlink() {
+                    return Err(format!(
+                        "Refusing to follow symlinked path component: {}",
+                        walk.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(dir.join(relative_path))
+}
+
+/// Quarantine a bad completion-signal file by renaming it to a collision-safe
+/// `<name>.<pid>.<nanos>.bad` sibling (no-clobber). The `.bad` suffix removes it
+/// from the `*.done.json` scan filter, breaking the silent re-fail loop, while
+/// preserving the original bytes as forensic evidence. Both endpoints are
+/// path-validated and the whole component chain is symlink-guarded (defense in
+/// depth at every entry point — the destination is derived, not caller-supplied,
+/// but validated regardless). Same parent → the rename is atomic on one fs.
+/// Returns the absolute destination path.
+#[tauri::command]
+pub fn quarantine_memory_file(
+    collab_session_id: String,
+    relative_path: String,
+) -> Result<String, String> {
+    let dir = get_memory_session_root(&collab_session_id)?;
+    quarantine_under(&dir, &relative_path)
+}
+
+pub(crate) fn quarantine_under(
+    dir: &std::path::Path,
+    relative_path: &str,
+) -> Result<String, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let source = reject_symlinked_path(dir, relative_path)?;
+
+    // Source must be an existing REGULAR file — reject symlink, directory, AND
+    // every other non-regular node (FIFO, socket, device): `is_file()` is the
+    // positive check, stricter than "not symlink && not dir".
+    let meta = std::fs::symlink_metadata(&source)
+        .map_err(|e| format!("quarantine stat {}: {}", relative_path, e))?;
+    if !meta.is_file() {
+        return Err("Refusing to quarantine a non-regular file".to_string());
+    }
+
+    let basename = source
+        .file_name()
+        .ok_or_else(|| "Source has no basename".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Source has no parent".to_string())?;
+
+    // Exclusive-reservation no-clobber (portable — macOS lacks
+    // RENAME_NOREPLACE): atomically CREATE_NEW (O_EXCL) a unique `.bad`
+    // destination so the name is provably ours before we rename into it. If the
+    // name collides (astronomically unlikely with pid+nanos), bump the counter
+    // and retry. This guarantees no EARLIER forensic `.bad` artifact is ever
+    // overwritten by the subsequent rename (it would have a different name).
+    let mut dest = parent.join(String::new());
+    let mut reserved = false;
+    for attempt in 0..64u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let candidate = parent.join(format!(
+            "{}.{}.{}.{}.bad",
+            basename,
+            std::process::id(),
+            nanos,
+            attempt
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&candidate)
+        {
+            Ok(_) => {
+                dest = candidate;
+                reserved = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("quarantine reserve: {}", e)),
+        }
+    }
+    if !reserved {
+        return Err("quarantine: could not reserve a destination name".to_string());
+    }
+
+    // Rename replaces our just-created empty reservation with the source bytes;
+    // atomic within the same parent directory. On failure (e.g. the source
+    // vanished via TOCTOU between the is_file() stat and here), unlink the empty
+    // reservation so it does not leak.
+    if let Err(e) = std::fs::rename(&source, &dest) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!("quarantine rename {}: {}", relative_path, e));
+    }
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Structural facts about a report file, discovered WITHOUT following symlinks.
+/// `camelCase` so the Tauri-serialized shape matches the TS `ReportFileInfo`
+/// (`{exists, isRegular, sizeBytes}`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportFileInfo {
+    pub exists: bool,
+    pub is_regular: bool,
+    pub size_bytes: u64,
+}
+
+/// Inspect a completion report reference without ever following a symlink.
+///
+/// The generic `read_memory_file`/`get_memory_file_mtime` commands follow
+/// symlinks by design; a completion `report_path` is agent-influenced, so it
+/// needs a no-follow inspector. Uses `symlink_metadata` on the final path and
+/// rejects any symlinked parent component. Returns `{exists,is_regular,size}`;
+/// the scanner stores only a reference and never reads report content, so a
+/// stat is sufficient. A symlinked target/parent is an Err — the caller treats
+/// that as an unsafe reference (soft-fail: terminalize, drop the reference).
+#[tauri::command]
+pub fn inspect_report_file(
+    collab_session_id: String,
+    relative_path: String,
+) -> Result<ReportFileInfo, String> {
+    let dir = get_memory_session_root(&collab_session_id)?;
+    inspect_report_under(&dir, &relative_path)
+}
+
+pub(crate) fn inspect_report_under(
+    dir: &std::path::Path,
+    relative_path: &str,
+) -> Result<ReportFileInfo, String> {
+    let full_path = reject_symlinked_path(dir, relative_path)?;
+    match std::fs::symlink_metadata(&full_path) {
+        Err(_) => Ok(ReportFileInfo {
+            exists: false,
+            is_regular: false,
+            size_bytes: 0,
+        }),
+        Ok(meta) => {
+            if meta.is_symlink() {
+                return Err("Refusing to inspect a symlinked report".to_string());
+            }
+            Ok(ReportFileInfo {
+                exists: true,
+                is_regular: meta.is_file(),
+                size_bytes: meta.len(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod scoped_memory_tests {
     //! Per-collab-session isolation coverage: the sanitizer contract, the
@@ -644,6 +813,81 @@ mod scoped_memory_tests {
             read_memory_file(sid.into(), "agents-x.json".into()).unwrap().as_deref(),
             Some("{}")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_renames_to_bad_and_stops_matching_scan() {
+        let sid = "session-mem-quar-1";
+        write_memory_file(sid.into(), "task-1.done.json".into(), "garbage".into()).unwrap();
+        let dest = quarantine_memory_file(sid.into(), "task-1.done.json".into()).unwrap();
+        assert!(dest.ends_with(".bad"));
+        // Original name gone; a `.bad` artifact remains and is excluded from
+        // the `.done.json` scan filter (breaks the re-fail loop).
+        let listed = list_memory_files(sid.into()).unwrap();
+        assert!(!listed.iter().any(|f| f == "task-1.done.json"));
+        assert!(listed.iter().any(|f| f.ends_with(".bad")));
+        let _ = std::fs::remove_dir_all(get_memory_session_root(sid).unwrap());
+    }
+
+    #[test]
+    fn quarantine_is_no_clobber_across_repeated_calls() {
+        let sid = "session-mem-quar-2";
+        let root = get_memory_session_root(sid).unwrap();
+        write_memory_file(sid.into(), "task-2.done.json".into(), "a".into()).unwrap();
+        let d1 = quarantine_memory_file(sid.into(), "task-2.done.json".into()).unwrap();
+        write_memory_file(sid.into(), "task-2.done.json".into(), "b".into()).unwrap();
+        let d2 = quarantine_memory_file(sid.into(), "task-2.done.json".into()).unwrap();
+        assert_ne!(d1, d2, "second quarantine must not clobber the first artifact");
+        assert!(std::path::Path::new(&d1).exists());
+        assert!(std::path::Path::new(&d2).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_rejects_symlink_source() {
+        let sid = "session-mem-quar-sym";
+        let root = get_memory_session_root(sid).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("task-3.done.json");
+        std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
+        assert!(quarantine_memory_file(sid.into(), "task-3.done.json".into()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantine_rejects_non_regular_fifo() {
+        let sid = "session-mem-quar-fifo";
+        let root = get_memory_session_root(sid).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("task-4.done.json");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        if rc == 0 {
+            // A FIFO is not a regular file → must be refused (is_file() gate).
+            assert!(quarantine_memory_file(sid.into(), "task-4.done.json".into()).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inspect_report_reports_regular_missing_and_rejects_symlink() {
+        let sid = "session-mem-inspect-1";
+        let root = get_memory_session_root(sid).unwrap();
+        // regular file
+        write_memory_file(sid.into(), "task-1-report.md".into(), "hello".into()).unwrap();
+        let info = inspect_report_file(sid.into(), "task-1-report.md".into()).unwrap();
+        assert!(info.exists && info.is_regular);
+        assert_eq!(info.size_bytes, 5);
+        // missing file
+        let miss = inspect_report_file(sid.into(), "nope.md".into()).unwrap();
+        assert!(!miss.exists && !miss.is_regular);
+        // symlinked report → error (soft-fail path in the caller)
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", root.join("evil.md")).unwrap();
+        assert!(inspect_report_file(sid.into(), "evil.md".into()).is_err());
+        // traversal / absolute rejected by validate_relative_path
+        assert!(inspect_report_file(sid.into(), "../escape.md".into()).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

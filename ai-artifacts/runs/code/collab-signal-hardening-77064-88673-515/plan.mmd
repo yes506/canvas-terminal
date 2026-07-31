@@ -1,0 +1,29 @@
+graph LR
+  CompletionProtocol["CompletionProtocol"]
+  CompletionScanner["CompletionScanner"]
+  CompletionCodec["CompletionCodec"]
+  TaskIdResolver["TaskIdResolver"]
+  IngestFailurePolicy["IngestFailurePolicy"]
+  StabilityTracker["StabilityTracker"]
+  ReportFileInspector["ReportFileInspector"]
+  TerminalizationTxn["TerminalizationTxn"]
+  TaskLedger["TaskLedger"]
+  TerminalizationReceipt["TerminalizationReceipt"]
+  MemorySignalStore["MemorySignalStore"]
+  QuarantineCmd["QuarantineCmd"]
+  IngestDiagnostics["IngestDiagnostics"]
+  SlashCommands["SlashCommands"]
+  CompletionProtocol --> CompletionScanner
+  CompletionScanner --> MemorySignalStore
+  CompletionScanner --> CompletionCodec
+  CompletionScanner --> TaskIdResolver
+  CompletionScanner --> IngestFailurePolicy
+  CompletionScanner --> ReportFileInspector
+  CompletionScanner --> IngestDiagnostics
+  CompletionScanner --> TerminalizationTxn
+  IngestFailurePolicy --> StabilityTracker
+  TerminalizationTxn --> TaskLedger
+  TerminalizationTxn --> TerminalizationReceipt
+  TaskLedger --> MemorySignalStore
+  MemorySignalStore --> QuarantineCmd
+  SlashCommands --> TaskIdResolver

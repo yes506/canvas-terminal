@@ -7,6 +7,7 @@ import {
   formatTaskSummaryForAgent,
   toolShortName,
   _resetWriteStateForTests,
+  _resetTerminalizationStateForTests,
   _isRenamePendingForTests,
   RECENT_OUTCOME_TTL_MS,
   STATUS_TTL_MS,
@@ -2412,19 +2413,24 @@ describe("Phase 1.3 — orphan `.done.json` cleanup (task-31)", () => {
     vi.mocked(invoke).mockImplementation(baseInvokeMock);
   });
 
-  it("empty-session pane scans the loop and deletes orphan with mtime > 24h", async () => {
-    // Session has NO tasks. The pre-Phase-1.3 early-return at line 921
-    // would short-circuit here; with the early-return removed, the
-    // orphan loop runs.
+  it("empty-session pane scans the loop and QUARANTINES orphan with mtime > 24h", async () => {
+    // Session has NO tasks. Post collab-signal-hardening, a no-match signal
+    // past the 24h grace is QUARANTINED (rename → .bad) for forensics, NOT
+    // silently deleted — the reworked taxonomy replaced the orphan delete.
     const orphanPath = "task-orphan-1.done.json";
     const orphanJson = JSON.stringify({ task_id: "task-orphan-1", status: "completed" });
     const oldMtime = Date.now() - ORPHAN_GRACE_MS - 1000; // 24h + 1s old
+    const quarantinedFiles: string[] = [];
     const deletedFiles: string[] = [];
 
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
       if (cmd === "list_memory_files") return [orphanPath];
       if (cmd === "read_memory_file") return orphanJson;
       if (cmd === "get_memory_file_mtime") return oldMtime;
+      if (cmd === "quarantine_memory_file") {
+        quarantinedFiles.push((args as { relativePath: string }).relativePath);
+        return `${(args as { relativePath: string }).relativePath}.123.bad`;
+      }
       if (cmd === "delete_memory_file") {
         deletedFiles.push((args as { relativePath: string }).relativePath);
         return null;
@@ -2433,7 +2439,8 @@ describe("Phase 1.3 — orphan `.done.json` cleanup (task-31)", () => {
     });
 
     await scanForTaskCompletions(SESSION);
-    expect(deletedFiles).toContain(orphanPath);
+    expect(quarantinedFiles).toContain(orphanPath);
+    expect(deletedFiles).not.toContain(orphanPath); // no silent delete
   });
 
   it("preserves orphan with mtime < 24h (hydration-race safety)", async () => {
@@ -2898,5 +2905,433 @@ describe("agy migration — state-level publish disable (node 18)", () => {
     useCollaboratorStore.getState().setPublishOptedIn("pty-g1", true);
     const agent = useCollaboratorStore.getState().agents.find((a) => a.sessionId === "pty-g1")!;
     expect(agent.publishOptedIn).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// collab-signal-hardening — acknowledged terminalization txn + typed taxonomy
+// ---------------------------------------------------------------------------
+describe("collab-signal-hardening — scanner txn + taxonomy", () => {
+  const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
+  beforeEach(() => {
+    resetStores();
+    _resetTerminalizationStateForTests();
+  });
+
+  function countTaskReports(): number {
+    const entries = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    return entries.filter((e) => e.content.includes("Task Report")).length;
+  }
+
+  it("persist failure RETAINS the signal (acknowledged txn never deletes on a failed ledger write)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    const deleted: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "write_memory_file_atomic") throw new Error("disk full");
+      if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION);
+    expect(deleted).not.toContain(signalPath); // retained for retry
+  });
+
+  it("retry after a persist failure deletes the signal and emits the Task Report EXACTLY ONCE", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    let atomicOk = false;
+    const deleted: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
+      if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION); // fails persist → retained, no emit
+    expect(countTaskReports()).toBe(0);
+    atomicOk = true;
+    await scanForTaskCompletions(SESSION); // retry → ack → emit once → delete
+    expect(deleted).toContain(signalPath);
+    expect(countTaskReports()).toBe(1); // exactly once
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("completed");
+  });
+
+  it("malformed signal is NOT quarantined on first sight; quarantined only after the stability window", async () => {
+    vi.useFakeTimers();
+    try {
+      resetStores();
+      _resetTerminalizationStateForTests();
+      const t0 = 1_000_000_000;
+      vi.setSystemTime(t0);
+      const signalPath = "task-9.done.json";
+      const badRaw = "{ this is not json";
+      const oldMtime = t0 - 5000; // older than STABILITY_MIN_AGE_MS
+      const quarantined: string[] = [];
+      vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "get_memory_session_dir") return "/mem/x";
+        if (cmd === "list_memory_files") return [signalPath];
+        if (cmd === "read_memory_file") return badRaw;
+        if (cmd === "get_memory_file_mtime") return oldMtime;
+        if (cmd === "quarantine_memory_file") { quarantined.push((args as { relativePath: string }).relativePath); return `${signalPath}.bad`; }
+        return null;
+      });
+      await scanForTaskCompletions(SESSION); // first observation
+      expect(quarantined).not.toContain(signalPath);
+      vi.setSystemTime(t0 + 4000); // > STABILITY_MIN_INTERVAL_MS
+      await scanForTaskCompletions(SESSION); // stable now
+      expect(quarantined).toContain(signalPath);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a valid signal whose report_path is MISSING soft-fails: task terminalizes, no quarantine", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1", report_path: `${task.id}-report.md` });
+    const quarantined: string[] = [];
+    const deleted: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "inspect_report_file") return { exists: false, isRegular: false, sizeBytes: 0 };
+      if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+      if (cmd === "quarantine_memory_file") { quarantined.push((args as { relativePath: string }).relativePath); return `${signalPath}.bad`; }
+      if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION);
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("completed"); // soft-fail terminalizes
+    expect(quarantined).not.toContain(signalPath);
+    expect(deleted).toContain(signalPath);
+  });
+
+  it("a present report_path is mapped into the task output as a discoverable reference", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const reportPath = `${task.id}-report.md`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1", report_path: reportPath });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "inspect_report_file") return { exists: true, isRegular: true, sizeBytes: 42 };
+      if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+      return null;
+    });
+    await scanForTaskCompletions(SESSION);
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("completed");
+    expect(t.output).toContain(`Report: ${reportPath}`);
+  });
+
+  it("wrong-session signal past grace is QUARANTINED (never stranded under scoped isolation)", async () => {
+    const store = useCollaboratorStore.getState();
+    // The matching task lives in ANOTHER loaded session; THIS session has none.
+    const other = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, "other-session");
+    const signalPath = `${other.id}.done.json`;
+    const payload = JSON.stringify({ task_id: other.id, status: "completed", author: "@claude1" });
+    const oldMtime = Date.now() - ORPHAN_GRACE_MS - 1000;
+    const quarantined: string[] = [];
+    const deleted: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return oldMtime;
+      if (cmd === "quarantine_memory_file") { quarantined.push((args as { relativePath: string }).relativePath); return `${signalPath}.bad`; }
+      if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION);
+    expect(quarantined).toContain(signalPath);
+    expect(deleted).not.toContain(signalPath);
+  });
+});
+
+// /task resolver wiring — the shared exact-first resolver (commands.ts N17).
+describe("collab-signal-hardening — /task uses exact-first resolver", () => {
+  beforeEach(() => resetStores());
+
+  it("`/task task-1 done` resolves task-1, NOT task-10", async () => {
+    const store = useCollaboratorStore.getState();
+    store.addTask({ objective: "a", title: "one", assignee: "@claude1" }, SESSION);
+    store.addTask({ objective: "b", title: "ten", assignee: "@claude1" }, SESSION);
+    useCollaboratorStore.setState((s) => ({
+      tasksBySession: {
+        ...s.tasksBySession,
+        [SESSION]: [
+          { ...s.tasksBySession[SESSION]![0], id: "task-1-1785474396813" },
+          { ...s.tasksBySession[SESSION]![1], id: "task-10-1785474396999" },
+        ],
+      },
+    }));
+    const cmd = parseInput("/task task-1 done");
+    await executeCommand(cmd, SESSION);
+    const tasks = useCollaboratorStore.getState().tasksBySession[SESSION]!;
+    expect(tasks.find((t) => t.id === "task-1-1785474396813")!.status).toBe("completed");
+    expect(tasks.find((t) => t.id === "task-10-1785474396999")!.status).not.toBe("completed");
+  });
+});
+
+// Regression coverage for the post-review hardening round (task-35 fixes).
+describe("collab-signal-hardening — hardening round (reopen CAS, teardown, oversize)", () => {
+  beforeEach(() => {
+    resetStores();
+    _resetTerminalizationStateForTests();
+  });
+
+  function taskReports(): number {
+    const entries = useCollaboratorStore.getState().logEntriesBySession[SESSION] ?? [];
+    return entries.filter((e) => e.content.includes("Task Report")).length;
+  }
+
+  it("B1: reopen after a failed persist SUPERSEDES — the tombstone blocks re-completion even while the signal is STILL LISTED (race-realistic)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    const quarantined: string[] = [];
+    const deleted: string[] = [];
+    let atomicOk = false;
+    // KEY: `list_memory_files` KEEPS returning the signal even after quarantine is
+    // called — simulating the scheduler window where a scan races AHEAD of the
+    // physical file move. The synchronous tombstone (not the file move) must be
+    // what prevents re-completion.
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      const rel = (args as { relativePath?: string })?.relativePath;
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return 1_000_000; // pre-reopen (stale)
+      if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
+      if (cmd === "quarantine_memory_file") { quarantined.push(rel!); return `${rel}.bad`; }
+      if (cmd === "delete_memory_file") { deleted.push(rel!); return true; }
+      return null;
+    });
+
+    await scanForTaskCompletions(SESSION); // persist fails → receipt retained, signal kept
+    expect(deleted).not.toContain(signalPath);
+
+    useCollaboratorStore.getState().updateTask(task.id, { status: "pending" }, SESSION); // reopen → tombstone
+
+    atomicOk = true;
+    await scanForTaskCompletions(SESSION); // signal STILL listed — tombstone must block re-completion
+
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("pending"); // reopen WON — not re-completed despite the signal being listed
+    expect(quarantined).toContain(signalPath); // stale signal quarantined durably
+    expect(deleted).not.toContain(signalPath); // never deleted against a reopened task
+    expect(taskReports()).toBe(0); // no false "completed" Task Report
+  });
+
+  it("B1-window: a reopen landing DURING the report-inspect await does not re-complete (terminalizeWithAck honors the tombstone)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const reportPath = `${task.id}-report.md`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1", report_path: reportPath });
+    const deleted: string[] = [];
+    let atomicOk = false;
+    let reopenDuringInspect = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      const rel = (args as { relativePath?: string })?.relativePath;
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
+      if (cmd === "inspect_report_file") {
+        if (reopenDuringInspect) {
+          // Interleave the reopen INSIDE the await between the scan's tombstone
+          // guard and terminalizeWithAck — the exact window the reviewer found.
+          useCollaboratorStore.getState().updateTask(task.id, { status: "pending" }, SESSION);
+        }
+        return { exists: true, isRegular: true, sizeBytes: 10 };
+      }
+      if (cmd === "quarantine_memory_file") return `${rel}.bad`;
+      if (cmd === "delete_memory_file") { deleted.push(rel!); return true; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION); // scan1: persist fails → task completed in-mem + receipt
+    atomicOk = true;
+    reopenDuringInspect = true;
+    await scanForTaskCompletions(SESSION); // scan2: reopen fires mid-inspect → must NOT re-complete
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("pending"); // reopen preserved despite landing in the async window
+    expect(deleted).not.toContain(signalPath); // signal not lost
+  });
+
+  it("B1-two-files: TWO stale signals (short-id + full-id) mapping to one reassigned task are BOTH quarantined — no re-completion (generational tombstone)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const shortId = task.id.replace(/-\d{13}$/, "");
+    const fileFull = `${task.id}.done.json`; // full-id filename + payload
+    const fileShort = `${shortId}.done.json`; // short-id filename + payload — both resolve to `task`
+    const payFull = JSON.stringify({ task_id: task.id, status: "completed", author: "@a" });
+    const payShort = JSON.stringify({ task_id: shortId, status: "completed", author: "@b" });
+    const quarantined: string[] = [];
+    const deleted: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      const rel = (args as { relativePath?: string })?.relativePath;
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [fileFull, fileShort];
+      if (cmd === "read_memory_file") return rel === fileShort ? payShort : payFull;
+      if (cmd === "get_memory_file_mtime") return 1_000_000; // both written pre-reassign (stale)
+      if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+      if (cmd === "quarantine_memory_file") { quarantined.push(rel!); return `${rel}.bad`; }
+      if (cmd === "delete_memory_file") { deleted.push(rel!); return true; }
+      return null;
+    });
+    // Reassign supersedes both stale signals (reassigned → tombstone, generation = now).
+    useCollaboratorStore.getState().updateTask(task.id, { assignee: "@claude2" }, SESSION);
+    await scanForTaskCompletions(SESSION);
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).not.toBe("completed"); // neither stale file re-completed the reassigned task
+    expect(quarantined).toContain(fileFull);
+    expect(quarantined).toContain(fileShort); // the SECOND stale file is blocked too
+    expect(deleted).toHaveLength(0);
+    expect(taskReports()).toBe(0);
+  });
+
+  it("B1-toctou: a reassign landing DURING the mtime-stat await is not discarded (compare-and-delete) — no re-completion", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_700_000_000_000);
+      resetStores();
+      _resetTerminalizationStateForTests();
+      const store = useCollaboratorStore.getState();
+      const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+      const signalPath = `${task.id}.done.json`;
+      const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@a" });
+      const deleted: string[] = [];
+      store.updateTask(task.id, { assignee: "@claude2" }, SESSION); // reassign #1 → tombstone T1
+      const T1 = Date.now();
+      vi.setSystemTime(T1 + 5000);
+      let firedSecond = false;
+      vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "get_memory_session_dir") return "/mem/x";
+        if (cmd === "list_memory_files") return [signalPath];
+        if (cmd === "read_memory_file") return payload;
+        if (cmd === "get_memory_file_mtime") {
+          if (!firedSecond) {
+            firedSecond = true;
+            // Reassign #2 lands INSIDE this await → tombstone T2 (= now) > T1.
+            useCollaboratorStore.getState().updateTask(task.id, { assignee: "@claude3" }, SESSION);
+          }
+          return T1 + 2000; // signal is "new" vs T1, but STALE vs T2
+        }
+        if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+        if (cmd === "quarantine_memory_file") return `${(args as { relativePath: string }).relativePath}.bad`;
+        if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+        return null;
+      });
+      await scanForTaskCompletions(SESSION); // scan1: mid-await reassign; T2 tombstone must NOT be discarded
+      await scanForTaskCompletions(SESSION); // scan2: without the fix, the discarded tombstone lets this re-complete
+      const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+      expect(t.status).not.toBe("completed"); // superseded by T2 reassign — never re-completed
+      expect(deleted).not.toContain(signalPath);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("B1-permanent: if quarantine keeps FAILING after a reopen, the task is never re-completed (no infinite reopen→complete loop)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    const deleted: string[] = [];
+    let atomicOk = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return 1_000_000; // pre-reopen (stale)
+      if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
+      if (cmd === "quarantine_memory_file") throw new Error("quarantine IPC down"); // always fails
+      if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION); // persist fails → task completed in-memory, receipt retained
+    atomicOk = true;
+    useCollaboratorStore.getState().updateTask(task.id, { status: "pending" }, SESSION); // reopen (completed→pending) → tombstone
+    for (let i = 0; i < 3; i++) await scanForTaskCompletions(SESSION); // quarantine keeps failing
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("pending"); // never re-completed even though the signal persists
+    expect(deleted).not.toContain(signalPath);
+  });
+
+  it("B3: a signal never terminalizes during teardown (aborted persist is not an ack)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    const deleted: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+      if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+      return null;
+    });
+    useCollaboratorStore.getState().endSession(SESSION); // marks the session aborted
+    await scanForTaskCompletions(SESSION);
+    expect(deleted).not.toContain(signalPath); // aborted persist must not ack + delete
+  });
+
+  it("oversize report_path soft-fails: task terminalizes, reference dropped, no quarantine", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const reportPath = `${task.id}-report.md`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1", report_path: reportPath });
+    const quarantined: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "inspect_report_file") return { exists: true, isRegular: true, sizeBytes: 1024 * 1024 }; // 1 MB > cap
+      if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+      if (cmd === "quarantine_memory_file") { quarantined.push((args as { relativePath: string }).relativePath); return "x.bad"; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION);
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("completed"); // soft-fail still terminalizes
+    expect(t.output ?? "").not.toContain("Report:"); // oversize reference dropped
+    expect(quarantined).not.toContain(signalPath);
+    expect(taskReports()).toBe(1);
+  });
+
+  it("endSession purges per-session terminalization state (no cross-session residue)", () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    // Terminalize via the human path so a revision is bumped, then end the session.
+    store.updateTask(task.id, { status: "completed", completedBy: "@claude1" }, SESSION);
+    useCollaboratorStore.getState().endSession(SESSION);
+    // A fresh scan on the ended session must be a clean no-op (state purged).
+    expect(() => useCollaboratorStore.getState().getTasks(SESSION)).not.toThrow();
   });
 });

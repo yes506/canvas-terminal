@@ -6,7 +6,31 @@ import {
 } from "../../stores/collaboratorStore";
 import { scopedMemoryIpc } from "../../lib/scopedCollabMemory";
 import { exportCanvasSnapshot, startImportForSession } from "../../lib/canvasOps";
-import type { SpawnedAgent, TaskStatus } from "../../types/collaborator";
+import { resolveTaskId } from "../../lib/collabCompletion";
+import type { CollabTask, SpawnedAgent, TaskStatus } from "../../types/collaborator";
+
+/**
+ * Resolve a (possibly stripped) `/task` id via the SHARED exact-first resolver,
+ * emitting a distinct message for the none / ambiguous cases. Returns the task
+ * or null (caller `break`s on null). Replaces the old
+ * `t.id === taskId || t.id.startsWith(taskId)` matcher, which mis-matched
+ * `task-1` against `task-10..19` — the same collision the scanner's resolver
+ * now fixes, kept in ONE place so the two can't drift.
+ */
+function resolveTaskOrReport(
+  tasks: CollabTask[],
+  id: string,
+  status: (msg: string) => void,
+): CollabTask | null {
+  const r = resolveTaskId(tasks, id);
+  if (r.kind === "unique") return r.task;
+  if (r.kind === "ambiguous") {
+    status(`Ambiguous task id "${id}" — matches ${r.matches.length} tasks; use the full id.`);
+  } else {
+    status(`Task not found: ${id}`);
+  }
+  return null;
+}
 
 export interface ParsedCommand {
   type:
@@ -457,11 +481,8 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             status(`Invalid status. Use: ${valid.join(", ")}`);
             break;
           }
-          const task = store.getTasks(collabSessionId).find((t) => t.id === taskId || t.id.startsWith(taskId));
-          if (!task) {
-            status(`Task not found: ${taskId}`);
-            break;
-          }
+          const task = resolveTaskOrReport(store.getTasks(collabSessionId), taskId, status);
+          if (!task) break;
           store.updateTask(task.id, { status: newStatus as TaskStatus }, collabSessionId);
           status(`Task ${task.id} → ${newStatus}`);
           break;
@@ -475,11 +496,8 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             break;
           }
           const [, taskId, agent] = assignMatch;
-          const task = store.getTasks(collabSessionId).find((t) => t.id === taskId || t.id.startsWith(taskId));
-          if (!task) {
-            status(`Task not found: ${taskId}`);
-            break;
-          }
+          const task = resolveTaskOrReport(store.getTasks(collabSessionId), taskId, status);
+          if (!task) break;
           // Canonicalize the typed token through resolveAgent BEFORE writing to
           // the task ledger. Otherwise a user typing /task X assign @bug-hunter
           // (a nickname) would land assignee: "@bug-hunter" — which never
@@ -505,11 +523,8 @@ export async function executeCommand(cmd: ParsedCommand, collabSessionId?: strin
             break;
           }
           const [, taskId, notes] = doneMatch;
-          const task = store.getTasks(collabSessionId).find((t) => t.id === taskId || t.id.startsWith(taskId));
-          if (!task) {
-            status(`Task not found: ${taskId}`);
-            break;
-          }
+          const task = resolveTaskOrReport(store.getTasks(collabSessionId), taskId, status);
+          if (!task) break;
           store.updateTask(task.id, {
             status: "completed",
             conclusion: notes?.trim() ?? null,

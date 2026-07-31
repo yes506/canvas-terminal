@@ -182,6 +182,8 @@ pub fn run() {
             commands::memory::clear_memory_dir,
             commands::memory::list_memory_files,
             commands::memory::get_memory_file_mtime,
+            commands::memory::quarantine_memory_file,
+            commands::memory::inspect_report_file,
             commands::settings::get_settings,
             commands::settings::set_settings,
             commands::settings::set_browser_settings,
