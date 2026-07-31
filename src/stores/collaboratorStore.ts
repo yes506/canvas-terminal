@@ -416,12 +416,18 @@ const terminalizationReceipts = new Map<string, TerminalizationReceipt>();
  * async quarantine — so `ingestSignalFile` can durably refuse to re-terminalize
  * a superseded task even if a scan races ahead of the physical file move —
  * `terminalizeWithAck` ALSO reads it (a mid-flight reopen after the scan's
- * point-check must still be honored). The tombstone is cleared once the stale
- * signal for that task is quarantined, or on session teardown, so a genuinely
- * NEW completion can proceed. Closes the reopen re-completion / signal-loss race
- * that a fire-and-forget quarantine alone left open (adversarial review).
+ * point-check must still be honored).
+ *
+ * GENERATIONAL: the value is the reopen timestamp (ms). A completion signal is
+ * "stale" (superseded) iff its file mtime is at-or-before that timestamp — those
+ * are quarantined WITHOUT clearing the tombstone, so EVERY stale file that maps
+ * to the task is blocked (two distinct `.done.json` files can resolve to one
+ * task via the short-id/full-id equivalence). Only a signal written AFTER the
+ * reopen is a genuine new completion → it clears the tombstone and proceeds.
+ * Cleared otherwise only on session teardown. Closes the reopen re-completion /
+ * signal-loss race across all windows (three adversarial-review rounds).
  */
-const reopenTombstones = new Set<string>();
+const reopenTombstones = new Map<string, number>();
 
 function tombstoneKey(forSession: string, taskId: string): string {
   return `${forSession}::${taskId}`;
@@ -444,7 +450,9 @@ function cancelReceiptsForTask(forSession: string, taskId: string): void {
   for (const k of terminalizationReceipts.keys()) {
     if (k.startsWith(prefix)) terminalizationReceipts.delete(k);
   }
-  reopenTombstones.add(tombstoneKey(forSession, taskId));
+  // Stamp the supersession generation (system clock; same clock the file mtime
+  // uses, so the guard's mtime comparison is skew-free on one machine).
+  reopenTombstones.set(tombstoneKey(forSession, taskId), Date.now());
 }
 
 // Per-`(session,relPath)` in-flight guard: overlapping scans (onFlush + 2s poll
@@ -489,7 +497,7 @@ function purgeTerminalizationSessionState(forSession: string): void {
   for (const k of Array.from(noMatchDiagnosed)) {
     if (k.startsWith(kprefix)) noMatchDiagnosed.delete(k);
   }
-  for (const k of Array.from(reopenTombstones)) {
+  for (const k of Array.from(reopenTombstones.keys())) {
     if (k.startsWith(kprefix)) reopenTombstones.delete(k);
   }
   const dprefix = `${forSession} `; // ingestDiagnosticDedupe is space-delimited
@@ -1409,25 +1417,39 @@ async function ingestSignalFile(forSession: string, relPath: string): Promise<vo
   }
   const task = res.task;
 
-  // SUPERSESSION GUARD (durable, synchronous): if this task was explicitly
-  // reopened/reassigned, its old completion signal must NOT re-terminalize it —
-  // even if this scan raced ahead of the reopen's async quarantine. Quarantine
-  // the stale signal here (awaited), then clear the tombstone so a genuinely new
-  // completion can proceed. On quarantine failure keep the tombstone + signal
-  // and retry next scan (never re-complete). Closes the reopen re-completion /
-  // signal-loss race (adversarial review, hardening round).
+  // SUPERSESSION GUARD (durable, generational): if this task was explicitly
+  // reopened/reassigned, any completion signal written AT OR BEFORE that reopen
+  // is stale and must NOT re-terminalize it. Compare the signal's file mtime to
+  // the reopen generation: stale → quarantine WITHOUT clearing the tombstone (so
+  // EVERY stale file mapping to this task — short-id and full-id forms both
+  // resolve here — is blocked, not just the first); a signal written AFTER the
+  // reopen is a genuine new completion → clear the tombstone and proceed. On a
+  // stat/quarantine failure, retain the signal + tombstone and retry (never
+  // re-complete). Closes the reopen race across all windows (adversarial review).
   const tkey = tombstoneKey(forSession, task.id);
-  if (reopenTombstones.has(tkey)) {
+  const reopenAt = reopenTombstones.get(tkey);
+  if (reopenAt !== undefined) {
+    let sigMtime: number;
     try {
-      await scopedMemoryIpc.quarantineMemoryFile(forSession, relPath);
-      reopenTombstones.delete(tkey);
+      sigMtime = await scopedMemoryIpc.getMemoryFileMtime(forSession, relPath);
     } catch {
-      return; // keep tombstone + signal; retry next scan (no re-completion)
+      return; // can't stat → unknown generation; retry, never re-complete
     }
-    scanStabilityTracker.purge(key);
-    noMatchDiagnosed.delete(key);
-    clearIngestDedupe(forSession, relPath);
-    return;
+    if (sigMtime <= reopenAt) {
+      // Stale (pre-reopen) → quarantine; KEEP the tombstone for sibling stale files.
+      try {
+        await scopedMemoryIpc.quarantineMemoryFile(forSession, relPath);
+      } catch {
+        return; // keep tombstone + signal; retry next scan (no re-completion)
+      }
+      scanStabilityTracker.purge(key);
+      noMatchDiagnosed.delete(key);
+      clearIngestDedupe(forSession, relPath);
+      return;
+    }
+    // Signal is newer than the reopen → a genuine new completion. Clear the
+    // tombstone and fall through to normal terminalization.
+    reopenTombstones.delete(tkey);
   }
 
   // Already-terminal short-circuit, RECEIPT-AWARE: only delete when there is no

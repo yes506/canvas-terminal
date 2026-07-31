@@ -3121,7 +3121,7 @@ describe("collab-signal-hardening — hardening round (reopen CAS, teardown, ove
       if (cmd === "get_memory_session_dir") return "/mem/x";
       if (cmd === "list_memory_files") return [signalPath];
       if (cmd === "read_memory_file") return payload;
-      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "get_memory_file_mtime") return 1_000_000; // pre-reopen (stale)
       if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
       if (cmd === "quarantine_memory_file") { quarantined.push(rel!); return `${rel}.bad`; }
       if (cmd === "delete_memory_file") { deleted.push(rel!); return true; }
@@ -3180,6 +3180,38 @@ describe("collab-signal-hardening — hardening round (reopen CAS, teardown, ove
     expect(deleted).not.toContain(signalPath); // signal not lost
   });
 
+  it("B1-two-files: TWO stale signals (short-id + full-id) mapping to one reassigned task are BOTH quarantined — no re-completion (generational tombstone)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const shortId = task.id.replace(/-\d{13}$/, "");
+    const fileFull = `${task.id}.done.json`; // full-id filename + payload
+    const fileShort = `${shortId}.done.json`; // short-id filename + payload — both resolve to `task`
+    const payFull = JSON.stringify({ task_id: task.id, status: "completed", author: "@a" });
+    const payShort = JSON.stringify({ task_id: shortId, status: "completed", author: "@b" });
+    const quarantined: string[] = [];
+    const deleted: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      const rel = (args as { relativePath?: string })?.relativePath;
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [fileFull, fileShort];
+      if (cmd === "read_memory_file") return rel === fileShort ? payShort : payFull;
+      if (cmd === "get_memory_file_mtime") return 1_000_000; // both written pre-reassign (stale)
+      if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+      if (cmd === "quarantine_memory_file") { quarantined.push(rel!); return `${rel}.bad`; }
+      if (cmd === "delete_memory_file") { deleted.push(rel!); return true; }
+      return null;
+    });
+    // Reassign supersedes both stale signals (reassigned → tombstone, generation = now).
+    useCollaboratorStore.getState().updateTask(task.id, { assignee: "@claude2" }, SESSION);
+    await scanForTaskCompletions(SESSION);
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).not.toBe("completed"); // neither stale file re-completed the reassigned task
+    expect(quarantined).toContain(fileFull);
+    expect(quarantined).toContain(fileShort); // the SECOND stale file is blocked too
+    expect(deleted).toHaveLength(0);
+    expect(taskReports()).toBe(0);
+  });
+
   it("B1-permanent: if quarantine keeps FAILING after a reopen, the task is never re-completed (no infinite reopen→complete loop)", async () => {
     const store = useCollaboratorStore.getState();
     const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
@@ -3191,7 +3223,7 @@ describe("collab-signal-hardening — hardening round (reopen CAS, teardown, ove
       if (cmd === "get_memory_session_dir") return "/mem/x";
       if (cmd === "list_memory_files") return [signalPath];
       if (cmd === "read_memory_file") return payload;
-      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "get_memory_file_mtime") return 1_000_000; // pre-reopen (stale)
       if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
       if (cmd === "quarantine_memory_file") throw new Error("quarantine IPC down"); // always fails
       if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
