@@ -13,6 +13,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   MemoryFileEntry,
+  ReportFileInfo,
   ScopedMemoryClient,
   ScopedMemoryIpc,
 } from "../types/scopedCollabMemory";
@@ -56,6 +57,14 @@ export const scopedMemoryIpc: ScopedMemoryIpc = {
 
   getMemoryFileMtime(collabSessionId: string, relativePath: string): Promise<number> {
     return invoke<number>("get_memory_file_mtime", { collabSessionId, relativePath });
+  },
+
+  quarantineMemoryFile(collabSessionId: string, relativePath: string): Promise<string> {
+    return invoke<string>("quarantine_memory_file", { collabSessionId, relativePath });
+  },
+
+  inspectReportFile(collabSessionId: string, relativePath: string): Promise<ReportFileInfo> {
+    return invoke<ReportFileInfo>("inspect_report_file", { collabSessionId, relativePath });
   },
 };
 
