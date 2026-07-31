@@ -1,0 +1,15 @@
+graph LR
+  CompletionCodec["CompletionCodec"]
+  TaskIdResolver["TaskIdResolver"]
+  MemorySignalStore["MemorySignalStore"]
+  CompletionScanner["CompletionScanner"]
+  IngestDiagnostics["IngestDiagnostics"]
+  MissingSignalWatchdog["MissingSignalWatchdog"]
+  RenameMemoryFileCmd["RenameMemoryFileCmd"]
+  CompletionCodec --> MemorySignalStore
+  CompletionCodec --> TaskIdResolver
+  MemorySignalStore --> RenameMemoryFileCmd
+  CompletionScanner --> MemorySignalStore
+  CompletionScanner --> CompletionCodec
+  CompletionScanner --> TaskIdResolver
+  CompletionScanner --> IngestDiagnostics
