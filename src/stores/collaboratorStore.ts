@@ -1447,8 +1447,13 @@ async function ingestSignalFile(forSession: string, relPath: string): Promise<vo
       clearIngestDedupe(forSession, relPath);
       return;
     }
-    // Signal is newer than the reopen → a genuine new completion. Clear the
-    // tombstone and fall through to normal terminalization.
+    // Signal is newer than the generation we READ before the await. But a
+    // SECOND reopen/reassign may have landed DURING the `getMemoryFileMtime`
+    // await (TOCTOU) and installed a newer generation. Compare-and-delete: only
+    // clear + proceed if the tombstone is unchanged. If a newer supersession
+    // landed, retain the signal and re-evaluate it against that generation next
+    // scan — never blindly discard a newer tombstone (adversarial review R4).
+    if (reopenTombstones.get(tkey) !== reopenAt) return;
     reopenTombstones.delete(tkey);
   }
 

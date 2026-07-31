@@ -3212,6 +3212,48 @@ describe("collab-signal-hardening — hardening round (reopen CAS, teardown, ove
     expect(taskReports()).toBe(0);
   });
 
+  it("B1-toctou: a reassign landing DURING the mtime-stat await is not discarded (compare-and-delete) — no re-completion", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_700_000_000_000);
+      resetStores();
+      _resetTerminalizationStateForTests();
+      const store = useCollaboratorStore.getState();
+      const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+      const signalPath = `${task.id}.done.json`;
+      const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@a" });
+      const deleted: string[] = [];
+      store.updateTask(task.id, { assignee: "@claude2" }, SESSION); // reassign #1 → tombstone T1
+      const T1 = Date.now();
+      vi.setSystemTime(T1 + 5000);
+      let firedSecond = false;
+      vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+        if (cmd === "get_memory_session_dir") return "/mem/x";
+        if (cmd === "list_memory_files") return [signalPath];
+        if (cmd === "read_memory_file") return payload;
+        if (cmd === "get_memory_file_mtime") {
+          if (!firedSecond) {
+            firedSecond = true;
+            // Reassign #2 lands INSIDE this await → tombstone T2 (= now) > T1.
+            useCollaboratorStore.getState().updateTask(task.id, { assignee: "@claude3" }, SESSION);
+          }
+          return T1 + 2000; // signal is "new" vs T1, but STALE vs T2
+        }
+        if (cmd === "write_memory_file_atomic") return "/mem/x/tasks.md";
+        if (cmd === "quarantine_memory_file") return `${(args as { relativePath: string }).relativePath}.bad`;
+        if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+        return null;
+      });
+      await scanForTaskCompletions(SESSION); // scan1: mid-await reassign; T2 tombstone must NOT be discarded
+      await scanForTaskCompletions(SESSION); // scan2: without the fix, the discarded tombstone lets this re-complete
+      const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+      expect(t.status).not.toBe("completed"); // superseded by T2 reassign — never re-completed
+      expect(deleted).not.toContain(signalPath);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("B1-permanent: if quarantine keeps FAILING after a reopen, the task is never re-completed (no infinite reopen→complete loop)", async () => {
     const store = useCollaboratorStore.getState();
     const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
