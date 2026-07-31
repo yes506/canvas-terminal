@@ -2520,7 +2520,6 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
 
     const task0 = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
     if (!task0) return false; // task vanished (removed/reassigned) — nothing to drive
-    const wasTerminalBefore = task0.status === "completed" || task0.status === "blocked";
 
     // 1. Mark terminal in-memory WITHOUT side effects + bump rev, synchronously,
     //    so no ordinary mutation can interleave with pre-terminal state behind
@@ -2552,12 +2551,15 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       return false; // keep terminal state + signal + receipt; retried next scan
     }
 
-    // 3. Emit terminal side effects EXACTLY ONCE (unless a human path already
-    //    terminalized this task before the txn began), then advance the receipt.
+    // 3. Emit terminal side effects EXACTLY ONCE, gated on the RECEIPT phase
+    //    (NOT the task's terminal state — on a retry the task is already
+    //    terminal in-memory from the prior failed attempt, but side effects
+    //    were never emitted). A receipt that already reached `effects_emitted`
+    //    (e.g. a prior delete failure) skips straight to the delete retry.
     const cur = terminalizationReceipts.get(rkey);
     if (cur && cur.phase === "terminal_unpersisted") {
       terminalizationReceipts.set(rkey, { phase: "ledger_acknowledged", rev });
-      if (!wasTerminalBefore) get().emitTaskTerminalOutcome(taskId, forSession);
+      get().emitTaskTerminalOutcome(taskId, forSession);
       terminalizationReceipts.set(rkey, { phase: "effects_emitted", rev });
     }
 
