@@ -626,9 +626,13 @@ pub(crate) fn quarantine_under(
     }
 
     // Rename replaces our just-created empty reservation with the source bytes;
-    // atomic within the same parent directory.
-    std::fs::rename(&source, &dest)
-        .map_err(|e| format!("quarantine rename {}: {}", relative_path, e))?;
+    // atomic within the same parent directory. On failure (e.g. the source
+    // vanished via TOCTOU between the is_file() stat and here), unlink the empty
+    // reservation so it does not leak.
+    if let Err(e) = std::fs::rename(&source, &dest) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!("quarantine rename {}: {}", relative_path, e));
+    }
     Ok(dest.to_string_lossy().to_string())
 }
 

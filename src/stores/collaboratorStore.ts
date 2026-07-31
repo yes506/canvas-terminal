@@ -410,25 +410,40 @@ interface TerminalizationReceipt {
 /** Keyed by `${session}::${taskId}::${signalPath}`. */
 const terminalizationReceipts = new Map<string, TerminalizationReceipt>();
 
+/**
+ * SYNCHRONOUS supersession tombstones, keyed `${session}::${taskId}`. Set the
+ * instant a task is explicitly reopened/reassigned (`updateTask`) — BEFORE any
+ * async quarantine — so `ingestSignalFile` can durably refuse to re-terminalize
+ * a superseded task even if a scan races ahead of the physical file move. The
+ * tombstone is cleared once the stale signal for that task is actually
+ * quarantined (or the file is gone), so a genuinely NEW completion can proceed.
+ * This closes the reopen re-completion / signal-loss race that a fire-and-forget
+ * quarantine alone left open (adversarial review, hardening round).
+ */
+const reopenTombstones = new Set<string>();
+
+function tombstoneKey(forSession: string, taskId: string): string {
+  return `${forSession}::${taskId}`;
+}
+
 function receiptKey(forSession: string, taskId: string, signalPath: string): string {
   return `${forSession}::${taskId}::${signalPath}`;
 }
 
 /**
- * Cancel every terminalization receipt for `(forSession, taskId)` and quarantine
- * the now-stale completion signals they point at. Called from `updateTask` on an
- * explicit status change/reopen so the in-flight (or retrying) txn cannot later
- * acknowledge a superseded snapshot and delete the signal (plan C1: "explicit
- * reopen cancels the receipt"). Quarantining the signal (fire-and-forget) stops
- * the next scan from re-completing a task the user just reopened.
+ * Supersede every in-flight/retrying terminalization for `(forSession, taskId)`:
+ * delete its receipts AND set a synchronous reopen tombstone. Called from
+ * `updateTask` on an explicit status change or reassignment (plan C1: "explicit
+ * reopen cancels the receipt"). The tombstone — not a racy fire-and-forget
+ * quarantine — is what stops the next scan from re-completing a task the user
+ * just reopened; `ingestSignalFile` quarantines the stale signal durably.
  */
 function cancelReceiptsForTask(forSession: string, taskId: string): void {
   const prefix = `${forSession}::${taskId}::`;
-  for (const [k, r] of terminalizationReceipts) {
-    if (!k.startsWith(prefix)) continue;
-    terminalizationReceipts.delete(k);
-    void scopedMemoryIpc.quarantineMemoryFile(forSession, r.signalPath).catch(() => {});
+  for (const k of terminalizationReceipts.keys()) {
+    if (k.startsWith(prefix)) terminalizationReceipts.delete(k);
   }
+  reopenTombstones.add(tombstoneKey(forSession, taskId));
 }
 
 // Per-`(session,relPath)` in-flight guard: overlapping scans (onFlush + 2s poll
@@ -473,6 +488,9 @@ function purgeTerminalizationSessionState(forSession: string): void {
   for (const k of Array.from(noMatchDiagnosed)) {
     if (k.startsWith(kprefix)) noMatchDiagnosed.delete(k);
   }
+  for (const k of Array.from(reopenTombstones)) {
+    if (k.startsWith(kprefix)) reopenTombstones.delete(k);
+  }
   const dprefix = `${forSession} `; // ingestDiagnosticDedupe is space-delimited
   for (const k of ingestDiagnosticDedupe.keys()) {
     if (k.startsWith(dprefix)) ingestDiagnosticDedupe.delete(k);
@@ -487,6 +505,7 @@ export function _resetTerminalizationStateForTests(): void {
   ingestInFlight.clear();
   ingestDiagnosticDedupe.clear();
   noMatchDiagnosed.clear();
+  reopenTombstones.clear();
   scanStabilityTracker.clearAll();
 }
 
@@ -1389,6 +1408,27 @@ async function ingestSignalFile(forSession: string, relPath: string): Promise<vo
   }
   const task = res.task;
 
+  // SUPERSESSION GUARD (durable, synchronous): if this task was explicitly
+  // reopened/reassigned, its old completion signal must NOT re-terminalize it —
+  // even if this scan raced ahead of the reopen's async quarantine. Quarantine
+  // the stale signal here (awaited), then clear the tombstone so a genuinely new
+  // completion can proceed. On quarantine failure keep the tombstone + signal
+  // and retry next scan (never re-complete). Closes the reopen re-completion /
+  // signal-loss race (adversarial review, hardening round).
+  const tkey = tombstoneKey(forSession, task.id);
+  if (reopenTombstones.has(tkey)) {
+    try {
+      await scopedMemoryIpc.quarantineMemoryFile(forSession, relPath);
+      reopenTombstones.delete(tkey);
+    } catch {
+      return; // keep tombstone + signal; retry next scan (no re-completion)
+    }
+    scanStabilityTracker.purge(key);
+    noMatchDiagnosed.delete(key);
+    clearIngestDedupe(forSession, relPath);
+    return;
+  }
+
   // Already-terminal short-circuit, RECEIPT-AWARE: only delete when there is no
   // outstanding `terminal_unpersisted` receipt (i.e. durability is confirmed).
   const rkey = receiptKey(forSession, task.id, relPath);
@@ -1441,6 +1481,19 @@ export async function scanForTaskCompletions(forSession: string): Promise<void> 
     useCollaboratorStore.getState().reportIngestFailure("list-error", "(session)", forSession);
     return;
   }
+  // Reconcile: a completion signal removed by NON-pipeline means (an agent
+  // overwriting/deleting its own file) after a failed strict persist would
+  // otherwise leak its receipt until session teardown, since no ingest call
+  // ever observes `raw === null` for it. Drop receipts whose signal is no
+  // longer listed (adversarial-review nit). Runs at scan start, before any
+  // receipt this scan will create.
+  const presentSignals = new Set(doneFiles);
+  for (const [k, r] of terminalizationReceipts) {
+    if (r.forSession === forSession && !presentSignals.has(r.signalPath)) {
+      terminalizationReceipts.delete(k);
+    }
+  }
+
   if (doneFiles.length === 0) return;
 
   for (const relPath of doneFiles) {
@@ -2514,11 +2567,13 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
       // Append a structured task report when status changes to a terminal state.
       const isTerminal = task.status === "completed" || task.status === "blocked";
       const statusChanged = task.status !== prevStatus;
-      if (statusChanged) {
-        // An explicit status change (human `/task done|status|assign`, a reopen)
-        // SUPERSEDES any in-flight scanner terminalization for this task: cancel
-        // its receipt + quarantine its now-stale signal so the txn can't later
-        // acknowledge a superseded snapshot and delete/re-complete (plan C1).
+      if (statusChanged || reassigned) {
+        // An explicit status change OR reassignment SUPERSEDES any in-flight
+        // scanner terminalization for this task: delete its receipt + set a
+        // synchronous reopen tombstone so the txn can't later acknowledge a
+        // superseded snapshot, and the next scan can't re-complete the task
+        // by racing ahead of the physical file move (plan C1 + adversarial
+        // review). `ingestSignalFile` durably quarantines the stale signal.
         cancelReceiptsForTask(forSession, taskId);
       }
       if (isTerminal && statusChanged) {

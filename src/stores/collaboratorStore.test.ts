@@ -3104,22 +3104,26 @@ describe("collab-signal-hardening — hardening round (reopen CAS, teardown, ove
     return entries.filter((e) => e.content.includes("Task Report")).length;
   }
 
-  it("B1: reopen after a failed persist SUPERSEDES the completion — signal quarantined not lost, task stays reopened, no false emit", async () => {
+  it("B1: reopen after a failed persist SUPERSEDES — the tombstone blocks re-completion even while the signal is STILL LISTED (race-realistic)", async () => {
     const store = useCollaboratorStore.getState();
     const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
     const signalPath = `${task.id}.done.json`;
     const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
-    const quarantined = new Set<string>();
+    const quarantined: string[] = [];
     const deleted: string[] = [];
     let atomicOk = false;
+    // KEY: `list_memory_files` KEEPS returning the signal even after quarantine is
+    // called — simulating the scheduler window where a scan races AHEAD of the
+    // physical file move. The synchronous tombstone (not the file move) must be
+    // what prevents re-completion.
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
       const rel = (args as { relativePath?: string })?.relativePath;
       if (cmd === "get_memory_session_dir") return "/mem/x";
-      if (cmd === "list_memory_files") return quarantined.has(signalPath) ? [] : [signalPath];
+      if (cmd === "list_memory_files") return [signalPath];
       if (cmd === "read_memory_file") return payload;
       if (cmd === "get_memory_file_mtime") return Date.now();
       if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
-      if (cmd === "quarantine_memory_file") { quarantined.add(rel!); return `${rel}.bad`; }
+      if (cmd === "quarantine_memory_file") { quarantined.push(rel!); return `${rel}.bad`; }
       if (cmd === "delete_memory_file") { deleted.push(rel!); return true; }
       return null;
     });
@@ -3127,16 +3131,42 @@ describe("collab-signal-hardening — hardening round (reopen CAS, teardown, ove
     await scanForTaskCompletions(SESSION); // persist fails → receipt retained, signal kept
     expect(deleted).not.toContain(signalPath);
 
-    // User explicitly reopens the task — must cancel the receipt + quarantine the signal.
-    useCollaboratorStore.getState().updateTask(task.id, { status: "pending" }, SESSION);
+    useCollaboratorStore.getState().updateTask(task.id, { status: "pending" }, SESSION); // reopen → tombstone
 
     atomicOk = true;
-    await scanForTaskCompletions(SESSION); // signal now quarantined → nothing to re-complete
+    await scanForTaskCompletions(SESSION); // signal STILL listed — tombstone must block re-completion
 
     const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
-    expect(t.status).toBe("pending"); // reopen WON — not silently re-completed
-    expect(quarantined.has(signalPath)).toBe(true); // signal preserved forensically
+    expect(t.status).toBe("pending"); // reopen WON — not re-completed despite the signal being listed
+    expect(quarantined).toContain(signalPath); // stale signal quarantined durably
     expect(deleted).not.toContain(signalPath); // never deleted against a reopened task
+    expect(taskReports()).toBe(0); // no false "completed" Task Report
+  });
+
+  it("B1-permanent: if quarantine keeps FAILING after a reopen, the task is never re-completed (no infinite reopen→complete loop)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1" });
+    const deleted: string[] = [];
+    let atomicOk = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
+      if (cmd === "quarantine_memory_file") throw new Error("quarantine IPC down"); // always fails
+      if (cmd === "delete_memory_file") { deleted.push((args as { relativePath: string }).relativePath); return true; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION); // persist fails → task completed in-memory, receipt retained
+    atomicOk = true;
+    useCollaboratorStore.getState().updateTask(task.id, { status: "pending" }, SESSION); // reopen (completed→pending) → tombstone
+    for (let i = 0; i < 3; i++) await scanForTaskCompletions(SESSION); // quarantine keeps failing
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("pending"); // never re-completed even though the signal persists
+    expect(deleted).not.toContain(signalPath);
   });
 
   it("B3: a signal never terminalizes during teardown (aborted persist is not an ack)", async () => {
