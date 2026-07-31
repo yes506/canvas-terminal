@@ -112,6 +112,37 @@ New regression tests: reopen-CAS signal-loss, teardown non-ack, oversize soft-fa
 `endSession` purge, FIFO/non-regular reject, author-wins, nested/injection report
 paths.
 
+## Second review round — adversarial concurrency verification (5 passes)
+
+After the first hardening round, a focused adversarial re-review of the reopen/
+reassign concurrency guard found FOUR more genuine, progressively-narrower
+signal-loss/re-completion bugs — each fixed, then re-verified:
+1. Fire-and-forget quarantine race → **synchronous supersession tombstone**.
+2. Stale point-check; reopen during the report-inspect await slipped past →
+   **`terminalizeWithAck` checks the tombstone at start + in the CAS**.
+3. Per-task tombstone consumed per-file (short-id + full-id both resolve to one
+   task) → **generational tombstone** (mtime ≤ reopen-time = stale; all siblings
+   blocked; only a signal newer than the reopen proceeds).
+4. TOCTOU across the mtime await (a 2nd reopen's newer generation blindly
+   discarded) → **compare-and-delete** (clear only if the generation is
+   unchanged).
+
+Round-5 adversarial verification: **CLEAN** — the four fixes compose with no gap;
+the invariant (a superseded task is never re-completed and its signal never lost)
+holds across all reachable interleavings on a single-machine monotonic clock.
+Residual items are NON-BLOCKING nits that all fail safe (conservative same-ms
+tie / NTP-backward-step → false-quarantine, never wrong completion; one
+forensic-only delete-vs-quarantine of an already-consumed stale duplicate).
+
+Dedicated interleaving tests added: B1 race-realistic (signal stays listed),
+B1-window (reopen inside the inspect await), B1-two-files (short+full both
+quarantined), B1-toctou (reassign inside the mtime await), B1-permanent
+(quarantine keeps failing → never re-completes). Reopen-test mtimes are genuinely
+pre-reopen so they prove the generational logic, not same-millisecond luck.
+
+Final validation: tsc clean · **485 vitest** · **95 Rust** (13 memory) · 0 failed ·
+worktree clean · 0 NUL bytes.
+
 ## Per-item outcomes
 All 21 queue items `completed` + the hardening round; see `.implementer-state.json`.
 Commits: `c52e86c` (codec), `0a91338` (Rust IPCs), `d4279bc` (/task), `d82e8f1`
