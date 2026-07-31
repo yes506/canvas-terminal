@@ -414,11 +414,12 @@ const terminalizationReceipts = new Map<string, TerminalizationReceipt>();
  * SYNCHRONOUS supersession tombstones, keyed `${session}::${taskId}`. Set the
  * instant a task is explicitly reopened/reassigned (`updateTask`) — BEFORE any
  * async quarantine — so `ingestSignalFile` can durably refuse to re-terminalize
- * a superseded task even if a scan races ahead of the physical file move. The
- * tombstone is cleared once the stale signal for that task is actually
- * quarantined (or the file is gone), so a genuinely NEW completion can proceed.
- * This closes the reopen re-completion / signal-loss race that a fire-and-forget
- * quarantine alone left open (adversarial review, hardening round).
+ * a superseded task even if a scan races ahead of the physical file move —
+ * `terminalizeWithAck` ALSO reads it (a mid-flight reopen after the scan's
+ * point-check must still be honored). The tombstone is cleared once the stale
+ * signal for that task is quarantined, or on session teardown, so a genuinely
+ * NEW completion can proceed. Closes the reopen re-completion / signal-loss race
+ * that a fire-and-forget quarantine alone left open (adversarial review).
  */
 const reopenTombstones = new Set<string>();
 
@@ -2733,9 +2734,19 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
 
   terminalizeWithAck: async (taskId, updates, forSession, signalPath) => {
     const rkey = receiptKey(forSession, taskId, signalPath);
-    const existing = terminalizationReceipts.get(rkey);
+    const tkey = tombstoneKey(forSession, taskId);
     const intendedStatus = (updates.status ?? "completed") as CollabTask["status"];
 
+    // SUPERSESSION CHECK (durable). A reopen/reassign may have landed AFTER the
+    // scanner's guard point-check but BEFORE we got here (e.g. during the
+    // caller's report-inspect await). The tombstone is the only reopen-durable
+    // marker; the CAS on receipt+status alone is blind to it because this txn
+    // re-establishes both. Honor the tombstone at the START (before marking
+    // terminal) so we never overwrite the reopened status, and again in the CAS.
+    // The signal stays on disk for the scan's guard to quarantine.
+    if (reopenTombstones.has(tkey)) return false;
+
+    const existing = terminalizationReceipts.get(rkey);
     const task0 = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
     if (!task0) return false; // task vanished (removed/reassigned) — nothing to drive
 
@@ -2784,7 +2795,7 @@ export const useCollaboratorStore = create<CollaboratorState>((set, get) => ({
     //    bug). `updateTask` already quarantined the stale signal on reopen.
     const cur = terminalizationReceipts.get(rkey);
     const taskNow = (get().tasksBySession[forSession] ?? []).find((t) => t.id === taskId);
-    if (!cur || !taskNow || taskNow.status !== intendedStatus) {
+    if (!cur || !taskNow || taskNow.status !== intendedStatus || reopenTombstones.has(tkey)) {
       terminalizationReceipts.delete(rkey);
       return false;
     }

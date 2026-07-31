@@ -3143,6 +3143,43 @@ describe("collab-signal-hardening — hardening round (reopen CAS, teardown, ove
     expect(taskReports()).toBe(0); // no false "completed" Task Report
   });
 
+  it("B1-window: a reopen landing DURING the report-inspect await does not re-complete (terminalizeWithAck honors the tombstone)", async () => {
+    const store = useCollaboratorStore.getState();
+    const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
+    const signalPath = `${task.id}.done.json`;
+    const reportPath = `${task.id}-report.md`;
+    const payload = JSON.stringify({ task_id: task.id, status: "completed", author: "@claude1", report_path: reportPath });
+    const deleted: string[] = [];
+    let atomicOk = false;
+    let reopenDuringInspect = false;
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
+      const rel = (args as { relativePath?: string })?.relativePath;
+      if (cmd === "get_memory_session_dir") return "/mem/x";
+      if (cmd === "list_memory_files") return [signalPath];
+      if (cmd === "read_memory_file") return payload;
+      if (cmd === "get_memory_file_mtime") return Date.now();
+      if (cmd === "write_memory_file_atomic") { if (!atomicOk) throw new Error("disk full"); return "/mem/x/tasks.md"; }
+      if (cmd === "inspect_report_file") {
+        if (reopenDuringInspect) {
+          // Interleave the reopen INSIDE the await between the scan's tombstone
+          // guard and terminalizeWithAck — the exact window the reviewer found.
+          useCollaboratorStore.getState().updateTask(task.id, { status: "pending" }, SESSION);
+        }
+        return { exists: true, isRegular: true, sizeBytes: 10 };
+      }
+      if (cmd === "quarantine_memory_file") return `${rel}.bad`;
+      if (cmd === "delete_memory_file") { deleted.push(rel!); return true; }
+      return null;
+    });
+    await scanForTaskCompletions(SESSION); // scan1: persist fails → task completed in-mem + receipt
+    atomicOk = true;
+    reopenDuringInspect = true;
+    await scanForTaskCompletions(SESSION); // scan2: reopen fires mid-inspect → must NOT re-complete
+    const t = useCollaboratorStore.getState().tasksBySession[SESSION]!.find((x) => x.id === task.id)!;
+    expect(t.status).toBe("pending"); // reopen preserved despite landing in the async window
+    expect(deleted).not.toContain(signalPath); // signal not lost
+  });
+
   it("B1-permanent: if quarantine keeps FAILING after a reopen, the task is never re-completed (no infinite reopen→complete loop)", async () => {
     const store = useCollaboratorStore.getState();
     const task = store.addTask({ objective: "o", title: "t", assignee: "@claude1" }, SESSION);
