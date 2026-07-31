@@ -1,15 +1,18 @@
 graph LR
+  CompletionProtocol["CompletionProtocol"]
+  CompletionScanner["CompletionScanner"]
   CompletionCodec["CompletionCodec"]
   TaskIdResolver["TaskIdResolver"]
+  IngestFailurePolicy["IngestFailurePolicy"]
   MemorySignalStore["MemorySignalStore"]
-  CompletionScanner["CompletionScanner"]
+  QuarantineCmd["QuarantineCmd"]
   IngestDiagnostics["IngestDiagnostics"]
-  MissingSignalWatchdog["MissingSignalWatchdog"]
-  RenameMemoryFileCmd["RenameMemoryFileCmd"]
-  CompletionCodec --> MemorySignalStore
-  CompletionCodec --> TaskIdResolver
-  MemorySignalStore --> RenameMemoryFileCmd
+  SlashCommands["SlashCommands"]
+  CompletionProtocol --> CompletionScanner
   CompletionScanner --> MemorySignalStore
   CompletionScanner --> CompletionCodec
   CompletionScanner --> TaskIdResolver
+  CompletionScanner --> IngestFailurePolicy
   CompletionScanner --> IngestDiagnostics
+  MemorySignalStore --> QuarantineCmd
+  SlashCommands --> TaskIdResolver
